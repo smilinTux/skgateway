@@ -394,12 +394,6 @@ export function createMetricsCollector(config) {
         INSERT INTO latency_log (req_id, model, backend, ts, first_byte_ms, total_ms)
         VALUES (@req_id, @model, @backend, @ts, @first_byte_ms, @total_ms)
       `),
-      purgeOld: db.prepare(`
-        DELETE FROM token_usage WHERE ts < @cutoff;
-        DELETE FROM cost_log     WHERE ts < @cutoff;
-        DELETE FROM latency_log  WHERE ts < @cutoff;
-        DELETE FROM request_log  WHERE started_at < @cutoff;
-      `),
     };
 
     // Wrap all inserts in a single transaction for performance
