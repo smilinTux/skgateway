@@ -42,6 +42,23 @@ try {
   console.log("[skgateway] metrics collector not available (optional):", e.message);
 }
 
+// Dashboard server
+let dashboard = null;
+try {
+  const { createDashboardServer } = await import("./dashboard/server.mjs");
+  const dashPort = config.dashboard?.port || config.server?.dashboard_port || 18781;
+  dashboard = createDashboardServer({
+    port:    dashPort,
+    bind:    config.server?.bind || "0.0.0.0",
+    metrics,
+    router,
+    config,
+  });
+  console.log(`[skgateway] dashboard server started on port ${dashPort}`);
+} catch (e) {
+  console.log("[skgateway] dashboard server not available (optional):", e.message);
+}
+
 // ─── Build proxy config ───
 const proxyConfig = buildConfig({
   port,
@@ -115,7 +132,8 @@ const server = http.createServer(async (req, res) => {
 function shutdown(signal) {
   console.log(`[skgateway] ${signal} received, shutting down`);
   server.close(() => {
-    if (metrics) metrics.close?.();
+    if (metrics)   metrics.close?.();
+    if (dashboard) dashboard.close?.();
     process.exit(0);
   });
   // Force exit after 5s

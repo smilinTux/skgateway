@@ -1,0 +1,315 @@
+## SKGateway Policy Configuration
+## ─────────────────────────────────────────────────────────────────────────────
+## Rules are evaluated in order.  The first matching rule with action
+## deny/allow/rate_limit wins.  Rules with action=transform or action=alert
+## apply their effect and continue evaluation (they do not stop the chain).
+##
+## Condition fields
+## ────────────────
+##   agent_id         string / glob   e.g. "sentinel" or "bot-*"
+##   model            string / glob   e.g. "claude-opus-*"
+##   backend          string          nvidia | anthropic | ollama
+##   prompt_class     string          system | user | tool
+##   risk_score       numeric         ">= 5"  (0–10 scale)
+##   jailbreak_score  numeric         ">= 8"  (0–10 scale)
+##   pii_detected     boolean         true | false
+##   time_of_day      range           "HH:MM-HH:MM" (24 h, wraps midnight)
+##   tokens_today     numeric         ">= 50000"
+##   budget_remaining numeric         "< 1.00"  (USD)
+##
+## Actions
+## ───────
+##   allow      — immediately allow (skip remaining rules)
+##   deny       — block with HTTP 403 + message
+##   transform  — apply transform then continue
+##   rate_limit — block with HTTP 429 + message
+##   alert      — emit alert event, continue evaluation
+##
+## Transforms
+## ──────────
+##   redact_pii        — replace PII in messages with [REDACTED] labels
+##   downgrade_model   — replace model with fallback_model
+##   strip_tools       — remove tools and tool_choice from request
+##   add_safety_prompt — prepend safety instruction to system messages
+##
+## Severity levels (for alerting / logging)
+## ─────────────────────────────────────────
+##   info | low | medium | high | critical
+
+rules:
+
+  ## ─── Security ─────────────────────────────────────────────────────────────
+
+  - name: "block-jailbreak-critical"
+    condition:
+      jailbreak_score: ">= 9"
+    action: deny
+    message: "Request blocked: high-confidence jailbreak attempt detected"
+    severity: critical
+
+  - name: "alert-jailbreak-moderate"
+    condition:
+      jailbreak_score: ">= 7"
+    action: alert
+    severity: high
+
+  - name: "block-high-risk"
+    condition:
+      risk_score: ">= 9"
+    action: deny
+    message: "Request blocked: risk score exceeds threshold"
+    severity: critical
+
+  - name: "add-safety-prompt-elevated-risk"
+    condition:
+      risk_score: ">= 6"
+    action: transform
+    transform: add_safety_prompt
+    safety_prompt: >
+      You are operating in a monitored session. Respond helpfully, accurately,
+      and safely. Do not assist with harmful, illegal, or deceptive content.
+      If unsure, err on the side of caution.
+    severity: medium
+
+  ## ─── PII Protection ───────────────────────────────────────────────────────
+
+  - name: "redact-pii-outbound"
+    condition:
+      pii_detected: true
+    action: transform
+    transform: redact_pii
+    severity: medium
+
+  ## ─── Agent Restrictions ───────────────────────────────────────────────────
+
+  ## sentinel is a READ-ONLY monitoring agent — block expensive/capable models
+  - name: "restrict-sentinel-opus"
+    condition:
+      agent_id: "sentinel"
+      model: "claude-opus-*"
+    action: deny
+    message: "Sentinel agent is restricted to non-Opus models"
+    severity: medium
+
+  - name: "restrict-sentinel-sonnet"
+    condition:
+      agent_id: "sentinel"
+      model: "claude-sonnet-*"
+    action: deny
+    message: "Sentinel agent is restricted to non-Sonnet models (use kimi-k2-instruct)"
+    severity: low
+
+  ## sentinel may not use tools (read-only posture)
+  - name: "strip-sentinel-tools"
+    condition:
+      agent_id: "sentinel"
+    action: transform
+    transform: strip_tools
+    severity: info
+
+  ## ─── Budget / Cost Controls ───────────────────────────────────────────────
+
+  ## When an agent is out of budget, downgrade to the free-tier model
+  - name: "budget-fallback-downgrade"
+    condition:
+      agent_budget_exceeded: true
+    action: transform
+    transform: downgrade_model
+    fallback_model: "kimi-k2-instruct"
+    severity: medium
+
+  ## Alert (but don't block) when budget is running low
+  - name: "alert-low-budget"
+    condition:
+      budget_remaining: "< 1.00"
+    action: alert
+    message: "Agent budget is critically low (< $1.00 remaining)"
+    severity: high
+
+  ## ─── After-Hours Controls ─────────────────────────────────────────────────
+
+  ## Outside business hours (22:00–06:00) automatically downgrade model to
+  ## preserve quota for daytime interactive work.
+  ## Uncomment to activate:
+  ##
+  ## - name: "after-hours-model-downgrade"
+  ##   condition:
+  ##     time_of_day: "22:00-06:00"
+  ##     model: "claude-opus-*"
+  ##   action: transform
+  ##   transform: downgrade_model
+  ##   fallback_model: "kimi-k2-instruct"
+  ##   severity: info
+
+  ## ─── Token Quota ──────────────────────────────────────────────────────────
+
+  ## Agents that have consumed a very large number of tokens today get
+  ## their model downgraded and tools stripped.
+  - name: "token-quota-exceeded-downgrade"
+    condition:
+      tokens_today: ">= 500000"
+    action: transform
+    transform: downgrade_model
+    fallback_model: "kimi-k2-instruct"
+    severity: high
+
+  - name: "token-quota-exceeded-alert"
+    condition:
+      tokens_today: ">= 400000"
+    action: alert
+    message: "Agent has consumed 400k+ tokens today — approaching daily quota"
+    severity: medium
+
+  ## ─── Rate Limiting ────────────────────────────────────────────────────────
+
+  ## Example: bot agents are rate-limited more aggressively
+  ## Uncomment and customise as needed:
+  ##
+  ## - name: "rate-limit-bot-agents"
+  ##   condition:
+  ##     agent_id: "bot-*"
+  ##   action: rate_limit
+  ##   message: "Bot agent rate limit exceeded"
+  ##   severity: low
+
+  ## ─── Allow-listing ────────────────────────────────────────────────────────
+
+  ## Lumina (primary agent) gets an explicit allow on all requests
+  ## that haven't been blocked by the rules above.
+  - name: "allow-lumina"
+    condition:
+      agent_id: "lumina"
+    action: allow
+    severity: info
+
+  ## Trusted swarm agents: artisan, herald, architect, scholar, steward, coder
+  - name: "allow-swarm-agents"
+    condition:
+      agent_id: "artisan"
+    action: allow
+    severity: info
+
+  - name: "allow-herald"
+    condition:
+      agent_id: "herald"
+    action: allow
+    severity: info
+
+  - name: "allow-architect"
+    condition:
+      agent_id: "architect"
+    action: allow
+    severity: info
+
+  - name: "allow-scholar"
+    condition:
+      agent_id: "scholar"
+    action: allow
+    severity: info
+
+  - name: "allow-steward"
+    condition:
+      agent_id: "steward"
+    action: allow
+    severity: info
+
+  - name: "allow-coder"
+    condition:
+      agent_id: "coder"
+    action: allow
+    severity: info
+
+  ## Jarvis is a terminal agent — restrict to ollama/local models by default
+  - name: "jarvis-restrict-to-local-models"
+    condition:
+      agent_id: "jarvis"
+      backend: "anthropic"
+    action: deny
+    message: "Jarvis is restricted to local/NVIDIA models to preserve Anthropic quota"
+    severity: low
+
+  ## opus (Cursor/Claude Code agent) — allow all
+  - name: "allow-opus-agent"
+    condition:
+      agent_id: "opus"
+    action: allow
+    severity: info
+
+## ─── Rate Limit Configuration ─────────────────────────────────────────────────
+## Used by ratelimit.mjs when loadPolicies() is called.
+## These limits are applied in addition to (not instead of) the rules above.
+
+rate_limits:
+  default:
+    requests_per_min:   60
+    requests_per_hour:  1000
+    requests_per_day:   10000
+    tokens_per_min:     200000
+    tokens_per_hour:    2000000
+    tokens_per_day:     20000000
+    burst:              10
+
+  agents:
+    lumina:
+      requests_per_min:   120
+      requests_per_hour:  2000
+      requests_per_day:   20000
+      tokens_per_min:     500000
+      tokens_per_hour:    5000000
+      tokens_per_day:     50000000
+      burst:              20
+
+    sentinel:
+      requests_per_min:   10
+      requests_per_hour:  100
+      requests_per_day:   500
+      tokens_per_min:     10000
+      tokens_per_hour:    50000
+      tokens_per_day:     200000
+      burst:              3
+
+    jarvis:
+      requests_per_min:   30
+      requests_per_hour:  500
+      requests_per_day:   5000
+      tokens_per_min:     100000
+      tokens_per_hour:    1000000
+      tokens_per_day:     10000000
+      burst:              5
+
+  models:
+    "claude-opus-*":
+      requests_per_min:   20
+      requests_per_hour:  200
+      requests_per_day:   1000
+      tokens_per_min:     50000
+      tokens_per_hour:    500000
+      tokens_per_day:     5000000
+      burst:              5
+
+    "claude-sonnet-*":
+      requests_per_min:   60
+      requests_per_hour:  1000
+      requests_per_day:   10000
+      tokens_per_min:     200000
+      tokens_per_hour:    2000000
+      tokens_per_day:     20000000
+      burst:              10
+
+    "kimi-k2-instruct":
+      requests_per_min:   120
+      requests_per_hour:  3000
+      requests_per_day:   50000
+      tokens_per_min:     500000
+      tokens_per_hour:    10000000
+      tokens_per_day:     100000000
+      burst:              20
+
+    "kimi-k2.5":
+      requests_per_min:   30
+      requests_per_hour:  300
+      requests_per_day:   2000
+      tokens_per_min:     200000
+      tokens_per_hour:    2000000
+      tokens_per_day:     10000000
+      burst:              5

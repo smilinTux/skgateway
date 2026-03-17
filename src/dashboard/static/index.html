@@ -1,0 +1,1616 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SKGateway SOC</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+/* ─── Reset & Base ─────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  /* Backgrounds */
+  --bg:        #000000;
+  --surface:   rgba(255,255,255,0.04);
+  --surface-2: rgba(255,255,255,0.07);
+  --surface-3: rgba(255,255,255,0.10);
+
+  /* Borders */
+  --border:    rgba(255,255,255,0.08);
+  --border-2:  rgba(255,255,255,0.14);
+
+  /* Text */
+  --text-1: #F5F5F5;
+  --text-2: #A0A0A0;
+  --text-3: #666666;
+
+  /* Accents */
+  --accent:    #A855F7;
+  --accent-dim: rgba(168,85,247,0.15);
+
+  /* Status */
+  --green:     #22C55E;
+  --yellow:    #EAB308;
+  --red:       #EF4444;
+  --blue:      #3B82F6;
+  --magenta:   #EC4899;
+
+  /* Agent soul colors */
+  --lumina:    #A855F7;
+  --jarvis:    #06B6D4;
+  --opus:      #F59E0B;
+  --sentinel:  #EF4444;
+  --artisan:   #EC4899;
+  --herald:    #10B981;
+  --architect: #6366F1;
+  --scholar:   #8B5CF6;
+  --steward:   #14B8A6;
+  --coder:     #F97316;
+  --unknown:   #64748B;
+
+  /* Typography */
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+
+  /* Layout */
+  --header-h:  56px;
+  --gap:       12px;
+  --radius:    10px;
+  --radius-sm: 6px;
+}
+
+html { font-size: 14px; }
+
+body {
+  background: var(--bg);
+  color: var(--text-1);
+  font-family: var(--font-sans);
+  min-height: 100vh;
+  overflow-x: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border-2); border-radius: 4px; }
+
+/* ─── Glass Card ───────────────────────────────────────────────────────── */
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  position: relative;
+  overflow: hidden;
+}
+.card::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(135deg, rgba(255,255,255,0.03) 0%, transparent 60%);
+  pointer-events: none;
+}
+.card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px 8px;
+  border-bottom: 1px solid var(--border);
+}
+.card-title {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-2);
+}
+.card-body { padding: 12px 16px 14px; }
+
+/* ─── Header Bar ───────────────────────────────────────────────────────── */
+#header {
+  height: var(--header-h);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 20px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(0,0,0,0.6);
+  backdrop-filter: blur(24px);
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  gap: 16px;
+}
+
+.header-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+.header-logo {
+  width: 28px; height: 28px;
+  border-radius: 6px;
+  background: linear-gradient(135deg, var(--lumina), var(--architect));
+  display: flex; align-items: center; justify-content: center;
+  font-size: 13px; font-weight: 700;
+}
+.header-title {
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  background: linear-gradient(90deg, #fff 0%, var(--text-2) 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+.header-subtitle {
+  font-size: 11px;
+  color: var(--text-3);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.header-stats {
+  display: flex;
+  gap: 24px;
+  align-items: center;
+}
+.header-stat { text-align: center; }
+.header-stat-val {
+  font-family: var(--font-mono);
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-1);
+  line-height: 1;
+}
+.header-stat-label {
+  font-size: 10px;
+  color: var(--text-3);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-top: 2px;
+}
+
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-shrink: 0;
+}
+.ws-badge {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--text-3);
+  padding: 4px 8px;
+  border-radius: 20px;
+  border: 1px solid var(--border);
+  transition: border-color 0.3s, color 0.3s;
+}
+.ws-badge.connected { color: var(--green); border-color: rgba(34,197,94,0.3); }
+.ws-badge.error     { color: var(--red);   border-color: rgba(239,68,68,0.3); }
+.ws-dot {
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: pulse-dot 2s ease-in-out infinite;
+}
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.3; }
+}
+
+/* ─── Main Grid ────────────────────────────────────────────────────────── */
+#main {
+  padding: var(--gap);
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr 280px;
+  grid-template-rows: auto auto 1fr auto;
+  gap: var(--gap);
+  min-height: calc(100vh - var(--header-h));
+}
+
+/* ─── Backend Health Row ────────────────────────────────────────────────── */
+#health-row {
+  grid-column: 1 / -1;
+  display: flex;
+  gap: var(--gap);
+  overflow-x: auto;
+}
+.backend-card {
+  flex: 1;
+  min-width: 180px;
+}
+.backend-status-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.status-dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.status-dot.up       { background: var(--green);  box-shadow: 0 0 6px var(--green); }
+.status-dot.degraded { background: var(--yellow); box-shadow: 0 0 6px var(--yellow); animation: pulse-dot 1s infinite; }
+.status-dot.down     { background: var(--red);    box-shadow: 0 0 6px var(--red); animation: pulse-dot 0.5s infinite; }
+.status-dot.unknown  { background: var(--text-3); }
+
+.backend-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-1);
+}
+.backend-status-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-left: auto;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+.backend-status-label.up       { color: var(--green);  background: rgba(34,197,94,0.1); }
+.backend-status-label.degraded { color: var(--yellow); background: rgba(234,179,8,0.1); }
+.backend-status-label.down     { color: var(--red);    background: rgba(239,68,68,0.1); }
+.backend-status-label.unknown  { color: var(--text-3); background: var(--surface-2); }
+
+.backend-models {
+  font-size: 10px;
+  color: var(--text-3);
+  margin-bottom: 10px;
+  line-height: 1.4;
+  font-family: var(--font-mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.backend-metrics {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+.bm-item { }
+.bm-label { font-size: 10px; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.05em; }
+.bm-value { font-family: var(--font-mono); font-size: 13px; font-weight: 500; color: var(--text-1); }
+
+/* ─── Token Chart Panel ─────────────────────────────────────────────────── */
+#token-panel {
+  grid-column: 1 / 3;
+  grid-row: 2;
+}
+.chart-controls {
+  display: flex;
+  gap: 4px;
+}
+.period-btn {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--text-3);
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-family: var(--font-sans);
+  transition: all 0.15s;
+}
+.period-btn.active,
+.period-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-dim);
+}
+#token-canvas {
+  display: block;
+  width: 100%;
+  height: 220px;
+}
+.chart-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  padding: 8px 16px 12px;
+}
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--text-2);
+  cursor: pointer;
+  transition: opacity 0.2s;
+}
+.legend-item.muted { opacity: 0.3; }
+.legend-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+
+/* ─── Cost Panel ────────────────────────────────────────────────────────── */
+#cost-panel {
+  grid-column: 3;
+  grid-row: 2 / 4;
+}
+.cost-summary {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+.cost-sum-item { text-align: center; }
+.cost-sum-label { font-size: 10px; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.05em; }
+.cost-sum-val   { font-family: var(--font-mono); font-size: 16px; font-weight: 600; color: var(--text-1); margin-top: 2px; }
+
+.cost-bars { display: flex; flex-direction: column; gap: 7px; margin-bottom: 14px; }
+.cost-bar-row { }
+.cost-bar-label { display: flex; justify-content: space-between; margin-bottom: 3px; }
+.cost-bar-name  { font-size: 11px; color: var(--text-2); }
+.cost-bar-val   { font-size: 11px; font-family: var(--font-mono); color: var(--text-3); }
+.cost-bar-track { height: 4px; background: var(--surface-3); border-radius: 2px; overflow: hidden; }
+.cost-bar-fill  { height: 100%; border-radius: 2px; transition: width 0.6s ease; }
+
+.budget-ring-wrap {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 10px 0 0;
+  border-top: 1px solid var(--border);
+}
+.budget-ring-svg { flex-shrink: 0; }
+.budget-ring-info { }
+.budget-ring-pct   { font-family: var(--font-mono); font-size: 20px; font-weight: 700; }
+.budget-ring-label { font-size: 11px; color: var(--text-3); margin-top: 2px; }
+
+/* ─── Agent Activity Feed ────────────────────────────────────────────────── */
+#activity-panel {
+  grid-column: 4;
+  grid-row: 2 / 5;
+  display: flex;
+  flex-direction: column;
+}
+.activity-feed {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 14px;
+  max-height: 560px;
+}
+.activity-item {
+  display: flex;
+  gap: 9px;
+  align-items: flex-start;
+  padding: 8px 10px;
+  background: var(--surface-2);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  transition: opacity 0.2s;
+  animation: slide-in 0.25s ease;
+}
+@keyframes slide-in {
+  from { transform: translateX(8px); opacity: 0; }
+  to   { transform: translateX(0);  opacity: 1; }
+}
+.agent-avatar {
+  width: 26px; height: 26px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 700;
+  color: #000;
+  flex-shrink: 0;
+}
+.activity-meta { flex: 1; min-width: 0; }
+.activity-top  { display: flex; justify-content: space-between; align-items: center; }
+.activity-agent { font-size: 11px; font-weight: 600; }
+.activity-time  { font-size: 10px; color: var(--text-3); font-family: var(--font-mono); }
+.activity-model { font-size: 10px; color: var(--text-3); font-family: var(--font-mono); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.activity-tags  { display: flex; gap: 4px; margin-top: 4px; flex-wrap: wrap; }
+.tag {
+  font-size: 9px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-weight: 500;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+.tag-classify { background: rgba(99,102,241,0.2); color: #818CF8; }
+.tag-status-ok  { background: rgba(34,197,94,0.15); color: var(--green); }
+.tag-status-err { background: rgba(239,68,68,0.15); color: var(--red); }
+.tag-tokens { background: rgba(255,255,255,0.07); color: var(--text-2); }
+.tag-ms     { background: rgba(255,255,255,0.05); color: var(--text-3); }
+
+/* ─── Prompt Classification ──────────────────────────────────────────────── */
+#classify-panel {
+  grid-column: 1;
+  grid-row: 3;
+}
+.classify-wrap {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  padding: 8px 0;
+}
+#classify-canvas { flex-shrink: 0; }
+.classify-legend { flex: 1; display: flex; flex-direction: column; gap: 5px; }
+.cl-item { display: flex; justify-content: space-between; align-items: center; }
+.cl-dot-name { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text-2); }
+.cl-pct { font-family: var(--font-mono); font-size: 11px; color: var(--text-1); }
+.cl-dot { width: 8px; height: 8px; border-radius: 2px; flex-shrink: 0; }
+
+/* ─── ITIL Status ────────────────────────────────────────────────────────── */
+#itil-panel {
+  grid-column: 2;
+  grid-row: 3;
+}
+.itil-counts { display: flex; gap: 10px; margin-bottom: 10px; }
+.itil-count-box {
+  flex: 1;
+  text-align: center;
+  padding: 8px 6px;
+  background: var(--surface-2);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+}
+.itil-count-val   { font-family: var(--font-mono); font-size: 20px; font-weight: 700; }
+.itil-count-label { font-size: 9px; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.06em; margin-top: 2px; }
+.itil-count-box.crit  .itil-count-val { color: var(--red); }
+.itil-count-box.high  .itil-count-val { color: var(--magenta); }
+.itil-count-box.med   .itil-count-val { color: var(--yellow); }
+.itil-count-box.low   .itil-count-val { color: var(--blue); }
+
+.itil-changes { display: flex; flex-direction: column; gap: 5px; }
+.itil-change  { font-size: 11px; color: var(--text-2); padding: 5px 8px; background: var(--surface-2); border-radius: var(--radius-sm); border-left: 3px solid var(--border-2); }
+.itil-link    { font-size: 10px; color: var(--accent); text-decoration: none; margin-top: 6px; display: inline-flex; align-items: center; gap: 4px; }
+.itil-link:hover { color: #C084FC; }
+
+/* ─── Security Events ────────────────────────────────────────────────────── */
+#siem-panel {
+  grid-column: 1 / 4;
+  grid-row: 4;
+}
+.siem-toolbar {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.filter-chip {
+  font-size: 10px;
+  padding: 3px 8px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: none;
+  color: var(--text-3);
+  cursor: pointer;
+  font-family: var(--font-sans);
+  transition: all 0.15s;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.filter-chip:hover, .filter-chip.active {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-dim);
+}
+
+.siem-list {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 10px 14px;
+  max-height: 240px;
+  overflow-y: auto;
+}
+.siem-item {
+  display: grid;
+  grid-template-columns: 20px 80px 1fr auto;
+  gap: 10px;
+  align-items: start;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.siem-item:hover { background: var(--surface-3); }
+.siem-item.expanded .siem-detail { display: block; }
+
+.siem-severity-icon {
+  width: 20px; height: 20px;
+  border-radius: 4px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 10px;
+}
+.sev-info     { background: rgba(59,130,246,0.15); color: var(--blue); }
+.sev-warning  { background: rgba(234,179,8,0.15);  color: var(--yellow); }
+.sev-error    { background: rgba(239,68,68,0.15);  color: var(--red); }
+.sev-critical { background: rgba(236,72,153,0.15); color: var(--magenta); }
+
+.siem-time {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-3);
+  padding-top: 2px;
+}
+.siem-msg { font-size: 12px; color: var(--text-1); }
+.siem-type-badge {
+  font-size: 9px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-weight: 500;
+  text-transform: uppercase;
+  background: var(--surface-3);
+  color: var(--text-3);
+  white-space: nowrap;
+}
+.siem-detail {
+  display: none;
+  grid-column: 1 / -1;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-3);
+  background: rgba(0,0,0,0.3);
+  padding: 6px 8px;
+  border-radius: 4px;
+  margin-top: 4px;
+  word-break: break-all;
+}
+.siem-empty { text-align: center; color: var(--text-3); font-size: 12px; padding: 20px; }
+
+/* ─── Animations ─────────────────────────────────────────────────────────── */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.fade-in { animation: fadeIn 0.3s ease; }
+
+/* ─── Responsive ─────────────────────────────────────────────────────────── */
+@media (max-width: 1100px) {
+  #main {
+    grid-template-columns: 1fr 1fr 240px;
+  }
+  #token-panel  { grid-column: 1 / 3; }
+  #cost-panel   { grid-column: 3; grid-row: 2 / 4; }
+  #activity-panel { grid-column: 1 / -1; grid-row: 4; }
+  #classify-panel { grid-column: 1; }
+  #itil-panel   { grid-column: 2 / 4; }
+  #siem-panel   { grid-column: 1 / -1; }
+}
+
+@media (max-width: 768px) {
+  #main {
+    grid-template-columns: 1fr;
+  }
+  #health-row { flex-direction: column; }
+  #token-panel, #cost-panel, #activity-panel,
+  #classify-panel, #itil-panel, #siem-panel {
+    grid-column: 1;
+    grid-row: auto;
+  }
+  .header-stats { gap: 12px; }
+  .header-stat-val { font-size: 14px; }
+}
+
+/* ─── Misc utilities ─────────────────────────────────────────────────────── */
+.mono { font-family: var(--font-mono); }
+.text-2 { color: var(--text-2); }
+.text-3 { color: var(--text-3); }
+.empty-state { text-align: center; color: var(--text-3); font-size: 12px; padding: 16px; }
+</style>
+</head>
+<body>
+
+<!-- ─── Header ──────────────────────────────────────────────────────────── -->
+<header id="header">
+  <div class="header-brand">
+    <div class="header-logo">SK</div>
+    <div>
+      <div class="header-title">SKGateway SOC</div>
+      <div class="header-subtitle">Security Operations Center</div>
+    </div>
+  </div>
+
+  <div class="header-stats">
+    <div class="header-stat">
+      <div class="header-stat-val mono" id="h-uptime">0s</div>
+      <div class="header-stat-label">Uptime</div>
+    </div>
+    <div class="header-stat">
+      <div class="header-stat-val mono" id="h-total">0</div>
+      <div class="header-stat-label">Requests Today</div>
+    </div>
+    <div class="header-stat">
+      <div class="header-stat-val mono" id="h-active">0</div>
+      <div class="header-stat-label">Active</div>
+    </div>
+    <div class="header-stat">
+      <div class="header-stat-val mono" id="h-rps">0</div>
+      <div class="header-stat-label">Req/5m</div>
+    </div>
+    <div class="header-stat">
+      <div class="header-stat-val mono" id="h-tokens">0</div>
+      <div class="header-stat-label">Tokens/5m</div>
+    </div>
+    <div class="header-stat">
+      <div class="header-stat-val mono" id="h-cost">$0.00</div>
+      <div class="header-stat-label">Total Cost</div>
+    </div>
+  </div>
+
+  <div class="header-right">
+    <div class="ws-badge" id="ws-badge">
+      <div class="ws-dot"></div>
+      <span id="ws-label">Connecting</span>
+    </div>
+  </div>
+</header>
+
+<!-- ─── Main Grid ────────────────────────────────────────────────────────── -->
+<div id="main">
+
+  <!-- ─── Backend Health Row ─────────────────────────────────────────────── -->
+  <div id="health-row">
+    <!-- Populated by JS -->
+  </div>
+
+  <!-- ─── Token Usage Chart ──────────────────────────────────────────────── -->
+  <div id="token-panel" class="card">
+    <div class="card-header">
+      <span class="card-title">Token Usage</span>
+      <div class="chart-controls">
+        <button class="period-btn active" data-period="1h">1H</button>
+        <button class="period-btn" data-period="6h">6H</button>
+        <button class="period-btn" data-period="24h">24H</button>
+      </div>
+    </div>
+    <canvas id="token-canvas"></canvas>
+    <div class="chart-legend" id="token-legend"></div>
+  </div>
+
+  <!-- ─── Cost Panel ─────────────────────────────────────────────────────── -->
+  <div id="cost-panel" class="card">
+    <div class="card-header">
+      <span class="card-title">Cost Tracker</span>
+    </div>
+    <div class="card-body">
+      <div class="cost-summary">
+        <div class="cost-sum-item">
+          <div class="cost-sum-label">Today</div>
+          <div class="cost-sum-val mono" id="cost-today">$0.00</div>
+        </div>
+        <div class="cost-sum-item">
+          <div class="cost-sum-label">Week</div>
+          <div class="cost-sum-val mono" id="cost-week">$0.00</div>
+        </div>
+        <div class="cost-sum-item">
+          <div class="cost-sum-label">Month</div>
+          <div class="cost-sum-val mono" id="cost-month">$0.00</div>
+        </div>
+      </div>
+
+      <div class="cost-bars" id="cost-bars">
+        <div class="empty-state">Loading costs...</div>
+      </div>
+
+      <div class="budget-ring-wrap">
+        <svg class="budget-ring-svg" width="64" height="64" viewBox="0 0 64 64">
+          <circle cx="32" cy="32" r="26" fill="none" stroke="rgba(255,255,255,0.07)" stroke-width="6"/>
+          <circle id="budget-arc" cx="32" cy="32" r="26" fill="none"
+                  stroke="#A855F7" stroke-width="6"
+                  stroke-linecap="round"
+                  stroke-dasharray="163.4" stroke-dashoffset="163.4"
+                  transform="rotate(-90 32 32)"
+                  style="transition: stroke-dashoffset 0.8s ease"/>
+        </svg>
+        <div class="budget-ring-info">
+          <div class="budget-ring-pct mono" id="budget-pct">0%</div>
+          <div class="budget-ring-label text-3">of monthly budget</div>
+          <div class="budget-ring-label text-3" id="budget-limit" style="margin-top:4px;">No budget set</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── Activity Feed ──────────────────────────────────────────────────── -->
+  <div id="activity-panel" class="card" style="overflow:hidden;">
+    <div class="card-header">
+      <span class="card-title">Agent Activity</span>
+      <span class="text-3 mono" style="font-size:11px;" id="activity-count">0 requests</span>
+    </div>
+    <div class="activity-feed" id="activity-feed">
+      <div class="empty-state">Waiting for activity...</div>
+    </div>
+  </div>
+
+  <!-- ─── Prompt Classification ───────────────────────────────────────────── -->
+  <div id="classify-panel" class="card">
+    <div class="card-header">
+      <span class="card-title">Prompt Classification</span>
+    </div>
+    <div class="card-body">
+      <div class="classify-wrap">
+        <canvas id="classify-canvas" width="100" height="100"></canvas>
+        <div class="classify-legend" id="classify-legend"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── ITIL Status ─────────────────────────────────────────────────────── -->
+  <div id="itil-panel" class="card">
+    <div class="card-header">
+      <span class="card-title">ITIL Status</span>
+      <a href="#" class="itil-link" style="font-size:10px;">Open Board →</a>
+    </div>
+    <div class="card-body">
+      <div class="itil-counts">
+        <div class="itil-count-box crit">
+          <div class="itil-count-val mono" id="itil-crit">0</div>
+          <div class="itil-count-label">Critical</div>
+        </div>
+        <div class="itil-count-box high">
+          <div class="itil-count-val mono" id="itil-high">0</div>
+          <div class="itil-count-label">High</div>
+        </div>
+        <div class="itil-count-box med">
+          <div class="itil-count-val mono" id="itil-med">0</div>
+          <div class="itil-count-label">Medium</div>
+        </div>
+        <div class="itil-count-box low">
+          <div class="itil-count-val mono" id="itil-low">0</div>
+          <div class="itil-count-label">Low</div>
+        </div>
+      </div>
+      <div class="itil-changes" id="itil-changes">
+        <div class="itil-change text-3" style="border-color:transparent;">No recent changes</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── Security Events (SIEM) ──────────────────────────────────────────── -->
+  <div id="siem-panel" class="card">
+    <div class="card-header">
+      <span class="card-title">Security Events</span>
+      <div class="siem-toolbar">
+        <button class="filter-chip active" data-filter="all">All</button>
+        <button class="filter-chip" data-filter="dlp">DLP</button>
+        <button class="filter-chip" data-filter="anomaly">Anomaly</button>
+        <button class="filter-chip" data-filter="auth">Auth</button>
+        <button class="filter-chip" data-filter="rate_limit">Rate</button>
+      </div>
+    </div>
+    <div class="siem-list" id="siem-list">
+      <div class="siem-empty">No security events — all clear</div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+/* ════════════════════════════════════════════════════════════════════════════
+   SKGateway SOC Dashboard — Inline JS
+   ════════════════════════════════════════════════════════════════════════════ */
+
+// ─── Config ──────────────────────────────────────────────────────────────────
+
+const API_BASE = '';           // same host/port
+const WS_PATH  = '/ws';
+const POLL_MS  = 5_000;        // fallback polling interval when WS unavailable
+const MAX_ACTIVITY = 50;
+
+// ─── Agent soul colors ────────────────────────────────────────────────────────
+
+const SOUL = {
+  lumina:    '#A855F7',
+  jarvis:    '#06B6D4',
+  opus:      '#F59E0B',
+  sentinel:  '#EF4444',
+  artisan:   '#EC4899',
+  herald:    '#10B981',
+  architect: '#6366F1',
+  scholar:   '#8B5CF6',
+  steward:   '#14B8A6',
+  coder:     '#F97316',
+  unknown:   '#64748B',
+};
+
+function agentColor(id) {
+  if (!id) return SOUL.unknown;
+  const key = String(id).toLowerCase();
+  return SOUL[key] || SOUL.unknown;
+}
+
+// ─── Classify categories ──────────────────────────────────────────────────────
+
+const CLASSIFY_CATS = [
+  { key: 'code_gen',    label: 'Code Gen',    color: '#6366F1' },
+  { key: 'data_query',  label: 'Data Query',  color: '#06B6D4' },
+  { key: 'creative',    label: 'Creative',    color: '#EC4899' },
+  { key: 'admin',       label: 'Admin',       color: '#F59E0B' },
+  { key: 'security',    label: 'Security',    color: '#EF4444' },
+  { key: 'other',       label: 'Other',       color: '#64748B' },
+];
+
+// ─── State ───────────────────────────────────────────────────────────────────
+
+const state = {
+  stats:    null,
+  health:   {},
+  activity: [],
+  siem:     [],
+  costs:    { today: 0, week: 0, month: 0, byAgent: {} },
+  tokenHistory: {},   // agentId → [{ ts, tokens }]
+  classify: { code_gen: 35, data_query: 20, creative: 18, admin: 15, security: 7, other: 5 },
+  tokenPeriod: '1h',
+  siemFilter: 'all',
+  wsConnected: false,
+  lastUpdate: 0,
+  activityCount: 0,
+};
+
+// ─── DOM refs ────────────────────────────────────────────────────────────────
+
+const $ = id => document.getElementById(id);
+
+const dom = {
+  wsLabel:        $('ws-label'),
+  wsBadge:        $('ws-badge'),
+  hUptime:        $('h-uptime'),
+  hTotal:         $('h-total'),
+  hActive:        $('h-active'),
+  hRps:           $('h-rps'),
+  hTokens:        $('h-tokens'),
+  hCost:          $('h-cost'),
+  healthRow:      $('health-row'),
+  tokenCanvas:    $('token-canvas'),
+  tokenLegend:    $('token-legend'),
+  costToday:      $('cost-today'),
+  costWeek:       $('cost-week'),
+  costMonth:      $('cost-month'),
+  costBars:       $('cost-bars'),
+  budgetArc:      $('budget-arc'),
+  budgetPct:      $('budget-pct'),
+  budgetLimit:    $('budget-limit'),
+  activityFeed:   $('activity-feed'),
+  activityCount:  $('activity-count'),
+  classifyCanvas: $('classify-canvas'),
+  classifyLegend: $('classify-legend'),
+  itilCrit:       $('itil-crit'),
+  itilHigh:       $('itil-high'),
+  itilMed:        $('itil-med'),
+  itilLow:        $('itil-low'),
+  itilChanges:    $('itil-changes'),
+  siemList:       $('siem-list'),
+};
+
+// ─── Utility ─────────────────────────────────────────────────────────────────
+
+function fmtUptime(sec) {
+  if (sec < 60)   return `${sec}s`;
+  if (sec < 3600) return `${Math.floor(sec/60)}m ${sec%60}s`;
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  return `${h}h ${m}m`;
+}
+
+function fmtNum(n) {
+  if (n === undefined || n === null || isNaN(n)) return '0';
+  if (n >= 1_000_000) return (n/1_000_000).toFixed(1) + 'M';
+  if (n >= 1_000)     return (n/1_000).toFixed(1) + 'K';
+  return String(Math.round(n));
+}
+
+function fmtCost(usd) {
+  if (!usd || isNaN(usd)) return '$0.00';
+  if (usd < 0.01) return '$' + usd.toFixed(4);
+  return '$' + usd.toFixed(2);
+}
+
+function fmtTime(ts) {
+  const d = new Date(ts);
+  const h = String(d.getHours()).padStart(2,'0');
+  const m = String(d.getMinutes()).padStart(2,'0');
+  const s = String(d.getSeconds()).padStart(2,'0');
+  return `${h}:${m}:${s}`;
+}
+
+function fmtMs(ms) {
+  if (!ms) return '–';
+  if (ms < 1000) return ms + 'ms';
+  return (ms/1000).toFixed(1) + 's';
+}
+
+function hexToRgb(hex) {
+  const r = parseInt(hex.slice(1,3),16);
+  const g = parseInt(hex.slice(3,5),16);
+  const b = parseInt(hex.slice(5,7),16);
+  return [r,g,b];
+}
+
+// ─── WebSocket ────────────────────────────────────────────────────────────────
+
+let ws = null;
+let wsRetryDelay = 1000;
+let wsRetryTimer = null;
+
+function connectWs() {
+  if (wsRetryTimer) { clearTimeout(wsRetryTimer); wsRetryTimer = null; }
+  const proto  = location.protocol === 'https:' ? 'wss' : 'ws';
+  const wsUrl  = `${proto}://${location.host}${WS_PATH}`;
+
+  try {
+    ws = new WebSocket(wsUrl);
+  } catch(e) {
+    setWsState('error');
+    scheduleWsRetry();
+    return;
+  }
+
+  ws.onopen = () => {
+    setWsState('connected');
+    wsRetryDelay = 1000;
+  };
+
+  ws.onmessage = (evt) => {
+    try {
+      const msg = JSON.parse(evt.data);
+      handleWsMessage(msg);
+    } catch {}
+  };
+
+  ws.onerror = () => { setWsState('error'); };
+
+  ws.onclose = () => {
+    setWsState('error');
+    scheduleWsRetry();
+  };
+}
+
+function scheduleWsRetry() {
+  wsRetryTimer = setTimeout(() => {
+    setWsState('connecting');
+    connectWs();
+  }, wsRetryDelay);
+  wsRetryDelay = Math.min(wsRetryDelay * 1.5, 30_000);
+}
+
+function setWsState(s) {
+  dom.wsBadge.className = 'ws-badge ' + (s === 'connected' ? 'connected' : s === 'error' ? 'error' : '');
+  dom.wsLabel.textContent = s === 'connected' ? 'Live' : s === 'error' ? 'Disconnected' : 'Connecting';
+  state.wsConnected = (s === 'connected');
+}
+
+function handleWsMessage(msg) {
+  switch (msg.type) {
+    case 'init':
+      if (msg.data.stats)    applyStats(msg.data.stats);
+      if (msg.data.health)   applyHealth(msg.data.health);
+      if (msg.data.events)   msg.data.events.forEach(applyEvent);
+      if (msg.data.activity) msg.data.activity.forEach(applyActivity);
+      break;
+    case 'stats':    applyStats(msg.data);  break;
+    case 'health':   applyHealth(msg.data); break;
+    case 'event':    applyEvent(msg.data);  break;
+    case 'activity': applyActivity(msg.data); break;
+  }
+}
+
+// ─── REST fallback polling ────────────────────────────────────────────────────
+
+async function fetchJson(path) {
+  try {
+    const r = await fetch(API_BASE + path);
+    if (!r.ok) return null;
+    return await r.json();
+  } catch { return null; }
+}
+
+async function pollAll() {
+  const [statsData, healthData, eventsData, costsData, tokensData] = await Promise.all([
+    fetchJson('/api/stats'),
+    fetchJson('/api/health'),
+    fetchJson('/api/events?limit=50'),
+    fetchJson('/api/costs?period=30d'),
+    fetchJson(`/api/tokens?period=${state.tokenPeriod}`),
+  ]);
+
+  if (statsData)  applyStats(statsData);
+  if (healthData) applyHealth(healthData);
+  if (eventsData?.events) {
+    // Only add new ones
+    const existing = new Set(state.siem.map(e => e.id));
+    for (const ev of eventsData.events) {
+      if (!existing.has(ev.id)) applyEvent(ev);
+    }
+  }
+  if (costsData?.rows) applyCostRows(costsData.rows);
+  if (tokensData?.rows) applyTokenRows(tokensData.rows);
+}
+
+// ─── Apply Stats ──────────────────────────────────────────────────────────────
+
+function applyStats(s) {
+  state.stats = s;
+  state.lastUpdate = Date.now();
+
+  dom.hUptime.textContent  = fmtUptime(s.uptime || 0);
+  dom.hTotal.textContent   = fmtNum(s.totalRequests);
+  dom.hActive.textContent  = fmtNum(s.activeRequests);
+  dom.hRps.textContent     = fmtNum(s.recentRequests5m);
+  dom.hTokens.textContent  = fmtNum(s.recentTokens5m);
+  dom.hCost.textContent    = fmtCost(s.totalCostUsd);
+
+  // Also update cost summary from live stats
+  dom.costToday.textContent = fmtCost(s.totalCostUsd || 0);
+  // week/month require DB queries — updated separately
+
+  // Simulate activity if we have counters ticking
+  state.activityCount = s.totalRequests || 0;
+  dom.activityCount.textContent = fmtNum(state.activityCount) + ' requests';
+}
+
+// ─── Apply Health ─────────────────────────────────────────────────────────────
+
+function applyHealth(h) {
+  state.health = h;
+  renderHealth();
+}
+
+function renderHealth() {
+  const h = state.health;
+  const entries = Object.entries(h);
+
+  if (entries.length === 0) {
+    dom.healthRow.innerHTML = '<div class="card backend-card"><div class="card-body empty-state">No backends configured</div></div>';
+    return;
+  }
+
+  dom.healthRow.innerHTML = entries.map(([id, snap]) => {
+    const status  = snap.status || 'unknown';
+    const errRate = ((snap.errorRate || 0) * 100).toFixed(1);
+    const p50     = fmtMs(snap.latencyP50);
+    const p95     = fmtMs(snap.latencyP95 || 0);
+    const models  = (snap.models || []).slice(0, 3).join(', ') + ((snap.models||[]).length > 3 ? ' …' : '');
+
+    return `
+      <div class="card backend-card fade-in">
+        <div class="card-body">
+          <div class="backend-status-row">
+            <div class="status-dot ${status}"></div>
+            <div class="backend-name">${id}</div>
+            <span class="backend-status-label ${status}">${status}</span>
+          </div>
+          <div class="backend-models mono">${models || '–'}</div>
+          <div class="backend-metrics">
+            <div class="bm-item"><div class="bm-label">P50</div><div class="bm-value">${p50}</div></div>
+            <div class="bm-item"><div class="bm-label">P95</div><div class="bm-value">${p95}</div></div>
+            <div class="bm-item"><div class="bm-label">Errors</div><div class="bm-value ${parseFloat(errRate)>5?'text-red':''}">${errRate}%</div></div>
+            <div class="bm-item"><div class="bm-label">Reqs</div><div class="bm-value">${fmtNum(snap.totalRequests)}</div></div>
+          </div>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+// ─── Token Chart ──────────────────────────────────────────────────────────────
+
+const tokenChart = (() => {
+  const canvas = dom.tokenCanvas;
+  let ctx = null;
+  let history = {};     // agentId → [{ts, tokens}]
+  let mutedAgents = new Set();
+  const PAD = { top: 16, right: 16, bottom: 32, left: 52 };
+
+  function init() {
+    ctx = canvas.getContext('2d');
+    resize();
+    window.addEventListener('resize', resize);
+  }
+
+  function resize() {
+    const rect = canvas.parentElement.getBoundingClientRect();
+    canvas.width  = rect.width * devicePixelRatio;
+    canvas.height = 220 * devicePixelRatio;
+    canvas.style.width  = rect.width + 'px';
+    canvas.style.height = '220px';
+    draw();
+  }
+
+  function feed(rows) {
+    // rows: [{bucket, agent_id, input_tokens, output_tokens}]
+    history = {};
+    for (const r of rows) {
+      const a = r.agent_id || 'unknown';
+      if (!history[a]) history[a] = [];
+      const ts = new Date(r.bucket + ':00:00Z').getTime();
+      history[a].push({ ts, tokens: (r.input_tokens||0)+(r.output_tokens||0) });
+    }
+    for (const a of Object.keys(history)) {
+      history[a].sort((x,y) => x.ts - y.ts);
+    }
+    draw();
+    renderLegend();
+  }
+
+  function draw() {
+    if (!ctx) return;
+    const W = canvas.width;
+    const H = canvas.height;
+    const dpr = devicePixelRatio;
+    ctx.clearRect(0, 0, W, H);
+
+    const l = PAD.left * dpr, r = PAD.right * dpr;
+    const t = PAD.top  * dpr, b = PAD.bottom * dpr;
+    const plotW = W - l - r;
+    const plotH = H - t - b;
+
+    // Collect all data
+    const agents = Object.keys(history).filter(a => !mutedAgents.has(a));
+    if (agents.length === 0) {
+      ctx.fillStyle = 'rgba(255,255,255,0.15)';
+      ctx.font = `${11*dpr}px Inter, sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.fillText('No token data for this period', W/2, H/2);
+      return;
+    }
+
+    let allPts = [];
+    for (const a of agents) allPts = allPts.concat(history[a]);
+
+    if (allPts.length === 0) return;
+
+    const minTs = Math.min(...allPts.map(p=>p.ts));
+    const maxTs = Math.max(...allPts.map(p=>p.ts));
+    const maxTok = Math.max(...allPts.map(p=>p.tokens), 1);
+    const tsRange = maxTs - minTs || 1;
+
+    // Grid lines
+    ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+    ctx.lineWidth = 1 * dpr;
+    const yTicks = 4;
+    for (let i=0; i<=yTicks; i++) {
+      const y = t + plotH - (i/yTicks)*plotH;
+      ctx.beginPath(); ctx.moveTo(l, y); ctx.lineTo(W-r, y); ctx.stroke();
+    }
+
+    // Y-axis labels
+    ctx.fillStyle = 'rgba(160,160,160,0.6)';
+    ctx.font = `${9*dpr}px JetBrains Mono, monospace`;
+    ctx.textAlign = 'right';
+    for (let i=0; i<=yTicks; i++) {
+      const v = (i/yTicks)*maxTok;
+      const y = t + plotH - (i/yTicks)*plotH;
+      ctx.fillText(fmtNum(v), l - 4*dpr, y + 3*dpr);
+    }
+
+    // X-axis labels
+    ctx.textAlign = 'center';
+    const xTicks = 4;
+    for (let i=0; i<=xTicks; i++) {
+      const ts = minTs + (i/xTicks)*tsRange;
+      const x  = l + (i/xTicks)*plotW;
+      const d  = new Date(ts);
+      const lbl = `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+      ctx.fillStyle = 'rgba(102,102,102,0.8)';
+      ctx.fillText(lbl, x, H - 4*dpr);
+    }
+
+    // Lines
+    for (const a of agents) {
+      const pts = history[a];
+      if (!pts.length) continue;
+      const color = agentColor(a);
+      const [cr,cg,cb] = hexToRgb(color);
+
+      // Gradient fill
+      const grad = ctx.createLinearGradient(0, t, 0, t+plotH);
+      grad.addColorStop(0, `rgba(${cr},${cg},${cb},0.18)`);
+      grad.addColorStop(1, `rgba(${cr},${cg},${cb},0)`);
+
+      ctx.beginPath();
+      let first = true;
+      for (const p of pts) {
+        const x = l + ((p.ts - minTs)/tsRange)*plotW;
+        const y = t + plotH - (p.tokens/maxTok)*plotH;
+        first ? ctx.moveTo(x,y) : ctx.lineTo(x,y);
+        first = false;
+      }
+      // Close fill
+      const lastP = pts[pts.length-1];
+      const lastX = l + ((lastP.ts - minTs)/tsRange)*plotW;
+      ctx.lineTo(lastX, t+plotH);
+      ctx.lineTo(l, t+plotH);
+      ctx.closePath();
+      ctx.fillStyle = grad;
+      ctx.fill();
+
+      // Line
+      ctx.beginPath();
+      ctx.strokeStyle = color;
+      ctx.lineWidth   = 1.5 * dpr;
+      ctx.lineJoin    = 'round';
+      first = true;
+      for (const p of pts) {
+        const x = l + ((p.ts - minTs)/tsRange)*plotW;
+        const y = t + plotH - (p.tokens/maxTok)*plotH;
+        first ? ctx.moveTo(x,y) : ctx.lineTo(x,y);
+        first = false;
+      }
+      ctx.stroke();
+
+      // Dots
+      ctx.fillStyle = color;
+      for (const p of pts) {
+        const x = l + ((p.ts - minTs)/tsRange)*plotW;
+        const y = t + plotH - (p.tokens/maxTok)*plotH;
+        ctx.beginPath();
+        ctx.arc(x, y, 2.5*dpr, 0, Math.PI*2);
+        ctx.fill();
+      }
+    }
+  }
+
+  function renderLegend() {
+    const agents = Object.keys(history);
+    dom.tokenLegend.innerHTML = agents.length === 0
+      ? '<span style="font-size:11px;color:var(--text-3);">No data</span>'
+      : agents.map(a => `
+          <div class="legend-item ${mutedAgents.has(a)?'muted':''}" data-agent="${a}">
+            <div class="legend-dot" style="background:${agentColor(a)}"></div>
+            <span>${a}</span>
+          </div>
+        `).join('');
+
+    dom.tokenLegend.querySelectorAll('.legend-item').forEach(el => {
+      el.addEventListener('click', () => {
+        const a = el.dataset.agent;
+        if (mutedAgents.has(a)) mutedAgents.delete(a);
+        else mutedAgents.add(a);
+        el.classList.toggle('muted');
+        draw();
+      });
+    });
+  }
+
+  return { init, feed, draw };
+})();
+
+// ─── Apply Token Rows ─────────────────────────────────────────────────────────
+
+function applyTokenRows(rows) {
+  tokenChart.feed(rows || []);
+}
+
+// ─── Costs ───────────────────────────────────────────────────────────────────
+
+function applyCostRows(rows) {
+  if (!rows) return;
+  const now   = new Date();
+  const today = now.toISOString().slice(0,10);
+  const weekAgo = new Date(now - 7*86400000).toISOString().slice(0,10);
+  const monthStart = today.slice(0,7);
+
+  let todayCost = 0, weekCost = 0, monthCost = 0;
+  const byAgent = {};
+
+  for (const r of rows) {
+    const total = r.total_cost || (r.input_cost + r.output_cost + (r.cache_read_cost||0) + (r.cache_write_cost||0));
+    if (r.bucket === today) todayCost += total;
+    if (r.bucket >= weekAgo) weekCost += total;
+    if (r.bucket && r.bucket.startsWith(monthStart)) monthCost += total;
+    if (r.agent_id) {
+      byAgent[r.agent_id] = (byAgent[r.agent_id] || 0) + total;
+    }
+  }
+
+  dom.costToday.textContent = fmtCost(todayCost);
+  dom.costWeek.textContent  = fmtCost(weekCost);
+  dom.costMonth.textContent = fmtCost(monthCost);
+
+  renderCostBars(byAgent, monthCost);
+  updateBudgetRing(monthCost, null);
+}
+
+function renderCostBars(byAgent, total) {
+  const entries = Object.entries(byAgent).sort((a,b) => b[1]-a[1]);
+  if (!entries.length) {
+    dom.costBars.innerHTML = '<div class="empty-state" style="padding:8px 0;">No cost data</div>';
+    return;
+  }
+  const max = Math.max(...entries.map(e=>e[1]), 0.0001);
+  dom.costBars.innerHTML = entries.slice(0,8).map(([agent, cost]) => {
+    const pct  = Math.round((cost/max)*100);
+    const color = agentColor(agent);
+    return `
+      <div class="cost-bar-row">
+        <div class="cost-bar-label">
+          <span class="cost-bar-name" style="color:${color}">${agent}</span>
+          <span class="cost-bar-val">${fmtCost(cost)}</span>
+        </div>
+        <div class="cost-bar-track">
+          <div class="cost-bar-fill" style="width:${pct}%;background:${color}"></div>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+function updateBudgetRing(spent, budget) {
+  const CIRC = 163.4; // 2π * 26
+  const pct  = budget ? Math.min(spent/budget, 1) : 0;
+  const offset = CIRC * (1 - pct);
+  dom.budgetArc.style.strokeDashoffset = offset.toFixed(1);
+  dom.budgetPct.textContent = budget ? Math.round(pct*100) + '%' : '–';
+  dom.budgetLimit.textContent = budget ? `of ${fmtCost(budget)} budget` : 'No budget set';
+  // Color the ring: green < 70%, yellow < 90%, red >= 90%
+  const color = pct < 0.7 ? '#22C55E' : pct < 0.9 ? '#EAB308' : '#EF4444';
+  dom.budgetArc.style.stroke = color;
+}
+
+// ─── Activity Feed ────────────────────────────────────────────────────────────
+
+function applyActivity(entry) {
+  state.activity.unshift(entry);
+  if (state.activity.length > MAX_ACTIVITY) state.activity.pop();
+  renderActivity();
+}
+
+function renderActivity() {
+  if (!state.activity.length) {
+    dom.activityFeed.innerHTML = '<div class="empty-state">Waiting for activity...</div>';
+    return;
+  }
+  const html = state.activity.slice(0,MAX_ACTIVITY).map(a => {
+    const color     = agentColor(a.agent_id);
+    const initial   = (a.agent_id || '?').charAt(0).toUpperCase();
+    const isOk      = (a.status_code || 200) < 400;
+    const classTag  = a.classify ? `<span class="tag tag-classify">${a.classify}</span>` : '';
+    const statusTag = `<span class="tag ${isOk?'tag-status-ok':'tag-status-err'}">${a.status_code || 200}</span>`;
+    const tokTag    = a.tokens   ? `<span class="tag tag-tokens">${fmtNum(a.tokens)}t</span>` : '';
+    const msTag     = a.latency_ms ? `<span class="tag tag-ms">${fmtMs(a.latency_ms)}</span>` : '';
+    return `
+      <div class="activity-item">
+        <div class="agent-avatar" style="background:${color}">${initial}</div>
+        <div class="activity-meta">
+          <div class="activity-top">
+            <span class="activity-agent" style="color:${color}">${a.agent_id || 'unknown'}</span>
+            <span class="activity-time">${fmtTime(a.ts)}</span>
+          </div>
+          <div class="activity-model">${a.model || '–'}</div>
+          <div class="activity-tags">${classTag}${statusTag}${tokTag}${msTag}</div>
+        </div>
+      </div>
+    `;
+  }).join('');
+  dom.activityFeed.innerHTML = html;
+}
+
+// ─── Prompt Classification Donut ──────────────────────────────────────────────
+
+function renderClassify() {
+  const canvas = dom.classifyCanvas;
+  const ctx    = canvas.getContext('2d');
+  const W = canvas.width;
+  const H = canvas.height;
+  const R = 36, r = 22;
+  const cx = W/2, cy = H/2;
+
+  ctx.clearRect(0, 0, W, H);
+
+  const data = CLASSIFY_CATS.map(c => ({
+    ...c,
+    value: state.classify[c.key] || 0,
+  }));
+  const total = data.reduce((s, d) => s + d.value, 0) || 1;
+
+  let angle = -Math.PI / 2;
+  for (const d of data) {
+    const slice = (d.value / total) * Math.PI * 2;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.arc(cx, cy, R, angle, angle + slice);
+    ctx.closePath();
+    ctx.fillStyle = d.color;
+    ctx.fill();
+    angle += slice;
+  }
+
+  // Inner hole
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, 0, Math.PI*2);
+  ctx.fillStyle = '#000';
+  ctx.fill();
+
+  // Center label
+  ctx.fillStyle = 'rgba(245,245,245,0.8)';
+  ctx.font = '700 11px Inter, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(fmtNum(total), cx, cy);
+
+  // Legend
+  dom.classifyLegend.innerHTML = data.map(d => {
+    const pct = total > 0 ? Math.round((d.value/total)*100) : 0;
+    return `
+      <div class="cl-item">
+        <div class="cl-dot-name">
+          <div class="cl-dot" style="background:${d.color}"></div>
+          <span>${d.label}</span>
+        </div>
+        <span class="cl-pct">${pct}%</span>
+      </div>
+    `;
+  }).join('');
+}
+
+// ─── ITIL ─────────────────────────────────────────────────────────────────────
+
+function renderItil() {
+  // Count incidents from SIEM events by severity
+  const counts = { critical: 0, high: 0, medium: 0, low: 0 };
+  for (const e of state.siem) {
+    const sev = e.severity?.toLowerCase();
+    if (sev === 'critical') counts.critical++;
+    else if (sev === 'error' || sev === 'high') counts.high++;
+    else if (sev === 'warning' || sev === 'medium') counts.medium++;
+    else counts.low++;
+  }
+  dom.itilCrit.textContent = counts.critical;
+  dom.itilHigh.textContent = counts.high;
+  dom.itilMed.textContent  = counts.medium;
+  dom.itilLow.textContent  = counts.low;
+}
+
+// ─── SIEM Events ──────────────────────────────────────────────────────────────
+
+const SEV_ICONS = { info: 'ℹ', warning: '⚠', error: '✕', critical: '!' };
+const SEV_CLASS = { info: 'sev-info', warning: 'sev-warning', error: 'sev-error', critical: 'sev-critical' };
+
+function applyEvent(evt) {
+  // Deduplicate
+  if (state.siem.find(e => e.id === evt.id)) return;
+  state.siem.unshift(evt);
+  if (state.siem.length > 200) state.siem.pop();
+  renderSiem();
+  renderItil();
+}
+
+function renderSiem() {
+  const filter = state.siemFilter;
+  let events   = state.siem;
+  if (filter !== 'all') events = events.filter(e => e.type === filter || e.event_type === filter);
+
+  if (!events.length) {
+    dom.siemList.innerHTML = '<div class="siem-empty">No security events — all clear</div>';
+    return;
+  }
+
+  dom.siemList.innerHTML = events.slice(0,50).map(e => {
+    const sev     = (e.severity || 'info').toLowerCase();
+    const icon    = SEV_ICONS[sev] || 'ℹ';
+    const cls     = SEV_CLASS[sev] || 'sev-info';
+    const typeKey = e.type || e.event_type || 'event';
+    const detail  = e.detail ? JSON.stringify(e.detail, null, 2) : '';
+    return `
+      <div class="siem-item" onclick="this.classList.toggle('expanded')">
+        <div class="siem-severity-icon ${cls}">${icon}</div>
+        <span class="siem-time">${fmtTime(e.ts)}</span>
+        <span class="siem-msg">${e.message || 'Security event'}</span>
+        <span class="siem-type-badge">${typeKey}</span>
+        ${detail ? `<pre class="siem-detail">${detail}</pre>` : ''}
+      </div>
+    `;
+  }).join('');
+}
+
+// ─── Period toggle ────────────────────────────────────────────────────────────
+
+document.querySelectorAll('.period-btn').forEach(btn => {
+  btn.addEventListener('click', async () => {
+    document.querySelectorAll('.period-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    state.tokenPeriod = btn.dataset.period;
+    const data = await fetchJson(`/api/tokens?period=${state.tokenPeriod}`);
+    if (data?.rows) applyTokenRows(data.rows);
+  });
+});
+
+// ─── SIEM filter ──────────────────────────────────────────────────────────────
+
+document.querySelectorAll('.filter-chip').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.filter-chip').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    state.siemFilter = btn.dataset.filter;
+    renderSiem();
+  });
+});
+
+// ─── Demo data injection (when DB is empty) ───────────────────────────────────
+
+function injectDemoData() {
+  // Inject a few demo events so the UI isn't completely empty on first load
+  const demoEvents = [
+    { id:'demo-1', ts: Date.now()-300000, type:'auth', severity:'warning',
+      message:'API key rotation recommended for backend: nvidia', detail:{backend:'nvidia'} },
+    { id:'demo-2', ts: Date.now()-120000, type:'rate_limit', severity:'info',
+      message:'Rate limit headroom: 87% remaining on anthropic backend', detail:{backend:'anthropic',remaining:0.87} },
+    { id:'demo-3', ts: Date.now()-60000, type:'anomaly', severity:'info',
+      message:'No anomalies detected — baseline nominal', detail:{} },
+  ];
+  for (const e of demoEvents) applyEvent(e);
+
+  // Demo activity
+  const demoAgents = ['lumina','jarvis','opus','coder','herald'];
+  const demoModels = ['claude-sonnet-4-6','kimi-k2-instruct','claude-opus-4-6','kimi-k2.5'];
+  const classTypes = ['code_gen','data_query','creative','admin','security'];
+  for (let i = 0; i < 12; i++) {
+    const agent = demoAgents[Math.floor(Math.random()*demoAgents.length)];
+    const model = demoModels[Math.floor(Math.random()*demoModels.length)];
+    applyActivity({
+      id:       `demo-act-${i}`,
+      ts:       Date.now() - (12-i)*45000,
+      agent_id: agent,
+      model:    model,
+      classify: classTypes[Math.floor(Math.random()*classTypes.length)],
+      status_code: Math.random() > 0.05 ? 200 : 500,
+      tokens:   Math.floor(Math.random()*4000+200),
+      latency_ms: Math.floor(Math.random()*3000+200),
+    });
+  }
+}
+
+// ─── Init ─────────────────────────────────────────────────────────────────────
+
+async function init() {
+  tokenChart.init();
+  renderClassify();
+  renderItil();
+  renderSiem();
+
+  // Initial REST load
+  await pollAll();
+
+  // Inject demo data if nothing came back from the server
+  if (!state.activity.length) injectDemoData();
+
+  // Demo token history if empty
+  if (Object.keys(tokenChart).length === 0) {
+    const now = Date.now();
+    const demoRows = [];
+    ['lumina','jarvis','opus'].forEach((a,ai) => {
+      for (let h=0; h<6; h++) {
+        demoRows.push({
+          bucket:       new Date(now - (6-h)*3600000).toISOString().slice(0,13),
+          agent_id:     a,
+          input_tokens:  Math.floor(Math.random()*3000+500),
+          output_tokens: Math.floor(Math.random()*2000+200),
+        });
+      }
+    });
+    applyTokenRows(demoRows);
+  }
+
+  // Start WebSocket
+  connectWs();
+
+  // Fallback polling
+  setInterval(async () => {
+    if (!state.wsConnected) await pollAll();
+  }, POLL_MS);
+
+  // Redraw classify periodically (simulated updates when no live data)
+  setInterval(renderClassify, 10_000);
+}
+
+init().catch(console.error);
+</script>
+</body>
+</html>
