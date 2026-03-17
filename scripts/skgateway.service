@@ -1,0 +1,17 @@
+[Unit]
+Description=SKGateway — Enterprise AI Inference Proxy
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/node /home/cbrd21/clawd/skcapstone-repos/skgateway/src/index.mjs --port 18780 --config /home/cbrd21/clawd/skcapstone-repos/skgateway/config/skgateway.yaml
+Restart=on-failure
+RestartSec=5
+Environment=NODE_ENV=production
+Environment=SKCAPSTONE_AGENT=lumina
+Environment=PATH=/home/cbrd21/.skenv/bin:/usr/local/bin:/usr/bin:/bin
+ExecReload=/bin/kill -HUP $MAINPID
+WorkingDirectory=/home/cbrd21/clawd/skcapstone-repos/skgateway
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,99 @@
+## SKGateway configuration
+## All fields have code-level defaults; this file only needs entries that differ.
+## Reload at runtime: kill -HUP <pid>  or  pkill -HUP skgateway
+
+server:
+  port: 18780
+  dashboard_port: 18781
+  bind: 0.0.0.0
+
+backends:
+  nvidia:
+    url: https://integrate.api.nvidia.com/v1
+    auth_type: api_key
+    api_key_env: NVIDIA_API_KEY
+    models:
+      - kimi-k2-instruct
+      - kimi-k2.5
+      - minimax-m2.1
+    priority: 1
+
+  anthropic:
+    url: https://api.anthropic.com/v1
+    auth_type: oauth
+    credentials_path: ~/.claude/.credentials.json
+    models:
+      - claude-opus-4-6
+      - claude-sonnet-4-6
+    priority: 2
+
+  ollama:
+    url: http://192.168.0.100:11434/v1
+    auth_type: none
+    models:
+      - "dolphin-*"
+    priority: 3
+
+tools:
+  guaranteed:
+    - exec
+    - read
+    - write
+    - edit
+    - message
+  max_budget: 16
+  fallback_budget: 8
+  call_limit: 10
+
+sanitizer:
+  max_system_bytes: 40000
+  max_body_bytes: 120000
+  keep_start: 2
+  keep_end: 12
+  strip_thinking: true
+
+metrics:
+  enabled: true
+  db_path: ./data/metrics.db
+  retention_days: 90
+  token_tracking: true
+  cost_tracking: true
+
+  ## Per-model pricing (USD per 1 000 000 tokens)
+  ## Format:  <model-prefix>: { input: N, output: N, cache_read: N, cache_write: N }
+  pricing:
+    claude-opus-4-6:
+      input: 15.00
+      output: 75.00
+      cache_read: 1.50
+      cache_write: 3.75
+    claude-sonnet-4-6:
+      input: 3.00
+      output: 15.00
+      cache_read: 0.30
+      cache_write: 0.375
+    ## NVIDIA hosted models — free tier
+    kimi-k2-instruct:
+      input: 0
+      output: 0
+    kimi-k2.5:
+      input: 0
+      output: 0
+    minimax-m2.1:
+      input: 0
+      output: 0
+    ## Ollama local
+    default_local:
+      input: 0
+      output: 0
+
+siem:
+  enabled: true
+  outputs:
+    - type: file
+      path: ./logs/audit.jsonl
+      rotate_mb: 100
+
+dashboard:
+  enabled: true
+  refresh_ms: 5000

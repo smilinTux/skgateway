@@ -1,0 +1,21 @@
+{
+  "name": "skgateway",
+  "version": "0.1.0",
+  "description": "Enterprise AI inference proxy — routes, throttles, audits and observes AI API traffic",
+  "type": "module",
+  "main": "src/index.mjs",
+  "scripts": {
+    "start": "node src/index.mjs",
+    "dev": "node --watch src/index.mjs",
+    "test": "node --test tests/"
+  },
+  "dependencies": {
+    "better-sqlite3": "^9.4.3",
+    "js-yaml": "^4.1.0"
+  },
+  "devDependencies": {},
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "license": "MIT"
+}
