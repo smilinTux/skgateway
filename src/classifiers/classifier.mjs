@@ -677,3 +677,98 @@ export function detectInjection(messages) {
     confidence: clamp(confidence, 0, 1),
   };
 }
+
+// ---------------------------------------------------------------------------
+// Non-streaming decision
+// ---------------------------------------------------------------------------
+
+/**
+ * Decide whether a chat-completion request should be forced to non-streaming
+ * mode upstream (the client's SSE contract is preserved by re-emitting the
+ * buffered JSON as SSE).  Non-streaming avoids mid-stream connection drops
+ * from providers like NVIDIA NIM on long or tool-heavy turns.
+ *
+ * Precedence: force header > per-model aggressive > threshold triggers.
+ *
+ * @param {object} parsed  Parsed JSON request body (may be null).
+ * @param {Record<string,string|string[]>} headers  Incoming request headers.
+ * @param {number} bodyBytes  Byte length of the raw request body.
+ * @param {object} streamCfg  cfg.streaming — { force_header, auto_nonstream }.
+ * @returns {{ force: boolean, reason: string }}
+ */
+export function shouldForceNonStream(parsed, headers, bodyBytes, streamCfg) {
+  if (!streamCfg || streamCfg.default === false) {
+    return { force: true, reason: "streaming_disabled_globally" };
+  }
+
+  const auto = streamCfg.auto_nonstream || {};
+  const hdrName = (streamCfg.force_header || "x-skgateway-nonstream").toLowerCase();
+  const hdrVal = String(headers?.[hdrName] ?? "").toLowerCase();
+  if (hdrVal === "force" || hdrVal === "1" || hdrVal === "true") {
+    return { force: true, reason: "force_header" };
+  }
+
+  if (!auto.enabled) return { force: false, reason: "auto_disabled" };
+  if (!parsed) return { force: false, reason: "non_json" };
+
+  const model = parsed.model || "";
+  const aggressive = auto.aggressive_models || [];
+  const isAggressive = aggressive.some((m) => model.includes(m));
+
+  if (isAggressive) {
+    // Aggressive: any one trigger flips.  Everything else: all-of (rare).
+    if (Number.isFinite(auto.trigger_if_body_bytes_ge) &&
+        bodyBytes >= auto.trigger_if_body_bytes_ge) {
+      return { force: true, reason: `aggressive_body_bytes=${bodyBytes}` };
+    }
+    if (Number.isFinite(auto.trigger_if_messages_ge) &&
+        Array.isArray(parsed.messages) &&
+        parsed.messages.length >= auto.trigger_if_messages_ge) {
+      return { force: true, reason: `aggressive_messages=${parsed.messages.length}` };
+    }
+    const toolHistCount = countToolCallsInHistory(parsed.messages);
+    if (Number.isFinite(auto.trigger_if_tool_call_history_ge) &&
+        toolHistCount >= auto.trigger_if_tool_call_history_ge) {
+      return { force: true, reason: `aggressive_tool_history=${toolHistCount}` };
+    }
+    // Aggressive models also non-stream if any `tools` are present at all —
+    // NIM streaming is unstable on tool-calling turns regardless of size.
+    if (Array.isArray(parsed.tools) && parsed.tools.length > 0) {
+      return { force: true, reason: "aggressive_tools_present" };
+    }
+    return { force: false, reason: "aggressive_no_trigger" };
+  }
+
+  // Non-aggressive: only flip on clear-cut large turns.
+  if (Number.isFinite(auto.trigger_if_body_bytes_ge) &&
+      bodyBytes >= auto.trigger_if_body_bytes_ge) {
+    return { force: true, reason: `body_bytes=${bodyBytes}` };
+  }
+  if (Array.isArray(parsed.messages) &&
+      Number.isFinite(auto.trigger_if_messages_ge) &&
+      parsed.messages.length >= auto.trigger_if_messages_ge) {
+    const toolHistCount = countToolCallsInHistory(parsed.messages);
+    if (Number.isFinite(auto.trigger_if_tool_call_history_ge) &&
+        toolHistCount >= auto.trigger_if_tool_call_history_ge) {
+      return { force: true, reason: `messages=${parsed.messages.length}+tool_history=${toolHistCount}` };
+    }
+  }
+
+  return { force: false, reason: "no_trigger" };
+}
+
+/**
+ * Count assistant messages in `messages` that carry `tool_calls` entries.
+ * Proxy for "how deep is the tool-use loop so far".
+ * @param {Array} messages
+ * @returns {number}
+ */
+function countToolCallsInHistory(messages) {
+  if (!Array.isArray(messages)) return 0;
+  let n = 0;
+  for (const m of messages) {
+    if (m?.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) n++;
+    if (m?.role === "tool" || m?.role === "toolResult") n++;
+  }
+  return n;
+}

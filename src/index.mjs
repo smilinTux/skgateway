@@ -59,12 +59,31 @@ try {
   console.log("[skgateway] dashboard server not available (optional):", e.message);
 }
 
+// ─── SIEM hook — append gateway decisions to logs/audit.jsonl ───
+import fs from "node:fs";
+import path from "node:path";
+const siemPath = path.resolve(
+  path.dirname(new URL(import.meta.url).pathname),
+  "..",
+  config.siem?.outputs?.[0]?.path || "./logs/audit.jsonl",
+);
+try { fs.mkdirSync(path.dirname(siemPath), { recursive: true }); } catch {}
+function siemHook(evt) {
+  try {
+    fs.appendFile(siemPath, JSON.stringify(evt) + "\n", () => {});
+  } catch (e) {
+    console.warn("[skgateway] siem append failed:", e.message);
+  }
+}
+
 // ─── Build proxy config ───
 const proxyConfig = buildConfig({
   port,
   targetUrl: Object.values(config.backends || {})[0]?.url || "https://integrate.api.nvidia.com/v1",
   ...config.tools,
   ...config.sanitizer,
+  ...(config.streaming ? { streaming: config.streaming } : {}),
+  siem: siemHook,
 });
 
 // ─── Create HTTP server ───

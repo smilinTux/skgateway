@@ -58,6 +58,7 @@ import { URL } from "node:url";
 import { sendUpstream } from "./upstream.mjs";
 import { reduceTools, stripToolCallHistory } from "./tools.mjs";
 import { sanitizeContent } from "./sanitizer.mjs";
+import { shouldForceNonStream } from "../classifiers/classifier.mjs";
 
 // ---------------------------------------------------------------------------
 // Default configuration
@@ -161,6 +162,36 @@ export const DEFAULT_CONFIG = {
    * @type {function(string): string}
    */
   sanitizer: null, // resolved to sanitizeContent in buildConfig()
+
+  /**
+   * Streaming → non-streaming auto-flip policy.  Consumed by
+   * shouldForceNonStream() to decide when a client's `stream:true` request
+   * should be buffered upstream and re-emitted as SSE.  Overridable via
+   * buildConfig({ streaming: {...} }) or the YAML config.
+   */
+  streaming: {
+    default: true,
+    force_header: "x-skgateway-nonstream",
+    auto_nonstream: {
+      enabled: true,
+      trigger_if_body_bytes_ge: 40000,
+      trigger_if_messages_ge: 6,
+      trigger_if_tool_call_history_ge: 3,
+      aggressive_models: [
+        "nvidia/moonshotai/kimi-k2-instruct-0905",
+        "kimi-k2.5",
+        "kimi-k2-instruct",
+      ],
+    },
+  },
+
+  /**
+   * Optional SIEM event hook.  Called as `siem({ event, ...fields })` on
+   * notable gateway decisions (non-stream flip, tool reduction, etc.).
+   * Left null by default — index.mjs injects a real hook.
+   * @type {?function(object): void}
+   */
+  siem: null,
 };
 
 /**
@@ -646,7 +677,74 @@ export async function handleRequest(clientReq, clientRes, cfg) {
   }
 
   // --- Transparent relay for non-tool or non-chat requests ---
+  // Before handing off, check the non-streaming classifier: large non-tool
+  // chat/completions on flaky upstreams (NVIDIA NIM) benefit from the same
+  // buffer-and-reemit strategy the tool path uses below.  This keeps the
+  // client-side SSE contract intact while removing the mid-stream-drop
+  // failure mode.
   if (!parsed || !parsed.tools || !Array.isArray(parsed.tools) || parsed.tools.length === 0) {
+    if (parsed && isChatCompletion) {
+      const decision = shouldForceNonStream(
+        parsed, clientReq.headers, body.length, cfg.streaming || {},
+      );
+      if (decision.force && parsed.stream) {
+        const wasStreaming = true;
+        parsed.stream = false;
+        delete parsed.stream_options;
+        log(`non-stream flip: model=${parsed.model || "?"} reason=${decision.reason} bodyLen=${body.length}`);
+        if (typeof cfg.siem === "function") {
+          try {
+            cfg.siem({
+              event: "nonstream_flip",
+              model: parsed.model || null,
+              reason: decision.reason,
+              body_bytes: body.length,
+              messages: Array.isArray(parsed.messages) ? parsed.messages.length : 0,
+              ts: new Date().toISOString(),
+            });
+          } catch (e) { warn(`siem hook failed: ${e.message}`); }
+        }
+
+        const sseState = { sseStarted: false, keepAliveTimer: null };
+        if (wasStreaming) startSSEKeepAlive(clientRes, sseState, wasStreaming);
+
+        const reqBody = Buffer.from(JSON.stringify(parsed), "utf-8");
+        const res = await sendUpstream(
+          clientReq.url, clientReq.method, clientReq.headers, reqBody, cfg.targetUrl,
+        );
+        stopSSEKeepAlive(sseState);
+
+        if (res.status === 200) {
+          let resBody;
+          try {
+            resBody = JSON.parse(res.body.toString("utf-8"));
+          } catch (e) {
+            error(`non-stream flip: upstream returned non-JSON despite stream:false: ${e.message}`);
+            if (!clientRes.headersSent) {
+              clientRes.writeHead(res.status, res.headers);
+            }
+            clientRes.end(res.body);
+            return;
+          }
+          sendOk(clientRes, resBody, res.headers, wasStreaming, cfg);
+          return;
+        }
+
+        // Non-200: pass through as-is.  If SSE headers already sent via
+        // keep-alive start, fall back to an error data frame + [DONE].
+        if (clientRes.headersSent) {
+          const errPayload = { error: { message: res.body.toString("utf-8"), code: res.status } };
+          clientRes.write(`data: ${JSON.stringify(errPayload)}\n\n`);
+          clientRes.write("data: [DONE]\n\n");
+          clientRes.end();
+        } else {
+          clientRes.writeHead(res.status, res.headers);
+          clientRes.end(res.body);
+        }
+        return;
+      }
+    }
+
     const res = await sendUpstream(
       clientReq.url, clientReq.method, clientReq.headers, body, cfg.targetUrl,
     );

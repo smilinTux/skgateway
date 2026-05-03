@@ -14,6 +14,8 @@ backends:
     api_key_env: NVIDIA_API_KEY
     models:
       - kimi-k2-instruct
+      - kimi-k2-instruct-0905
+      - nvidia/moonshotai/kimi-k2-instruct-0905
       - kimi-k2.5
       - minimax-m2.1
     priority: 1
@@ -44,6 +46,26 @@ tools:
   max_budget: 16
   fallback_budget: 8
   call_limit: 10
+
+# Streaming → non-streaming auto-flip.  Tool-heavy or large-context turns
+# hit NVIDIA NIM streaming instability (connection drops mid-stream at ~10k
+# tokens).  When any trigger below matches, the proxy forces `stream:false`
+# upstream, buffers the complete JSON, and re-emits SSE to the client so
+# the streaming contract is preserved without the mid-stream-drop failure
+# mode.  Tool requests already non-stream upstream (see core.mjs); this
+# covers non-tool traffic and explicit opt-in.
+streaming:
+  default: true
+  force_header: x-skgateway-nonstream        # value 'force' or '1'
+  auto_nonstream:
+    enabled: true
+    trigger_if_body_bytes_ge: 40000          # ~10k tokens
+    trigger_if_messages_ge: 6
+    trigger_if_tool_call_history_ge: 3
+    aggressive_models:
+      - nvidia/moonshotai/kimi-k2-instruct-0905
+      - kimi-k2.5
+      - kimi-k2-instruct
 
 sanitizer:
   max_system_bytes: 40000

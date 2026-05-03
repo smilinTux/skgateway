@@ -90,6 +90,25 @@ const DEFAULTS = {
     strip_thinking: true,
   },
 
+  // Streaming → non-streaming auto-flip for upstream stability on large /
+  // tool-heavy turns.  Independent of the tool-request path (which always
+  // buffers upstream).  Used by shouldForceNonStream() in the classifier.
+  streaming: {
+    default: true,
+    force_header: 'x-skgateway-nonstream',   // value 'force' or '1' triggers
+    auto_nonstream: {
+      enabled: true,
+      trigger_if_body_bytes_ge: 40_000,      // ~10k tokens
+      trigger_if_messages_ge: 6,
+      trigger_if_tool_call_history_ge: 3,    // tool_call messages in history
+      aggressive_models: [                   // match via includes() on model name
+        'nvidia/moonshotai/kimi-k2-instruct-0905',
+        'kimi-k2.5',
+        'kimi-k2-instruct',
+      ],
+    },
+  },
+
   metrics: {
     enabled: true,
     db_path: './data/metrics.db',

@@ -4,3 +4,9 @@ logs/
 *.db
 *.db-journal
 .env
+__pycache__/
+*.pyc
+.coverage
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
