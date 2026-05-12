@@ -57,7 +57,7 @@ const DEFAULTS = {
       url: 'https://integrate.api.nvidia.com/v1',
       auth_type: 'api_key',
       api_key_env: 'NVIDIA_API_KEY',
-      models: ['kimi-k2-instruct', 'kimi-k2.5', 'minimax-m2.1'],
+      models: ['moonshotai/kimi-k2.6', 'minimaxai/minimax-m2.7'],
       priority: 1,
     },
     anthropic: {
@@ -102,9 +102,9 @@ const DEFAULTS = {
       trigger_if_messages_ge: 6,
       trigger_if_tool_call_history_ge: 3,    // tool_call messages in history
       aggressive_models: [                   // match via includes() on model name
-        'nvidia/moonshotai/kimi-k2-instruct-0905',
-        'kimi-k2.5',
-        'kimi-k2-instruct',
+        'moonshotai/kimi-k2.6',
+        'deepseek-ai/deepseek-v4',
+        'qwen/qwen3-next',
       ],
     },
   },
@@ -116,11 +116,11 @@ const DEFAULTS = {
     token_tracking: true,
     cost_tracking: true,
     pricing: {
-      'claude-opus-4-6': { input: 15.00, output: 75.00, cache_read: 1.50, cache_write: 3.75 },
+      'claude-opus-4-7': { input: 15.00, output: 75.00, cache_read: 1.50, cache_write: 3.75 },
       'claude-sonnet-4-6': { input: 3.00, output: 15.00, cache_read: 0.30, cache_write: 0.375 },
-      'kimi-k2-instruct': { input: 0, output: 0 },
-      'kimi-k2.5': { input: 0, output: 0 },
-      'minimax-m2.1': { input: 0, output: 0 },
+      'claude-haiku-4-5': { input: 0.80, output: 4.00, cache_read: 0.08, cache_write: 0.10 },
+      'moonshotai/kimi-k2.6': { input: 0, output: 0 },
+      'minimaxai/minimax-m2.7': { input: 0, output: 0 },
       'default_local': { input: 0, output: 0 },
     },
   },
