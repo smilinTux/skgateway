@@ -144,6 +144,19 @@ export const DEFAULT_CONFIG = {
   },
 
   /**
+   * Per-model body/system byte limits.  Keys are exact model IDs.
+   * When a request matches, maxBodyBytes and maxSystemBytes are overridden
+   * for that request only — global defaults apply to everything else.
+   *
+   * Example YAML:
+   *   model_limits:
+   *     moonshotai/kimi-k2.6: { max_body_bytes: 800000, max_system_bytes: 320000 }
+   *
+   * @type {Record<string, { maxBodyBytes?: number, maxSystemBytes?: number }>}
+   */
+  modelLimits: {},
+
+  /**
    * Tag used in log lines.  Defaults to "skgateway".
    * Set to "nvidia-proxy" when running in legacy compatibility mode.
    */
@@ -788,11 +801,15 @@ export async function handleRequest(clientReq, clientRes, cfg) {
     }
   }
 
+  // --- Resolve per-model limits (overrides global maxBodyBytes / maxSystemBytes) ---
+  const perModel = cfg.modelLimits?.[parsed.model || ""];
+  const effectiveCfg = perModel ? { ...cfg, ...perModel } : cfg;
+
   // --- Trim system messages first (to free budget for history) ---
-  trimSystemMessages(parsed, cfg);
+  trimSystemMessages(parsed, effectiveCfg);
 
   // --- Trim conversation history ---
-  trimConversationHistory(parsed, cfg);
+  trimConversationHistory(parsed, effectiveCfg);
 
   // --- Tool round limit check ---
   // Track consecutive tool result turns per model to prevent infinite loops.

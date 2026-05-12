@@ -76,12 +76,34 @@ function siemHook(evt) {
   }
 }
 
+// ─── Build per-model limit map from YAML model_limits section ───
+// YAML uses snake_case; core.mjs uses camelCase.
+// model_limits:
+//   moonshotai/kimi-k2.6: { max_body_bytes: 800000, max_system_bytes: 320000 }
+function buildModelLimits(raw) {
+  if (!raw || typeof raw !== "object") return {};
+  const out = {};
+  for (const [model, limits] of Object.entries(raw)) {
+    out[model] = {
+      ...(limits.max_body_bytes   != null ? { maxBodyBytes:   limits.max_body_bytes   } : {}),
+      ...(limits.max_system_bytes != null ? { maxSystemBytes: limits.max_system_bytes } : {}),
+    };
+  }
+  return out;
+}
+
 // ─── Build proxy config ───
+// Explicitly map YAML snake_case keys → core.mjs camelCase to avoid silent misses.
+const s = config.sanitizer || {};
+const t = config.tools     || {};
 const proxyConfig = buildConfig({
   port,
-  targetUrl: Object.values(config.backends || {})[0]?.url || "https://integrate.api.nvidia.com/v1",
-  ...config.tools,
-  ...config.sanitizer,
+  targetUrl:          Object.values(config.backends || {})[0]?.url || "https://integrate.api.nvidia.com/v1",
+  maxBodyBytes:       s.max_body_bytes,
+  maxSystemBytes:     s.max_system_bytes,
+  proactiveToolLimit: t.max_budget,
+  toolRoundLimit:     t.call_limit,
+  modelLimits:        buildModelLimits(config.model_limits),
   ...(config.streaming ? { streaming: config.streaming } : {}),
   siem: siemHook,
 });

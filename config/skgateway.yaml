@@ -13,11 +13,33 @@ backends:
     auth_type: api_key
     api_key_env: NVIDIA_API_KEY
     models:
-      - kimi-k2-instruct
-      - kimi-k2-instruct-0905
-      - nvidia/moonshotai/kimi-k2-instruct-0905
-      - kimi-k2.5
-      - minimax-m2.1
+      ## ── Moonshot / Kimi ──────────────────────────────────────────────────
+      - moonshotai/kimi-k2.6
+      ## ── Qwen ─────────────────────────────────────────────────────────────
+      - qwen/qwen3-next-80b-a3b-instruct
+      - qwen/qwen3-next-80b-a3b-thinking
+      - qwen/qwen3-coder-480b-a35b-instruct
+      - qwen/qwen3.5-122b-a10b
+      - qwen/qwen3.5-397b-a17b
+      ## ── OpenAI OSS ───────────────────────────────────────────────────────
+      - openai/gpt-oss-120b
+      - openai/gpt-oss-20b
+      ## ── DeepSeek ─────────────────────────────────────────────────────────
+      - deepseek-ai/deepseek-v4-flash
+      - deepseek-ai/deepseek-v4-pro
+      ## ── Mistral ──────────────────────────────────────────────────────────
+      - mistralai/mistral-medium-3.5-128b
+      - mistralai/mistral-large-3-675b-instruct-2512
+      - mistralai/ministral-14b-instruct-2512
+      ## ── Meta / NVIDIA ────────────────────────────────────────────────────
+      - meta/llama-3.3-70b-instruct
+      - nvidia/llama-3.3-nemotron-super-49b-v1.5
+      ## ── Google ───────────────────────────────────────────────────────────
+      - google/gemma-4-31b-it
+      ## ── ByteDance ────────────────────────────────────────────────────────
+      - bytedance/seed-oss-36b-instruct
+      ## ── MiniMax ──────────────────────────────────────────────────────────
+      - minimaxai/minimax-m2.7
     priority: 1
 
   anthropic:
@@ -25,8 +47,9 @@ backends:
     auth_type: oauth
     credentials_path: ~/.claude/.credentials.json
     models:
-      - claude-opus-4-6
+      - claude-opus-4-7
       - claude-sonnet-4-6
+      - claude-haiku-4-5
     priority: 2
 
   ollama:
@@ -63,16 +86,47 @@ streaming:
     trigger_if_messages_ge: 6
     trigger_if_tool_call_history_ge: 3
     aggressive_models:
-      - nvidia/moonshotai/kimi-k2-instruct-0905
-      - kimi-k2.5
-      - kimi-k2-instruct
+      - moonshotai/kimi-k2.6
+      - qwen/qwen3-next-80b-a3b-instruct
+      - qwen/qwen3-next-80b-a3b-thinking
+      - deepseek-ai/deepseek-v4-flash
+      - deepseek-ai/deepseek-v4-pro
 
 sanitizer:
-  max_system_bytes: 40000
-  max_body_bytes: 120000
+  max_system_bytes: 40000       # global default — ~10K tokens
+  max_body_bytes: 120000        # global default — ~30K tokens
   keep_start: 2
   keep_end: 12
   strip_thinking: true
+
+# Per-model context limits.  Formula: max_body_bytes = context_tokens * 4 bytes * 0.80
+# max_system_bytes = max_body_bytes * 0.40.  Values from NVIDIA NIM model cards (2026-05-12).
+model_limits:
+  ## 256K context (kimi-k2.6)
+  moonshotai/kimi-k2.6:                       { max_body_bytes: 800000,   max_system_bytes: 320000  }
+  ## 262K context (Qwen3 family, Mistral family, Gemma 4)
+  qwen/qwen3-next-80b-a3b-instruct:           { max_body_bytes: 838000,   max_system_bytes: 335000  }
+  qwen/qwen3-next-80b-a3b-thinking:           { max_body_bytes: 838000,   max_system_bytes: 335000  }
+  qwen/qwen3-coder-480b-a35b-instruct:        { max_body_bytes: 838000,   max_system_bytes: 335000  }
+  qwen/qwen3.5-122b-a10b:                     { max_body_bytes: 838000,   max_system_bytes: 335000  }
+  qwen/qwen3.5-397b-a17b:                     { max_body_bytes: 838000,   max_system_bytes: 335000  }
+  mistralai/mistral-medium-3.5-128b:          { max_body_bytes: 838000,   max_system_bytes: 335000  }
+  mistralai/mistral-large-3-675b-instruct-2512: { max_body_bytes: 838000, max_system_bytes: 335000  }
+  mistralai/ministral-14b-instruct-2512:      { max_body_bytes: 838000,   max_system_bytes: 335000  }
+  google/gemma-4-31b-it:                      { max_body_bytes: 838000,   max_system_bytes: 335000  }
+  ## 1M context (DeepSeek V4 — cap at 2M bytes practical limit)
+  deepseek-ai/deepseek-v4-flash:              { max_body_bytes: 2000000,  max_system_bytes: 800000  }
+  deepseek-ai/deepseek-v4-pro:               { max_body_bytes: 2000000,  max_system_bytes: 800000  }
+  ## 512K context (ByteDance Seed OSS)
+  bytedance/seed-oss-36b-instruct:            { max_body_bytes: 1638000,  max_system_bytes: 655000  }
+  ## 204K context (MiniMax M2.7)
+  minimaxai/minimax-m2.7:                     { max_body_bytes: 655000,   max_system_bytes: 262000  }
+  ## 128K context (GPT-OSS, Llama 3.3)
+  openai/gpt-oss-120b:                        { max_body_bytes: 409000,   max_system_bytes: 164000  }
+  openai/gpt-oss-20b:                         { max_body_bytes: 409000,   max_system_bytes: 164000  }
+  meta/llama-3.3-70b-instruct:               { max_body_bytes: 409000,   max_system_bytes: 164000  }
+  ## 131K context (Nemotron Super 49B)
+  nvidia/llama-3.3-nemotron-super-49b-v1.5:  { max_body_bytes: 419000,   max_system_bytes: 168000  }
 
 metrics:
   enabled: true
@@ -82,9 +136,8 @@ metrics:
   cost_tracking: true
 
   ## Per-model pricing (USD per 1 000 000 tokens)
-  ## Format:  <model-prefix>: { input: N, output: N, cache_read: N, cache_write: N }
   pricing:
-    claude-opus-4-6:
+    claude-opus-4-7:
       input: 15.00
       output: 75.00
       cache_read: 1.50
@@ -94,14 +147,31 @@ metrics:
       output: 15.00
       cache_read: 0.30
       cache_write: 0.375
+    claude-haiku-4-5:
+      input: 0.80
+      output: 4.00
+      cache_read: 0.08
+      cache_write: 0.10
     ## NVIDIA hosted models — free tier
-    kimi-k2-instruct:
+    moonshotai/kimi-k2.6:
       input: 0
       output: 0
-    kimi-k2.5:
+    qwen/qwen3-next-80b-a3b-instruct:
       input: 0
       output: 0
-    minimax-m2.1:
+    qwen/qwen3-coder-480b-a35b-instruct:
+      input: 0
+      output: 0
+    openai/gpt-oss-120b:
+      input: 0
+      output: 0
+    deepseek-ai/deepseek-v4-flash:
+      input: 0
+      output: 0
+    deepseek-ai/deepseek-v4-pro:
+      input: 0
+      output: 0
+    minimaxai/minimax-m2.7:
       input: 0
       output: 0
     ## Ollama local
