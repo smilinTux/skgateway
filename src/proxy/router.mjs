@@ -19,6 +19,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { sendUpstream } from "./upstream.mjs";
+import { getPool } from "./connection-pool.mjs";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -473,7 +474,7 @@ export class Backend {
  *   Emit structured SIEM events for failover and health changes.  Default true.
  *
  * @returns {{
- *   route(request: RouteRequest): Promise<RouteResult>,
+ *   route(request: RouteRequest): Promise<RouteResult[]>,
  *   getHealth(): Record<string, HealthSnapshot>,
  *   addBackend(cfg: BackendConfig): void,
  *   removeBackend(id: string): void,
@@ -573,11 +574,7 @@ export function createRouter(config = {}) {
    *   const start = Date.now();
    *   const res = await sendUpstream(path, method, headers, body, new URL(result.backendUrl));
    *   result.backend.recordOutcome(res.status < 500, Date.now() - start);
-   *   if (res.status < 500) { // success
-   *     // use res
-   *     break;
-   *   }
-   *   // loop → try next backend
+   *   break;
    * }
    * ```
    *
@@ -763,13 +760,17 @@ export function createDefaultRouter(overrides = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// Convenience: route + upstream in one call
+// Convenience: route + upstream in one call WITH connection pooling
 // ---------------------------------------------------------------------------
 
 /**
  * High-level helper used by the proxy request handler.
- * Tries each candidate backend in order, records outcomes, and returns
- * the first successful response.  On failover it emits a SIEM log line.
+ * Tries each candidate backend in order, acquires a pool slot, sends the
+ * request, records outcomes, and returns the first successful response.
+ * On failover it emits a SIEM log line.
+ *
+ * NEW: Uses connection pooler to enforce per-backend concurrency limits
+ * and queue excess requests.
  *
  * @param {ReturnType<typeof createRouter>} router
  * @param {RouteRequest} request
@@ -777,15 +778,18 @@ export function createDefaultRouter(overrides = {}) {
  * @param {string}  method         HTTP method
  * @param {Record<string, string>} clientHeaders  Incoming client headers
  * @param {Buffer}  body           Buffered request body
+ * @param {boolean} [usePool=true] Whether to use the connection pool
  * @returns {Promise<{
  *   status: number,
  *   headers: Record<string, string>,
  *   body: Buffer,
  *   backendId: string,
  *   failover: boolean,
+ *   queueWaitMs?: number,
  * }>}
  */
-export async function routeAndSend(router, request, upstreamPath, method, clientHeaders, body) {
+export async function routeAndSend(router, request, upstreamPath, method, clientHeaders, body, usePool = true) {
+  const pool = usePool ? getPool() : null;
   const candidates = await router.route(request);
 
   let lastResult = null;
@@ -824,7 +828,33 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     delete forwardHeaders["keep-alive"];
 
     const targetUrl = new URL(backendUrl);
-    const start = Date.now();
+    const queueStart = Date.now();
+
+    // Acquire a connection pool slot (waits if at capacity)
+    let slot = null;
+    if (pool) {
+      try {
+        slot = await pool.acquire(backendId);
+      } catch (err) {
+        // Pool rejected (queue full) — log and fall back to serving a 503
+        console.error(`[routeAndSend] pool rejected backend=${backendId}: ${err.message}`);
+        return {
+          status: 503,
+          headers: { "content-type": "application/json" },
+          body: Buffer.from(JSON.stringify({
+            error: {
+              message: `Backend ${backendId} is at capacity. Queue full.`,
+              code: "capacity_exceeded",
+              backend: backendId,
+            }
+          })),
+          backendId,
+          failover: didFailover,
+        };
+      }
+    }
+
+    const queueWaitMs = Date.now() - queueStart;
 
     let res;
     try {
@@ -836,18 +866,24 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         headers: {},
         body: Buffer.from(JSON.stringify({ error: { message: err.message } })),
       };
+    } finally {
+      // Always release the slot, even on error
+      if (pool && slot) {
+        pool.release(backendId);
+      }
     }
 
-    const latencyMs = Date.now() - start;
+    const latencyMs = Date.now() - queueStart;
     const success = res.status < 500;
     backend.recordOutcome(success, latencyMs);
 
-    lastResult = { ...res, backendId, failover: didFailover };
+    lastResult = { ...res, backendId, failover: didFailover, queueWaitMs };
 
     if (success) {
       console.log(
         `[router] ${res.status} OK backend=${backendId} latency=${latencyMs}ms` +
-        (didFailover ? " (failover)" : "")
+        (didFailover ? " (failover)" : "") +
+        (queueWaitMs > 0 ? ` queued=${queueWaitMs}ms` : "" )
       );
       return lastResult;
     }

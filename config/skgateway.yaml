@@ -7,6 +7,24 @@ server:
   dashboard_port: 18781
   bind: 0.0.0.0
 
+## Connection Pooling — enforces per-backend concurrency limits
+## NVIDIA NIM allows 20 concurrent requests max. We enforce this here
+## so the gateway never exceeds the upstream limit.
+pooling:
+  default_max_concurrent: 20    # Max concurrent requests per backend
+  default_max_queue: 1000        # Max queue depth per backend
+  queue_timeout_ms: 300000        # Max time a request waits in queue (5 min)
+  per_backend:                   # Per-backend overrides
+    nvidia:
+      max: 20                     # NVIDIA NIM: 20 concurrent
+      maxQueue: 500               # Queue up to 500 requests for NVIDIA
+    ollama:
+      max: 50                     # Ollama local: more lenient
+      maxQueue: 200
+    anthropic:
+      max: 10                     # Anthropic API limit
+      maxQueue: 200
+
 backends:
   nvidia:
     url: https://integrate.api.nvidia.com/v1

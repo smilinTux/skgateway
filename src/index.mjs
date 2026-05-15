@@ -13,6 +13,7 @@ import http from "node:http";
 import { loadConfig } from "./config.mjs";
 import { createProxyServer, handleRequest, buildConfig } from "./proxy/core.mjs";
 import { createRouter } from "./proxy/router.mjs";
+import { getPool, resetPool } from "./proxy/connection-pool.mjs";
 
 // ─── Parse CLI args ───
 const args = process.argv.slice(2);
@@ -31,6 +32,15 @@ const bind = config.server?.bind || "127.0.0.1";
 
 // ─── Initialize subsystems ───
 const router = createRouter(config.backends || {});
+
+// Initialize connection pool with per-backend limits from config
+const poolConfig = {
+  defaultMaxConcurrent: config.pooling?.default_max_concurrent || 20,
+  defaultMaxQueue: config.pooling?.default_max_queue || 1000,
+  queueTimeoutMs: config.pooling?.queue_timeout_ms || 300000,
+  perBackend: config.pooling?.per_backend || {},
+};
+const pool = getPool(poolConfig);
 
 // Metrics collector (lazy — may not be installed yet)
 let metrics = null;
@@ -112,7 +122,7 @@ const proxyConfig = buildConfig({
 const server = http.createServer(async (req, res) => {
   const startTime = Date.now();
 
-  // Health check endpoint
+  // ── Health check endpoint ──
   if (req.url === "/health" || req.url === "/healthz") {
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
@@ -123,7 +133,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Status endpoint
+  // ── Status endpoint (includes pool stats) ──
   if (req.url === "/status") {
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
@@ -131,15 +141,35 @@ const server = http.createServer(async (req, res) => {
       version: "0.1.0",
       uptime: process.uptime(),
       backends: router.getHealth(),
+      pool: pool.getTotalStats(),
       metrics: metrics?.getStats() || null,
     }));
     return;
   }
 
-  // Dashboard redirect (future)
+  // ── Queue / connection pool depth endpoint ──
+  if (req.url === "/queue") {
+    const allStats = pool.getAllStats();
+    const total = pool.getTotalStats();
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      pool: {
+        totalActive: total.totalActive,
+        totalQueued: total.totalQueued,
+        totalCapacity: total.totalCapacity,
+        utilization: total.totalCapacity > 0 ? (total.totalActive / total.totalCapacity) : 0,
+      },
+      backends: allStats,
+      timestamp: new Date().toISOString(),
+    }));
+    return;
+  }
+
+  // ── Dashboard redirect (future) ──
   if (req.url === "/" || req.url === "/dashboard") {
     const dashboardPort = config.dashboard?.port || config.server?.dashboard_port || 18781;
-    res.writeHead(302, { location: `http://${req.headers.host?.split(":")[0] || "localhost"}:${dashboardPort}/` });
+    const host = req.headers.host?.split(":")[0] || "localhost";
+    res.writeHead(302, { location: `http://${host}:${dashboardPort}/` });
     res.end();
     return;
   }
@@ -198,8 +228,10 @@ process.on("SIGHUP", () => {
 
 // ─── Start ───
 server.listen(port, bind, () => {
-  console.log(`[skgateway] listening on http://${bind}:${port}`);
-  console.log(`[skgateway] backends: ${Object.keys(config.backends || {}).join(", ") || "default"}`);
-  console.log(`[skgateway] metrics: ${metrics ? "enabled" : "disabled"}`);
-  console.log(`[skgateway] dashboard: port ${config.server?.dashboard_port || 18781} (coming soon)`);
+    console.log("[skgateway] listening on http://" + bind + ":" + port);
+    const backendNames = Object.keys(config.backends || {});
+    console.log("[skgateway] backends: " + (backendNames.join(", ") || "default"));
+    console.log("[skgateway] metrics: " + (metrics ? "enabled" : "disabled"));
+    const dashPort = config.server?.dashboard_port || 18781;
+    console.log("[skgateway] dashboard: port " + dashPort + " (coming soon)");
 });
