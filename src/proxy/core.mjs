@@ -58,6 +58,7 @@ import { URL } from "node:url";
 import { sendUpstream } from "./upstream.mjs";
 import { reduceTools, stripToolCallHistory } from "./tools.mjs";
 import { sanitizeContent } from "./sanitizer.mjs";
+import { parseRetryAfter, jitteredBackoff } from "./retry.mjs";
 import { shouldForceNonStream } from "../classifiers/classifier.mjs";
 
 // ---------------------------------------------------------------------------
@@ -86,11 +87,23 @@ export const DEFAULT_CONFIG = {
    */
   maxRetries: 4,
 
-  /** Maximum number of 429 retries per outer attempt. */
-  max429Retries: 3,
+  /**
+   * Maximum number of 429 retries per outer attempt.
+   * Reduced from 3 → 1 (May 15 2026) — NVIDIA NIM rate-window violations
+   * compound when hermes-side retries + gateway-side retries cascade. One
+   * retry that respects Retry-After is enough; escalate to L2/L3 sooner.
+   */
+  max429Retries: 1,
 
-  /** Base delay (ms) for 429 backoff.  Multiplied by (r429+1) each round. */
+  /**
+   * Fallback base delay (ms) for 429 backoff when the upstream omits a
+   * Retry-After header.  Only used when the header is absent — when present
+   * we honor the header (capped at rateLimitMaxMs).
+   */
   rateLimitDelayMs: 2000,
+
+  /** Hard cap on any single 429 wait (ms).  Prevents 10-min Retry-After holds. */
+  rateLimitMaxMs: 30000,
 
   /**
    * Maximum byte length of the full request body before conversation
@@ -863,14 +876,25 @@ export async function handleRequest(clientReq, clientRes, cfg) {
     if (wasStreaming) startSSEKeepAlive(clientRes, sseState, wasStreaming);
 
     // --- Inner 429 retry loop ---
+    // Honors upstream Retry-After header (delta-seconds or HTTP-date), capped
+    // at cfg.rateLimitMaxMs to prevent 10-minute holds.  Falls back to
+    // jittered exponential backoff when no header is present.
     let res;
     for (let r429 = 0; r429 <= cfg.max429Retries; r429++) {
       res = await sendUpstream(
         clientReq.url, clientReq.method, clientReq.headers, reqBody, cfg.targetUrl,
       );
       if (res.status !== 429 || r429 === cfg.max429Retries) break;
-      const delay = cfg.rateLimitDelayMs * (r429 + 1);
-      log(`429 rate limited, waiting ${delay}ms (retry ${r429 + 1}/${cfg.max429Retries})...`);
+      const headerWait = parseRetryAfter(res.headers?.["retry-after"], -1);
+      const fallback = Math.min(
+        cfg.rateLimitMaxMs,
+        jitteredBackoff(r429, cfg.rateLimitDelayMs, cfg.rateLimitMaxMs),
+      );
+      const delay = headerWait >= 0
+        ? Math.min(headerWait, cfg.rateLimitMaxMs)
+        : Math.max(cfg.rateLimitDelayMs, fallback);
+      const src = headerWait >= 0 ? "Retry-After header" : "jittered fallback";
+      log(`429 rate limited, waiting ${delay}ms via ${src} (retry ${r429 + 1}/${cfg.max429Retries})...`);
       await new Promise((r) => setTimeout(r, delay));
     }
 
