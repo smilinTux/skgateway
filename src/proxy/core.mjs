@@ -860,6 +860,25 @@ export async function handleRequest(clientReq, clientRes, cfg) {
 
   const model = parsed.model || "unknown";
 
+  // --- Untrimmed-toolset warning ---
+  // Fires once per request when the caller hasn't reduced its tool inventory
+  // before sending.  The gateway *does* run its own keyword-routed reduction
+  // downstream (~16 tools target), but a 200+ tool body still costs us:
+  //   - bigger JSON ⇒ slower upstream parse ⇒ higher 429 risk on rate-limited
+  //     providers (NVIDIA NIM in particular).
+  //   - signals the caller (Hermes cron job, etc.) is missing an
+  //     ``enabled_toolsets`` declaration and is shipping the full toolset.
+  // Threshold of 64 is well above the post-reduction target (16) and well below
+  // typical full-Hermes (~241), so it fires cleanly on real offenders.
+  const incomingToolCount = parsed.tools ? parsed.tools.length : 0;
+  if (incomingToolCount > 64) {
+    log(
+      `WARN: untrimmed toolset model=${model} tools=${incomingToolCount} ` +
+      `(threshold=64) — caller likely missing enabled_toolsets / tool-budget. ` +
+      `Reduction will run, but consider declaring upstream.`,
+    );
+  }
+
   // --- SSE keep-alive state ---
   const sseState = { sseStarted: false, keepAliveTimer: null };
 
