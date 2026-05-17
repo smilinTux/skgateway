@@ -57,7 +57,7 @@ import { URL } from "node:url";
 
 import { sendUpstream } from "./upstream.mjs";
 import { reduceTools, stripToolCallHistory } from "./tools.mjs";
-import { sanitizeContent } from "./sanitizer.mjs";
+import { sanitizeContent, trimHistoryToBudget } from "./sanitizer.mjs";
 import { parseRetryAfter, jitteredBackoff } from "./retry.mjs";
 import { shouldForceNonStream } from "../classifiers/classifier.mjs";
 
@@ -489,77 +489,21 @@ function truncateLargeToolResults(parsed) {
 export function trimConversationHistory(parsed, cfg) {
   if (!Array.isArray(parsed.messages) || parsed.messages.length < 6) return;
 
-  const log = cfg.logger.log.bind(cfg.logger);
-  const roleSummary = parsed.messages.map((m) => m.role).join(",");
-  log(`conversation roles (${parsed.messages.length} msgs): ${roleSummary}`);
-
   // Pass 1: truncate large tool results
   truncateLargeToolResults(parsed);
 
-  let bodySize = Buffer.byteLength(JSON.stringify(parsed), "utf-8");
-  if (bodySize <= cfg.maxBodyBytes) return;
-
-  const msgs = parsed.messages;
-  const system    = msgs.filter((m) => m.role === "system");
-  const nonSystem = msgs.filter((m) => m.role !== "system");
-
-  if (nonSystem.length <= 4) return; // not enough to safely trim
-
-  const keepStart = 2;
-  let keepEnd = Math.min(12, nonSystem.length - keepStart);
-
-  // Pass 2: reduce middle, progressively shrink tail
-  while (keepEnd >= 2) {
-    const dropped = nonSystem.length - keepStart - keepEnd;
-    const trimmed = [
-      ...system,
-      ...nonSystem.slice(0, keepStart),
-      ...(dropped > 0
-        ? [{ role: "system", content: `[${dropped} earlier messages trimmed to save context]` }]
-        : []),
-      ...nonSystem.slice(-keepEnd),
-    ];
-    const candidateSize = Buffer.byteLength(JSON.stringify({ ...parsed, messages: trimmed }), "utf-8");
-    if (candidateSize <= cfg.maxBodyBytes) {
-      parsed.messages = trimmed;
-      log(`trimmed history: dropped ${dropped} middle messages, keepEnd=${keepEnd}, bodyLen now ~${candidateSize}`);
-      return;
-    }
-    keepEnd--;
-  }
-
-  // Pass 3 & 4: aggressive — system + first user + last N non-system
-  // (N=4 covers tool_call + result + next tool_call + result pairs)
-  const firstUser = nonSystem.find((m) => m.role === "user");
-  for (const tailSize of [4, 2]) {
-    const lastN = nonSystem.slice(-tailSize);
-    const minimal = [
-      ...system,
-      ...(firstUser && !lastN.includes(firstUser)
-        ? [firstUser, { role: "system", content: "[earlier messages trimmed — answer the user's request using tool results below]" }]
-        : []),
-      ...lastN,
-    ];
-    const candidateSize = Buffer.byteLength(JSON.stringify({ ...parsed, messages: minimal }), "utf-8");
-    if (candidateSize <= cfg.maxBodyBytes) {
-      parsed.messages = minimal;
-      log(`trimmed history: AGGRESSIVE — kept system + first user + last ${tailSize}, bodyLen now ~${candidateSize}`);
-      return;
-    }
-  }
-
-  // Pass 5: absolute last resort
-  const lastTwo = nonSystem.slice(-2);
-  const minimal = [
-    ...system,
-    ...(firstUser && !lastTwo.includes(firstUser)
-      ? [firstUser, { role: "system", content: "[earlier messages trimmed — answer the user's request using tool results below]" }]
-      : []),
-    ...lastTwo,
-  ];
-  parsed.messages = minimal;
-  bodySize = Buffer.byteLength(JSON.stringify(parsed), "utf-8");
-  log(`trimmed history: AGGRESSIVE — kept system + first user + last 2, bodyLen now ~${bodySize}`);
+  // Passes 2-5: delegate to the canonical history-trim algorithm in
+  // sanitizer.mjs. Single source of truth — fixes to the trim/repair logic
+  // (e.g. repairToolPairing for the 2026-05-16 kimi-k2.6 CJK incident) only
+  // need to land in one place.
+  trimHistoryToBudget(parsed, {
+    maxBodyBytes: cfg.maxBodyBytes,
+    keepStart: 2,
+    keepEnd: 12,
+    label: "proxy",
+    log: cfg.logger.log.bind(cfg.logger),
+    aggressiveNotice: "[earlier messages trimmed — answer the user's request using tool results below]",
+  });
 }
 
 /**

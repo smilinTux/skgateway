@@ -53,6 +53,24 @@ const RE_TOOL_CALL_BLOCK = /<\|tool_call_begin\|>[\s\S]*?<\|tool_call_end\|>/g;
 const RE_TOOL_CALL_ARGUMENT = /<\|tool_call_argument_begin\|>[\s\S]*?(<\|tool_call_end\|>|$)/g;
 
 /**
+ * Matches a single complete Kimi tool-call expressed as leaked markup, with
+ * named capture groups for the function id and JSON arguments.
+ *
+ * Ported from hermes-agent's `kimi_k2_parser.py` (VLLM-derived). The id format
+ * is `functions.tool_name:idx` or `tool_name:idx`.
+ *
+ * The lazy `[\s\S]*?` for arguments is bounded by `<|tool_call_end|>`; we don't
+ * use the python parser's negative-lookahead variant because the lazy match
+ * naturally terminates at the first end marker.
+ */
+const RE_KIMI_TOOL_CALL_RECOVER =
+  /<\|tool_call_begin\|>\s*([^<]+:\d+)\s*<\|tool_call_argument_begin\|>\s*([\s\S]*?)\s*<\|tool_call_end\|>/g;
+
+/** Detects ANY kimi tool-call markup token in a string. */
+const RE_KIMI_HAS_MARKUP =
+  /<\|tool_calls?_section_begin\|>|<\|tool_call_begin\|>/;
+
+/**
  * Matches leaked chain-of-thought / planning monologue at the start of a
  * response.  Kimi K2.5 occasionally leaks its reasoning as visible text.
  * The pattern deliberately covers multi-line planning sequences.
@@ -181,6 +199,62 @@ function luhn(digits) {
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Recover leaked Kimi K2 tool-call markup from a text string into a proper
+ * `tool_calls` array.
+ *
+ * kimi-k2 (notably k2.6 on NVIDIA NIM) sometimes emits tool calls as raw
+ * markup tokens inside `message.content` instead of populating the proper
+ * `message.tool_calls` field. The previous behavior was to strip the markup
+ * — losing the model's intent and forcing it to retry. This helper parses
+ * the markup into structured tool calls so the gateway can dispatch them.
+ *
+ * Format (per Moonshot tokenizer / VLLM `KimiK2ToolParser`):
+ *   <|tool_calls_section_begin|>
+ *   <|tool_call_begin|>{function_id}<|tool_call_argument_begin|>{json}<|tool_call_end|>
+ *   <|tool_calls_section_end|>
+ *
+ * Where `function_id` is `functions.tool_name:idx` or `tool_name:idx`.
+ *
+ * Returns `{ content, toolCalls }`. `content` is the text BEFORE the first
+ * tool-call marker (trimmed). `toolCalls` is an array of OpenAI-style
+ * `{id, type, function: {name, arguments}}` objects, or `[]` if no recovery
+ * was possible.
+ *
+ * Pure: does not mutate input.
+ *
+ * @param {string} text
+ * @returns {{ content: string, toolCalls: object[] }}
+ */
+export function recoverKimiToolCalls(text) {
+  if (!text || typeof text !== "string") return { content: text ?? "", toolCalls: [] };
+  if (!RE_KIMI_HAS_MARKUP.test(text)) return { content: text, toolCalls: [] };
+
+  RE_KIMI_TOOL_CALL_RECOVER.lastIndex = 0;
+  const matches = [...text.matchAll(RE_KIMI_TOOL_CALL_RECOVER)];
+  if (matches.length === 0) return { content: text, toolCalls: [] };
+
+  const toolCalls = matches.map((m) => {
+    const functionId = m[1].trim();
+    const args = m[2].trim();
+    // "functions.get_weather:0" -> "get_weather"; "get_weather:0" -> "get_weather"
+    const name = functionId.split(":")[0].split(".").pop();
+    return {
+      id: functionId,
+      type: "function",
+      function: { name, arguments: args },
+    };
+  });
+
+  // Content = text before the first markup token (section begin OR call begin)
+  RE_KIMI_HAS_MARKUP.lastIndex = 0;
+  const markerMatch = text.match(RE_KIMI_HAS_MARKUP);
+  const sectionStart = markerMatch ? markerMatch.index : text.length;
+  const content = text.slice(0, sectionStart).trim();
+
+  return { content, toolCalls };
+}
 
 /**
  * Strip all Kimi K2.5 leaked tool-call markup from a text string.
@@ -329,7 +403,11 @@ function repairToolCallJson(jsonStr) {
  * clone).
  *
  * Operations performed (in order):
- *  1. Strip Kimi K2.5 leaked tool-call markup from `message.content`.
+ *  1a. Recover leaked Kimi K2 tool-call markup in `message.content` into
+ *      proper `message.tool_calls` (only if `tool_calls` is empty); when
+ *      recovery succeeds, set `choice.finish_reason = "tool_calls"`.
+ *  1b. Strip any remaining Kimi K2.5 leaked tool-call markup from
+ *      `message.content`.
  *  2. Handle `<think>...</think>` blocks per `config.thinkMode`.
  *  3. Promote `message.reasoning` → `message.content` if content is empty and
  *     the reasoning is substantial (> REASONING_PROMOTE_MIN_CHARS chars).
@@ -361,7 +439,28 @@ export function sanitizeResponse(body, config = {}) {
 
     c.message = { ...c.message };
 
-    // --- Step 1: Strip Kimi leaked markup from text content ---
+    // --- Step 1a: Recover leaked tool-call markup into structured tool_calls ---
+    // Only attempt recovery when the message has no proper tool_calls already;
+    // if NVIDIA NIM correctly parsed the tokens we don't want to double-dispatch.
+    if (
+      typeof c.message.content === "string" &&
+      !(Array.isArray(c.message.tool_calls) && c.message.tool_calls.length > 0) &&
+      RE_KIMI_HAS_MARKUP.test(c.message.content)
+    ) {
+      const { content: recoveredContent, toolCalls: recovered } =
+        recoverKimiToolCalls(c.message.content);
+      if (recovered.length > 0) {
+        c.message.tool_calls = recovered;
+        c.message.content = recoveredContent;
+        c.finish_reason = "tool_calls";
+        const names = recovered.map((tc) => tc.function?.name).join(",");
+        console.log(
+          `[${label}] SANITIZED: recovered ${recovered.length} tool_call(s) from leaked markup [${names}]`
+        );
+      }
+    }
+
+    // --- Step 1b: Strip remaining Kimi leaked markup from text content ---
     if (typeof c.message.content === "string") {
       c.message.content = stripKimiMarkup(c.message.content, { label });
     }
@@ -422,6 +521,225 @@ export function sanitizeResponse(body, config = {}) {
 }
 
 // ---------------------------------------------------------------------------
+// Tool-pairing repair (internal helper)
+// ---------------------------------------------------------------------------
+
+/**
+ * Repair OpenAI-style assistant(tool_calls)↔tool pairing after a tail slice.
+ *
+ * Trimming the conversation tail can leave two kinds of broken state that
+ * cause hallucinations (notably kimi-k2.6 returning CJK + emoji noise):
+ *
+ *   1. Leading orphan `tool` messages whose parent assistant(tool_calls) was
+ *      dropped from the slice.
+ *   2. An assistant(tool_calls) whose set of `tool_call_id` responses is
+ *      incomplete inside the slice (some tool replies live in the dropped
+ *      middle, or the slice ends before all tool replies arrive).
+ *
+ * Repairs (in order):
+ *   a. Drop any leading `tool`/`toolResult` messages.
+ *   b. Walk forward; for each assistant with non-empty `tool_calls`, verify
+ *      every `tc.id` has a matching `tool_call_id` in the immediately
+ *      following tool block. If any id is missing, drop the assistant and
+ *      its partial tool replies as a unit.
+ *
+ * Pure: does not mutate input, returns a new array.
+ *
+ * @param {object[]} slice
+ * @returns {object[]}
+ */
+export function repairToolPairing(slice) {
+  if (!Array.isArray(slice) || slice.length === 0) return slice;
+
+  // Step 1: drop leading orphan tool messages.
+  let start = 0;
+  while (
+    start < slice.length &&
+    (slice[start].role === "tool" || slice[start].role === "toolResult")
+  ) {
+    start++;
+  }
+  const trimmed = start === 0 ? slice : slice.slice(start);
+
+  // Step 2: walk forward, validating each assistant(tool_calls) block.
+  const out = [];
+  for (let i = 0; i < trimmed.length; i++) {
+    const m = trimmed[i];
+    if (
+      m.role === "assistant" &&
+      Array.isArray(m.tool_calls) &&
+      m.tool_calls.length > 0
+    ) {
+      const expectedIds = m.tool_calls
+        .map((tc) => tc && tc.id)
+        .filter((id) => typeof id === "string" && id.length > 0);
+      const seenIds = new Set();
+      let j = i + 1;
+      while (
+        j < trimmed.length &&
+        (trimmed[j].role === "tool" || trimmed[j].role === "toolResult")
+      ) {
+        if (typeof trimmed[j].tool_call_id === "string") {
+          seenIds.add(trimmed[j].tool_call_id);
+        }
+        j++;
+      }
+      const allPresent =
+        expectedIds.length === 0 || expectedIds.every((id) => seenIds.has(id));
+      if (!allPresent) {
+        // Drop this assistant and its partial tool replies as a unit.
+        i = j - 1;
+        continue;
+      }
+    }
+    out.push(m);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Public API: trimHistoryToBudget
+// ---------------------------------------------------------------------------
+
+/**
+ * Trim a request body's conversation history so the serialized body stays
+ * under `maxBodyBytes`. Single source of truth for the history-trim algorithm
+ * — both `sanitizeRequest` here and `trimConversationHistory` in core.mjs
+ * delegate to this function.
+ *
+ * Assumes the caller has already:
+ *   - Truncated oversized tool-result messages.
+ *   - Trimmed oversized system messages.
+ *
+ * Strategy (in order):
+ *   1. If body is already under budget, no-op.
+ *   2. Drop middle messages: keep first `keepStart` non-system + last `keepEnd`
+ *      non-system, with a "[N earlier messages trimmed]" system notice between.
+ *      Progressively shrink `keepEnd` from its max down to 2 until under budget.
+ *   3. Aggressive fallback: system + first user + last 4, then last 2.
+ *   4. Absolute last resort: system + first user + last 2 (returned even if
+ *      still over budget — caller decides what to do).
+ *
+ * Every tail slice is passed through `repairToolPairing` to drop orphan
+ * `tool` messages and incomplete `assistant(tool_calls)` blocks. Without this
+ * repair, kimi-k2.6 hallucinates CJK + emoji noise when the slice begins with
+ * an orphan tool result (2026-05-16 ocp-coherence-watch incident).
+ *
+ * Mutates `body.messages` in place (following nvidia-proxy.mjs convention).
+ *
+ * @param {object} body                 Parsed request body.
+ * @param {object} [options]
+ * @param {number} [options.maxBodyBytes=120000]
+ * @param {number} [options.keepStart=2]
+ * @param {number} [options.keepEnd=12]
+ * @param {string} [options.label="sanitizer"]   Log prefix.
+ * @param {(msg: string) => void} [options.log] Custom logger; defaults to
+ *   `console.log` with the label prefix.
+ * @param {string} [options.aggressiveNotice]    Body of the system "fall-back"
+ *   notice inserted when only first-user + tail survive. Defaults to a generic
+ *   phrasing; callers may override (e.g. core.mjs uses a slightly different
+ *   wording for back-compat).
+ * @returns {object} The same `body` object.
+ */
+export function trimHistoryToBudget(body, options = {}) {
+  if (!body || !Array.isArray(body.messages)) return body;
+
+  const maxBodyBytes      = options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
+  const keepStart         = options.keepStart    ?? DEFAULT_KEEP_START;
+  const keepEndMax        = options.keepEnd      ?? DEFAULT_KEEP_END;
+  const label             = options.label        ?? "sanitizer";
+  const log               = options.log          ?? ((m) => console.log(`[${label}] ${m}`));
+  const aggressiveNotice  = options.aggressiveNotice
+    ?? "[earlier messages trimmed — answer using tool results below]";
+
+  if (body.messages.length < 6) return body;
+
+  let bodySize = Buffer.byteLength(JSON.stringify(body), "utf-8");
+  const roleSummary = body.messages.map((m) => m.role).join(",");
+  log(`conversation roles (${body.messages.length} msgs): ${roleSummary}`);
+  if (bodySize <= maxBodyBytes) return body;
+
+  const system    = body.messages.filter((m) => m.role === "system");
+  const nonSystem = body.messages.filter((m) => m.role !== "system");
+
+  if (nonSystem.length <= 4) return body;
+
+  let keepEnd = Math.min(keepEndMax, nonSystem.length - keepStart);
+
+  // Pass A: progressively shrink tail until under budget
+  while (keepEnd >= 2) {
+    const dropped = nonSystem.length - keepStart - keepEnd;
+    const rawTail = nonSystem.slice(-keepEnd);
+    const tail = repairToolPairing(rawTail);
+    const tailRepaired = tail.length !== rawTail.length;
+    const candidate = [
+      ...system,
+      ...nonSystem.slice(0, keepStart),
+      ...(dropped > 0
+        ? [{ role: "system", content: `[${dropped} earlier messages trimmed to save context]` }]
+        : []),
+      ...tail,
+    ];
+    const candidateSize = Buffer.byteLength(
+      JSON.stringify({ ...body, messages: candidate }), "utf-8",
+    );
+    if (candidateSize <= maxBodyBytes) {
+      body.messages = candidate;
+      log(
+        `trimmed history: dropped ${dropped} middle messages, keepEnd=${keepEnd}, bodyLen ~${candidateSize}` +
+        (tailRepaired ? ` (repaired tool pairing: ${rawTail.length}→${tail.length})` : ""),
+      );
+      return body;
+    }
+    keepEnd--;
+  }
+
+  // Pass B: aggressive — system + first user + last N
+  const firstUser = nonSystem.find((m) => m.role === "user");
+  for (const tailSize of [4, 2]) {
+    const rawLastN = nonSystem.slice(-tailSize);
+    const lastN = repairToolPairing(rawLastN);
+    const tailRepaired = lastN.length !== rawLastN.length;
+    const minimal = [
+      ...system,
+      ...(firstUser && !lastN.includes(firstUser)
+        ? [firstUser, { role: "system", content: aggressiveNotice }]
+        : []),
+      ...lastN,
+    ];
+    const candidateSize = Buffer.byteLength(
+      JSON.stringify({ ...body, messages: minimal }), "utf-8",
+    );
+    if (candidateSize <= maxBodyBytes) {
+      body.messages = minimal;
+      log(
+        `trimmed history: AGGRESSIVE — kept system + first user + last ${tailSize}, bodyLen ~${candidateSize}` +
+        (tailRepaired ? ` (repaired tool pairing: ${rawLastN.length}→${lastN.length})` : ""),
+      );
+      return body;
+    }
+  }
+
+  // Pass C: absolute last resort
+  const rawLastTwo = nonSystem.slice(-2);
+  const lastTwo = repairToolPairing(rawLastTwo);
+  const tailRepaired = lastTwo.length !== rawLastTwo.length;
+  body.messages = [
+    ...system,
+    ...(firstUser && !lastTwo.includes(firstUser)
+      ? [firstUser, { role: "system", content: aggressiveNotice }]
+      : []),
+    ...lastTwo,
+  ];
+  bodySize = Buffer.byteLength(JSON.stringify(body), "utf-8");
+  log(
+    `trimmed history: ABSOLUTE LAST RESORT — kept system + first user + last 2, bodyLen ~${bodySize}` +
+    (tailRepaired ? ` (repaired tool pairing: ${rawLastTwo.length}→${lastTwo.length})` : ""),
+  );
+  return body;
+}
+
+// ---------------------------------------------------------------------------
 // Public API: sanitizeRequest
 // ---------------------------------------------------------------------------
 
@@ -442,6 +760,9 @@ export function sanitizeResponse(body, config = {}) {
  *       c. Drop middle messages, inserting a trim notice.
  *       d. If still over budget, progressively shrink tail down to 2.
  *       e. Last resort: system + first user message + last 2.
+ *     Every tail slice is passed through `repairToolPairing` to drop orphan
+ *     `tool` messages and incomplete assistant(tool_calls) blocks — kimi-k2.6
+ *     specifically hallucinates CJK + emoji noise on malformed pairing.
  *
  * @param {object} body - Parsed JSON request body (mutated in-place for messages).
  * @param {object} [config={}]
@@ -520,84 +841,13 @@ export function sanitizeRequest(body, config = {}) {
     }
   }
 
-  // --- Step 3: Trim conversation history ---
-  if (body.messages.length < 6) return body;
-
-  let bodySize = Buffer.byteLength(JSON.stringify(body), "utf-8");
-  if (bodySize <= maxBodyBytes) {
-    console.log(`[${label}] conversation roles (${body.messages.length} msgs): ${body.messages.map((m) => m.role).join(",")}`);
-    return body;
-  }
-
-  console.log(`[${label}] conversation roles (${body.messages.length} msgs): ${body.messages.map((m) => m.role).join(",")}`);
-
-  const system    = body.messages.filter((m) => m.role === "system");
-  const nonSystem = body.messages.filter((m) => m.role !== "system");
-
-  if (nonSystem.length <= 4) return body;
-
-  let keepEnd = Math.min(keepEndMax, nonSystem.length - keepStart);
-
-  // Progressively shrink tail until under budget
-  while (keepEnd >= 2) {
-    const dropped = nonSystem.length - keepStart - keepEnd;
-    const candidate = [
-      ...system,
-      ...nonSystem.slice(0, keepStart),
-      ...(dropped > 0
-        ? [{ role: "system", content: `[${dropped} earlier messages trimmed to save context]` }]
-        : []),
-      ...nonSystem.slice(-keepEnd),
-    ];
-    const candidateSize = Buffer.byteLength(
-      JSON.stringify({ ...body, messages: candidate }), "utf-8",
-    );
-    if (candidateSize <= maxBodyBytes) {
-      body.messages = candidate;
-      console.log(
-        `[${label}] trimmed history: dropped ${dropped} middle messages, keepEnd=${keepEnd}, bodyLen ~${candidateSize}`,
-      );
-      return body;
-    }
-    keepEnd--;
-  }
-
-  // Aggressive fallback: system + first user + last N
-  const firstUser = nonSystem.find((m) => m.role === "user");
-  for (const tailSize of [4, 2]) {
-    const lastN = nonSystem.slice(-tailSize);
-    const minimal = [
-      ...system,
-      ...(firstUser && !lastN.includes(firstUser)
-        ? [firstUser, { role: "system", content: "[earlier messages trimmed — answer using tool results below]" }]
-        : []),
-      ...lastN,
-    ];
-    const candidateSize = Buffer.byteLength(
-      JSON.stringify({ ...body, messages: minimal }), "utf-8",
-    );
-    if (candidateSize <= maxBodyBytes) {
-      body.messages = minimal;
-      console.log(
-        `[${label}] trimmed history: AGGRESSIVE — kept system + first user + last ${tailSize}, bodyLen ~${candidateSize}`,
-      );
-      return body;
-    }
-  }
-
-  // Absolute last resort
-  const lastTwo = nonSystem.slice(-2);
-  body.messages = [
-    ...system,
-    ...(firstUser && !lastTwo.includes(firstUser)
-      ? [firstUser, { role: "system", content: "[earlier messages trimmed — answer using tool results below]" }]
-      : []),
-    ...lastTwo,
-  ];
-  bodySize = Buffer.byteLength(JSON.stringify(body), "utf-8");
-  console.log(
-    `[${label}] trimmed history: ABSOLUTE LAST RESORT — kept system + first user + last 2, bodyLen ~${bodySize}`,
-  );
+  // --- Step 3: Trim conversation history (delegate to shared helper) ---
+  trimHistoryToBudget(body, {
+    maxBodyBytes,
+    keepStart,
+    keepEnd: keepEndMax,
+    label,
+  });
   return body;
 }
 
