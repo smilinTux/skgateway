@@ -667,6 +667,69 @@ Outputs are pluggable modules in `src/siem/`. To add a new destination (e.g. Spl
 
 ---
 
+---
+
+## First Principles & The Full Vertical
+
+> **Get back to first principles.**
+> The modern stack is rented. Every prompt your AI sends exits through a cloud provider's endpoint, gets logged in a datacenter you've never seen, and billed through an account you can't fully audit. You don't own the inference path — you rent it.
+>
+> SKGateway is your **Comms / Gateway layer**. Every prompt inspected on your hardware. Every policy enforced by your rules. Every token counted in your ledger. Every layer **yours**.
+
+**SKGateway is the Comms / Gateway layer of the SKWorld full vertical** — the network chokepoint that enforces identity, policy, cost, and observability on every AI inference request before it reaches any model backend, whether local or cloud.
+
+### The full vertical
+
+| Layer | Product(s) |
+|---|---|
+| **Soul** | soul blueprints · cloud9 |
+| **Apps** | skforge · skarchitect |
+| **Comms** | skcomm · skchat · **skgateway** · skvoice |
+| **Models** | skmodel (Ollama/vLLM) |
+| **Data** | skmemory · skdata · skvector · skgraph |
+| **Identity** | capauth · skaid |
+| **Security** | sksecurity · skwaf · skca |
+| **OS** | skos |
+| **Silicon** | *your hardware* |
+
+SKGateway answers the gateway question at the Comms layer: *who is allowed to call which model, at what cost, subject to what policy, and what happened?* It is transparent to any OpenAI-compatible client — point it at `http://localhost:18780` and your agents gain full SOC observability without a single code change.
+
+### Data sovereignty
+
+Your prompts and completions never reach a third party unexamined. Every request is classified, signed with a CapAuth-verified agent identity, and logged in a local JSONL audit trail on your disk before it is forwarded upstream. The SOC dashboard runs locally at `:18781` — no telemetry leaves your infrastructure. Metrics and latency history are stored in a local SQLite database. You run the SIEM; you hold the logs. If you choose Ollama as your only backend, the prompt never leaves your LAN at all.
+
+### SKCapstone alignment
+
+**Integrated skcapstone subsystem.** SKGateway reads agent identities from `~/.skcapstone/agents/<name>/identity/public.asc` and auto-discovers registered agents from the `~/.skcapstone/agents/` directory. The tool reducer carries an explicit keyword budget for skcapstone MCP tools (`skcapstone_status`, `skcapstone_coord_*`, `skcapstone_soul_*`, `skcapstone_agent_*`, `skmemory_health`, etc.), ensuring those tools survive reduction even under a tight 16-tool budget. The SIEM module includes a reference path to `~/clawd/skcapstone-repos/SKSecurity/sign.mjs` for audit log signing. SKGateway is the network layer of the skcapstone sovereign agent framework — named as such in its own architecture documentation.
+
+### Where SKGateway fits in the vertical
+
+```mermaid
+flowchart TD
+    CLIENTS["AI Clients\nOpenClaw · Claude Code · SKVoice\nCustom apps · skchat"]
+    GW["**Comms / Gateway — SKGateway :18780**\nIdentity (CapAuth · session · reputation)\nPolicy engine (rules · DLP · rate limit)\nClassifiers (intent · risk · jailbreak · PII)\nTool reducer (skcapstone budget)\nSIEM event bus · SOC dashboard :18781"]
+    BACKENDS["LLM Backends\nAnthropic · NVIDIA NIM · Ollama\nOpenAI-compat · vLLM"]
+    SKCAPSTONE["skcapstone\nagent store ~/.skcapstone/agents/\norchestrator · ITIL incident bus"]
+    SKMEMORY["skmemory\nagent context enrichment"]
+    SKSEC["SKSecurity / CapAuth\nPGP identity · audit log signing"]
+    SKCOMM["skcomm\ntransport (config sync via Syncthing)"]
+    SOC["SOC Dashboard :18781\nreal-time · WebSocket · OLED"]
+    DATA["Data layer\nskmemory · skgraph"]
+    SILICON["Silicon — your hardware"]
+
+    CLIENTS -->|"POST /v1/chat/completions"| GW
+    GW -->|"verified + classified"| BACKENDS
+    GW <-->|"agent discovery\ncritical incident creation"| SKCAPSTONE
+    GW <-->|"agent context (200-byte rehydration)"| SKMEMORY
+    GW <-->|"PGP identity verify\naudit log signing"| SKSEC
+    SKCAPSTONE --> SKCOMM
+    GW --> SOC
+    BACKENDS --> DATA
+    DATA --> SILICON
+```
+
+---
+
 ## License
 
 MIT — see [LICENSE](LICENSE) for details.
