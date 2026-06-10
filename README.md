@@ -33,31 +33,31 @@ SKGateway is a first-class pillar of the [SKCapstone](https://github.com/smilinT
 graph LR
     subgraph Clients
         OC[OpenClaw]
-        SV[SKVoice]
+        SV[skvoice]
         CC[Claude Code]
         CA[Custom Apps]
     end
 
     subgraph SKGateway["SKGateway :18780 / :18781"]
         direction TB
-        ID[Identity\nCapAuth · Session · Reputation]
-        PE[Policy Engine\nRules · DLP · Rate Limit]
-        CL[Classifiers\nIntent · Risk · Jailbreak · PII]
-        PC[Proxy Core\nRouter · Tools · Sanitizer · Stream · Retry]
-        ME[Metrics\nTokens · Cost · Latency P50/P95/P99]
-        SI[SIEM Event Bus\nCEF · JSONL · Syslog · Elastic]
-        DA[SOC Dashboard\nReal-time · WebSocket · Canvas]
+        ID["Identity<br/>CapAuth · Session · Reputation"]
+        PE["Policy Engine<br/>Rules · DLP · Rate Limit"]
+        CL["Classifiers<br/>Intent · Risk · Jailbreak · PII"]
+        PC["Proxy Core<br/>Router · Tools · Sanitizer · Stream · Retry"]
+        ME["Metrics<br/>Tokens · Cost · Latency P50/P95/P99"]
+        SI["SIEM Event Bus<br/>CEF · JSONL · Syslog · Elastic"]
+        DA["SOC Dashboard<br/>Real-time · WebSocket · Canvas"]
 
         ID --> PE --> CL --> PC --> ME --> SI
         SI --> DA
     end
 
     subgraph Backends
-        AN[Anthropic\nclaude-opus/sonnet]
-        NV[NVIDIA NIM\nkimi-k2 · minimax-m2]
-        OL[Ollama\nLocal Models]
-        OA[OpenAI\nCompatible]
-        CU[Custom\nvLLM / LMStudio]
+        AN["Anthropic<br/>claude-opus/sonnet"]
+        NV["NVIDIA NIM<br/>kimi-k2 · minimax-m2"]
+        OL["Ollama<br/>Local Models"]
+        OA["OpenAI<br/>Compatible"]
+        CU["Custom<br/>vLLM / LMStudio"]
     end
 
     OC & SV & CC & CA -->|HTTP / SSE| SKGateway
@@ -547,23 +547,23 @@ SKGateway is the network layer of the [SKCapstone](https://github.com/smilinTux/
 
 ```mermaid
 graph LR
-    subgraph SKCapstone Ecosystem
-        OC[OpenClaw\nAgent orchestrator]
-        SKV[SKVoice\nVoice pipeline]
-        MEM[skmemory\nMemory system]
-        SEC[SKSecurity\nCapAuth / PGP]
-        ITIL[skcapstone\nITIL / Deming / Coord]
-        SYNC[Syncthing\nConfig sync]
+    subgraph Ecosystem["SKCapstone / SKWorld ecosystem"]
+        OC["OpenClaw<br/>agent orchestrator"]
+        SKV["skvoice<br/>voice pipeline"]
+        MEM["skmemory<br/>memory system"]
+        SEC["capauth<br/>PGP identity"]
+        ITIL["skops / skcapstone<br/>ITIL · coord board"]
+        SYNC["Syncthing<br/>config sync"]
     end
 
-    GW[SKGateway]
+    GW["SKGateway"]
 
-    OC -->|baseUrl: localhost:18780| GW
-    SKV -->|inference requests| GW
-    GW -->|identity verification| SEC
-    GW -->|agent context enrichment| MEM
-    GW -->|incident creation on anomaly| ITIL
-    SYNC -->|config/policies.yaml sync| GW
+    OC -->|"baseUrl: localhost:18780"| GW
+    SKV -->|"inference requests"| GW
+    GW -->|"identity verification"| SEC
+    GW -->|"agent context enrichment"| MEM
+    GW -->|"critical events via sk-alert"| ITIL
+    SYNC -->|"config/policies.yaml sync"| GW
 ```
 
 **OpenClaw** — Set `baseUrl: http://localhost:18780` on any model provider in `openclaw.json`. SKGateway becomes transparent to OpenClaw while gaining full observability over every call.
@@ -691,66 +691,75 @@ Outputs are pluggable modules in `src/siem/`. To add a new destination (e.g. Spl
 
 ---
 
----
-
-## First Principles & The Full Vertical
+## First Principles
 
 > **Get back to first principles.**
-> The modern stack is rented. Every prompt your AI sends exits through a cloud provider's endpoint, gets logged in a datacenter you've never seen, and billed through an account you can't fully audit. You don't own the inference path — you rent it.
+> The modern stack is rented. Every prompt your AI sends exits through a cloud provider's
+> endpoint, gets logged in a datacenter you've never seen, and billed through an account
+> you can't fully audit. You don't own the inference path — you rent it.
 >
-> SKGateway is your **Comms / Gateway layer**. Every prompt inspected on your hardware. Every policy enforced by your rules. Every token counted in your ledger. Every layer **yours**.
+> SKGateway is the **inference chokepoint you own**. Every prompt inspected on your
+> hardware. Every policy enforced by your rules. Every token counted in your ledger.
 
-**SKGateway is the Comms / Gateway layer of the SKWorld full vertical** — the network chokepoint that enforces identity, policy, cost, and observability on every AI inference request before it reaches any model backend, whether local or cloud.
+Your prompts and completions never reach a third party unexamined. Every request is
+classified, stamped with a CapAuth-verified agent identity, and logged to a local JSONL
+audit trail on your disk before it is forwarded upstream. The SOC dashboard runs locally
+at `:18781` — no telemetry leaves your infrastructure. Metrics and latency history live in
+a local SQLite database. You run the SIEM; you hold the logs. If you point every backend at
+local Ollama, the prompt never leaves your LAN at all.
 
-### The full vertical
+---
 
-| Layer | Product(s) |
-|---|---|
-| **Soul** | soul blueprints · cloud9 |
-| **Apps** | skforge · skarchitect |
-| **Comms** | skcomm · skchat · **skgateway** · skvoice |
-| **Models** | skmodel (Ollama/vLLM) |
-| **Data** | skmemory · skdata · skvector · skgraph |
-| **Identity** | capauth · skaid |
-| **Security** | sksecurity · skwaf · skca |
-| **OS** | skos |
-| **Silicon** | *your hardware* |
+## Where it lives in SKStack v2
 
-SKGateway answers the gateway question at the Comms layer: *who is allowed to call which model, at what cost, subject to what policy, and what happened?* It is transparent to any OpenAI-compatible client — point it at `http://localhost:18780` and your agents gain full SOC observability without a single code change.
+SKWorld is deployed through **skos** (the sovereign agent OS) using a ports/adapters model,
+organized by the **4 C's** capability map: **cloud · comms · compute · core**. SKGateway is
+a **core** capability — the security plane through which all AI inference traffic flows. It
+sits in front of the **compute** layer's model backends (`skmodel`/Ollama and cloud LLMs),
+enforces **core** identity (`capauth`), and reports up the shared platform primitives
+(`sk-alert`, the coord/ITIL board, `skscheduler`).
 
-### Data sovereignty
-
-Your prompts and completions never reach a third party unexamined. Every request is classified, signed with a CapAuth-verified agent identity, and logged in a local JSONL audit trail on your disk before it is forwarded upstream. The SOC dashboard runs locally at `:18781` — no telemetry leaves your infrastructure. Metrics and latency history are stored in a local SQLite database. You run the SIEM; you hold the logs. If you choose Ollama as your only backend, the prompt never leaves your LAN at all.
-
-### SKCapstone alignment
-
-**Integrated skcapstone subsystem.** SKGateway reads agent identities from `~/.skcapstone/agents/<name>/identity/public.asc` and auto-discovers registered agents from the `~/.skcapstone/agents/` directory. The tool reducer carries an explicit keyword budget for skcapstone MCP tools (`skcapstone_status`, `skcapstone_coord_*`, `skcapstone_soul_*`, `skcapstone_agent_*`, `skmemory_health`, etc.), ensuring those tools survive reduction even under a tight 16-tool budget. The SIEM module includes a reference path to `~/clawd/skcapstone-repos/SKSecurity/sign.mjs` for audit log signing. SKGateway is the network layer of the skcapstone sovereign agent framework — named as such in its own architecture documentation.
-
-### Where SKGateway fits in the vertical
+It depends only on what it actually touches: `capauth` for PGP agent identity, `skmemory`
+for optional agent-context enrichment, and the file-based `sk-alert` bus + `skscheduler`
+job tree when an `~/.skcapstone/` install is present (otherwise it runs fully standalone).
 
 ```mermaid
 flowchart TD
-    CLIENTS["AI Clients\nOpenClaw · Claude Code · SKVoice\nCustom apps · skchat"]
-    GW["**Comms / Gateway — SKGateway :18780**\nIdentity (CapAuth · session · reputation)\nPolicy engine (rules · DLP · rate limit)\nClassifiers (intent · risk · jailbreak · PII)\nTool reducer (skcapstone budget)\nSIEM event bus · SOC dashboard :18781"]
-    BACKENDS["LLM Backends\nAnthropic · NVIDIA NIM · Ollama\nOpenAI-compat · vLLM"]
-    SKCAPSTONE["skcapstone\nagent store ~/.skcapstone/agents/\norchestrator · ITIL incident bus"]
-    SKMEMORY["skmemory\nagent context enrichment"]
-    SKSEC["SKSecurity / CapAuth\nPGP identity · audit log signing"]
-    SKCOMM["skcomm\ntransport (config sync via Syncthing)"]
-    SOC["SOC Dashboard :18781\nreal-time · WebSocket · OLED"]
-    DATA["Data layer\nskmemory · skgraph"]
-    SILICON["Silicon — your hardware"]
+    CLIENTS["AI clients<br/>OpenClaw · Claude Code · skvoice · skchat · custom apps"]
+    CLIENTS -->|"POST /v1/chat/completions (OpenAI-compatible)"| GW
 
-    CLIENTS -->|"POST /v1/chat/completions"| GW
-    GW -->|"verified + classified"| BACKENDS
-    GW <-->|"agent discovery\ncritical incident creation"| SKCAPSTONE
-    GW <-->|"agent context (200-byte rehydration)"| SKMEMORY
-    GW <-->|"PGP identity verify\naudit log signing"| SKSEC
-    SKCAPSTONE --> SKCOMM
+    subgraph GW["**skgateway** :18780 — core / inference security plane"]
+      direction TB
+      ID["identity<br/>capauth verify · session · reputation"]
+      PE["policy engine<br/>rules · rate limit · transforms"]
+      CL["classifiers<br/>intent · risk · jailbreak · PII"]
+      PC["proxy core<br/>tool-reduce · sanitize · retry · pool"]
+      RO["router<br/>backend select · health · failover"]
+      ME["metrics<br/>tokens · cost · P50/P95/P99 (SQLite)"]
+      SI["SIEM event bus<br/>CEF · JSONL · syslog"]
+      ID --> PE --> CL --> PC --> RO
+      RO --> ME --> SI
+    end
+
+    GW -->|"verified + classified + reduced"| COMPUTE
+    subgraph COMPUTE["compute — model backends"]
+      direction LR
+      SKMODEL["skmodel / Ollama<br/>local models (LAN-only)"]
+      CLOUD["Anthropic · NVIDIA NIM<br/>OpenAI-compat · vLLM"]
+    end
+
+    GW <-->|"PGP agent identity"| CAPAUTH["core · capauth<br/>identity source of truth"]
+    GW <-->|"agent-context rehydration"| SKMEM["core · skmemory<br/>context enrichment"]
+    SI -->|"critical events → file bus"| ALERT["sk-alert<br/>Telegram alert bus"]
+    GW -.->|"health job (when integrated)"| SCHED["skscheduler<br/>fleet job scheduler"]
+    ALERT -.->|"surfaced as incidents"| OPS["skops<br/>ITIL ops board"]
+
+    SOC["SOC dashboard :18781<br/>real-time · WebSocket · OLED"]
     GW --> SOC
-    BACKENDS --> DATA
-    DATA --> SILICON
 ```
+
+For the request lifecycle, retry state machine, and module-level source map, see
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ---
 
@@ -760,5 +769,5 @@ MIT — see [LICENSE](LICENSE) for details.
 
 ---
 
-*Part of the [SKCapstone](https://github.com/smilinTux/skcapstone) sovereign agent framework.*
-*Built for Chef (David) and Lumina — sovereign infrastructure, no compromises.*
+Part of the **[SKWorld](https://skworld.io)** sovereign ecosystem · site:
+**[skgateway.skworld.io](https://skgateway.skworld.io)** · 🐧 smilinTux
