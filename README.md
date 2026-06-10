@@ -578,6 +578,30 @@ graph LR
 
 **Syncthing** — `config/skgateway.yaml` and `config/policies.yaml` are designed to be Syncthing-synced across nodes. Hot-reload (`SIGHUP`) means config updates propagate without service interruption.
 
+### Integration modes (skcapstone)
+
+skgateway is a Node.js service and integrates with skcapstone **file-based** (no Python import):
+
+| Mode | Trigger | Alert path | Scheduler |
+|---|---|---|---|
+| **Standalone** | `SK_STANDALONE=1` or `~/.skcapstone/` not present | No-op (alert() returns false) | Native systemd `skgateway.service` |
+| **Integrated** | `~/.skcapstone/` exists and `SK_STANDALONE` unset | File-based PubSub: writes `~/.skcapstone/pubsub/topics/skgateway.<severity>/msg-*.json` | File-based: writes `~/.skcapstone/config/jobs.d/skgateway_health.yaml` |
+| **Forced standalone** | `SK_STANDALONE=1` env var | No-op | Native |
+
+The Node adapter (`src/integration.mjs`) writes the same file formats as the Python SDK so
+`skcapstone alerts` (Python) reads SKGateway messages transparently. See
+`docs/ADR-optional-integration-backbone.md §3.5` (polyglot bridge) and
+`tests/integration.test.mjs` for the validated Node↔Python round-trip.
+
+### `~/.skcapstone/` filesystem contract
+
+When integrated, skgateway writes:
+- `~/.skcapstone/pubsub/topics/skgateway.<severity>/msg-*.json` — alert messages
+- `~/.skcapstone/registry/skgateway.json` — service discovery entry
+
+Alert topics follow the sk* convention: `skgateway.<severity>` (e.g. `skgateway.critical`).
+The semantic event name lives in the payload `event` field, not the topic suffix.
+
 ---
 
 ## API Reference
