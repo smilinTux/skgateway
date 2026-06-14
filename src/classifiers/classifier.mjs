@@ -129,7 +129,7 @@ const CATEGORY_PATTERNS = {
     [/\b(plugin|integration|webhook|http|curl|fetch|request|response)\b/i, 2],
     [/\b(upload|download|import|export|sync|backup|restore|transfer)\b/i, 2],
     // MCP/SK tool call patterns
-    [/\b(skmemory|skcapstone|skgit|cloud9|capauth|skcomm|skchat)\b/i, 4],
+    [/\b(skmemory|skcapstone|skgit|cloud9|capauth|skcomms|skchat)\b/i, 4],
   ],
 
   conversation: [
