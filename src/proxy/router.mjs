@@ -440,21 +440,79 @@ export class Backend {
         return null;
       }
 
-      this._oauthToken = accessToken;
       // expires_at may be epoch seconds or ms — normalise to ms
       const expRaw = creds.expires_at || creds.expiry || creds.expiresAt || 0;
-      this._oauthExpiry = expRaw > 1e12 ? expRaw : expRaw * 1000;
+      const expiryMs = expRaw > 1e12 ? expRaw : expRaw * 1000;
+      const refreshToken = creds.refresh_token || creds.refreshToken;
 
-      if (now >= this._oauthExpiry - 60_000) {
-        console.warn(
-          `[router] backend=${this.id} oauth token is expired or expiring within 60s. ` +
-          `Refresh may be needed. Continuing with stale token.`
-        );
+      // Proactively refresh within 5 min of expiry. Claude Code OAuth tokens
+      // live ~8h; without this the subscription path dies every 8h unless a
+      // `claude` CLI happens to refresh the creds for us.
+      if (refreshToken && now >= expiryMs - 300_000) {
+        const refreshed = await this._refreshOAuth(refreshToken, filePath, credsRaw);
+        if (refreshed) {
+          this._oauthToken = refreshed.accessToken;
+          this._oauthExpiry = refreshed.expiryMs;
+          return this._oauthToken;
+        }
+        console.warn(`[router] backend=${this.id} oauth refresh failed; using stale token`);
       }
 
+      this._oauthToken = accessToken;
+      this._oauthExpiry = expiryMs;
       return this._oauthToken;
     } catch (err) {
       console.error(`[router] backend=${this.id} failed to load credentials file ${filePath}: ${err.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Refresh an expired Claude Code OAuth token using the subscription
+   * refresh_token, persisting the new tokens back to the credentials file
+   * (preserving its shape). Mirrors Claude Code / CLIProxyAPI behaviour.
+   *
+   * @returns {Promise<{accessToken:string, expiryMs:number}|null>}
+   */
+  async _refreshOAuth(refreshToken, filePath, credsRaw) {
+    const CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"; // Claude Code CLI
+    try {
+      const resp = await fetch("https://console.anthropic.com/v1/oauth/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "User-Agent": "anthropic" },
+        body: JSON.stringify({
+          grant_type: "refresh_token",
+          refresh_token: refreshToken,
+          client_id: CLIENT_ID,
+        }),
+      });
+      if (!resp.ok) {
+        console.error(`[router] backend=${this.id} oauth refresh HTTP ${resp.status}: ${(await resp.text()).slice(0, 200)}`);
+        return null;
+      }
+      const data = await resp.json();
+      const accessToken = data.access_token;
+      if (!accessToken) return null;
+      const newRefresh = data.refresh_token || refreshToken;
+      const expiryMs = Date.now() + (data.expires_in ? data.expires_in * 1000 : 8 * 3600 * 1000);
+      try {
+        if (credsRaw.claudeAiOauth) {
+          credsRaw.claudeAiOauth.accessToken = accessToken;
+          credsRaw.claudeAiOauth.refreshToken = newRefresh;
+          credsRaw.claudeAiOauth.expiresAt = expiryMs;
+        } else {
+          credsRaw.access_token = accessToken;
+          credsRaw.refresh_token = newRefresh;
+          credsRaw.expires_at = expiryMs;
+        }
+        fs.writeFileSync(filePath, JSON.stringify(credsRaw, null, 2), { mode: 0o600 });
+      } catch (werr) {
+        console.warn(`[router] backend=${this.id} could not persist refreshed token: ${werr.message}`);
+      }
+      console.log(`[router] backend=${this.id} oauth token refreshed (expires in ${Math.round((expiryMs - Date.now()) / 3600000)}h)`);
+      return { accessToken, expiryMs };
+    } catch (err) {
+      console.error(`[router] backend=${this.id} oauth refresh error: ${err.message}`);
       return null;
     }
   }
