@@ -43,7 +43,7 @@ export const DEFAULT_PRIORITY_TOOLS = [
   // Web
   "web_search", "web_fetch",
   // Alternate communication channels
-  "skchat_send", "skcomm_send",
+  "skchat_send", "skcomms_send",
   // SKCapstone core
   "skcapstone_status", "skcapstone_whoami", "skcapstone_mood",
   // Cloud 9 emotional continuity
@@ -86,7 +86,7 @@ export const DEFAULT_TOOL_GROUPS = {
   "chat|inbox|dm|group chat|peer|send message|who.s online|thread": [
     "skchat_send", "skchat_inbox", "skchat_history", "skchat_search",
     "skchat_who", "skchat_group_send", "skchat_group_list", "skchat_send_file",
-    "skchat_status", "skcomm_send", "skcomm_status",
+    "skchat_status", "skcomms_send", "skcomms_status",
   ],
 
   // Security
@@ -116,7 +116,7 @@ export const DEFAULT_TOOL_GROUPS = {
   // Status & Health
   "status|health|doctor|diagnos": [
     "skcapstone_status", "skcapstone_doctor", "skmemory_health",
-    "skchat_daemon_status", "skcomm_status",
+    "skchat_daemon_status", "skcomms_status",
   ],
 
   // Projects & Notion

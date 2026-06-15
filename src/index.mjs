@@ -87,12 +87,16 @@ const siemPath = path.resolve(
   config.siem?.outputs?.[0]?.path || "./logs/audit.jsonl",
 );
 try { fs.mkdirSync(path.dirname(siemPath), { recursive: true }); } catch {}
+// Optional skcapstone bridge — shares warn+ SIEM events on the mesh-wide
+// sk-alert bus when ~/.skcapstone is present; no-op otherwise.
+import * as skcapstone from "./integration.mjs";
 function siemHook(evt) {
   try {
     fs.appendFile(siemPath, JSON.stringify(evt) + "\n", () => {});
   } catch (e) {
     console.warn("[skgateway] siem append failed:", e.message);
   }
+  try { skcapstone.forwardSiemEvent(evt); } catch {}
 }
 
 // ─── Build per-model limit map from YAML model_limits section ───
@@ -291,4 +295,10 @@ server.listen(port, bind, () => {
     console.log("[skgateway] metrics: " + (metrics ? "enabled" : "disabled"));
     const dashPort = config.server?.dashboard_port || 18781;
     console.log("[skgateway] dashboard: port " + dashPort + " (coming soon)");
+    // Advertise to skcapstone service discovery when present (no-op otherwise).
+    try {
+      if (skcapstone.registerService({ healthUrl: `http://localhost:${port}/health` })) {
+        console.log("[skgateway] registered with skcapstone service discovery");
+      }
+    } catch {}
 });
