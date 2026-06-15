@@ -449,13 +449,23 @@ export class Backend {
       // live ~8h; without this the subscription path dies every 8h unless a
       // `claude` CLI happens to refresh the creds for us.
       if (refreshToken && now >= expiryMs - 300_000) {
-        const refreshed = await this._refreshOAuth(refreshToken, filePath, credsRaw);
-        if (refreshed) {
-          this._oauthToken = refreshed.accessToken;
-          this._oauthExpiry = refreshed.expiryMs;
-          return this._oauthToken;
+        if (now < (this._refreshCooldownUntil || 0)) {
+          console.warn(`[router] backend=${this.id} oauth refresh in cooldown; using stale token`);
+        } else {
+          const refreshed = await this._refreshOAuth(refreshToken, filePath, credsRaw);
+          if (refreshed) {
+            this._oauthToken = refreshed.accessToken;
+            this._oauthExpiry = refreshed.expiryMs;
+            this._refreshCooldownUntil = 0;
+            return this._oauthToken;
+          }
+          // Back off 10 min on failure: hammering the token endpoint just
+          // perpetuates the rate-limit (429) and never recovers.
+          this._refreshCooldownUntil = now + 10 * 60_000;
+          console.warn(
+            `[router] backend=${this.id} oauth refresh failed; backing off 10m, using stale token`,
+          );
         }
-        console.warn(`[router] backend=${this.id} oauth refresh failed; using stale token`);
       }
 
       this._oauthToken = accessToken;
