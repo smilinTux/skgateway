@@ -19,6 +19,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { sendUpstream } from "./upstream.mjs";
+import { isAnthropicBackend, toAnthropicRequest, toOpenAIResponse } from "./anthropic-adapter.mjs";
 import { getPool } from "./connection-pool.mjs";
 
 // ---------------------------------------------------------------------------
@@ -428,16 +429,20 @@ export class Backend {
     const filePath = this._credentials_file.replace(/^~/, process.env.HOME || "");
     try {
       const raw = fs.readFileSync(filePath, "utf-8");
-      const creds = JSON.parse(raw);
+      const credsRaw = JSON.parse(raw);
+      // Support both flat tokens and the Claude Code format:
+      //   { "claudeAiOauth": { accessToken, expiresAt, refreshToken } }
+      const creds = credsRaw.claudeAiOauth || credsRaw;
 
-      if (!creds.access_token) {
-        console.warn(`[router] backend=${this.id} credentials file has no access_token: ${filePath}`);
+      const accessToken = creds.access_token || creds.accessToken;
+      if (!accessToken) {
+        console.warn(`[router] backend=${this.id} credentials file has no access token: ${filePath}`);
         return null;
       }
 
-      this._oauthToken = creds.access_token;
+      this._oauthToken = accessToken;
       // expires_at may be epoch seconds or ms — normalise to ms
-      const expRaw = creds.expires_at || creds.expiry || 0;
+      const expRaw = creds.expires_at || creds.expiry || creds.expiresAt || 0;
       this._oauthExpiry = expRaw > 1e12 ? expRaw : expRaw * 1000;
 
       if (now >= this._oauthExpiry - 60_000) {
@@ -858,7 +863,22 @@ export async function routeAndSend(router, request, upstreamPath, method, client
 
     let res;
     try {
-      res = await sendUpstream(upstreamPath, method, forwardHeaders, body, targetUrl);
+      if (isAnthropicBackend(backend)) {
+        // Translate OpenAI chat-completions → Anthropic Messages API.
+        const tr = toAnthropicRequest(body, {
+          authorization: forwardHeaders.authorization,
+        });
+        if (tr) {
+          const aHeaders = { ...forwardHeaders, ...tr.headers };
+          delete aHeaders["content-length"];
+          const raw = await sendUpstream(tr.path, method, aHeaders, tr.body, targetUrl);
+          res = toOpenAIResponse(raw, request.model);
+        } else {
+          res = await sendUpstream(upstreamPath, method, forwardHeaders, body, targetUrl);
+        }
+      } else {
+        res = await sendUpstream(upstreamPath, method, forwardHeaders, body, targetUrl);
+      }
     } catch (err) {
       // sendUpstream resolves with 502 on network error, but be defensive
       res = {

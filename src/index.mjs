@@ -12,7 +12,7 @@
 import http from "node:http";
 import { loadConfig } from "./config.mjs";
 import { createProxyServer, handleRequest, buildConfig } from "./proxy/core.mjs";
-import { createRouter } from "./proxy/router.mjs";
+import { createRouter, routeAndSend } from "./proxy/router.mjs";
 import { getPool, resetPool } from "./proxy/connection-pool.mjs";
 
 // ─── Parse CLI args ───
@@ -26,12 +26,21 @@ for (let i = 0; i < args.length; i++) {
 }
 
 // ─── Load config ───
-const config = loadConfig(configPath);
+const _cfgEmitter = await loadConfig({ configPath });
+const config = _cfgEmitter.current();
 const port = portOverride || config.server?.port || 18780;
 const bind = config.server?.bind || "127.0.0.1";
 
 // ─── Initialize subsystems ───
-const router = createRouter(config.backends || {});
+// Map YAML credentials_path → credentials_file (Backend reads credentials_file)
+const _routerBackends = {};
+for (const [id, b] of Object.entries(config.backends || {})) {
+  _routerBackends[id] = { ...b };
+  if (b.credentials_path && !b.credentials_file) {
+    _routerBackends[id].credentials_file = b.credentials_path;
+  }
+}
+const router = createRouter({ backends: _routerBackends });
 
 // Initialize connection pool with per-backend limits from config
 const poolConfig = {
@@ -174,9 +183,56 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Proxy all /v1/* requests
+  // ── Aggregated model catalog from configured backends ──
+  if (req.url === "/v1/models" && req.method === "GET") {
+    const seen = new Set();
+    const data = [];
+    for (const [id, b] of Object.entries(config.backends || {})) {
+      for (const m of (b.models || [])) {
+        if (m.includes("*") || seen.has(m)) continue;
+        seen.add(m);
+        data.push({ id: m, object: "model", created: 0, owned_by: id });
+      }
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ object: "list", data }));
+    return;
+  }
+
+  // Proxy all /v1/* requests — model-aware routing via the router.
   try {
-    await handleRequest(req, res, proxyConfig);
+    // Buffer the request body so we can read the model for routing.
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = Buffer.concat(chunks);
+
+    let parsedModel = req.headers["x-model"] || undefined;
+    if (req.headers["content-type"]?.includes("application/json") && body.length) {
+      try { parsedModel = JSON.parse(body.toString("utf-8")).model || parsedModel; } catch {}
+    }
+
+    const routeRequest = {
+      model:   parsedModel,
+      agentId: req.headers["x-agent-id"] || undefined,
+    };
+
+    const result = await routeAndSend(
+      router, routeRequest, req.url, req.method, req.headers, body, true,
+    );
+
+    if (!result) {
+      if (!res.headersSent) {
+        res.writeHead(502, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "No backend produced a response", code: 502 } }));
+      }
+    } else {
+      const headers = { ...result.headers };
+      delete headers["content-length"];
+      delete headers["transfer-encoding"];
+      delete headers["content-encoding"];
+      res.writeHead(result.status, headers);
+      res.end(result.body);
+    }
 
     // Record metrics
     if (metrics) {
@@ -185,9 +241,10 @@ const server = http.createServer(async (req, res) => {
         path: req.url,
         method: req.method,
         duration,
-        status: res.statusCode,
+        status: result?.status ?? res.statusCode,
         agent_id: req.headers["x-agent-id"] || "unknown",
-        model: req.headers["x-model"] || "unknown",
+        model: parsedModel || "unknown",
+        backend: result?.backendId,
       });
     }
   } catch (err) {
@@ -215,11 +272,11 @@ process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
 
 // ─── Hot reload config on SIGHUP ───
-process.on("SIGHUP", () => {
-  console.log("[skgateway] SIGHUP — reloading config");
+// config.mjs registers its own SIGHUP handler that re-reads + validates the
+// file and emits "config-changed"; we just refresh our local snapshot from it.
+_cfgEmitter.on("config-changed", () => {
   try {
-    const newConfig = loadConfig(configPath);
-    Object.assign(config, newConfig);
+    Object.assign(config, _cfgEmitter.current());
     console.log("[skgateway] config reloaded");
   } catch (e) {
     console.error("[skgateway] config reload failed:", e.message);

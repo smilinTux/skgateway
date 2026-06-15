@@ -10,10 +10,9 @@
     "test": "node --test tests/"
   },
   "dependencies": {
-    "better-sqlite3": "^9.4.3",
+    "better-sqlite3": "^12.10.1",
     "js-yaml": "^4.1.0"
   },
-  "devDependencies": {},
   "engines": {
     "node": ">=20.0.0"
   },

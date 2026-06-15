@@ -26,6 +26,12 @@ pooling:
       maxQueue: 200
 
 backends:
+  local:
+    url: http://192.168.0.100:8082/v1
+    auth_type: none
+    models:
+      - qwen3.6-27b-abliterated
+    priority: 1
   nvidia:
     url: https://integrate.api.nvidia.com/v1
     auth_type: api_key
@@ -65,6 +71,7 @@ backends:
     auth_type: oauth
     credentials_path: ~/.claude/.credentials.json
     models:
+      - claude-opus-4-8
       - claude-opus-4-7
       - claude-sonnet-4-6
       - claude-haiku-4-5
