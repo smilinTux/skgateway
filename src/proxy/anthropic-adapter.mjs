@@ -67,8 +67,9 @@ export function toAnthropicRequest(openaiBody, extraHeaders = {}) {
     messages,
     system,
   };
-  if (typeof req.temperature === "number") out.temperature = req.temperature;
-  if (typeof req.top_p === "number") out.top_p = req.top_p;
+  // Anthropic's newest models (e.g. claude-opus-4-8) deprecate `temperature`
+  // and `top_p` and reject them with HTTP 400. Omit unsupported sampling
+  // params and let Anthropic use its defaults.
   if (Array.isArray(req.stop)) out.stop_sequences = req.stop;
   else if (typeof req.stop === "string") out.stop_sequences = [req.stop];
   // Streaming not translated here — force non-stream and let caller buffer.
