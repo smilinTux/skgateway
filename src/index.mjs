@@ -218,6 +218,12 @@ const server = http.createServer(async (req, res) => {
     const routeRequest = {
       model:   parsedModel,
       agentId: req.headers["x-agent-id"] || undefined,
+      // skmodels registry role/context routing (single source of truth).
+      // Present => routeAndSend resolves via ~/.skcapstone/models/registry.yaml
+      // (precedence context > service > role > default) before backend select.
+      context: req.headers["x-sk-context"] || undefined,
+      service: req.headers["x-sk-service"] || undefined,
+      role:    req.headers["x-sk-role"]    || undefined,
     };
 
     const result = await routeAndSend(
