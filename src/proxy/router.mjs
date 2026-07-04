@@ -23,6 +23,7 @@ import { isAnthropicBackend, toAnthropicRequest, toOpenAIResponse } from "./anth
 import { getPool } from "./connection-pool.mjs";
 import { isRegistryRouted, resolve as resolveRegistry, getAutoConfig } from "./registry.mjs";
 import { classifyDifficulty } from "../classifiers/difficulty.mjs";
+import { adjustWithEmpirical, promptClassFromResult } from "../classifiers/empirical.mjs";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -968,10 +969,24 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // real role, then re-resolve THAT role to a concrete backend and route it.
     if (reg && reg.auto) {
       const messages = extractMessages(request, body);
-      const d = classifyDifficulty(messages, getAutoConfig());
+      const autoCfg = getAutoConfig();
+      // Pure heuristic BASELINE, then a bounded empirical nudge from the shared
+      // Telegram ratings store (skchat telegram_ratings ↔ ratings.jsonl).
+      const base = classifyDifficulty(messages, autoCfg);
+      const promptClass = promptClassFromResult(base);
+      const d = adjustWithEmpirical(base, {
+        promptClass,
+        config: autoCfg,
+        // Map a logical role to its concrete model name so empirical stats
+        // (keyed by concrete model) can be looked up.
+        resolveModel: (role) => {
+          const r = resolveRegistry({ role });
+          return r && r.model ? r.model : null;
+        },
+      });
       const picked = resolveRegistry({ role: d.role });
       console.log(
-        `[router] auto-route difficulty=${d.role} reason=${d.reason} ` +
+        `[router] auto-route difficulty=${d.role} class=${promptClass} reason=${d.reason} ` +
         `signals=[${d.signals.join(",")}] -> backend=${picked ? picked.backend : "(unresolved)"}`
       );
       reg = picked;

@@ -6,9 +6,36 @@
 
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { classifyDifficulty } from "../src/classifiers/difficulty.mjs";
+import {
+  adjustWithEmpirical,
+  promptClassFromResult,
+  modelStats,
+} from "../src/classifiers/empirical.mjs";
 
 const userMsg = (text) => [{ role: "user", content: text }];
+
+/** Write a ratings JSONL fixture and return its path (unique dir per call so
+ *  the empirical mtime cache never serves a stale read across tests). */
+function writeRatings(rows) {
+  const dir = mkdtempSync(join(tmpdir(), "skratings-"));
+  const path = join(dir, "ratings.jsonl");
+  writeFileSync(path, rows.map((r) => JSON.stringify(r)).join("\n") + "\n");
+  return { path, dir };
+}
+
+const sent = (msg_id, model, prompt_class, score, ts = Date.now() / 1000) => ({
+  ts,
+  chat_id: "c",
+  msg_id,
+  model,
+  prompt_class,
+  prompt_hash: null,
+  score,
+});
 
 describe("classifyDifficulty — vision (highest precedence)", () => {
   test("image_url content part => sk-vision", () => {
@@ -110,5 +137,168 @@ describe("classifyDifficulty — opts overrides", () => {
   test("custom role names are honoured", () => {
     const r = classifyDifficulty(userMsg("hi"), { default_role: "sk-cheap" });
     assert.equal(r.role, "sk-cheap");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Empirical adjuster (coord c87faa13) — bounded nudge over the heuristic.
+// ---------------------------------------------------------------------------
+
+describe("promptClassFromResult — stable bucketing", () => {
+  test("buckets by first meaningful signal", () => {
+    assert.equal(promptClassFromResult({ signals: ["image"] }), "vision");
+    assert.equal(promptClassFromResult({ signals: ["code-fence", "hard-verb"] }), "code");
+    assert.equal(promptClassFromResult({ signals: ["reasoning-cue"] }), "reasoning");
+    assert.equal(promptClassFromResult({ signals: ["agentic"] }), "agentic");
+    assert.equal(promptClassFromResult({ signals: ["long(2100>2000)"] }), "long");
+    assert.equal(promptClassFromResult({ signals: [] }), "general");
+  });
+});
+
+describe("adjustWithEmpirical", () => {
+  const resolveModel = (role) => (role === "sk-default" ? "ornith" : "opus");
+  const base = (role) => ({ role, reason: "heuristic", signals: ["seed"] });
+
+  test("no ratings file => baseline unchanged", () => {
+    const r = adjustWithEmpirical(base("sk-default"), {
+      promptClass: "general",
+      ratingsPath: "/nonexistent/ratings.jsonl",
+      resolveModel,
+    });
+    assert.equal(r.role, "sk-default");
+    assert.deepEqual(r.signals, ["seed"]);
+  });
+
+  test("ESCALATE: sk-default model scores low for the class => sk-heavy", () => {
+    const { path, dir } = writeRatings([
+      sent("a", "ornith", "code", 1),
+      sent("b", "ornith", "code", 2),
+      sent("c", "ornith", "code", 1),
+      sent("d", "ornith", "code", 2),
+      sent("e", "ornith", "code", 2),
+      sent("f", "ornith", "code", 1),
+      sent("g", "ornith", "code", 2),
+    ]);
+    try {
+      const r = adjustWithEmpirical(base("sk-default"), {
+        promptClass: "code",
+        ratingsPath: path,
+        resolveModel,
+      });
+      assert.equal(r.role, "sk-heavy");
+      assert.ok(r.signals.some((s) => s.startsWith("empirical:escalate(ornith")));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("below minSamples => no escalation despite low mean", () => {
+    const { path, dir } = writeRatings([
+      sent("a", "ornith", "code", 1),
+      sent("b", "ornith", "code", 1),
+    ]);
+    try {
+      const r = adjustWithEmpirical(base("sk-default"), {
+        promptClass: "code",
+        ratingsPath: path,
+        resolveModel,
+      });
+      assert.equal(r.role, "sk-default");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("DE-ESCALATE: heuristic sk-heavy but default model scores fine => sk-default", () => {
+    const { path, dir } = writeRatings([
+      sent("a", "ornith", "code", 4),
+      sent("b", "ornith", "code", 5),
+      sent("c", "ornith", "code", 4),
+      sent("d", "ornith", "code", 4),
+      sent("e", "ornith", "code", 5),
+    ]);
+    try {
+      const r = adjustWithEmpirical(base("sk-heavy"), {
+        promptClass: "code",
+        ratingsPath: path,
+        resolveModel,
+      });
+      assert.equal(r.role, "sk-default");
+      assert.ok(r.signals.some((s) => s.startsWith("empirical:de-escalate(ornith")));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("mid-range mean => no change (bounded)", () => {
+    const { path, dir } = writeRatings([
+      sent("a", "ornith", "code", 3),
+      sent("b", "ornith", "code", 3),
+      sent("c", "ornith", "code", 3),
+      sent("d", "ornith", "code", 3),
+      sent("e", "ornith", "code", 3),
+    ]);
+    try {
+      assert.equal(
+        adjustWithEmpirical(base("sk-default"), { promptClass: "code", ratingsPath: path, resolveModel }).role,
+        "sk-default",
+      );
+      assert.equal(
+        adjustWithEmpirical(base("sk-heavy"), { promptClass: "code", ratingsPath: path, resolveModel }).role,
+        "sk-heavy",
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("vision role is never touched by empirical", () => {
+    const { path, dir } = writeRatings([sent("a", "ornith", "vision", 1)]);
+    try {
+      const r = adjustWithEmpirical(base("sk-vision"), {
+        promptClass: "vision",
+        ratingsPath: path,
+        resolveModel,
+      });
+      assert.equal(r.role, "sk-vision");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("no resolveModel => cannot map, baseline unchanged", () => {
+    const { path, dir } = writeRatings([
+      sent("a", "ornith", "code", 1),
+      sent("b", "ornith", "code", 1),
+      sent("c", "ornith", "code", 1),
+      sent("d", "ornith", "code", 1),
+      sent("e", "ornith", "code", 1),
+    ]);
+    try {
+      const r = adjustWithEmpirical(base("sk-default"), { promptClass: "code", ratingsPath: path });
+      assert.equal(r.role, "sk-default");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("modelStats aggregates by model + class, last N window", () => {
+    const { path, dir } = writeRatings([
+      sent("a", "ornith", "code", 1, 1),
+      sent("c", "opus", "code", 5, 2),
+      sent("d", "ornith", "reasoning", 5, 3),
+      sent("b", "ornith", "code", 5, 4), // newest, so window:1 keeps this
+    ]);
+    try {
+      const s = modelStats("ornith", "code", { path });
+      assert.equal(s.n, 2);
+      assert.equal(s.mean, 3);
+      // window is applied over ALL recent rated rows, THEN filtered by model/class.
+      const w = modelStats("ornith", "code", { path, window: 1 });
+      assert.equal(w.n, 1);
+      assert.equal(w.mean, 5);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
