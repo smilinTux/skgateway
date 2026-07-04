@@ -61,17 +61,32 @@ export function loadRegistry(path = REGISTRY_PATH) {
       roles: parsed.roles || {},
       contexts: parsed.contexts || {},
       defaults: parsed.defaults || {},
+      // Optional tuning block for sk-auto difficulty routing (thresholds +
+      // keyword lists). Empty {} => difficulty.mjs uses its built-in defaults.
+      auto: parsed.auto || {},
     };
     _cacheMtime = st.mtimeMs;
     _cachePath = path;
   } catch (err) {
     if (!_cache) {
-      _cache = { backends: {}, roles: {}, contexts: {}, defaults: {} };
+      _cache = { backends: {}, roles: {}, contexts: {}, defaults: {}, auto: {} };
       _cachePath = path;
     }
     // else: keep the last good cache
   }
   return _cache;
+}
+
+/**
+ * Return the `auto:` tuning block from the registry (thresholds + keyword
+ * lists for sk-auto difficulty routing). Empty object when unset — callers
+ * (difficulty.mjs) then fall back to built-in defaults.
+ *
+ * @param {string} [path]
+ * @returns {object}
+ */
+export function getAutoConfig(path = REGISTRY_PATH) {
+  return loadRegistry(path).auto || {};
 }
 
 /**
@@ -149,6 +164,23 @@ export function resolve({ model, context, service, role } = {}, path = REGISTRY_
   if (roles[target] != null) {
     roleName = target;
     backendName = roles[target];
+  }
+
+  // ── sk-auto marker ──
+  // The registry defines `roles: { sk-auto: auto }`. "auto" is NOT a real
+  // backend — it signals the gateway to run the difficulty classifier and
+  // resolve the CONCRETE role per-request. Surface an auto marker; the gateway
+  // (routeAndSend) classifies then calls resolve() again with a real role.
+  if (roleName === "sk-auto" || backendName === "auto" || target === "sk-auto") {
+    return {
+      auto: true,
+      backend: "auto",
+      model: null,
+      vision: false,
+      anthropic: false,
+      via,
+      role: "sk-auto",
+    };
   }
 
   const bcfg = backends[backendName] || null;

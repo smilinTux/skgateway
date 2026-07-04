@@ -21,7 +21,8 @@ import path from "node:path";
 import { sendUpstream } from "./upstream.mjs";
 import { isAnthropicBackend, toAnthropicRequest, toOpenAIResponse } from "./anthropic-adapter.mjs";
 import { getPool } from "./connection-pool.mjs";
-import { isRegistryRouted, resolve as resolveRegistry } from "./registry.mjs";
+import { isRegistryRouted, resolve as resolveRegistry, getAutoConfig } from "./registry.mjs";
+import { classifyDifficulty } from "../classifiers/difficulty.mjs";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -131,6 +132,26 @@ function rewriteBodyModel(body, newModel) {
     // not JSON — leave untouched
   }
   return body;
+}
+
+/**
+ * Get the OpenAI `messages` array for difficulty classification. Prefers
+ * `request.messages` (populated by the entry point) and falls back to parsing
+ * the buffered JSON body so routeAndSend works standalone (e.g. in tests).
+ *
+ * @param {RouteRequest} request
+ * @param {Buffer} body
+ * @returns {Array}
+ */
+function extractMessages(request, body) {
+  if (Array.isArray(request?.messages)) return request.messages;
+  try {
+    const obj = JSON.parse(body.toString("utf-8"));
+    if (obj && Array.isArray(obj.messages)) return obj.messages;
+  } catch {
+    // not JSON — no messages
+  }
+  return [];
 }
 
 // ---------------------------------------------------------------------------
@@ -934,12 +955,28 @@ export async function routeAndSend(router, request, upstreamPath, method, client
   // model-name routing (full backward-compat).
   let candidates = null;
   if (isRegistryRouted(request)) {
-    const reg = resolveRegistry({
+    let reg = resolveRegistry({
       model: request.model,
       context: request.context,
       service: request.service,
       role: request.role,
     });
+
+    // ── sk-auto: pick the concrete role per-request by DIFFICULTY ──
+    // resolve() returns an { auto:true } marker for the sk-auto role/context.
+    // Run the (fast, no-LLM) classifier over the request messages to choose a
+    // real role, then re-resolve THAT role to a concrete backend and route it.
+    if (reg && reg.auto) {
+      const messages = extractMessages(request, body);
+      const d = classifyDifficulty(messages, getAutoConfig());
+      const picked = resolveRegistry({ role: d.role });
+      console.log(
+        `[router] auto-route difficulty=${d.role} reason=${d.reason} ` +
+        `signals=[${d.signals.join(",")}] -> backend=${picked ? picked.backend : "(unresolved)"}`
+      );
+      reg = picked;
+    }
+
     if (reg) {
       // Rewrite the outgoing model so the upstream receives a real name.
       body = rewriteBodyModel(body, reg.model);
