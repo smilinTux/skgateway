@@ -55,6 +55,29 @@ const DEFAULT_REASONING_CUES = [
 
 const DEFAULT_MAX_EASY_CHARS = 2000;
 const DEFAULT_HEAVY_ROLE = "sk-heavy";
+
+/**
+ * Infra / ops / system-status intent. These need FAITHFUL parsing of real command
+ * output — the small default model confabulates hardware specs (invents CPU/GPU
+ * names, driver versions, inverts which GPU runs what), so route them to the heavy
+ * model. Matches ops command names, hardware terms, and "check the server" intent.
+ */
+const INFRA_RE = new RegExp(
+  "\\b(" +
+  // command / tooling names
+  "nvidia-smi|intel_gpu_top|systemctl|journalctl|dmesg|lspci|lsblk|docker|kubectl|" +
+  "df\\s*-h|free\\s*-h|htop|nproc|uptime|ssh\\b|ss\\s*-|iostat|vmstat|sensors|" +
+  // hardware / resource terms
+  "vram|gpu|igpu|cpu\\s*(load|usage|temp)|ram\\s*(usage|free)|disk\\s*(usage|space|full)|" +
+  "swap|driver\\s*version|nvidia|5060|arc\\s*igpu|beelama|beellama|ornith.*(gpu|running|card)|" +
+  // status / which-runs-where intent
+  "server\\s*(status|load)|system\\s*status|hardware|what'?s\\s*running|which\\s*gpu|" +
+  "is\\s+\\w+\\s+running|running\\s+on\\s+the|the\\s+(box|machine|server|fleet|card)|" +
+  // fleet host references
+  "\\.(100|158|41)\\b|chiap0" +
+  ")\\b",
+  "i",
+);
 const DEFAULT_VISION_ROLE = "sk-vision";
 const DEFAULT_DEFAULT_ROLE = "sk-default";
 
@@ -210,20 +233,24 @@ export function classifyDifficulty(messages, opts = {}) {
   const hasHardVerb = hardVerbsRe.test(text);
   const hasCue = cuesRe.test(text);
   const agentic = looksAgentic(text);
+  const infra = INFRA_RE.test(text);
 
   if (long) signals.push(`long(${len}>${maxEasyChars})`);
   if (hasFence) signals.push("code-fence");
   if (hasHardVerb) signals.push("hard-verb");
   if (hasCue) signals.push("reasoning-cue");
   if (agentic) signals.push("agentic");
+  if (infra) signals.push("infra");
 
   // Precedence within HARD, per spec:
-  //   long-text OR (code-fence AND hard-verb) OR reasoning-cue OR agentic
-  const isHard = long || (hasFence && hasHardVerb) || hasCue || agentic;
+  //   long-text OR (code-fence AND hard-verb) OR reasoning-cue OR agentic OR infra
+  // infra/ops queries go to the heavy model — the small model confabulates specs.
+  const isHard = long || (hasFence && hasHardVerb) || hasCue || agentic || infra;
 
   if (isHard) {
     let reason;
-    if (long) reason = `user text ${len} chars > ${maxEasyChars}`;
+    if (infra) reason = "infra/ops query — needs faithful command-output parsing";
+    else if (long) reason = `user text ${len} chars > ${maxEasyChars}`;
     else if (hasFence && hasHardVerb) reason = "code fence + complex verb";
     else if (hasCue) reason = "multi-step reasoning cue";
     else reason = "agentic / multi-step shape";
