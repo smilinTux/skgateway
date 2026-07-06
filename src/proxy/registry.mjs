@@ -211,6 +211,7 @@ export function resolve({ model, context, service, role } = {}, path = REGISTRY_
     model: bcfg.model,
     vision: !!bcfg.vision,
     kind: bcfg.kind,
+    minOutputTokens: (bcfg && bcfg.min_output_tokens) || 0,
     anthropic: false,
     via,
     role: roleName,

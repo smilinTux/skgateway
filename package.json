@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node src/index.mjs",
     "dev": "node --watch src/index.mjs",
-    "test": "node --test tests/"
+    "test": "node --test tests/*.test.mjs"
   },
   "dependencies": {
     "better-sqlite3": "^12.10.1",
