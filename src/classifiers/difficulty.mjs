@@ -199,6 +199,32 @@ function looksAgentic(text) {
  *   reason  — short human-readable justification (for logs)
  *   signals — the individual heuristic hits that fired
  */
+/** Local-context guard threshold: chars across ALL messages (~100k tokens, under ornith 128k). */
+const DEFAULT_MAX_LOCAL_CONTEXT_CHARS = 400000;
+
+/**
+ * Concatenate the plain text of ALL messages (every role). Used to guard the
+ * LOCAL model's context window: a short user ask inside a huge conversation
+ * still overflows the small model, so route by total size, not just the ask.
+ * @param {Array} messages
+ * @returns {string}
+ */
+function totalText(messages) {
+  const out = [];
+  for (const m of messages) {
+    if (!m) continue;
+    const c = m.content;
+    if (typeof c === "string") out.push(c);
+    else if (Array.isArray(c)) {
+      for (const part of c) {
+        if (typeof part === "string") out.push(part);
+        else if (part && typeof part.text === "string") out.push(part.text);
+      }
+    }
+  }
+  return out.join("\n");
+}
+
 export function classifyDifficulty(messages, opts = {}) {
   const msgs = Array.isArray(messages) ? messages : [];
 
@@ -222,6 +248,23 @@ export function classifyDifficulty(messages, opts = {}) {
   if (hasImage(msgs)) {
     signals.push("image");
     return { role: visionRole, reason: "image content part present", signals };
+  }
+
+  // ── 1b. CONTEXT-SIZE GUARD → heavy model (local window protection) ──
+  // Route by TOTAL prompt size (all messages), not just the user ask, so a huge
+  // conversation never overflows the small local model's window.
+  const maxLocalCtxChars =
+    typeof opts.max_local_context_chars === "number"
+      ? opts.max_local_context_chars
+      : DEFAULT_MAX_LOCAL_CONTEXT_CHARS;
+  const totalChars = totalText(msgs).length;
+  if (totalChars > maxLocalCtxChars) {
+    signals.push(`ctx(${totalChars}>${maxLocalCtxChars})`);
+    return {
+      role: heavyRole,
+      reason: `total context ${totalChars} chars > ${maxLocalCtxChars} — exceeds local window`,
+      signals,
+    };
   }
 
   // ── 2. HARD → heavy model ──

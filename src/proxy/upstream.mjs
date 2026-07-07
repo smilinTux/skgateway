@@ -19,6 +19,12 @@ import http from "node:http";
 import https from "node:https";
 import { URL } from "node:url";
 
+// Pooled keep-alive agents so backend connections are REUSED across requests
+// instead of a fresh TCP(+TLS) handshake per call (cuts ~tens of ms proxy tax).
+const _agentOpts = { keepAlive: true, keepAliveMsecs: 30000, maxSockets: 64, maxFreeSockets: 16 };
+const httpAgent = new http.Agent(_agentOpts);
+const httpsAgent = new https.Agent(_agentOpts);
+
 /**
  * Forward one HTTP request to the upstream origin and collect the full
  * response body before resolving.
@@ -60,6 +66,7 @@ export function sendUpstream(reqUrl, method, headers, body, targetUrl) {
         path: upstream.pathname + upstream.search,
         method,
         headers: proxyHeaders,
+        agent: upstream.protocol === "https:" ? httpsAgent : httpAgent,
       },
       (upstreamRes) => {
         const chunks = [];
