@@ -90,6 +90,17 @@ export function getAutoConfig(path = REGISTRY_PATH) {
 }
 
 /**
+ * Config epoch = registry file mtime (ms). Changes whenever registry.yaml is
+ * edited, so callers can key caches on it for transparent invalidation.
+ * @param {string} [path]
+ * @returns {number}
+ */
+export function getConfigEpoch(path = REGISTRY_PATH) {
+  loadRegistry(path);
+  return _cacheMtime;
+}
+
+/**
  * Should this request be routed via the registry?
  * True when the model is a logical role ("sk-*"), or any sk routing header is
  * present. Concrete model names alone do NOT trigger registry routing.

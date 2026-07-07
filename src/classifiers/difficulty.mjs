@@ -78,6 +78,28 @@ const INFRA_RE = new RegExp(
   ")\\b",
   "i",
 );
+
+/**
+ * Build (memoized) the infra-intent regex. If `patterns` is provided (from the
+ * registry `auto.infra_patterns` config), compile an alternation of those
+ * fragments; otherwise use the built-in INFRA_RE. A bad user regex falls back
+ * to the default rather than throwing.
+ * @param {string[]} [patterns]
+ * @returns {RegExp}
+ */
+let _infraReCache = { key: null, re: INFRA_RE };
+function infraReFor(patterns) {
+  if (!Array.isArray(patterns) || patterns.length === 0) return INFRA_RE;
+  const key = patterns.join("\u0001");
+  if (_infraReCache.key !== key) {
+    try {
+      _infraReCache = { key, re: new RegExp("\\b(" + patterns.join("|") + ")\\b", "i") };
+    } catch {
+      _infraReCache = { key, re: INFRA_RE };
+    }
+  }
+  return _infraReCache.re;
+}
 const DEFAULT_VISION_ROLE = "sk-vision";
 const DEFAULT_DEFAULT_ROLE = "sk-default";
 
@@ -276,7 +298,7 @@ export function classifyDifficulty(messages, opts = {}) {
   const hasHardVerb = hardVerbsRe.test(text);
   const hasCue = cuesRe.test(text);
   const agentic = looksAgentic(text);
-  const infra = INFRA_RE.test(text);
+  const infra = infraReFor(opts.infra_patterns).test(text);
 
   if (long) signals.push(`long(${len}>${maxEasyChars})`);
   if (hasFence) signals.push("code-fence");

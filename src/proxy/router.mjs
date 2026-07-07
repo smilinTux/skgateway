@@ -21,8 +21,12 @@ import path from "node:path";
 import { sendUpstream } from "./upstream.mjs";
 import { isAnthropicBackend, toAnthropicRequest, toOpenAIResponse } from "./anthropic-adapter.mjs";
 import { getPool } from "./connection-pool.mjs";
-import { isRegistryRouted, resolve as resolveRegistry, getAutoConfig } from "./registry.mjs";
+import { isRegistryRouted, resolve as resolveRegistry, getAutoConfig, getConfigEpoch } from "./registry.mjs";
 import { applyReasoningFloor } from "./core.mjs";
+import { createDecisionCache, decisionKey } from "./decision-cache.mjs";
+
+// sk-auto routing decision cache (TTL+LRU); keyed by request fingerprint + config epoch.
+const _autoDecisionCache = createDecisionCache({ ttlMs: 60_000, maxEntries: 500 });
 import { classifyDifficulty } from "../classifiers/difficulty.mjs";
 import { adjustWithEmpirical, promptClassFromResult } from "../classifiers/empirical.mjs";
 
@@ -997,24 +1001,34 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     if (reg && reg.auto) {
       const messages = extractMessages(request, body);
       const autoCfg = getAutoConfig();
-      // Pure heuristic BASELINE, then a bounded empirical nudge from the shared
-      // Telegram ratings store (skchat telegram_ratings ↔ ratings.jsonl).
-      const base = classifyDifficulty(messages, autoCfg);
-      const promptClass = promptClassFromResult(base);
-      const d = adjustWithEmpirical(base, {
-        promptClass,
-        config: autoCfg,
-        // Map a logical role to its concrete model name so empirical stats
-        // (keyed by concrete model) can be looked up.
-        resolveModel: (role) => {
-          const r = resolveRegistry({ role });
-          return r && r.model ? r.model : null;
-        },
-      });
+      // Decision cache: identical prompts under the same config epoch skip
+      // re-classification + the empirical lookup. A registry `auto:` edit bumps
+      // the epoch → transparent invalidation. (Scaffolds the S2 small-LLM tier.)
+      const _ckey = decisionKey(messages, getConfigEpoch());
+      let d = _autoDecisionCache.get(_ckey);
+      const _cached = !!d;
+      if (!d) {
+        // Pure heuristic BASELINE, then a bounded empirical nudge from the shared
+        // Telegram ratings store (skchat telegram_ratings ↔ ratings.jsonl).
+        const base = classifyDifficulty(messages, autoCfg);
+        const promptClass = promptClassFromResult(base);
+        const adj = adjustWithEmpirical(base, {
+          promptClass,
+          config: autoCfg,
+          // Map a logical role to its concrete model name so empirical stats
+          // (keyed by concrete model) can be looked up.
+          resolveModel: (role) => {
+            const r = resolveRegistry({ role });
+            return r && r.model ? r.model : null;
+          },
+        });
+        d = { role: adj.role, reason: adj.reason, signals: adj.signals, promptClass };
+        _autoDecisionCache.set(_ckey, d, autoCfg.cache_ttl_ms);
+      }
       const picked = resolveRegistry({ role: d.role });
       console.log(
-        `[router] auto-route difficulty=${d.role} class=${promptClass} reason=${d.reason} ` +
-        `signals=[${d.signals.join(",")}] -> backend=${picked ? picked.backend : "(unresolved)"}`
+        `[router] auto-route difficulty=${d.role} class=${d.promptClass} reason=${d.reason} ` +
+        `signals=[${d.signals.join(",")}]${_cached ? " (cached)" : ""} -> backend=${picked ? picked.backend : "(unresolved)"}`
       );
       reg = picked;
     }
