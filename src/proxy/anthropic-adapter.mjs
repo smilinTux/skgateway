@@ -46,11 +46,52 @@ export function toAnthropicRequest(openaiBody, extraHeaders = {}) {
       pendingToolResults = null;
     }
   };
+  // System blocks are text-only — collapse to a plain string.
   const flatten = (content) =>
     typeof content === "string" ? content
       : Array.isArray(content)
         ? content.map((c) => (typeof c === "string" ? c : c.text || "")).join("\n")
         : String(content ?? "");
+
+  // OpenAI image_url -> Anthropic image source. Supports data: URIs (base64)
+  // and http(s) URLs. Returns null for anything unrecognised.
+  const imageBlockFromUrl = (url) => {
+    if (typeof url !== "string") return null;
+    const m = /^data:([^;,]+);base64,(.*)$/s.exec(url);
+    if (m) return { type: "image", source: { type: "base64", media_type: m[1], data: m[2] } };
+    if (/^https?:\/\//i.test(url)) return { type: "image", source: { type: "url", url } };
+    return null;
+  };
+
+  // Translate OpenAI message content into Anthropic content. Plain text stays a
+  // string; multimodal content becomes an array of text/image blocks so images
+  // (e.g. forwarded X-post/YouTube thumbnails) reach vision-capable models
+  // instead of being flattened to an empty string (which Anthropic 400s on with
+  // "user messages must have non-empty content").
+  const translateContent = (content) => {
+    if (typeof content === "string") return content;
+    if (!Array.isArray(content)) return String(content ?? "");
+    const blocks = [];
+    for (const c of content) {
+      if (typeof c === "string") { if (c) blocks.push({ type: "text", text: c }); continue; }
+      if (!c || typeof c !== "object") continue;
+      if (c.type === "text" && c.text) blocks.push({ type: "text", text: c.text });
+      else if (c.type === "image_url") {
+        const url = typeof c.image_url === "string" ? c.image_url : c.image_url?.url;
+        const b = imageBlockFromUrl(url);
+        if (b) blocks.push(b);
+      } else if (c.type === "image" && c.source) blocks.push(c); // already Anthropic
+      else if (c.text) blocks.push({ type: "text", text: c.text });
+    }
+    if (blocks.length === 0) return "";
+    if (blocks.every((b) => b.type === "text")) return blocks.map((b) => b.text).join("\n");
+    return blocks;
+  };
+
+  // True when translated content is empty (would trigger an Anthropic 400).
+  const isEmptyContent = (c) =>
+    (typeof c === "string" && c.trim() === "") ||
+    (Array.isArray(c) && c.length === 0);
 
   for (const m of req.messages) {
     if (m.role === "system") {
@@ -80,9 +121,15 @@ export function toAnthropicRequest(openaiBody, extraHeaders = {}) {
       continue;
     }
     const role = m.role === "assistant" ? "assistant" : "user";
-    messages.push({ role, content: flatten(m.content) });
+    const content = translateContent(m.content);
+    // Drop empty messages — Anthropic rejects empty user/assistant content.
+    if (isEmptyContent(content)) continue;
+    messages.push({ role, content });
   }
   flushToolResults();
+
+  // Never send an empty messages array (Anthropic requires ≥1 message).
+  if (messages.length === 0) messages.push({ role: "user", content: "(no content)" });
 
   // Claude Code system prompt MUST be first for OAuth tokens.
   const system = [{ type: "text", text: CLAUDE_CODE_SYSTEM }, ...systemBlocks];

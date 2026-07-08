@@ -1185,6 +1185,14 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         (didFailover ? " (failover)" : "") +
         (queueWaitMs > 0 ? ` queued=${queueWaitMs}ms` : "" )
       );
+      // 4xx are "success" for failover purposes (no retry) but are client/payload
+      // errors the operator needs to see — surface the upstream body so
+      // "check gateway logs" is actually actionable.
+      if (res.status >= 400) {
+        let detail = "";
+        try { detail = res.body?.toString("utf-8").slice(0, 500); } catch { /* ignore */ }
+        console.warn(`[router] ${res.status} upstream_error backend=${backendId} body=${detail}`);
+      }
       return lastResult;
     }
 
