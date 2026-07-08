@@ -22,7 +22,6 @@ import { sendUpstream } from "./upstream.mjs";
 import { isAnthropicBackend, toAnthropicRequest, toOpenAIResponse } from "./anthropic-adapter.mjs";
 import { getPool } from "./connection-pool.mjs";
 import { isRegistryRouted, resolve as resolveRegistry, getAutoConfig } from "./registry.mjs";
-import { applyReasoningFloor } from "./core.mjs";
 import { classifyDifficulty } from "../classifiers/difficulty.mjs";
 
 // ---------------------------------------------------------------------------
@@ -127,32 +126,6 @@ function rewriteBodyModel(body, newModel) {
     const obj = JSON.parse(body.toString("utf-8"));
     if (obj && typeof obj === "object") {
       obj.model = newModel;
-      return Buffer.from(JSON.stringify(obj), "utf-8");
-    }
-  } catch {
-    // not JSON — leave untouched
-  }
-  return body;
-}
-
-/**
- * Raise a sub-floor `max_tokens` in the request body for a reasoning model, so
- * <think> tokens do not starve the visible answer to empty content. Parses and
- * reserializes JSON; non-JSON, absent, or higher caps are left untouched. The
- * floor value comes from the model registry (min_output_tokens per backend).
- *
- * @param {Buffer} body
- * @param {string} model  Resolved concrete model id.
- * @param {number} floor  min_output_tokens from the registry (0 = disabled).
- * @returns {Buffer}
- */
-function applyBodyFloor(body, model, floor) {
-  if (!(floor > 0) || !body || body.length === 0) return body;
-  try {
-    const obj = JSON.parse(body.toString("utf-8"));
-    const cfg = { reasoningFloorMaxTokens: floor, reasoningModels: [model] };
-    if (obj && typeof obj === "object" &&
-        applyReasoningFloor(obj, cfg, model, (m) => console.log(`[router] ${m}`))) {
       return Buffer.from(JSON.stringify(obj), "utf-8");
     }
   } catch {
@@ -1007,7 +980,6 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     if (reg) {
       // Rewrite the outgoing model so the upstream receives a real name.
       body = rewriteBodyModel(body, reg.model);
-      body = applyBodyFloor(body, reg.model, reg.minOutputTokens);
       if (reg.anthropic) {
         // Route via the gateway's EXISTING anthropic backend (oauth creds,
         // OpenAI→Messages translation). Never loop back to the gateway url.

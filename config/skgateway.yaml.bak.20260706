@@ -30,8 +30,7 @@ backends:
     url: http://192.168.0.100:8082/v1
     auth_type: none
     models:
-      - ornith-1.0-9b
-      - qwen3.6-27b-abliterated  # legacy alias -> same :8082 (ornith)
+      - qwen3.6-27b-abliterated
     priority: 1
   nvidia:
     url: https://integrate.api.nvidia.com/v1
@@ -128,9 +127,6 @@ sanitizer:
 # Per-model context limits.  Formula: max_body_bytes = context_tokens * 4 bytes * 0.80
 # max_system_bytes = max_body_bytes * 0.40.  Values from NVIDIA NIM model cards (2026-05-12).
 model_limits:
-  ## 128K context (ornith-1.0-9b on .100:8082 — verified GPU max; 256K OOMs)
-  ornith-1.0-9b:                              { max_body_bytes: 419000,   max_system_bytes: 168000  }
-  qwen3.6-27b-abliterated:                    { max_body_bytes: 419000,   max_system_bytes: 168000  }
   ## 256K context (kimi-k2.6)
   moonshotai/kimi-k2.6:                       { max_body_bytes: 800000,   max_system_bytes: 320000  }
   ## 262K context (Qwen3 family, Mistral family, Gemma 4)
