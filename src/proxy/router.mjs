@@ -21,6 +21,14 @@ import path from "node:path";
 import { sendUpstream } from "./upstream.mjs";
 import { isAnthropicBackend, toAnthropicRequest, toOpenAIResponse } from "./anthropic-adapter.mjs";
 import { getPool } from "./connection-pool.mjs";
+import { isRegistryRouted, resolve as resolveRegistry, getAutoConfig, getConfigEpoch } from "./registry.mjs";
+import { applyReasoningFloor } from "./core.mjs";
+import { createDecisionCache, decisionKey } from "./decision-cache.mjs";
+
+// sk-auto routing decision cache (TTL+LRU); keyed by request fingerprint + config epoch.
+const _autoDecisionCache = createDecisionCache({ ttlMs: 60_000, maxEntries: 500 });
+import { classifyDifficulty } from "../classifiers/difficulty.mjs";
+import { adjustWithEmpirical, promptClassFromResult } from "../classifiers/empirical.mjs";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -105,6 +113,77 @@ function modelMatches(pattern, model) {
   // Convert glob-style "*" into a regex
   const reStr = "^" + pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*") + "$";
   return new RegExp(reStr, "i").test(model);
+}
+
+/**
+ * Return a copy of the JSON request body with its `model` field rewritten to
+ * `newModel`. Used by registry role/context routing to send a concrete model
+ * name to the resolved upstream (backends serve name-agnostically, but the
+ * right name keeps upstream logs/metrics honest). content-length is recomputed
+ * downstream by sendUpstream, so length changes are safe.
+ *
+ * @param {Buffer} body
+ * @param {string} newModel
+ * @returns {Buffer} rewritten body (or the original on parse failure / no model)
+ */
+function rewriteBodyModel(body, newModel) {
+  if (!newModel || !body || body.length === 0) return body;
+  try {
+    const obj = JSON.parse(body.toString("utf-8"));
+    if (obj && typeof obj === "object") {
+      obj.model = newModel;
+      return Buffer.from(JSON.stringify(obj), "utf-8");
+    }
+  } catch {
+    // not JSON — leave untouched
+  }
+  return body;
+}
+
+/**
+ * Raise a sub-floor `max_tokens` in the request body for a reasoning model, so
+ * <think> tokens do not starve the visible answer to empty content. Parses and
+ * reserializes JSON; non-JSON, absent, or higher caps are left untouched. The
+ * floor value comes from the model registry (min_output_tokens per backend).
+ *
+ * @param {Buffer} body
+ * @param {string} model  Resolved concrete model id.
+ * @param {number} floor  min_output_tokens from the registry (0 = disabled).
+ * @returns {Buffer}
+ */
+function applyBodyFloor(body, model, floor) {
+  if (!(floor > 0) || !body || body.length === 0) return body;
+  try {
+    const obj = JSON.parse(body.toString("utf-8"));
+    const cfg = { reasoningFloorMaxTokens: floor, reasoningModels: [model] };
+    if (obj && typeof obj === "object" &&
+        applyReasoningFloor(obj, cfg, model, (m) => console.log(`[router] ${m}`))) {
+      return Buffer.from(JSON.stringify(obj), "utf-8");
+    }
+  } catch {
+    // not JSON — leave untouched
+  }
+  return body;
+}
+
+/**
+ * Get the OpenAI `messages` array for difficulty classification. Prefers
+ * `request.messages` (populated by the entry point) and falls back to parsing
+ * the buffered JSON body so routeAndSend works standalone (e.g. in tests).
+ *
+ * @param {RouteRequest} request
+ * @param {Buffer} body
+ * @returns {Array}
+ */
+function extractMessages(request, body) {
+  if (Array.isArray(request?.messages)) return request.messages;
+  try {
+    const obj = JSON.parse(body.toString("utf-8"));
+    if (obj && Array.isArray(obj.messages)) return obj.messages;
+  } catch {
+    // not JSON — no messages
+  }
+  return [];
 }
 
 // ---------------------------------------------------------------------------
@@ -759,11 +838,20 @@ export function createRouter(config = {}) {
     console.log(`[router] deregistered backend=${id}`);
   }
 
+  /**
+   * Return the Backend instance registered under `id`, or null.
+   * @param {string} id
+   * @returns {Backend|null}
+   */
+  function getBackend(id) {
+    return backends.get(id) || null;
+  }
+
   // -------------------------------------------------------------------------
   // Return router interface
   // -------------------------------------------------------------------------
 
-  return { route, getHealth, addBackend, removeBackend };
+  return { route, getHealth, addBackend, removeBackend, getBackend };
 }
 
 // ---------------------------------------------------------------------------
@@ -837,6 +925,33 @@ export function createDefaultRouter(overrides = {}) {
 // ---------------------------------------------------------------------------
 
 /**
+ * Isolated pool of registry-materialised backends (ornith, qwen-vl, …).
+ * These are used ONLY as the sole candidate for registry role/context routing.
+ * They are deliberately kept OUT of the router's normal `backends` Map so their
+ * wildcard model match can never shadow concrete-model routing (backward-compat).
+ * Health + connection-pool tracking still work because each is a real Backend
+ * instance keyed by a stable id.
+ *
+ * @type {Map<string, Backend>}
+ */
+const _regBackends = new Map();
+
+/**
+ * Get (or lazily create) an isolated registry Backend for the given id/url.
+ * @param {string} id   e.g. "reg:ornith"
+ * @param {string} url  full base url incl. /v1
+ * @returns {Backend}
+ */
+function getRegBackend(id, url) {
+  const clean = String(url || "").replace(/\/$/, "");
+  const existing = _regBackends.get(id);
+  if (existing && existing.url === clean) return existing;
+  const b = new Backend({ id, url: clean, auth_type: "none", models: ["*"], priority: 1 });
+  _regBackends.set(id, b);
+  return b;
+}
+
+/**
  * High-level helper used by the proxy request handler.
  * Tries each candidate backend in order, acquires a pool slot, sends the
  * request, records outcomes, and returns the first successful response.
@@ -863,7 +978,104 @@ export function createDefaultRouter(overrides = {}) {
  */
 export async function routeAndSend(router, request, upstreamPath, method, clientHeaders, body, usePool = true) {
   const pool = usePool ? getPool() : null;
-  const candidates = await router.route(request);
+
+  // ── FRONT of backend selection: skmodels registry role/context routing ──
+  // If the request opts into logical routing (model="sk-*" or an x-sk-*
+  // header), resolve via the single-source-of-truth registry, rewrite the
+  // outgoing model to the resolved backend's concrete model name, and pin the
+  // upstream to the resolved backend. Otherwise fall through to normal
+  // model-name routing (full backward-compat).
+  let candidates = null;
+  if (isRegistryRouted(request)) {
+    let reg = resolveRegistry({
+      model: request.model,
+      context: request.context,
+      service: request.service,
+      role: request.role,
+    });
+
+    // ── sk-auto: pick the concrete role per-request by DIFFICULTY ──
+    // resolve() returns an { auto:true } marker for the sk-auto role/context.
+    // Run the (fast, no-LLM) classifier over the request messages to choose a
+    // real role, then re-resolve THAT role to a concrete backend and route it.
+    if (reg && reg.auto) {
+      const messages = extractMessages(request, body);
+      const autoCfg = getAutoConfig();
+      // Decision cache: identical prompts under the same config epoch skip
+      // re-classification + the empirical lookup. A registry `auto:` edit bumps
+      // the epoch → transparent invalidation. (Scaffolds the S2 small-LLM tier.)
+      const _ckey = decisionKey(messages, getConfigEpoch());
+      let d = _autoDecisionCache.get(_ckey);
+      const _cached = !!d;
+      if (!d) {
+        // Pure heuristic BASELINE, then a bounded empirical nudge from the shared
+        // Telegram ratings store (skchat telegram_ratings ↔ ratings.jsonl).
+        const base = classifyDifficulty(messages, autoCfg);
+        const promptClass = promptClassFromResult(base);
+        const adj = adjustWithEmpirical(base, {
+          promptClass,
+          config: autoCfg,
+          // Map a logical role to its concrete model name so empirical stats
+          // (keyed by concrete model) can be looked up.
+          resolveModel: (role) => {
+            const r = resolveRegistry({ role });
+            return r && r.model ? r.model : null;
+          },
+        });
+        d = { role: adj.role, reason: adj.reason, signals: adj.signals, promptClass };
+        _autoDecisionCache.set(_ckey, d, autoCfg.cache_ttl_ms);
+      }
+      const picked = resolveRegistry({ role: d.role });
+      console.log(
+        `[router] auto-route difficulty=${d.role} class=${d.promptClass} reason=${d.reason} ` +
+        `signals=[${d.signals.join(",")}]${_cached ? " (cached)" : ""} -> backend=${picked ? picked.backend : "(unresolved)"}`
+      );
+      reg = picked;
+    }
+
+    if (reg) {
+      // Rewrite the outgoing model so the upstream receives a real name.
+      body = rewriteBodyModel(body, reg.model);
+      body = applyBodyFloor(body, reg.model, reg.minOutputTokens);
+      if (reg.anthropic) {
+        // Route via the gateway's EXISTING anthropic backend (oauth creds,
+        // OpenAI→Messages translation). Never loop back to the gateway url.
+        const b = router.getBackend("anthropic");
+        if (b) {
+          candidates = [{
+            backendId: b.id,
+            backendUrl: b.url,
+            authHeaders: await b.buildAuthHeaders(),
+            backend: b,
+          }];
+        } else {
+          console.warn("[router] registry resolved to anthropic but no anthropic backend configured");
+        }
+      } else {
+        // External llama backend (ornith .100:8082 / qwen-vl chiap08:11436, …).
+        // Kept in an ISOLATED pool so it never joins normal model-name routing
+        // (would otherwise shadow concrete-model backends via wildcard match).
+        const b = getRegBackend("reg:" + reg.backend, reg.url);
+        candidates = [{
+          backendId: b.id,
+          backendUrl: b.url,
+          authHeaders: {},
+          backend: b,
+        }];
+      }
+      // Route the resolved model through the normal metrics/health path.
+      request = { ...request, model: reg.model };
+      console.log(
+        `[router] registry-route via=${reg.via} role=${reg.role || "-"} ` +
+        `backend=${reg.backend} model→${reg.model}` +
+        (reg.url ? ` url=${reg.url}` : reg.anthropic ? " (anthropic)" : "")
+      );
+    }
+  }
+
+  if (!candidates) {
+    candidates = await router.route(request);
+  }
 
   let lastResult = null;
   let didFailover = false;
@@ -973,6 +1185,14 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         (didFailover ? " (failover)" : "") +
         (queueWaitMs > 0 ? ` queued=${queueWaitMs}ms` : "" )
       );
+      // 4xx are "success" for failover purposes (no retry) but are client/payload
+      // errors the operator needs to see — surface the upstream body so
+      // "check gateway logs" is actually actionable.
+      if (res.status >= 400) {
+        let detail = "";
+        try { detail = res.body?.toString("utf-8").slice(0, 500); } catch { /* ignore */ }
+        console.warn(`[router] ${res.status} upstream_error backend=${backendId} body=${detail}`);
+      }
       return lastResult;
     }
 

@@ -211,13 +211,26 @@ const server = http.createServer(async (req, res) => {
     const body = Buffer.concat(chunks);
 
     let parsedModel = req.headers["x-model"] || undefined;
+    let parsedMessages = undefined;
     if (req.headers["content-type"]?.includes("application/json") && body.length) {
-      try { parsedModel = JSON.parse(body.toString("utf-8")).model || parsedModel; } catch {}
+      try {
+        const parsed = JSON.parse(body.toString("utf-8"));
+        parsedModel = parsed.model || parsedModel;
+        // Carry messages for sk-auto difficulty classification (registry.mjs).
+        if (Array.isArray(parsed.messages)) parsedMessages = parsed.messages;
+      } catch {}
     }
 
     const routeRequest = {
       model:   parsedModel,
+      messages: parsedMessages,
       agentId: req.headers["x-agent-id"] || undefined,
+      // skmodels registry role/context routing (single source of truth).
+      // Present => routeAndSend resolves via ~/.skcapstone/models/registry.yaml
+      // (precedence context > service > role > default) before backend select.
+      context: req.headers["x-sk-context"] || undefined,
+      service: req.headers["x-sk-service"] || undefined,
+      role:    req.headers["x-sk-role"]    || undefined,
     };
 
     const result = await routeAndSend(

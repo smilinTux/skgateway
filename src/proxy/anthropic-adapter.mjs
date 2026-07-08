@@ -34,29 +34,102 @@ export function toAnthropicRequest(openaiBody, extraHeaders = {}) {
   catch { return null; }
   if (!req || !Array.isArray(req.messages)) return null;
 
-  // Split system messages out of the messages array.
+  // Split system messages out; translate assistant tool_calls -> tool_use blocks
+  // and OpenAI role:"tool" results -> Anthropic tool_result blocks (merged into a
+  // user turn) so multi-turn tool loops work through the gateway.
   const systemBlocks = [];
   const messages = [];
-  for (const m of req.messages) {
-    if (m.role === "system") {
-      const text = typeof m.content === "string"
-        ? m.content
-        : Array.isArray(m.content)
-          ? m.content.map((c) => (typeof c === "string" ? c : c.text || "")).join("\n")
-          : String(m.content ?? "");
-      systemBlocks.push({ type: "text", text });
-      continue;
+  let pendingToolResults = null;
+  const flushToolResults = () => {
+    if (pendingToolResults && pendingToolResults.length) {
+      messages.push({ role: "user", content: pendingToolResults });
+      pendingToolResults = null;
     }
-    // Anthropic only allows user/assistant roles.
-    const role = m.role === "assistant" ? "assistant" : "user";
-    let content = m.content;
-    if (typeof content !== "string") {
-      content = Array.isArray(content)
+  };
+  // System blocks are text-only — collapse to a plain string.
+  const flatten = (content) =>
+    typeof content === "string" ? content
+      : Array.isArray(content)
         ? content.map((c) => (typeof c === "string" ? c : c.text || "")).join("\n")
         : String(content ?? "");
+
+  // OpenAI image_url -> Anthropic image source. Supports data: URIs (base64)
+  // and http(s) URLs. Returns null for anything unrecognised.
+  const imageBlockFromUrl = (url) => {
+    if (typeof url !== "string") return null;
+    const m = /^data:([^;,]+);base64,(.*)$/s.exec(url);
+    if (m) return { type: "image", source: { type: "base64", media_type: m[1], data: m[2] } };
+    if (/^https?:\/\//i.test(url)) return { type: "image", source: { type: "url", url } };
+    return null;
+  };
+
+  // Translate OpenAI message content into Anthropic content. Plain text stays a
+  // string; multimodal content becomes an array of text/image blocks so images
+  // (e.g. forwarded X-post/YouTube thumbnails) reach vision-capable models
+  // instead of being flattened to an empty string (which Anthropic 400s on with
+  // "user messages must have non-empty content").
+  const translateContent = (content) => {
+    if (typeof content === "string") return content;
+    if (!Array.isArray(content)) return String(content ?? "");
+    const blocks = [];
+    for (const c of content) {
+      if (typeof c === "string") { if (c) blocks.push({ type: "text", text: c }); continue; }
+      if (!c || typeof c !== "object") continue;
+      if (c.type === "text" && c.text) blocks.push({ type: "text", text: c.text });
+      else if (c.type === "image_url") {
+        const url = typeof c.image_url === "string" ? c.image_url : c.image_url?.url;
+        const b = imageBlockFromUrl(url);
+        if (b) blocks.push(b);
+      } else if (c.type === "image" && c.source) blocks.push(c); // already Anthropic
+      else if (c.text) blocks.push({ type: "text", text: c.text });
     }
+    if (blocks.length === 0) return "";
+    if (blocks.every((b) => b.type === "text")) return blocks.map((b) => b.text).join("\n");
+    return blocks;
+  };
+
+  // True when translated content is empty (would trigger an Anthropic 400).
+  const isEmptyContent = (c) =>
+    (typeof c === "string" && c.trim() === "") ||
+    (Array.isArray(c) && c.length === 0);
+
+  for (const m of req.messages) {
+    if (m.role === "system") {
+      systemBlocks.push({ type: "text", text: flatten(m.content) });
+      continue;
+    }
+    if (m.role === "tool") {
+      // tool result — accumulate into the next user turn
+      (pendingToolResults ||= []).push({
+        type: "tool_result",
+        tool_use_id: m.tool_call_id || m.tool_call_id,
+        content: typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? ""),
+      });
+      continue;
+    }
+    flushToolResults();
+    if (m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length) {
+      const content = [];
+      const txt = (typeof m.content === "string" ? m.content : "").trim();
+      if (txt) content.push({ type: "text", text: txt });
+      for (const tc of m.tool_calls) {
+        let input = {};
+        try { input = JSON.parse(tc.function?.arguments || "{}"); } catch { input = {}; }
+        content.push({ type: "tool_use", id: tc.id, name: tc.function?.name, input });
+      }
+      messages.push({ role: "assistant", content });
+      continue;
+    }
+    const role = m.role === "assistant" ? "assistant" : "user";
+    const content = translateContent(m.content);
+    // Drop empty messages — Anthropic rejects empty user/assistant content.
+    if (isEmptyContent(content)) continue;
     messages.push({ role, content });
   }
+  flushToolResults();
+
+  // Never send an empty messages array (Anthropic requires ≥1 message).
+  if (messages.length === 0) messages.push({ role: "user", content: "(no content)" });
 
   // Claude Code system prompt MUST be first for OAuth tokens.
   const system = [{ type: "text", text: CLAUDE_CODE_SYSTEM }, ...systemBlocks];
@@ -67,6 +140,23 @@ export function toAnthropicRequest(openaiBody, extraHeaders = {}) {
     messages,
     system,
   };
+
+  // Translate OpenAI function tools -> Anthropic tools (input_schema).
+  if (Array.isArray(req.tools) && req.tools.length) {
+    out.tools = req.tools
+      .filter((t) => t && t.type === "function" && t.function && t.function.name)
+      .map((t) => ({
+        name: t.function.name,
+        description: t.function.description || "",
+        input_schema: t.function.parameters || { type: "object", properties: {} },
+      }));
+    if (req.tool_choice === "required" || req.tool_choice === "any")
+      out.tool_choice = { type: "any" };
+    else if (req.tool_choice === "auto")
+      out.tool_choice = { type: "auto" };
+    else if (req.tool_choice && req.tool_choice.function)
+      out.tool_choice = { type: "tool", name: req.tool_choice.function.name };
+  }
   // Anthropic's newest models (e.g. claude-opus-4-8) deprecate `temperature`
   // and `top_p` and reject them with HTTP 400. Omit unsupported sampling
   // params and let Anthropic use its defaults.
@@ -104,12 +194,24 @@ export function toOpenAIResponse(anthropicRes, model) {
     ? msg.content.filter((b) => b.type === "text").map((b) => b.text).join("")
     : "";
 
+  // Extract tool_use blocks -> OpenAI tool_calls.
+  const toolUse = Array.isArray(msg.content)
+    ? msg.content.filter((b) => b.type === "tool_use") : [];
+  const toolCalls = toolUse.map((b, i) => ({
+    id: b.id || ("call_" + i),
+    type: "function",
+    function: { name: b.name, arguments: JSON.stringify(b.input || {}) },
+  }));
+
   const stopMap = {
     end_turn: "stop",
     max_tokens: "length",
     stop_sequence: "stop",
     tool_use: "tool_calls",
   };
+
+  const message = { role: "assistant", content: text || null };
+  if (toolCalls.length) message.tool_calls = toolCalls;
 
   const openai = {
     id: msg.id || ("chatcmpl-" + Date.now()),
@@ -118,8 +220,8 @@ export function toOpenAIResponse(anthropicRes, model) {
     model: msg.model || model,
     choices: [{
       index: 0,
-      message: { role: "assistant", content: text },
-      finish_reason: stopMap[msg.stop_reason] || "stop",
+      message,
+      finish_reason: toolCalls.length ? "tool_calls" : (stopMap[msg.stop_reason] || "stop"),
     }],
     usage: {
       prompt_tokens: msg.usage?.input_tokens ?? 0,

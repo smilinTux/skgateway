@@ -153,7 +153,15 @@ const CATEGORY_PATTERNS = {
 // Pre-flatten into a single scored pass per category
 const COMPILED_CATEGORIES = Object.entries(CATEGORY_PATTERNS).map(([cat, pairs]) => ({
   category: /** @type {IntentCategory} */ (cat),
-  pairs,
+  // Pre-compile each pattern ONCE with the global flag so classifyPrompt can
+  // count matches via an exec loop WITHOUT recompiling per call (hot path — this
+  // runs on every request). Instances are stateful (lastIndex); classifyPrompt
+  // resets lastIndex before each scan and always exhausts the exec loop, so
+  // sharing the instances across calls is safe.
+  pairs: pairs.map(([re, weight]) => [
+    new RegExp(re.source, re.flags.includes("g") ? re.flags : re.flags + "g"),
+    weight,
+  ]),
 }));
 
 // ---------------------------------------------------------------------------
@@ -456,12 +464,14 @@ export function classifyPrompt(messages, systemPrompt = "") {
   const scores = COMPILED_CATEGORIES.map(({ category, pairs }) => {
     let raw = 0;
     for (const [re, weight] of pairs) {
-      // Count all matches (global flag handled by exec loop to avoid state issues)
+      // re is pre-compiled with the global flag (see COMPILED_CATEGORIES). Reset
+      // lastIndex because instances are shared across calls; the loop below always
+      // runs to exhaustion, leaving lastIndex at 0 for the next caller.
+      re.lastIndex = 0;
       let m;
-      const testRe = new RegExp(re.source, re.flags.includes("g") ? re.flags : re.flags + "g");
-      while ((m = testRe.exec(combined)) !== null) {
+      while ((m = re.exec(combined)) !== null) {
         raw += weight;
-        if (m.index === testRe.lastIndex) testRe.lastIndex++; // guard against zero-width
+        if (m.index === re.lastIndex) re.lastIndex++; // guard against zero-width
       }
     }
     return { category, score: raw, confidence: 0 };

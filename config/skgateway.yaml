@@ -30,8 +30,29 @@ backends:
     url: http://192.168.0.100:8082/v1
     auth_type: none
     models:
-      - qwen3.6-27b-abliterated
+      - ornith-1.0-9b
+      - qwen3.6-27b-abliterated  # legacy alias -> same :8082 (ornith)
     priority: 1
+
+  ## Tyler's ornith-1.0-35b (Q4_K_M) — llama.cpp, 256K ctx, reasoning model.
+  ## Two boxes = active/standby: .150 primary → .153 failover (router fails
+  ## over on 5xx by priority). High priority NUMBERS (5/6) keep these OUT of
+  ## the unmatched-model fallback pool; they remain the SOLE match for the
+  ## exact id `ornith-1.0-35b`, so they never shadow other routing.
+  tyler-ornith:
+    url: http://192.168.0.150:8087/v1
+    auth_type: none
+    models:
+      - ornith-1.0-35b
+      - ornith-big            # short alias -> same Tyler backend (llama.cpp serves name-agnostically)
+    priority: 5
+  tyler-ornith-b:
+    url: http://192.168.0.153:8087/v1
+    auth_type: none
+    models:
+      - ornith-1.0-35b
+      - ornith-big            # short alias -> same Tyler backend
+    priority: 6
   nvidia:
     url: https://integrate.api.nvidia.com/v1
     auth_type: api_key
@@ -127,6 +148,12 @@ sanitizer:
 # Per-model context limits.  Formula: max_body_bytes = context_tokens * 4 bytes * 0.80
 # max_system_bytes = max_body_bytes * 0.40.  Values from NVIDIA NIM model cards (2026-05-12).
 model_limits:
+  ## 128K context (ornith-1.0-9b on .100:8082 — verified GPU max; 256K OOMs)
+  ornith-1.0-9b:                              { max_body_bytes: 419000,   max_system_bytes: 168000  }
+  qwen3.6-27b-abliterated:                    { max_body_bytes: 419000,   max_system_bytes: 168000  }
+  ## 256K context (ornith-1.0-35b on Tyler's .150/.153:8087 — verified n_ctx=256000)
+  ornith-1.0-35b:                             { max_body_bytes: 800000,   max_system_bytes: 320000  }
+  ornith-big:                                 { max_body_bytes: 800000,   max_system_bytes: 320000  }  # alias of ornith-1.0-35b
   ## 256K context (kimi-k2.6)
   moonshotai/kimi-k2.6:                       { max_body_bytes: 800000,   max_system_bytes: 320000  }
   ## 262K context (Qwen3 family, Mistral family, Gemma 4)
