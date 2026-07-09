@@ -88,9 +88,15 @@ backends:
     priority: 1
 
   anthropic:
-    url: https://api.anthropic.com/v1
-    auth_type: oauth
-    credentials_path: ~/.claude/.credentials.json
+    # Route Claude models through the LOCAL Claude Code client wrapper
+    # (claude-code-api :18782 = `claude --print`) so they bill as genuine
+    # FIRST-PARTY subscription usage. Hitting api.anthropic.com directly with the
+    # raw OAuth token is treated by Anthropic as a third-party app that draws from
+    # extra-usage (not the plan), which starves the subscription and 400s under
+    # load. The wrapper IS Claude Code, so it uses the plan correctly.
+    # OpenAI-compatible → auth_type none (no Messages-API translation, no oauth).
+    url: http://127.0.0.1:18782/v1
+    auth_type: none
     models:
       - claude-opus-4-8
       - claude-opus-4-7
