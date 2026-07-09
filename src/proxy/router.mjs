@@ -1152,6 +1152,12 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           const aHeaders = { ...forwardHeaders, ...tr.headers };
           delete aHeaders["content-length"];
           const raw = await sendUpstream(tr.path, method, aHeaders, tr.body, targetUrl);
+          if (raw && raw.status >= 400) {
+            let d = "";
+            try { d = raw.body?.toString("utf-8").slice(0, 600); } catch { /* ignore */ }
+            const reqTokens = (() => { try { return JSON.parse(tr.body.toString("utf-8")).max_tokens; } catch { return "?"; } })();
+            console.warn(`[router] anthropic ${raw.status} err (sent max_tokens=${reqTokens}): ${d}`);
+          }
           res = toOpenAIResponse(raw, request.model);
         } else {
           res = await sendUpstream(upstreamPath, method, forwardHeaders, body, targetUrl);
