@@ -1111,6 +1111,11 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     delete forwardHeaders.host;
     delete forwardHeaders.connection;
     delete forwardHeaders["keep-alive"];
+    // Don't let the client's Accept-Encoding reach the backend: the response
+    // relay strips content-encoding but forwards the (still-compressed) body, so
+    // a gzip'd upstream reply reaches the client as undecodable bytes ("HTTP 400:
+    // <garbage>"). Force identity so backends return uncompressed bodies.
+    delete forwardHeaders["accept-encoding"];
 
     const targetUrl = new URL(backendUrl);
     const queueStart = Date.now();
