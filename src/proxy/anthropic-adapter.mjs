@@ -16,6 +16,16 @@
 const CLAUDE_CODE_SYSTEM =
   "You are Claude Code, Anthropic's official CLI for Claude.";
 
+// Per-model OUTPUT-token ceilings (max_tokens). Anthropic rejects requests above
+// these with HTTP 400. Unknown models fall back to 128000 (never truncates a
+// legitimate ≤128k request; the family's current maximum).
+const MAX_OUTPUT_TOKENS = {
+  "claude-opus-4-8": 128000,
+  "claude-opus-4-7": 32000,
+  "claude-sonnet-4-6": 64000,
+  "claude-haiku-4-5": 32000,
+};
+
 /** Is this backend one we must speak the Anthropic Messages API to? */
 export function isAnthropicBackend(backend) {
   if (!backend) return false;
@@ -134,9 +144,13 @@ export function toAnthropicRequest(openaiBody, extraHeaders = {}) {
   // Claude Code system prompt MUST be first for OAuth tokens.
   const system = [{ type: "text", text: CLAUDE_CODE_SYSTEM }, ...systemBlocks];
 
+  // Anthropic 400s when max_tokens exceeds a model's OUTPUT ceiling. Clients that
+  // configure a large *context* window (e.g. "500K tokens") often send that as
+  // max_tokens by mistake → every request fails. Clamp to the model's output cap.
+  const cap = MAX_OUTPUT_TOKENS[req.model] ?? 128000;
   const out = {
     model: req.model,
-    max_tokens: req.max_tokens || 1024,
+    max_tokens: Math.min(req.max_tokens || 1024, cap),
     messages,
     system,
   };

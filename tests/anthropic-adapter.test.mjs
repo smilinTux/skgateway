@@ -97,6 +97,24 @@ test("system split + Claude Code prefix still first", () => {
   assert.equal(a.system[1].text, "You are Lumina.");
 });
 
+test("max_tokens is clamped to the model output ceiling", () => {
+  const a = tr({ model: "claude-opus-4-8", max_tokens: 500000,
+    messages: [{ role: "user", content: "test" }] });
+  assert.equal(a.max_tokens, 128000, "opus-4-8 output cap is 128000");
+});
+
+test("max_tokens under the cap is preserved", () => {
+  const a = tr({ model: "claude-opus-4-8", max_tokens: 64000,
+    messages: [{ role: "user", content: "hi" }] });
+  assert.equal(a.max_tokens, 64000);
+});
+
+test("unknown model falls back to 128000 cap", () => {
+  const a = tr({ model: "claude-future-9", max_tokens: 999999,
+    messages: [{ role: "user", content: "hi" }] });
+  assert.equal(a.max_tokens, 128000);
+});
+
 test("at least one message always survives (all-empty degenerate case)", () => {
   const a = tr({ model: "claude-opus-4-8", messages: [{ role: "user", content: "" }] });
   assert.ok(a.messages.length >= 1, "must keep at least one message");
