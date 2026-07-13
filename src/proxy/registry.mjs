@@ -102,15 +102,26 @@ export function getConfigEpoch(path = REGISTRY_PATH) {
 
 /**
  * Should this request be routed via the registry?
- * True when the model is a logical role ("sk-*"), or any sk routing header is
- * present. Concrete model names alone do NOT trigger registry routing.
+ * True when the model is a logical role ("sk-*"), a named role-key defined in
+ * the registry `roles:` map (e.g. "ornith-tiny"), or any sk routing header is
+ * present. Bare concrete model names (e.g. "ornith-1.0-9b") do NOT trigger it.
+ *
+ * Recognising named role-keys lets a friendly label like `ornith-tiny` inherit
+ * full registry treatment: model rewrite to the backend's concrete id AND the
+ * per-backend `min_output_tokens` floor (so a thinking model's <think> can't
+ * starve `.content` when a caller passes a tiny max_tokens).
  *
  * @param {{model?:string, context?:string, service?:string, role?:string}} req
+ * @param {string} [path]  Registry path override (for tests)
  * @returns {boolean}
  */
-export function isRegistryRouted({ model, context, service, role } = {}) {
+export function isRegistryRouted({ model, context, service, role } = {}, path = REGISTRY_PATH) {
   if (context || service || role) return true;
-  if (typeof model === "string" && model.startsWith("sk-")) return true;
+  if (typeof model === "string") {
+    if (model.startsWith("sk-")) return true;
+    const { roles } = loadRegistry(path);
+    if (roles && Object.prototype.hasOwnProperty.call(roles, model)) return true;
+  }
   return false;
 }
 
