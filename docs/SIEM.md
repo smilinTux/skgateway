@@ -459,22 +459,51 @@ is started. Only one rotated generation is kept.
 
 ### Syslog Adapter
 
-Forwards events to a syslog server using UDP or TCP transport.
+Forwards events to a syslog server using UDP, TCP, TLS, or a stream unix socket.
+**Disabled by default** — the sink is inert unless `enabled: true` (or the
+`SKGATEWAY_SYSLOG_*` env vars, below) turn it on.
 
 ```yaml
 siem:
   outputs:
     - type: syslog
+      enabled: true
       host: syslog.internal
       port: 514
-      protocol: udp     # udp | tcp
+      protocol: udp     # udp | tcp | tls | unix
       format: cef       # cef | json
       facility: 16      # 16 = local0
+      framing: octet    # octet (RFC 6587 octet-counting) | lf  (tcp/tls/unix only)
+      # protocol: unix  →  path: /dev/log
+      # protocol: tls   →  tls: { ca_file, cert_file, key_file, reject_unauthorized }
 ```
 
-Each event is sent as a single RFC 5424 syslog message. Priority is calculated
-from the CEF severity integer. The syslog timestamp uses the event's
-`timestamp` field.
+Each event is sent as a single **RFC 5424** message:
+
+```
+<PRI>1 TIMESTAMP HOSTNAME skgateway PROCID MSGID [skgateway@32473 …] MSG
+```
+
+- **PRI** = `facility * 8 + severity`, where severity maps
+  `critical→2, error→3, warning→4, info→6`.
+- **TIMESTAMP** = the event's `timestamp` (RFC 3339).
+- **MSGID** = the event type (`request`, `policy_violation`, …).
+- **STRUCTURED-DATA** carries `event_id`, `agent_id`, `session_id`, etc.
+- **MSG** = the CEF or JSON rendering of the event (UTF-8 BOM prefixed).
+
+Stream transports (`tcp`/`tls`/`unix`) reconnect lazily and buffer up to
+`max_buffer` (default 1000) messages while dialling.
+
+**Environment overrides** (handy for turning syslog on without editing YAML):
+
+| Env var | Effect |
+|---------|--------|
+| `SKGATEWAY_SYSLOG_ENABLED`  | `true`/`false` — enable the sink |
+| `SKGATEWAY_SYSLOG_HOST`     | server host |
+| `SKGATEWAY_SYSLOG_PORT`     | server port |
+| `SKGATEWAY_SYSLOG_PROTOCOL` | `udp` \| `tcp` \| `tls` \| `unix` |
+| `SKGATEWAY_SYSLOG_FACILITY` | facility integer (0-23) |
+| `SKGATEWAY_SYSLOG_FORMAT`   | `cef` \| `json` |
 
 ### Elasticsearch Adapter
 

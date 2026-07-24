@@ -90,6 +90,25 @@ try { fs.mkdirSync(path.dirname(siemPath), { recursive: true }); } catch {}
 // Optional skcapstone bridge — shares warn+ SIEM events on the mesh-wide
 // sk-alert bus when ~/.skcapstone is present; no-op otherwise.
 import * as skcapstone from "./integration.mjs";
+
+// ─── Syslog output (RFC 5424) — disabled by default ───
+// Build one adapter per `type: syslog` output in config.siem.outputs. Each is a
+// no-op unless `enabled: true` (or SKGATEWAY_SYSLOG_* env is set). Shipping to
+// syslog never blocks or breaks the existing file/append + skcapstone path.
+let syslogOutputs = [];
+try {
+  const { createSyslogOutput } = await import("./siem/syslog.mjs");
+  syslogOutputs = (config.siem?.outputs || [])
+    .filter((o) => o && o.type === "syslog")
+    .map((o) => createSyslogOutput(o))
+    .filter((a) => a.enabled);
+  if (syslogOutputs.length) {
+    console.log(`[skgateway] syslog output(s) enabled: ${syslogOutputs.length}`);
+  }
+} catch (e) {
+  console.log("[skgateway] syslog output not available (optional):", e.message);
+}
+
 function siemHook(evt) {
   try {
     fs.appendFile(siemPath, JSON.stringify(evt) + "\n", () => {});
@@ -97,6 +116,9 @@ function siemHook(evt) {
     console.warn("[skgateway] siem append failed:", e.message);
   }
   try { skcapstone.forwardSiemEvent(evt); } catch {}
+  for (const out of syslogOutputs) {
+    try { out.write(evt); } catch { /* never let syslog break the hot path */ }
+  }
 }
 
 // ─── Build per-model limit map from YAML model_limits section ───
@@ -279,6 +301,7 @@ function shutdown(signal) {
   server.close(() => {
     if (metrics)   metrics.close?.();
     if (dashboard) dashboard.close?.();
+    for (const out of syslogOutputs) { try { out.close?.(); } catch {} }
     process.exit(0);
   });
   // Force exit after 5s

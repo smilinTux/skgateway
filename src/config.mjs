@@ -191,6 +191,12 @@ function deepClone(obj) {
  * | SKGATEWAY_NVIDIA_KEY_ENV | backends.nvidia.api_key_env |
  * | SKGATEWAY_METRICS_DB     | metrics.db_path           |
  * | SKGATEWAY_RETENTION_DAYS | metrics.retention_days    |
+ * | SKGATEWAY_SYSLOG_ENABLED | siem syslog output (on/off) |
+ * | SKGATEWAY_SYSLOG_HOST    | syslog output host        |
+ * | SKGATEWAY_SYSLOG_PORT    | syslog output port        |
+ * | SKGATEWAY_SYSLOG_PROTOCOL| syslog transport (udp/tcp/tls/unix) |
+ * | SKGATEWAY_SYSLOG_FACILITY| syslog facility (0-23)    |
+ * | SKGATEWAY_SYSLOG_FORMAT  | syslog MSG format (cef/json) |
  *
  * @param {object} cfg  Mutable merged config object.
  * @returns {object} Same object, mutated in place.
@@ -206,7 +212,51 @@ function applyEnvOverrides(cfg) {
   if (e.SKGATEWAY_METRICS_DB)     cfg.metrics.db_path        = e.SKGATEWAY_METRICS_DB;
   if (e.SKGATEWAY_RETENTION_DAYS) cfg.metrics.retention_days = Number(e.SKGATEWAY_RETENTION_DAYS);
 
+  applySyslogEnv(cfg, e);
+
   return cfg;
+}
+
+/**
+ * Merge SKGATEWAY_SYSLOG_* environment variables into the SIEM syslog output.
+ *
+ * The syslog sink is DISABLED by default: it only becomes active when either a
+ * `type: syslog` output is present in the YAML with `enabled: true`, or
+ * `SKGATEWAY_SYSLOG_ENABLED` is set to a truthy value. Env values update the
+ * first existing syslog output (creating one if none exists) so operators can
+ * turn it on without editing the YAML.
+ *
+ * @param {object} cfg
+ * @param {Record<string,string|undefined>} e  process.env
+ */
+function applySyslogEnv(cfg, e) {
+  const touched =
+    e.SKGATEWAY_SYSLOG_ENABLED  !== undefined ||
+    e.SKGATEWAY_SYSLOG_HOST     !== undefined ||
+    e.SKGATEWAY_SYSLOG_PORT     !== undefined ||
+    e.SKGATEWAY_SYSLOG_PROTOCOL !== undefined ||
+    e.SKGATEWAY_SYSLOG_FACILITY !== undefined ||
+    e.SKGATEWAY_SYSLOG_FORMAT   !== undefined;
+
+  if (!touched) return;
+
+  cfg.siem = cfg.siem ?? {};
+  cfg.siem.outputs = Array.isArray(cfg.siem.outputs) ? cfg.siem.outputs : [];
+
+  let sink = cfg.siem.outputs.find((o) => o && o.type === 'syslog');
+  if (!sink) {
+    sink = { type: 'syslog' };
+    cfg.siem.outputs.push(sink);
+  }
+
+  if (e.SKGATEWAY_SYSLOG_ENABLED !== undefined) {
+    sink.enabled = /^(1|true|yes|on)$/i.test(e.SKGATEWAY_SYSLOG_ENABLED);
+  }
+  if (e.SKGATEWAY_SYSLOG_HOST     !== undefined) sink.host     = e.SKGATEWAY_SYSLOG_HOST;
+  if (e.SKGATEWAY_SYSLOG_PORT     !== undefined) sink.port     = Number(e.SKGATEWAY_SYSLOG_PORT);
+  if (e.SKGATEWAY_SYSLOG_PROTOCOL !== undefined) sink.protocol = e.SKGATEWAY_SYSLOG_PROTOCOL;
+  if (e.SKGATEWAY_SYSLOG_FACILITY !== undefined) sink.facility = Number(e.SKGATEWAY_SYSLOG_FACILITY);
+  if (e.SKGATEWAY_SYSLOG_FORMAT   !== undefined) sink.format   = e.SKGATEWAY_SYSLOG_FORMAT;
 }
 
 // ─── validation ───────────────────────────────────────────────────────────────
