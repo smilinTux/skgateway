@@ -507,23 +507,62 @@ Stream transports (`tcp`/`tls`/`unix`) reconnect lazily and buffer up to
 
 ### Elasticsearch Adapter
 
-Indexes events into Elasticsearch (or OpenSearch) using the bulk API.
+Ships the event stream to Elasticsearch **or OpenSearch** using the `_bulk` API.
+Both engines speak the identical bulk protocol, so one adapter serves both; use
+`type: opensearch` if you prefer that label. Implemented in
+`src/siem/elasticsearch.mjs`.
 
 ```yaml
 siem:
   outputs:
-    - type: elasticsearch
-      url: http://elasticsearch:9200
-      index: skgateway-events
-      username: elastic
-      password_env: ES_PASSWORD
-      batch_size: 50
-      flush_interval_ms: 5000
+    - type: elasticsearch          # or: opensearch
+      enabled: true
+      endpoint: https://elasticsearch:9200   # `url:` is accepted as an alias
+      index: skgateway-siem-%DATE%   # %DATE% -> YYYY.MM.DD (daily indices)
+      batch_size: 100
+      flush_ms: 5000                 # `flush_interval_ms:` is accepted as an alias
+      api_key_env: SKGATEWAY_ES_API_KEY   # NAME of an env var holding the key
 ```
 
-Events are batched and flushed every `flush_interval_ms` or when `batch_size`
-is reached, whichever comes first. The `_id` field is set to `event_id` to
-ensure idempotent indexing on retry.
+Behaviour:
+
+- **Disabled by default.** With no `endpoint` (or `enabled: false`) the adapter
+  is a no-op - nothing is shipped and no socket is opened.
+- **Batching.** Events buffer and flush every `flush_ms` or once `batch_size`
+  events accumulate, whichever comes first. Each event becomes one bulk document
+  with an added `@timestamp` (copied from `timestamp`) so time-based index
+  patterns work out of the box.
+- **Idempotent.** The document `_id` is set to `event_id`, so a retried batch
+  never creates duplicate documents.
+- **Fail-safe.** A network error, timeout, or non-2xx `_bulk` response is logged
+  to stderr and the batch is dropped - it never throws into or blocks the
+  request hot path. A bounded in-memory buffer (`max_buffer`, default 10000)
+  drops the oldest events under sustained backpressure.
+
+**Auth is referenced by ENV-VAR NAME, never a literal secret** (nothing
+sensitive is committed to YAML). Pick one:
+
+| Config key         | Header produced                | Use for                     |
+|--------------------|--------------------------------|-----------------------------|
+| `api_key_env`      | `Authorization: ApiKey <val>`  | Elasticsearch API keys      |
+| `bearer_token_env` | `Authorization: Bearer <val>`  | OpenSearch / JWT            |
+| `auth_header_env`  | `Authorization: <val>` (raw)   | any pre-built value         |
+| `username` + `password_env` | `Authorization: Basic …` | HTTP Basic (user + password) |
+
+The `*_env` value is the *name* of another environment variable; the gateway
+reads the secret from `process.env` at runtime and it is never logged.
+
+**Environment overrides** (turn ES on without editing YAML):
+
+```
+SKGATEWAY_ES_ENABLED=true
+SKGATEWAY_ES_ENDPOINT=https://elasticsearch:9200
+SKGATEWAY_ES_INDEX=skgateway-siem-%DATE%
+SKGATEWAY_ES_BATCH_SIZE=100
+SKGATEWAY_ES_FLUSH_MS=5000
+SKGATEWAY_ES_API_KEY_ENV=SKGATEWAY_ES_API_KEY   # name of the key-bearing env var
+# SKGATEWAY_ES_BEARER_TOKEN_ENV / SKGATEWAY_ES_AUTH_HEADER_ENV also supported
+```
 
 ---
 

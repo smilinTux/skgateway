@@ -180,6 +180,21 @@ siem:
     #   port: 514
     #   protocol: udp            # udp | tcp | tls | unix
     #   format: cef              # cef | json
+    ## Optional Elasticsearch / OpenSearch sink (ships the event stream via the
+    ## _bulk API). Both engines use the identical adapter; use type: opensearch
+    ## for clarity if you prefer. Disabled unless present + enabled with an
+    ## endpoint, or turned on via SKGATEWAY_ES_* env vars. See docs/SIEM.md.
+    ## Auth is referenced by ENV-VAR NAME, never a literal secret: set e.g.
+    ## SKGATEWAY_ES_API_KEY in the environment and name it here.
+    # - type: elasticsearch      # or: opensearch
+    #   enabled: true
+    #   endpoint: https://ES_HOST:9200
+    #   index: skgateway-siem-%DATE%   # %DATE% -> YYYY.MM.DD (daily indices)
+    #   batch_size: 100
+    #   flush_ms: 5000
+    #   api_key_env: SKGATEWAY_ES_API_KEY   # NAME of the env var holding the key
+    #   # bearer_token_env: SKGATEWAY_ES_BEARER   # OpenSearch/JWT alternative
+    #   # auth_header_env: SKGATEWAY_ES_AUTH      # raw Authorization value (e.g. "Basic ...")
 
 ## Passive prompt classification (labels only, never reroutes). Safe on hot path.
 classification:

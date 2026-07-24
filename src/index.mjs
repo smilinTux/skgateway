@@ -132,6 +132,25 @@ try {
   console.log("[skgateway] syslog output not available (optional):", e.message);
 }
 
+// ─── Elasticsearch / OpenSearch output (_bulk) - disabled by default ───
+// Build one adapter per `type: elasticsearch` (or `opensearch`) output. Both
+// engines speak the identical _bulk protocol, so one adapter serves both. Each
+// is a no-op unless `enabled: true` with an endpoint (or SKGATEWAY_ES_* env is
+// set). Shipping to ES never blocks or breaks the file/append + syslog path.
+let esOutputs = [];
+try {
+  const { createElasticsearchOutput } = await import("./siem/elasticsearch.mjs");
+  esOutputs = (config.siem?.outputs || [])
+    .filter((o) => o && (o.type === "elasticsearch" || o.type === "opensearch"))
+    .map((o) => createElasticsearchOutput(o))
+    .filter((a) => a.enabled);
+  if (esOutputs.length) {
+    console.log(`[skgateway] elasticsearch/opensearch output(s) enabled: ${esOutputs.length}`);
+  }
+} catch (e) {
+  console.log("[skgateway] elasticsearch output not available (optional):", e.message);
+}
+
 function siemHook(evt) {
   try {
     fs.appendFile(siemPath, JSON.stringify(evt) + "\n", () => {});
@@ -141,6 +160,9 @@ function siemHook(evt) {
   try { skcapstone.forwardSiemEvent(evt); } catch {}
   for (const out of syslogOutputs) {
     try { out.write(evt); } catch { /* never let syslog break the hot path */ }
+  }
+  for (const out of esOutputs) {
+    try { out.write(evt); } catch { /* never let ES break the hot path */ }
   }
 }
 
