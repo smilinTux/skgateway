@@ -132,7 +132,7 @@ try {
   console.log("[skgateway] syslog output not available (optional):", e.message);
 }
 
-// ─── Elasticsearch / OpenSearch output (_bulk) — disabled by default ───
+// ─── Elasticsearch / OpenSearch output (_bulk) - disabled by default ───
 // Build one adapter per `type: elasticsearch` (or `opensearch`) output. Both
 // engines speak the identical _bulk protocol, so one adapter serves both. Each
 // is a no-op unless `enabled: true` with an endpoint (or SKGATEWAY_ES_* env is

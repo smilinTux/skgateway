@@ -1,25 +1,25 @@
 /**
- * elasticsearch.mjs — Elasticsearch / OpenSearch Bulk Output for SKGateway SIEM
+ * elasticsearch.mjs - Elasticsearch / OpenSearch Bulk Output for SKGateway SIEM
  *
  * Responsibilities
  * ────────────────
- * 1. Bulk Indexing  — buffer {@link module:siem/events.GatewayEvent} objects and
+ * 1. Bulk Indexing  - buffer {@link module:siem/events.GatewayEvent} objects and
  *                     ship them to an Elasticsearch or OpenSearch cluster via the
  *                     `_bulk` API. Both engines speak the identical NDJSON bulk
  *                     protocol, so a single adapter serves both.
- * 2. Batching       — flush whenever the buffer reaches `batch_size` events
+ * 2. Batching       - flush whenever the buffer reaches `batch_size` events
  *                     (default 100) OR every `flush_ms` milliseconds
  *                     (default 5000), whichever comes first.
- * 3. Fail-Safe      — a network error, a non-2xx response, or a per-item reject
+ * 3. Fail-Safe      - a network error, a non-2xx response, or a per-item reject
  *                     never throws into the caller and never blocks the request
  *                     hot path. Failures are logged to stderr and the batch is
  *                     dropped (bounded buffer already protects memory). Writes are
  *                     fire-and-forget; a bounded buffer drops the oldest events
  *                     once `max_buffer` is exceeded.
- * 4. Config-Driven  — endpoint URL + index name + optional auth are all supplied
+ * 4. Config-Driven  - endpoint URL + index name + optional auth are all supplied
  *                     by config. Auth material is referenced by ENV-VAR NAME, never
  *                     by literal value, so no secret is ever committed or logged.
- * 5. Disabled by default — an adapter with `enabled: false`, or missing an
+ * 5. Disabled by default - an adapter with `enabled: false`, or missing an
  *                     endpoint URL, is a safe no-op. The gateway ships ES OFF.
  *
  * Index / document shape
@@ -114,7 +114,7 @@ export function buildBulkBody(events, indexTpl) {
 
 /**
  * Resolve the Authorization / api-key header from config. Auth is referenced by
- * ENV-VAR NAME only — the literal secret is read from `process.env` at runtime
+ * ENV-VAR NAME only - the literal secret is read from `process.env` at runtime
  * and never stored in config or logs.
  *
  *   - `api_key_env`      → `Authorization: ApiKey <value>`   (Elasticsearch API key)
@@ -272,9 +272,9 @@ export function createElasticsearchOutput(config = {}, deps = {}) {
             process.stderr.write(`[skgateway:siem:es] bulk had ${failed} rejected item(s)\n`);
           }
         }
-      } catch { /* body already consumed or not JSON — ignore */ }
+      } catch { /* body already consumed or not JSON - ignore */ }
     } catch (err) {
-      // Network failure, timeout, DNS, TLS — must never break the gateway.
+      // Network failure, timeout, DNS, TLS - must never break the gateway.
       process.stderr.write(`[skgateway:siem:es] bulk ship failed: ${err.message}\n`);
     }
   }
@@ -300,7 +300,7 @@ export function createElasticsearchOutput(config = {}, deps = {}) {
       if (closed) return;
       if (buffer.length >= maxBuffer) {
         buffer.shift(); // drop oldest to bound memory
-        process.stderr.write('[skgateway:siem:es] buffer full — dropped oldest event\n');
+        process.stderr.write('[skgateway:siem:es] buffer full - dropped oldest event\n');
       }
       buffer.push(event);
       startTimer();

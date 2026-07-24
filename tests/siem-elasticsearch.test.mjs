@@ -1,17 +1,17 @@
 /**
- * siem-elasticsearch.test.mjs — Elasticsearch / OpenSearch _bulk output tests.
+ * siem-elasticsearch.test.mjs - Elasticsearch / OpenSearch _bulk output tests.
  *
  * Coverage:
- *   1. Bulk body shape — NDJSON action+doc lines, correct _index, @timestamp,
+ *   1. Bulk body shape - NDJSON action+doc lines, correct _index, @timestamp,
  *      and %DATE% template expansion.
  *   2. Auth header resolution by ENV-VAR NAME (never a literal secret in config).
- *   3. Batching — events buffer and ship to a mocked _bulk endpoint when the
+ *   3. Batching - events buffer and ship to a mocked _bulk endpoint when the
  *      batch size is reached, with the right payload + index.
- *   4. Fail-safe — a network error is swallowed (no throw), the buffer stays
+ *   4. Fail-safe - a network error is swallowed (no throw), the buffer stays
  *      bounded, and write() never blocks or breaks.
- *   5. Disabled by default — no endpoint / enabled:false → a no-op adapter, and
+ *   5. Disabled by default - no endpoint / enabled:false → a no-op adapter, and
  *      the default config carries no ES sink.
- *   6. Config env overrides — SKGATEWAY_ES_* produce an enabled ES sink.
+ *   6. Config env overrides - SKGATEWAY_ES_* produce an enabled ES sink.
  */
 
 import { test } from "node:test";
@@ -173,7 +173,7 @@ test("flush ships a partial batch below batch_size", async () => {
 
 // ─── 4. fail-safe ────────────────────────────────────────────────────────────
 
-test("a network error is swallowed — write never throws, no crash", async () => {
+test("a network error is swallowed - write never throws, no crash", async () => {
   const fetchMock = fakeFetch({ throwErr: new Error("ECONNREFUSED") });
   const out = createElasticsearchOutput(
     { enabled: true, endpoint: "http://es:9200", batch_size: 1 },
@@ -200,7 +200,7 @@ test("a non-2xx _bulk response is swallowed (no throw)", async () => {
   await out.close();
 });
 
-test("buffer is bounded — oldest events drop past max_buffer, no unbounded growth", async () => {
+test("buffer is bounded - oldest events drop past max_buffer, no unbounded growth", async () => {
   // Never resolve the ship so the buffer would grow unless bounded.
   let released;
   const gate = new Promise((r) => { released = r; });

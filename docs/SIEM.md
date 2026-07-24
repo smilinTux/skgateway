@@ -527,7 +527,7 @@ siem:
 Behaviour:
 
 - **Disabled by default.** With no `endpoint` (or `enabled: false`) the adapter
-  is a no-op — nothing is shipped and no socket is opened.
+  is a no-op - nothing is shipped and no socket is opened.
 - **Batching.** Events buffer and flush every `flush_ms` or once `batch_size`
   events accumulate, whichever comes first. Each event becomes one bulk document
   with an added `@timestamp` (copied from `timestamp`) so time-based index
@@ -535,7 +535,7 @@ Behaviour:
 - **Idempotent.** The document `_id` is set to `event_id`, so a retried batch
   never creates duplicate documents.
 - **Fail-safe.** A network error, timeout, or non-2xx `_bulk` response is logged
-  to stderr and the batch is dropped — it never throws into or blocks the
+  to stderr and the batch is dropped - it never throws into or blocks the
   request hot path. A bounded in-memory buffer (`max_buffer`, default 10000)
   drops the oldest events under sustained backpressure.
 
