@@ -194,6 +194,20 @@ identity:
   allow_anonymous: true
   require_agent_id: false
 
+## Per-agent model routing rules (P4.3). Pin a resolved agent identity to a
+## specific model or alias/role, overriding the model the caller asked for. The
+## target is either a concrete model id served by a backend above, or an
+## alias/role the skmodels registry resolves (sk-default, sk-code, ornith-tiny,
+## ...). Agent ids are case-insensitive. Explicit x-sk-context / x-sk-service /
+## x-sk-role request headers still win; only the model field is pinned. Leave
+## per_agent empty (the default) for unchanged routing. NO secrets here, just
+## agent names mapped to model/alias labels.
+routing:
+  per_agent: {}
+    # lumina: sk-default            # Queen routes to the default model
+    # jarvis: qwen/qwen3.5-122b-a10b  # pin an agent to a concrete model
+    # herald: ornith-tiny           # mechanical/aux agent → small non-thinking model
+
 dashboard:
   enabled: true
   refresh_ms: 5000

@@ -117,6 +117,39 @@ const DEFAULT_QUARANTINE_COOLDOWN_MS = 30_000;
  */
 
 // ---------------------------------------------------------------------------
+// Per-agent model routing (card 45509bf5)
+// ---------------------------------------------------------------------------
+
+/**
+ * Normalise a `routing.per_agent` config map into a lowercase-keyed Map of
+ * agent id -> routing target (a concrete model id OR an alias/role that the
+ * skmodels registry resolves, e.g. "sk-default", "ornith-tiny").
+ *
+ * Agent ids are lowercased to match the CapAuth identity layer, which lowercases
+ * every resolved agent_id. Non-string / blank keys or targets are dropped so a
+ * malformed entry can never silently override routing. An absent or empty map =
+ * no rules, and routing behaviour is unchanged.
+ *
+ * @param {object} [routingCfg]  The `routing` config block (accepts per_agent or perAgent).
+ * @returns {Map<string, string>}
+ */
+function buildPerAgentRouting(routingCfg) {
+  const out = new Map();
+  const src = routingCfg && typeof routingCfg === "object"
+    ? (routingCfg.per_agent || routingCfg.perAgent)
+    : null;
+  if (src && typeof src === "object") {
+    for (const [agent, target] of Object.entries(src)) {
+      if (typeof agent === "string" && typeof target === "string" &&
+          agent.trim() && target.trim()) {
+        out.set(agent.trim().toLowerCase(), target.trim());
+      }
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // Glob matching helper
 // ---------------------------------------------------------------------------
 
@@ -793,6 +826,10 @@ export function createRouter(config = {}) {
     }
   }
 
+  // Per-agent model routing rules (card 45509bf5). Maps a resolved agent id to a
+  // pinned model or alias/role. Empty map = no rules (routing unchanged).
+  const perAgentRouting = buildPerAgentRouting(config.routing);
+
   /** @type {Map<string, Backend>} */
   const backends = new Map();
 
@@ -1004,11 +1041,24 @@ export function createRouter(config = {}) {
     return backends.get(id) || null;
   }
 
+  /**
+   * Resolve the per-agent routing target for an agent id (card 45509bf5).
+   * Returns the configured model/alias string when a rule exists, else null.
+   * Lookup is case-insensitive to match the lowercased CapAuth identity.
+   *
+   * @param {string|undefined} agentId
+   * @returns {string|null}
+   */
+  function resolveAgentTarget(agentId) {
+    if (!agentId || perAgentRouting.size === 0) return null;
+    return perAgentRouting.get(String(agentId).trim().toLowerCase()) || null;
+  }
+
   // -------------------------------------------------------------------------
   // Return router interface
   // -------------------------------------------------------------------------
 
-  return { route, getHealth, addBackend, removeBackend, getBackend };
+  return { route, getHealth, addBackend, removeBackend, getBackend, resolveAgentTarget };
 }
 
 // ---------------------------------------------------------------------------
@@ -1161,6 +1211,37 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       // SIEM must never break routing.
     }
   };
+
+  // ── Per-agent model routing rules (card 45509bf5) ──
+  // Map the resolved CapAuth agent identity to a pinned model or alias/role,
+  // overriding the model the caller asked for. This runs BEFORE registry +
+  // backend selection, and only rewrites the target MODEL, so it composes with
+  // everything downstream unchanged: an alias target flows through the registry
+  // resolver (incl. sk-auto difficulty classification), a concrete-model target
+  // flows through normal backend selection, and either way failover + the
+  // dead-alias quarantine below still apply. A pinned target whose backend is
+  // quarantined/down falls back through the normal candidate machinery.
+  //
+  // Explicit per-request registry signals (x-sk-context / x-sk-service /
+  // x-sk-role) are deliberate caller intent and WIN over the agent rule; only
+  // the model field is pinned. No rule for the agent (or none configured) = the
+  // request is untouched and routing behaviour is unchanged.
+  const agentTarget = typeof router.resolveAgentTarget === "function"
+    ? router.resolveAgentTarget(request.agentId)
+    : null;
+  if (agentTarget && !request.context && !request.service && !request.role) {
+    if (request.model !== agentTarget) {
+      console.log(
+        `[router] per-agent route agent=${request.agentId} ` +
+        `model=${request.model || "(none)"}→${agentTarget}`
+      );
+    }
+    request = { ...request, model: agentTarget };
+    // Rewrite the outgoing body model so the upstream (and its logs/metrics)
+    // sees the pinned target. When the target is an alias/role the registry
+    // block below re-rewrites the body to the resolved concrete model.
+    body = rewriteBodyModel(body, agentTarget);
+  }
 
   // ── FRONT of backend selection: skmodels registry role/context routing ──
   // If the request opts into logical routing (model="sk-*" or an x-sk-*
