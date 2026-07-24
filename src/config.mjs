@@ -248,6 +248,14 @@ function deepClone(obj) {
  * | SKGATEWAY_SYSLOG_PROTOCOL| syslog transport (udp/tcp/tls/unix) |
  * | SKGATEWAY_SYSLOG_FACILITY| syslog facility (0-23)    |
  * | SKGATEWAY_SYSLOG_FORMAT  | syslog MSG format (cef/json) |
+ * | SKGATEWAY_ES_ENABLED     | siem elasticsearch output (on/off) |
+ * | SKGATEWAY_ES_ENDPOINT    | ES/OpenSearch base URL    |
+ * | SKGATEWAY_ES_INDEX       | ES index name (may use %DATE%) |
+ * | SKGATEWAY_ES_BATCH_SIZE  | ES bulk batch size        |
+ * | SKGATEWAY_ES_FLUSH_MS    | ES flush interval (ms)    |
+ * | SKGATEWAY_ES_API_KEY_ENV | NAME of env var holding an ES API key |
+ * | SKGATEWAY_ES_BEARER_TOKEN_ENV | NAME of env var holding a bearer token |
+ * | SKGATEWAY_ES_AUTH_HEADER_ENV  | NAME of env var holding a raw Authorization value |
  *
  * @param {object} cfg  Mutable merged config object.
  * @returns {object} Same object, mutated in place.
@@ -264,6 +272,7 @@ function applyEnvOverrides(cfg) {
   if (e.SKGATEWAY_RETENTION_DAYS) cfg.metrics.retention_days = Number(e.SKGATEWAY_RETENTION_DAYS);
 
   applySyslogEnv(cfg, e);
+  applyElasticsearchEnv(cfg, e);
 
   return cfg;
 }
@@ -308,6 +317,60 @@ function applySyslogEnv(cfg, e) {
   if (e.SKGATEWAY_SYSLOG_PROTOCOL !== undefined) sink.protocol = e.SKGATEWAY_SYSLOG_PROTOCOL;
   if (e.SKGATEWAY_SYSLOG_FACILITY !== undefined) sink.facility = Number(e.SKGATEWAY_SYSLOG_FACILITY);
   if (e.SKGATEWAY_SYSLOG_FORMAT   !== undefined) sink.format   = e.SKGATEWAY_SYSLOG_FORMAT;
+}
+
+/**
+ * Merge SKGATEWAY_ES_* environment variables into the SIEM Elasticsearch /
+ * OpenSearch output.
+ *
+ * The ES sink is DISABLED by default: it only becomes active when either a
+ * `type: elasticsearch` (or `opensearch`) output is present in the YAML with
+ * `enabled: true` and an endpoint, or `SKGATEWAY_ES_ENABLED` is set truthy with
+ * an endpoint. Env values update the first existing ES/OpenSearch output
+ * (creating one if none exists) so operators can turn it on without editing the
+ * YAML.
+ *
+ * NOTE: `SKGATEWAY_ES_API_KEY_ENV` / `SKGATEWAY_ES_BEARER_TOKEN_ENV` /
+ * `SKGATEWAY_ES_AUTH_HEADER_ENV` carry the NAME of another env var that holds the
+ * secret, never the secret itself. This keeps credentials out of config.
+ *
+ * @param {object} cfg
+ * @param {Record<string,string|undefined>} e  process.env
+ */
+function applyElasticsearchEnv(cfg, e) {
+  const touched =
+    e.SKGATEWAY_ES_ENABLED         !== undefined ||
+    e.SKGATEWAY_ES_ENDPOINT        !== undefined ||
+    e.SKGATEWAY_ES_INDEX           !== undefined ||
+    e.SKGATEWAY_ES_BATCH_SIZE      !== undefined ||
+    e.SKGATEWAY_ES_FLUSH_MS        !== undefined ||
+    e.SKGATEWAY_ES_API_KEY_ENV     !== undefined ||
+    e.SKGATEWAY_ES_BEARER_TOKEN_ENV !== undefined ||
+    e.SKGATEWAY_ES_AUTH_HEADER_ENV !== undefined;
+
+  if (!touched) return;
+
+  cfg.siem = cfg.siem ?? {};
+  cfg.siem.outputs = Array.isArray(cfg.siem.outputs) ? cfg.siem.outputs : [];
+
+  let sink = cfg.siem.outputs.find(
+    (o) => o && (o.type === 'elasticsearch' || o.type === 'opensearch'),
+  );
+  if (!sink) {
+    sink = { type: 'elasticsearch' };
+    cfg.siem.outputs.push(sink);
+  }
+
+  if (e.SKGATEWAY_ES_ENABLED !== undefined) {
+    sink.enabled = /^(1|true|yes|on)$/i.test(e.SKGATEWAY_ES_ENABLED);
+  }
+  if (e.SKGATEWAY_ES_ENDPOINT         !== undefined) sink.endpoint         = e.SKGATEWAY_ES_ENDPOINT;
+  if (e.SKGATEWAY_ES_INDEX            !== undefined) sink.index            = e.SKGATEWAY_ES_INDEX;
+  if (e.SKGATEWAY_ES_BATCH_SIZE       !== undefined) sink.batch_size       = Number(e.SKGATEWAY_ES_BATCH_SIZE);
+  if (e.SKGATEWAY_ES_FLUSH_MS         !== undefined) sink.flush_ms         = Number(e.SKGATEWAY_ES_FLUSH_MS);
+  if (e.SKGATEWAY_ES_API_KEY_ENV      !== undefined) sink.api_key_env      = e.SKGATEWAY_ES_API_KEY_ENV;
+  if (e.SKGATEWAY_ES_BEARER_TOKEN_ENV !== undefined) sink.bearer_token_env = e.SKGATEWAY_ES_BEARER_TOKEN_ENV;
+  if (e.SKGATEWAY_ES_AUTH_HEADER_ENV  !== undefined) sink.auth_header_env  = e.SKGATEWAY_ES_AUTH_HEADER_ENV;
 }
 
 // ─── validation ───────────────────────────────────────────────────────────────
