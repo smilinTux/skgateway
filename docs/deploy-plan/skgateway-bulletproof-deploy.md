@@ -76,6 +76,43 @@ But it is not bulletproof today:
 
 Parallelization summary: P0.1, P0.2, P0.3, P1.1 can all start immediately in parallel. P1.2 waits on P1.1. P2.1 and P2.3 can start immediately; P2.2 waits on P2.1. P3.1 can start immediately; P3.2 waits on P0.2. P3.3 and P4.1 are independent.
 
+## 6. Resolution log
+
+### P2.1 — SIEM hook wired into the live request path (task 5, card 0dd0df6a) — DONE
+
+`routeAndSend()` (`src/proxy/router.mjs`) now takes an optional best-effort
+`siem` hook (8th arg) and `src/index.mjs` passes the existing `siemHook` into
+it, so `logs/audit.jsonl` records again on every live request. Structured
+GatewayEvents (`src/siem/events.mjs` shape, so the CEF/syslog formatters map
+cleanly) are emitted at each lifecycle point, all sharing one per-request
+`request_id`:
+
+- `auth` — agent identity + backend + resolved auth method/decision
+- `request` — path, method, candidate count, body bytes
+- `failover` — from/to backend + reason (also still logged to stdout)
+- `error` — upstream 5xx (per failed attempt), 4xx client errors, pool-capacity 503
+- `response` — status, latency_ms, queue_wait_ms, failover flag, best-effort token usage
+
+The hook is guarded and fully swallowed, so a throwing or slow SIEM consumer can
+never block or break routing (covered by `tests/siem-live-hook.test.mjs`).
+
+**Wire-or-descope decisions for the other `proxyConfig` layers** (they are wired
+only into the alternate `core.mjs`/`handleRequest` proxy, which the live
+`routeAndSend` entrypoint does not use):
+
+- sanitizer limits (`max_body_bytes`/`max_system_bytes`) — **descoped** from the
+  live path; tracked for entrypoint unification (task 12 / P4.1).
+- `model_limits` (per-model body/system caps) — **descoped**, same as above.
+- tool budgets (`tools.max_budget`/`call_limit`, tool reducer) — **descoped**, same.
+- identity/CapAuth verification — **descoped**; no identity enforcement on the
+  live path yet.
+- policy engine (allow/deny/transform/rate_limit) — **descoped**; planned.
+- classifiers — only the sk-auto **difficulty** classifier runs on the live path
+  (for routing); jailbreak/PII/intent classifiers are **descoped**.
+
+README `### Live request path (what actually runs today)` documents the same
+reality so it no longer overstates the live data path.
+
 ## 5. Task List
 
 1. **skgateway: fix metrics collector double config dereference** (critical). One-line fix in `src/metrics/collector.mjs` plus regression test. No deps.

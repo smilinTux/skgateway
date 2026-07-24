@@ -326,6 +326,41 @@ sequenceDiagram
     SI-->>C: Final response
 ```
 
+### Live request path (what actually runs today)
+
+The sequence above is the **full designed pipeline**. The production entrypoint
+`src/index.mjs` buffers the request body and calls `routeAndSend()`
+(`src/proxy/router.mjs`) directly — it does **not** go through
+`core.mjs`/`handleRequest`. So the layers that are actually invoked on a live
+request today are:
+
+- **Router** — model-name + registry role/context routing, sk-auto difficulty
+  classification, priority failover, per-backend connection pooling, health
+  tracking. ✅ live
+- **SIEM event bus** — `routeAndSend` emits structured `auth`, `request`,
+  `failover`, `error`, and `response` events (status + latency + best-effort
+  token usage), correlated by a per-request `request_id`, through the
+  best-effort hook that appends to `logs/audit.jsonl`, forwards warn+ events to
+  the skcapstone bus, and ships to any enabled syslog output. ✅ live
+- **Metrics** — per-request duration/status/agent/model/backend recorded. ✅ live
+
+The remaining layers are **implemented but wired only into the alternate
+`core.mjs`/`handleRequest` proxy** (used for embedded/library callers and the
+test suite), and are **descoped from the live `routeAndSend` path** until a
+dedicated card unifies the two entrypoints:
+
+| Layer | Status on live path | Decision |
+|---|---|---|
+| Content sanitizer (`sanitizer.mjs`, `max_body_bytes`/`max_system_bytes`) | not invoked | **descoped** — lives in `handleRequest`; unify entrypoints in a follow-up |
+| `model_limits` (per-model body/system caps) | not invoked | **descoped** — same as above |
+| Tool budgets (`tools.max_budget` / `call_limit`, tool reducer) | not invoked | **descoped** — same as above |
+| Identity / CapAuth verification | not invoked | **descoped** — no identity enforcement on the live path yet |
+| Policy engine (allow/deny/transform/rate_limit) | not invoked | **descoped** — planned, not on live path |
+| Prompt classifiers (jailbreak/PII/intent) | difficulty classifier only (sk-auto routing) | **partial** — risk/PII classifiers descoped on live path |
+
+Only the SIEM wiring is addressed by this change; the descoped layers are
+tracked separately. See `docs/deploy-plan/skgateway-bulletproof-deploy.md`.
+
 ---
 
 ## SOC Dashboard
