@@ -164,6 +164,17 @@ const DEFAULTS = {
     cooldown_ms: 30_000,
   },
 
+  // Per-agent model routing rules (SKGateway P4.3, card 45509bf5). Maps a
+  // resolved agent identity to a pinned routing target that overrides the model
+  // the caller asked for. The target is either a concrete model id or an
+  // alias/role the skmodels registry resolves (e.g. "sk-default", "ornith-tiny").
+  // Explicit x-sk-context / x-sk-service / x-sk-role headers still win; only the
+  // model field is pinned. Empty map = no rules, routing behaviour unchanged.
+  //   per_agent: { <agent-id>: <model-or-alias> } (agent ids are case-insensitive)
+  routing: {
+    per_agent: {},
+  },
+
   // CapAuth agent-identity (SKGateway P2.1). Every /v1/* request is resolved to
   // a verified agent identity used for routing / metrics / SIEM audit.
   //   allow_anonymous     — resolve unidentified callers to "anonymous" (default true)
