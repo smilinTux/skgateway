@@ -237,6 +237,7 @@ export function createDashboardServer({ port = 18781, bind = '0.0.0.0', metrics,
       totalCostUsd:     0,
       activeSessions:   {},
       latency:          {},
+      anomalies:        [],
     };
     return {
       ...base,

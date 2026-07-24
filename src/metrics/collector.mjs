@@ -7,7 +7,9 @@
  *    agent_id / model / backend / session_id / hour / day.
  * 2. Cost Calculation — multiply token counts by per-model pricing from config.
  * 3. Latency Tracking — record request duration with streaming P50/P95/P99
- *    using the P²-algorithm (no unbounded history).
+ *    using the P²-algorithm (no unbounded history). Per backend/model a
+ *    Welford running mean+variance drives 3-sigma anomaly detection, and a
+ *    bounded ring buffers the most recent anomalies for the /status surface.
  * 4. SQLite Storage   — batch-write every 5 s or 100 events; auto-purge old rows.
  * 5. In-Memory Counters — rolling 5-minute window for the live dashboard.
  *
@@ -43,6 +45,11 @@ const FLUSH_BATCH_SIZE   = 100;     // flush early when the buffer reaches this
 const WINDOW_MS          = 5 * 60 * 1000;  // 5-minute in-memory rolling window
 const PURGE_INTERVAL_MS  = 6 * 60 * 60 * 1000; // purge old rows every 6 h
 
+// ─── anomaly detection tunables ────────────────────────────────────────────────
+const ANOMALY_SIGMA       = 3;   // flag samples ≥ this many σ from the running mean
+const ANOMALY_MIN_SAMPLES = 30;  // require a stable baseline before flagging
+const ANOMALY_RING_SIZE   = 50;  // bounded history of recent anomalies for /status
+
 // ─── P² percentile estimator ─────────────────────────────────────────────────
 
 /**
@@ -59,21 +66,26 @@ class P2Estimator {
   constructor(p) {
     this.p = p;
     this._n = 0;                    // total observations
-    this._q  = [0, 0, 0, 0, 0];    // height (quantile estimate) at 5 markers
-    this._dn = [0, p/2, p, (1+p)/2, 1];  // desired positions
-    this._np = [1, 2, 3, 4, 5];    // actual marker positions (integers)
+    this._q  = [0, 0, 0, 0, 0];    // marker heights (quantile estimates)
+    // Desired-position increments per observation: n'_i grows by _inc[i] each step.
+    this._inc = [0, p / 2, p, (1 + p) / 2, 1];
+    this._np  = [1, 2, 3, 4, 5];   // actual marker positions
+    // Desired marker positions; seeded for n=5 as n'_i = 1 + 4·_inc[i].
+    this._npd = [1, 1 + 2 * p, 1 + 4 * p, 3 + 2 * p, 5];
   }
 
   /** Add one sample. @param {number} x */
   update(x) {
-    this._n++;
-    if (this._n <= 5) {
-      this._q[this._n - 1] = x;
+    // Initialisation phase: buffer the first 5 samples, then sort into markers.
+    if (this._n < 5) {
+      this._q[this._n] = x;
+      this._n++;
       if (this._n === 5) this._q.sort((a, b) => a - b);
       return;
     }
 
-    // Find the cell k where x falls
+    // Step B.1 — find the cell k the new sample falls into, extending the
+    // min/max markers if it lies outside the current range.
     let k;
     if (x < this._q[0]) {
       this._q[0] = x; k = 0;
@@ -89,32 +101,29 @@ class P2Estimator {
       this._q[4] = x; k = 3;
     }
 
-    // Increment positions of markers k+1 … 4
+    // Step B.2 — increment actual positions of markers above the cell, and
+    // advance every marker's desired position by its per-step increment.
     for (let i = k + 1; i < 5; i++) this._np[i]++;
+    for (let i = 0; i < 5; i++) this._npd[i] += this._inc[i];
 
-    // Update desired positions
-    const n = this._n;
-    for (let i = 0; i < 5; i++) {
-      this._dn[i] = 1 + (i * this.p * (n - 1)) / 4;
-    }
-    // Recalculate desired: dn = [1, 1+2p, 1+4p, 3+2p, n] normalised version
-    this._dn = [1, 1 + 2 * this.p, 1 + 4 * this.p, 3 + 2 * this.p, n];
-
-    // Adjust heights of markers 1..3
+    // Step B.3 — adjust the three interior marker heights if they have drifted
+    // a full position away from their desired location.
     for (let i = 1; i <= 3; i++) {
-      const d = this._dn[i] - this._np[i];
-      if ((d >= 1 && this._np[i + 1] - this._np[i] > 1) ||
-          (d <= -1 && this._np[i - 1] - this._np[i] < -1)) {
-        const sign = d > 0 ? 1 : -1;
-        const qp = this._parabolic(i, sign);
+      const d0 = this._npd[i] - this._np[i];
+      if ((d0 >= 1 && this._np[i + 1] - this._np[i] > 1) ||
+          (d0 <= -1 && this._np[i - 1] - this._np[i] < -1)) {
+        const d = d0 > 0 ? 1 : -1;
+        const qp = this._parabolic(i, d);
         if (this._q[i - 1] < qp && qp < this._q[i + 1]) {
           this._q[i] = qp;
         } else {
-          this._q[i] = this._linear(i, sign);
+          this._q[i] = this._linear(i, d);
         }
-        this._np[i] += sign;
+        this._np[i] += d;
       }
     }
+
+    this._n++;
   }
 
   /** @param {number} i @param {number} d */
@@ -488,8 +497,12 @@ export function createMetricsCollector(config) {
   /** @type {Map<string, { p50: P2Estimator, p95: P2Estimator, p99: P2Estimator }>} */
   const latencyEstimators = new Map();
 
+  function latencyKey(backend, model) {
+    return `${backend ?? '_'}:${model ?? '_'}`;
+  }
+
   function getEstimator(backend, model) {
-    const key = `${backend ?? '_'}:${model ?? '_'}`;
+    const key = latencyKey(backend, model);
     if (!latencyEstimators.has(key)) {
       latencyEstimators.set(key, {
         p50: new P2Estimator(0.50),
@@ -498,6 +511,67 @@ export function createMetricsCollector(config) {
       });
     }
     return latencyEstimators.get(key);
+  }
+
+  // Per-backend/per-model Welford running mean+variance for 3-sigma anomaly
+  // detection. O(1) state per key — no sample history is retained.
+  // Key: `${backend}:${model}` → { n, mean, m2, anomalies }
+  /** @type {Map<string, { n: number, mean: number, m2: number, anomalies: number }>} */
+  const latencyStats = new Map();
+
+  function getRunStat(key) {
+    let s = latencyStats.get(key);
+    if (!s) { s = { n: 0, mean: 0, m2: 0, anomalies: 0 }; latencyStats.set(key, s); }
+    return s;
+  }
+
+  // Bounded ring of the most recent anomaly records (newest last).
+  /** @type {Array<{ backend: string|null, model: string|null, key: string,
+   *   latencyMs: number, mean: number, stddev: number, sigma: number, ts: number }>} */
+  const recentAnomalies = [];
+
+  /**
+   * Fold a new latency sample into the per-key running stats and, if it deviates
+   * ≥ ANOMALY_SIGMA from the established baseline, record an anomaly.
+   *
+   * The deviation is measured against the baseline *before* the new sample is
+   * folded in, so a single spike is flagged even though it would otherwise
+   * inflate the variance and mask itself.
+   *
+   * @param {string}      key      backend:model key
+   * @param {string|null} backend
+   * @param {string|null} model
+   * @param {number}      x        latency sample (ms)
+   * @param {number}      ts       Unix ms
+   * @returns {object|null} the anomaly record if flagged, else null
+   */
+  function recordLatencyStat(key, backend, model, x, ts) {
+    const rs = getRunStat(key);
+    let anomaly = null;
+
+    if (rs.n >= ANOMALY_MIN_SAMPLES) {
+      const stddev = Math.sqrt(rs.m2 / (rs.n - 1));
+      if (stddev > 0) {
+        const sigma = Math.abs(x - rs.mean) / stddev;
+        if (sigma >= ANOMALY_SIGMA) {
+          rs.anomalies++;
+          anomaly = {
+            backend: backend ?? null, model: model ?? null, key,
+            latencyMs: x, mean: rs.mean, stddev, sigma, ts,
+          };
+          recentAnomalies.push(anomaly);
+          if (recentAnomalies.length > ANOMALY_RING_SIZE) recentAnomalies.shift();
+        }
+      }
+    }
+
+    // Welford online update.
+    rs.n++;
+    const delta = x - rs.mean;
+    rs.mean += delta / rs.n;
+    rs.m2   += delta * (x - rs.mean);
+
+    return anomaly;
   }
 
   // ── pending requests map ─────────────────────────────────────────────────
@@ -565,6 +639,8 @@ export function createMetricsCollector(config) {
    * @param {string}  [meta.model]      Override model
    * @param {string}  [meta.backend]    Override backend
    * @param {string}  [meta.sessionId]  Override sessionId
+   * @returns {object|null} anomaly record if this request was a ≥3-sigma latency
+   *   outlier for its backend/model, else null.
    */
   function recordResponse({
     reqId,
@@ -598,11 +674,12 @@ export function createMetricsCollector(config) {
       counters.recentErrors.add();
     }
 
-    // Latency estimators
+    // Latency estimators (percentiles) + running stats (3-sigma anomaly check)
     const est = getEstimator(backend, model);
     est.p50.update(total);
     est.p95.update(total);
     est.p99.update(total);
+    const anomaly = recordLatencyStat(latencyKey(backend, model), backend ?? null, model ?? null, total, ts);
 
     // Token extraction & cost
     let tokenRow = null;
@@ -654,6 +731,10 @@ export function createMetricsCollector(config) {
       });
       maybeFlush();
     }
+
+    // Return the anomaly record (or null) so callers (e.g. the router) can emit
+    // a SIEM anomaly event. Purely additive — legacy callers ignore it.
+    return anomaly;
   }
 
   // ── query helpers ─────────────────────────────────────────────────────────
@@ -672,16 +753,25 @@ export function createMetricsCollector(config) {
    *   totalOutputTokens: number,
    *   totalCostUsd: number,
    *   activeSessions: Record<string, number>,
-   *   latency: Record<string, { p50: number, p95: number, p99: number }>,
+   *   latency: Record<string, { p50: number, p95: number, p99: number,
+   *     mean: number, stddev: number, count: number, anomalies: number }>,
+   *   anomalies: object[],
    * }}
    */
   function getStats() {
     const latency = {};
     for (const [key, est] of latencyEstimators) {
+      const rs = latencyStats.get(key);
+      const n = rs?.n ?? 0;
+      const stddev = n > 1 ? Math.sqrt(rs.m2 / (n - 1)) : 0;
       latency[key] = {
         p50: Math.round(est.p50.value),
         p95: Math.round(est.p95.value),
         p99: Math.round(est.p99.value),
+        mean:      Math.round(rs?.mean ?? 0),
+        stddev:    Math.round(stddev),
+        count:     n,
+        anomalies: rs?.anomalies ?? 0,
       };
     }
 
@@ -702,7 +792,21 @@ export function createMetricsCollector(config) {
       totalCostUsd:     counters.totalCostUsd,
       activeSessions,
       latency,
+      anomalies:        recentAnomalies.slice(-ANOMALY_RING_SIZE).map(a => ({ ...a })),
     };
+  }
+
+  /**
+   * Return the most recent latency anomalies (newest last), bounded to the
+   * in-memory ring. Each record carries the offending backend/model, the
+   * observed latency, and the baseline mean/stddev/sigma it breached.
+   *
+   * @param {object} [opts]
+   * @param {number} [opts.limit=ANOMALY_RING_SIZE]  Max records to return.
+   * @returns {object[]}
+   */
+  function getAnomalies({ limit = ANOMALY_RING_SIZE } = {}) {
+    return recentAnomalies.slice(-limit).map(a => ({ ...a }));
   }
 
   /**
@@ -822,6 +926,7 @@ export function createMetricsCollector(config) {
     recordRequest,
     recordResponse,
     getStats,
+    getAnomalies,
     getTokenUsage,
     getCosts,
     close,
