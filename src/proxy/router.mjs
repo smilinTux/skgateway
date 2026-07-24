@@ -58,6 +58,25 @@ const DEFAULT_COOLDOWN_MS = 60_000;
 /** Timeout (ms) used for liveness probe requests during recovery. */
 const PROBE_TIMEOUT_MS = 8_000;
 
+/**
+ * Dead-alias auto-quarantine (card 2d1f3a2c).
+ *
+ * The error-rate health machine (DEGRADED/DOWN above) reacts to the fraction of
+ * failures across a 100-request window. That is slow to fire for a freshly-dead
+ * alias whose prior successes still dilute the window, and a backend can sit in
+ * "degraded" (still selectable) while failing every call. The quarantine layer
+ * is a complementary, faster CONSECUTIVE-failure trip: N failures in a row take
+ * the alias fully OUT of rotation (routing skips it) for a cooldown, after which
+ * a single probe is admitted; one success re-admits it. Quarantine and recovery
+ * both emit a SIEM/log event. Threshold <= 0 disables the layer.
+ */
+
+/** Consecutive upstream failures before an alias is quarantined. 0 = disabled. */
+const DEFAULT_QUARANTINE_THRESHOLD = 5;
+
+/** Cooldown (ms) a quarantined alias stays out of rotation before a re-probe. */
+const DEFAULT_QUARANTINE_COOLDOWN_MS = 30_000;
+
 // ---------------------------------------------------------------------------
 // Type documentation (JSDoc only — no TypeScript)
 // ---------------------------------------------------------------------------
@@ -286,6 +305,16 @@ export class Backend {
     // instead of hanging the request. See sendUpstream(timeoutMs).
     this.timeout_ms = typeof config.timeout_ms === "number" ? config.timeout_ms : 0;
 
+    // Dead-alias auto-quarantine tunables (card 2d1f3a2c). Per-backend config
+    // overrides the router-level default which overrides the module default.
+    // threshold <= 0 disables quarantine for this backend.
+    this.quarantine_threshold = Number.isInteger(config.quarantine_threshold)
+      ? config.quarantine_threshold
+      : DEFAULT_QUARANTINE_THRESHOLD;
+    this.quarantine_cooldown_ms = typeof config.quarantine_cooldown_ms === "number"
+      ? config.quarantine_cooldown_ms
+      : DEFAULT_QUARANTINE_COOLDOWN_MS;
+
     // Auth credentials
     this._api_key = config.api_key || null;
     this._api_key_env = config.api_key_env || null;
@@ -311,6 +340,14 @@ export class Backend {
     this._window = [];
     this._windowHead = 0;
     this._windowErrors = 0; // count of `false` in window
+
+    // ----- Quarantine state (consecutive-failure trip; independent of window) -----
+    /** @type {number} consecutive failures since the last success */
+    this._consecutiveFailures = 0;
+    /** @type {boolean} true = out of rotation (skipped by selection) */
+    this._quarantined = false;
+    /** @type {number} epoch ms (when quarantine started / cooldown last re-armed) */
+    this._quarantinedSince = 0;
 
     this._totalRequests = 0;
     this._totalErrors = 0;
@@ -371,6 +408,8 @@ export class Backend {
       lastCheck: this._lastCheck,
       totalRequests: this._totalRequests,
       totalErrors: this._totalErrors,
+      quarantined: this._quarantined,
+      consecutiveFailures: this._consecutiveFailures,
     };
   }
 
@@ -382,6 +421,17 @@ export class Backend {
    * @returns {boolean}
    */
   isAvailable() {
+    // Quarantine takes precedence over the error-rate status: a quarantined
+    // alias is fully out of rotation until its cooldown elapses. After the
+    // cooldown a single probe is admitted (quarantine stays armed until a
+    // success in recordOutcome() clears it, or a failure re-arms the cooldown).
+    if (this._quarantined) {
+      const elapsed = Date.now() - this._quarantinedSince;
+      // In cooldown → skip. Cooldown elapsed → admit exactly this probe,
+      // authoritatively (independent of the error-rate status/down cooldown).
+      return elapsed >= this.quarantine_cooldown_ms;
+    }
+
     if (this._status === "up" || this._status === "degraded") return true;
     // Down — check if cooldown has elapsed
     if (this._status === "down") {
@@ -401,6 +451,10 @@ export class Backend {
    *
    * @param {boolean} success   true if the request completed without error (non-5xx)
    * @param {number}  latencyMs round-trip time in milliseconds
+   * @returns {?{transition: 'quarantined'|'readmitted', consecutiveFailures: number, threshold: number}}
+   *   A quarantine transition descriptor when this outcome flipped the alias in
+   *   or out of quarantine, else null. The caller (routeAndSend) emits the
+   *   corresponding SIEM/log event; the Backend stays free of SIEM coupling.
    */
   recordOutcome(success, latencyMs) {
     this._lastCheck = Date.now();
@@ -421,6 +475,64 @@ export class Backend {
     }
 
     this._evaluateStatus();
+    return this._evaluateQuarantine(success);
+  }
+
+  /**
+   * Consecutive-failure quarantine transition (card 2d1f3a2c). Independent of
+   * the error-rate status machine in _evaluateStatus(). Returns a transition
+   * descriptor on a quarantine/re-admit flip, else null.
+   *
+   * @param {boolean} success
+   * @returns {?{transition: 'quarantined'|'readmitted', consecutiveFailures: number, threshold: number}}
+   */
+  _evaluateQuarantine(success) {
+    if (this.quarantine_threshold <= 0) return null; // disabled
+
+    if (success) {
+      this._consecutiveFailures = 0;
+      if (this._quarantined) {
+        // A probe (admitted after cooldown) succeeded, re-admit to rotation.
+        // Also clear the error-rate window so a stale burst of failures cannot
+        // immediately re-mark the recovered alias as DOWN and undo the re-admit;
+        // the successful probe is authoritative proof of liveness.
+        this._quarantined = false;
+        this._quarantinedSince = 0;
+        this._window = [];
+        this._windowHead = 0;
+        this._windowErrors = 0;
+        this._status = "up";
+        this._downSince = 0;
+        console.log(`[router] backend=${this.id} probe OK, READMITTED from quarantine`);
+        return { transition: "readmitted", consecutiveFailures: 0, threshold: this.quarantine_threshold };
+      }
+      return null;
+    }
+
+    // Failure
+    this._consecutiveFailures++;
+
+    if (this._quarantined) {
+      // Probe (or an in-flight overlap) failed, stay quarantined, re-arm cooldown.
+      this._quarantinedSince = Date.now();
+      return null;
+    }
+
+    if (this._consecutiveFailures >= this.quarantine_threshold) {
+      this._quarantined = true;
+      this._quarantinedSince = Date.now();
+      console.warn(
+        `[router] backend=${this.id} consecutive_failures=${this._consecutiveFailures}` +
+        ` >= ${this.quarantine_threshold}, QUARANTINED (cooldown=${this.quarantine_cooldown_ms}ms)`
+      );
+      return {
+        transition: "quarantined",
+        consecutiveFailures: this._consecutiveFailures,
+        threshold: this.quarantine_threshold,
+      };
+    }
+
+    return null;
   }
 
   // -------------------------------------------------------------------------
@@ -667,13 +779,27 @@ export function createRouter(config = {}) {
   const failoverEnabled = config.failover !== false;
   const siemLog = config.siem_log !== false;
 
+  // Router-level quarantine defaults (card 2d1f3a2c). Applied to every backend
+  // that does not set its own quarantine_threshold / quarantine_cooldown_ms, so
+  // a single config.quarantine block tunes the whole fleet. Per-backend values
+  // still win (they are spread AFTER these defaults below).
+  const qDefaults = {};
+  if (config.quarantine && typeof config.quarantine === "object") {
+    if (Number.isInteger(config.quarantine.threshold)) {
+      qDefaults.quarantine_threshold = config.quarantine.threshold;
+    }
+    if (typeof config.quarantine.cooldown_ms === "number") {
+      qDefaults.quarantine_cooldown_ms = config.quarantine.cooldown_ms;
+    }
+  }
+
   /** @type {Map<string, Backend>} */
   const backends = new Map();
 
   // Populate initial registry from config
   if (config.backends && typeof config.backends === "object") {
     for (const [id, cfg] of Object.entries(config.backends)) {
-      backends.set(id, new Backend({ id, ...cfg }));
+      backends.set(id, new Backend({ id, ...qDefaults, ...cfg }));
     }
   }
 
@@ -847,7 +973,7 @@ export function createRouter(config = {}) {
    */
   function addBackend(cfg) {
     if (!cfg.id) throw new Error("[router] addBackend: cfg.id is required");
-    backends.set(cfg.id, new Backend(cfg));
+    backends.set(cfg.id, new Backend({ ...qDefaults, ...cfg }));
     console.log(
       `[router] registered backend=${cfg.id} url=${cfg.url} ` +
       `priority=${cfg.priority} models=[${cfg.models?.join(", ")}]`
@@ -1267,7 +1393,33 @@ export async function routeAndSend(router, request, upstreamPath, method, client
 
     const latencyMs = Date.now() - queueStart;
     const success = res.status < 500;
-    backend.recordOutcome(success, latencyMs);
+    const qTransition = backend.recordOutcome(success, latencyMs);
+
+    // Dead-alias auto-quarantine transitions (card 2d1f3a2c). Mirror the
+    // failover pattern: a stdout JSON line (always) plus a structured SIEM
+    // event via the shared emitter (best-effort). Quarantine removes the alias
+    // from rotation; re-admit returns it once a probe succeeds.
+    if (qTransition) {
+      const isQ = qTransition.transition === "quarantined";
+      process.stdout.write(JSON.stringify({
+        ts: new Date().toISOString(),
+        event: isQ ? "backend_quarantined" : "backend_readmitted",
+        source: "router",
+        backend: backendId,
+        model: request.model,
+        consecutive_failures: qTransition.consecutiveFailures,
+        threshold: qTransition.threshold,
+      }) + "\n");
+      emitSiem("anomaly", {
+        type: isQ ? "backend_quarantine" : "backend_recovery",
+        backend: backendId,
+        consecutive_failures: qTransition.consecutiveFailures,
+        threshold: qTransition.threshold,
+      }, {
+        backend: backendId,
+        severity: isQ ? "warning" : "info",
+      });
+    }
 
     lastResult = { ...res, backendId, failover: didFailover, queueWaitMs };
 
