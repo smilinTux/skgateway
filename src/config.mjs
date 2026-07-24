@@ -152,6 +152,18 @@ const DEFAULTS = {
     refresh_ms: 5_000,
   },
 
+  // Dead-alias auto-quarantine (SKGateway card 2d1f3a2c). Complements the
+  // router's error-rate health machine + SPOF failover with a faster
+  // CONSECUTIVE-failure trip: a backend alias that fails `threshold` requests in
+  // a row is pulled OUT of rotation for `cooldown_ms`, after which one probe is
+  // admitted; a success re-admits it. Quarantine + re-admit emit SIEM events.
+  // Applied as the fleet-wide default; per-backend `quarantine_threshold` /
+  // `quarantine_cooldown_ms` override it. threshold 0 disables the layer.
+  quarantine: {
+    threshold: 5,
+    cooldown_ms: 30_000,
+  },
+
   // CapAuth agent-identity (SKGateway P2.1). Every /v1/* request is resolved to
   // a verified agent identity used for routing / metrics / SIEM audit.
   //   allow_anonymous     — resolve unidentified callers to "anonymous" (default true)

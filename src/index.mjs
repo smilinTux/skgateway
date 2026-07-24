@@ -42,7 +42,7 @@ for (const [id, b] of Object.entries(config.backends || {})) {
     _routerBackends[id].credentials_file = b.credentials_path;
   }
 }
-const router = createRouter({ backends: _routerBackends });
+const router = createRouter({ backends: _routerBackends, quarantine: config.quarantine });
 
 // Initialize connection pool with per-backend limits from config
 const poolConfig = {
