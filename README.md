@@ -9,7 +9,7 @@
   ╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝  ╚═╝   ╚══════╝ ╚══╝╚══╝ ╚═╝  ╚═╝   ╚═╝
 ```
 
-**Enterprise AI Inference Proxy — BlueCoat for AI**
+**Enterprise AI Inference Proxy - BlueCoat for AI**
 
 ![Version](https://img.shields.io/badge/version-0.1.0-blue)
 ![Node](https://img.shields.io/badge/node-%3E%3D20.0.0-green)
@@ -19,9 +19,9 @@
 
 ## What is SKGateway?
 
-SKGateway is a transparent, auditing proxy that sits between any AI client and any LLM backend — the same idea as BlueCoat/Zscaler for web traffic, applied to AI inference. Every prompt entering and every token leaving your infrastructure passes through SKGateway's identity verification, policy engine, prompt classifier, and SIEM event bus before reaching the model.
+SKGateway is a transparent, auditing proxy that sits between any AI client and any LLM backend - the same idea as BlueCoat/Zscaler for web traffic, applied to AI inference. Every prompt entering and every token leaving your infrastructure passes through SKGateway's identity verification, policy engine, prompt classifier, and SIEM event bus before reaching the model.
 
-Beyond raw proxying, SKGateway delivers enterprise SOC/SIEM capabilities that most AI deployments bolt on as an afterthought: per-agent rate limiting, cost accounting, DLP/PII scanning, jailbreak detection, and a real-time SOC dashboard styled for an OLED command center. It is sovereign infrastructure — no third-party telemetry, no cloud dependency, your data stays in your logs.
+Beyond raw proxying, SKGateway delivers enterprise SOC/SIEM capabilities that most AI deployments bolt on as an afterthought: per-agent rate limiting, cost accounting, DLP/PII scanning, jailbreak detection, and a real-time SOC dashboard styled for an OLED command center. It is sovereign infrastructure - no third-party telemetry, no cloud dependency, your data stays in your logs.
 
 SKGateway is a first-class pillar of the [SKCapstone](https://github.com/smilinTux/skcapstone) sovereign agent framework, serving as the network chokepoint for Lumina and the full agent swarm.
 
@@ -70,63 +70,63 @@ graph LR
 
 ### Core Proxy
 
-- [x] Multi-backend routing — Anthropic, NVIDIA NIM, Ollama, OpenAI-compatible, custom vLLM clusters
+- [x] Multi-backend routing - Anthropic, NVIDIA NIM, Ollama, OpenAI-compatible, custom vLLM clusters
 - [x] SSE streaming and JSON response handling with chunked transfer
-- [x] Intelligent tool reduction — semantic keyword routing trims 94 tools to a scored budget of 16
-- [x] Guaranteed tools — configurable set (exec, read, write, edit, message) always survive reduction
-- [x] Content sanitization — strips leaked model markup (e.g. Kimi `<|tool_calls_section_begin|>`)
+- [x] Intelligent tool reduction - semantic keyword routing trims 94 tools to a scored budget of 16
+- [x] Guaranteed tools - configurable set (exec, read, write, edit, message) always survive reduction
+- [x] Content sanitization - strips leaked model markup (e.g. Kimi `<|tool_calls_section_begin|>`)
 - [x] Multi-layer retry with backend fallback and circuit breaker logic
-- [x] Hot-reload config — `kill -HUP <pid>` reloads without dropping connections
-- [x] CLI flags — `--port`, `--config` for flexible deployment
+- [x] Hot-reload config - `kill -HUP <pid>` reloads without dropping connections
+- [x] CLI flags - `--port`, `--config` for flexible deployment
 
 ### Identity and Access
 
 - [x] CapAuth PGP-based identity verification for every request
-- [x] Agent registry — named agents with individual profiles and trust levels
+- [x] Agent registry - named agents with individual profiles and trust levels
 - [x] Session tracking and agent fingerprinting across requests
-- [x] Reputation scoring — real-time behavioral baseline per agent
+- [x] Reputation scoring - real-time behavioral baseline per agent
 
 ### Security
 
-- [x] Prompt intent classification — code gen, data query, creative, admin
-- [x] Risk scoring on a 0–10 scale with configurable thresholds
-- [x] Jailbreak detection — 13 pattern families, hard block at score >= 9
-- [x] Prompt injection detection — 7 injection type signatures
+- [x] Prompt intent classification - code gen, data query, creative, admin
+- [x] Risk scoring on a 0-10 scale with configurable thresholds
+- [x] Jailbreak detection - 13 pattern families, hard block at score >= 9
+- [x] Prompt injection detection - 7 injection type signatures
 - [x] DLP/PII scanning with configurable redaction transforms
-- [x] Secret detection — blocks `password=`, `api_key=`, `secret=` patterns outbound
+- [x] Secret detection - blocks `password=`, `api_key=`, `secret=` patterns outbound
 - [x] Safety prompt injection for elevated-risk requests
 
 ### Policy Engine
 
-- [x] YAML-driven rule files — human-readable, git-diffable, hot-reloadable
+- [x] YAML-driven rule files - human-readable, git-diffable, hot-reloadable
 - [x] Five actions: allow, deny, transform, rate_limit, alert
 - [x] Four transforms: redact_pii, downgrade_model, strip_tools, add_safety_prompt
-- [x] Model routing per agent — restrict `sentinel` to kimi, restrict `jarvis` to local
-- [x] Budget enforcement — auto-downgrade to free-tier model when budget exceeded
-- [x] Time-of-day rules — configurable after-hours model downgrade
-- [x] Token quota controls — downgrade + alert at configurable daily limits
+- [x] Model routing per agent - restrict `sentinel` to kimi, restrict `jarvis` to local
+- [x] Budget enforcement - auto-downgrade to free-tier model when budget exceeded
+- [x] Time-of-day rules - configurable after-hours model downgrade
+- [x] Token quota controls - downgrade + alert at configurable daily limits
 
 ### Observability
 
-- [x] SIEM event bus — structured events on every request lifecycle stage
+- [x] SIEM event bus - structured events on every request lifecycle stage
 - [x] ArcSight CEF format output
 - [x] JSONL audit logs with configurable rotation (default 100 MB)
 - [x] Syslog output (RFC 5424) for integration with Splunk, Elastic, Graylog
-- [x] Token tracking — input, output, cache read/write per agent per model
-- [x] Cost accounting — per-model USD pricing, budget alerts
-- [x] Latency tracking — P50, P95, P99 percentiles stored in SQLite
+- [x] Token tracking - input, output, cache read/write per agent per model
+- [x] Cost accounting - per-model USD pricing, budget alerts
+- [x] Latency tracking - P50, P95, P99 percentiles stored in SQLite
 - [x] 90-day metrics retention with configurable rollup
 
 ### Dashboard
 
-- [x] Real-time SOC UI at `:18781` — OLED black, glass morphism design
+- [x] Real-time SOC UI at `:18781` - OLED black, glass morphism design
 - [x] Canvas-based token usage graphs with live WebSocket updates
 - [x] Per-agent activity feed with soul color coding
 - [x] Cost tracking panels with budget alert indicators
 - [x] Prompt classification breakdown charts
 - [x] Security events and alert stream
 - [x] Backend health status at a glance
-- [x] Fully responsive — works on ultrawide command center displays
+- [x] Fully responsive - works on ultrawide command center displays
 
 ---
 
@@ -151,7 +151,7 @@ npm run dev
 # SOC Dashboard:     http://localhost:18781
 ```
 
-Point any OpenAI-compatible client at `http://localhost:18780/v1` — it speaks the same API.
+Point any OpenAI-compatible client at `http://localhost:18780/v1` - it speaks the same API.
 
 ### Systemd (production)
 
@@ -337,7 +337,7 @@ The dashboard at `http://localhost:18781` is a single-page real-time SOC interfa
 | Panel | Description |
 |---|---|
 | Request Rate | Live requests/min graph per agent and model |
-| Token Ledger | Rolling token usage — input, output, cache breakdown |
+| Token Ledger | Rolling token usage - input, output, cache breakdown |
 | Cost Tracker | Cumulative USD spend per agent with budget alert thresholds |
 | Classification | Donut chart of prompt intent categories |
 | Security Events | Live stream of jailbreak alerts, PII detections, policy denials |
@@ -345,7 +345,7 @@ The dashboard at `http://localhost:18781` is a single-page real-time SOC interfa
 | Agent Activity | Per-agent request timeline with soul color coding |
 | Latency | P50 / P95 / P99 line charts per backend |
 
-**Design system:** OLED black background (`#000`), glass morphism cards (`backdrop-filter: blur`), Canvas-rendered charts, per-agent accent colors that match soul color assignments in OpenClaw. Built with zero framework dependencies — vanilla JS + CSS Custom Properties.
+**Design system:** OLED black background (`#000`), glass morphism cards (`backdrop-filter: blur`), Canvas-rendered charts, per-agent accent colors that match soul color assignments in OpenClaw. Built with zero framework dependencies - vanilla JS + CSS Custom Properties.
 
 ---
 
@@ -566,17 +566,17 @@ graph LR
     SYNC -->|"config/policies.yaml sync"| GW
 ```
 
-**OpenClaw** — Set `baseUrl: http://localhost:18780` on any model provider in `openclaw.json`. SKGateway becomes transparent to OpenClaw while gaining full observability over every call.
+**OpenClaw** - Set `baseUrl: http://localhost:18780` on any model provider in `openclaw.json`. SKGateway becomes transparent to OpenClaw while gaining full observability over every call.
 
-**SKVoice** — The voice pipeline (`192.168.0.100:18800`) routes all LLM inference through SKGateway, giving the same rate limiting and cost accounting as interactive sessions.
+**SKVoice** - The voice pipeline (`192.168.0.100:18800`) routes all LLM inference through SKGateway, giving the same rate limiting and cost accounting as interactive sessions.
 
-**CapAuth** — PGP-signed agent identities flow through SKGateway's identity module. Every request carries a verified `agent_id` that policies and metrics key off.
+**CapAuth** - PGP-signed agent identities flow through SKGateway's identity module. Every request carries a verified `agent_id` that policies and metrics key off.
 
-**skmemory** — The `before_prompt_build` hook in the skmemory plugin delivers agent identity context (200-byte slim rehydration) that SKGateway can use for routing decisions.
+**skmemory** - The `before_prompt_build` hook in the skmemory plugin delivers agent identity context (200-byte slim rehydration) that SKGateway can use for routing decisions.
 
-**ITIL / Deming** — On `severity: critical` policy events, SKGateway emits SIEM events that the skcapstone coordination layer can surface as incident tasks.
+**ITIL / Deming** - On `severity: critical` policy events, SKGateway emits SIEM events that the skcapstone coordination layer can surface as incident tasks.
 
-**Syncthing** — `config/skgateway.yaml` and `config/policies.yaml` are designed to be Syncthing-synced across nodes. Hot-reload (`SIGHUP`) means config updates propagate without service interruption.
+**Syncthing** - `config/skgateway.yaml` and `config/policies.yaml` are designed to be Syncthing-synced across nodes. Hot-reload (`SIGHUP`) means config updates propagate without service interruption.
 
 ### Integration modes (skcapstone)
 
@@ -596,8 +596,8 @@ The Node adapter (`src/integration.mjs`) writes the same file formats as the Pyt
 ### `~/.skcapstone/` filesystem contract
 
 When integrated, skgateway writes:
-- `~/.skcapstone/pubsub/topics/skgateway.<severity>/msg-*.json` — alert messages
-- `~/.skcapstone/registry/skgateway.json` — service discovery entry
+- `~/.skcapstone/pubsub/topics/skgateway.<severity>/msg-*.json` - alert messages
+- `~/.skcapstone/registry/skgateway.json` - service discovery entry
 
 Alert topics follow the sk* convention: `skgateway.<severity>` (e.g. `skgateway.critical`).
 The semantic event name lives in the payload `event` field, not the topic suffix.
@@ -612,9 +612,9 @@ These endpoints speak the OpenAI Chat Completions API. Drop-in replacement for a
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/v1/chat/completions` | Chat completions — SSE streaming and JSON both supported |
+| `POST` | `/v1/chat/completions` | Chat completions - SSE streaming and JSON both supported |
 | `GET` | `/v1/models` | List available models across all configured backends |
-| `GET` | `/health` | Liveness check — returns `{ status: "ok", uptime: N }` |
+| `GET` | `/health` | Liveness check - returns `{ status: "ok", uptime: N }` |
 
 ### Dashboard (`:18781`)
 
@@ -641,7 +641,7 @@ npm test
 
 Currently includes:
 
-- `tests/classifier.test.mjs` — Prompt intent classifier unit tests
+- `tests/classifier.test.mjs` - Prompt intent classifier unit tests
 
 ### Adding a backend
 
@@ -654,7 +654,7 @@ Currently includes:
 
 1. Edit `config/policies.yaml`.
 2. Add a new entry in the `rules` array at the appropriate priority position.
-3. Send `SIGHUP` — no restart required.
+3. Send `SIGHUP` - no restart required.
 4. Verify the rule fires by watching `logs/audit.jsonl` or the dashboard Security Events panel.
 
 ### Adding a SIEM output
@@ -668,23 +668,23 @@ Outputs are pluggable modules in `src/siem/`. To add a new destination (e.g. Spl
 ### Module conventions
 
 - All source files are ES modules (`.mjs`), Node 20+ native.
-- No build step — run directly with `node`.
+- No build step - run directly with `node`.
 - Config is loaded once at startup from `config/skgateway.yaml` and reloaded on `SIGHUP`.
-- SQLite (`better-sqlite3`) is used for metrics persistence — no external database required.
+- SQLite (`better-sqlite3`) is used for metrics persistence - no external database required.
 
 ---
 
 ## Roadmap
 
-### Phase 6 — Hardening and Integration
+### Phase 6 - Hardening and Integration
 
-- [ ] OpenClaw plugin (`openclaw-plugin/`) — native plugin so OpenClaw auto-routes through gateway with zero config change on the client side
-- [ ] SKVoice integration — dedicated auth path and latency-optimized stream handling for voice inference
-- [ ] Traefik integration — run SKGateway behind Traefik for TLS termination, let's encrypt, and multi-node load balancing
-- [ ] Syncthing auto-reload — file watcher on `config/` triggers hot-reload when Syncthing delivers a new config version
-- [ ] Full docs site — expanded API reference, policy cookbook, deployment guides
-- [ ] `reputation.mjs` and `sentiment.mjs` — complete remaining classifier modules
-- [ ] `syslog.mjs` and `elastic.mjs` — complete remaining SIEM output modules
+- [ ] OpenClaw plugin (`openclaw-plugin/`) - native plugin so OpenClaw auto-routes through gateway with zero config change on the client side
+- [ ] SKVoice integration - dedicated auth path and latency-optimized stream handling for voice inference
+- [ ] Traefik integration - run SKGateway behind Traefik for TLS termination, let's encrypt, and multi-node load balancing
+- [ ] Syncthing auto-reload - file watcher on `config/` triggers hot-reload when Syncthing delivers a new config version
+- [ ] Full docs site - expanded API reference, policy cookbook, deployment guides
+- [ ] `reputation.mjs` and `sentiment.mjs` - complete remaining classifier modules
+- [ ] `syslog.mjs` and `elastic.mjs` - complete remaining SIEM output modules
 - [ ] Prometheus `/metrics` endpoint for Grafana integration
 - [ ] Per-agent budget dashboard with spend forecasting
 - [ ] ITIL incident auto-creation on critical SIEM events
@@ -696,7 +696,7 @@ Outputs are pluggable modules in `src/siem/`. To add a new destination (e.g. Spl
 > **Get back to first principles.**
 > The modern stack is rented. Every prompt your AI sends exits through a cloud provider's
 > endpoint, gets logged in a datacenter you've never seen, and billed through an account
-> you can't fully audit. You don't own the inference path — you rent it.
+> you can't fully audit. You don't own the inference path - you rent it.
 >
 > SKGateway is the **inference chokepoint you own**. Every prompt inspected on your
 > hardware. Every policy enforced by your rules. Every token counted in your ledger.
@@ -704,7 +704,7 @@ Outputs are pluggable modules in `src/siem/`. To add a new destination (e.g. Spl
 Your prompts and completions never reach a third party unexamined. Every request is
 classified, stamped with a CapAuth-verified agent identity, and logged to a local JSONL
 audit trail on your disk before it is forwarded upstream. The SOC dashboard runs locally
-at `:18781` — no telemetry leaves your infrastructure. Metrics and latency history live in
+at `:18781` - no telemetry leaves your infrastructure. Metrics and latency history live in
 a local SQLite database. You run the SIEM; you hold the logs. If you point every backend at
 local Ollama, the prompt never leaves your LAN at all.
 
@@ -714,7 +714,7 @@ local Ollama, the prompt never leaves your LAN at all.
 
 SKWorld is deployed through **skos** (the sovereign agent OS) using a ports/adapters model,
 organized by the **4 C's** capability map: **cloud · comms · compute · core**. SKGateway is
-a **core** capability — the security plane through which all AI inference traffic flows. It
+a **core** capability - the security plane through which all AI inference traffic flows. It
 sits in front of the **compute** layer's model backends (`skmodel`/Ollama and cloud LLMs),
 enforces **core** identity (`capauth`), and reports up the shared platform primitives
 (`sk-alert`, the coord/ITIL board, `skscheduler`).
@@ -728,7 +728,7 @@ flowchart TD
     CLIENTS["AI clients<br/>OpenClaw · Claude Code · skvoice · skchat · custom apps"]
     CLIENTS -->|"POST /v1/chat/completions (OpenAI-compatible)"| GW
 
-    subgraph GW["**skgateway** :18780 — core / inference security plane"]
+    subgraph GW["**skgateway** :18780 - core / inference security plane"]
       direction TB
       ID["identity<br/>capauth verify · session · reputation"]
       PE["policy engine<br/>rules · rate limit · transforms"]
@@ -742,7 +742,7 @@ flowchart TD
     end
 
     GW -->|"verified + classified + reduced"| COMPUTE
-    subgraph COMPUTE["compute — model backends"]
+    subgraph COMPUTE["compute - model backends"]
       direction LR
       SKMODEL["skmodel / Ollama<br/>local models (LAN-only)"]
       CLOUD["Anthropic · NVIDIA NIM<br/>OpenAI-compat · vLLM"]
@@ -763,9 +763,20 @@ For the request lifecycle, retry state machine, and module-level source map, see
 
 ---
 
+## Related projects / See also
+
+- ⬆️ **Depends on:** [capauth](https://github.com/smilinTux/capauth) - PGP agent identity SKGateway verifies on every request.
+- ⬆️ **Depends on:** [skmemory](https://github.com/smilinTux/skmemory) - optional agent-context rehydration used for routing decisions.
+- ⬇️ **Used by:** [skcapstone](https://github.com/smilinTux/skcapstone) - the sovereign agent framework; agents route inference through the gateway on `:18780`.
+- ⬇️ **Used by:** [skchat](https://github.com/smilinTux/skchat) and skvoice - chat and voice pipelines send LLM inference through the gateway.
+- ↔️ **Sibling:** [skops](https://github.com/smilinTux/skops) - ITIL / coord ops board that surfaces critical SIEM events as incidents.
+- 📐 **Standards:** [sk-standards](https://github.com/smilinTux/sk-standards) - crypto, data-flow, version, and doc/SOP standards this repo follows. See also `SOP.md`, `SECURITY.md`, `CONTRIBUTING.md`, `CHANGELOG.md`.
+
+---
+
 ## License
 
-MIT — see [LICENSE](LICENSE) for details.
+MIT - see [LICENSE](LICENSE) for details.
 
 ---
 
