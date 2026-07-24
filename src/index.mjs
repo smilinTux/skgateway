@@ -14,6 +14,7 @@ import { loadConfig } from "./config.mjs";
 import { createProxyServer, handleRequest, buildConfig } from "./proxy/core.mjs";
 import { createRouter, routeAndSend } from "./proxy/router.mjs";
 import { getPool, resetPool } from "./proxy/connection-pool.mjs";
+import { loadAgentRegistry, extractIdentity, ANONYMOUS_AGENT_ID } from "./identity/capauth.mjs";
 
 // ─── Parse CLI args ───
 const args = process.argv.slice(2);
@@ -59,6 +60,27 @@ try {
   console.log("[skgateway] metrics collector initialized");
 } catch (e) {
   console.log("[skgateway] metrics collector not available (optional):", e.message);
+}
+
+// ─── CapAuth agent-identity registry (P2.1) ───
+// Resolves every /v1/* request to a verified agent identity so routing,
+// metrics, and SIEM audit all key on the same caller. Building the registry
+// never blocks startup — on failure we degrade to identity disabled.
+let identityRegistry = null;
+const identityCfg = config.identity || {};
+const identityEnabled = identityCfg.enabled !== false;
+const requireAgentId = identityCfg.require_agent_id === true;
+if (identityEnabled) {
+  try {
+    identityRegistry = loadAgentRegistry(config);
+    console.log(
+      `[skgateway] identity registry loaded (${identityRegistry.byName.size} agents, ` +
+      `anonymous ${identityCfg.allow_anonymous === false ? "denied" : "allowed"}, ` +
+      `auth-gate ${requireAgentId ? "ON" : "OFF"})`,
+    );
+  } catch (e) {
+    console.log("[skgateway] identity registry not available (optional):", e.message);
+  }
 }
 
 // Dashboard server
@@ -227,6 +249,54 @@ const server = http.createServer(async (req, res) => {
 
   // Proxy all /v1/* requests — model-aware routing via the router.
   try {
+    // ── CapAuth agent-identity resolution (P2.1) ──
+    // Resolve the caller BEFORE routing so the verified agent identity drives
+    // routing, metrics, and every SIEM event. Fail-safe: any error degrades to
+    // anonymous, never crashes the request. Only the opt-in auth gate blocks.
+    let identity = {
+      agent_id: req.headers["x-agent-id"] || ANONYMOUS_AGENT_ID,
+      verified: false,
+      method: req.headers["x-agent-id"] ? "header" : "anonymous",
+      session_id: req.headers["x-session-id"] || null,
+      fingerprint: null,
+    };
+    if (identityRegistry) {
+      try {
+        identity = await extractIdentity(req, identityRegistry);
+      } catch (e) {
+        // degrade to anonymous — never let identity resolution break the request
+        identity = { agent_id: ANONYMOUS_AGENT_ID, verified: false, method: "anonymous", session_id: null, fingerprint: null };
+      }
+    }
+    req.identity = identity;
+    req.agent_id = identity.agent_id;
+
+    // Emit an audit event carrying the resolved (and verification-flagged) agent.
+    siemHook({
+      ts: new Date().toISOString(),
+      event: "identity.resolved",
+      agent_id: identity.agent_id,
+      method: identity.method,
+      verified: identity.verified,
+      session_id: identity.session_id,
+      fingerprint: identity.fingerprint,
+      path: req.url,
+      remote: req.socket?.remoteAddress ?? null,
+    });
+
+    // Opt-in auth gate: reject anonymous callers with 403 (OFF by default).
+    if (requireAgentId && identity.method === "anonymous") {
+      res.writeHead(403, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        error: {
+          message: "Agent identity required. Provide X-Agent-Id, X-CapAuth-Signature, or Authorization: Bearer.",
+          code: "identity_required",
+          status: 403,
+        },
+      }));
+      return;
+    }
+
     // Buffer the request body so we can read the model for routing.
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
@@ -246,7 +316,8 @@ const server = http.createServer(async (req, res) => {
     const routeRequest = {
       model:   parsedModel,
       messages: parsedMessages,
-      agentId: req.headers["x-agent-id"] || undefined,
+      // Verified CapAuth identity (falls back to X-Agent-Id / anonymous).
+      agentId: identity.agent_id !== ANONYMOUS_AGENT_ID ? identity.agent_id : (req.headers["x-agent-id"] || undefined),
       // skmodels registry role/context routing (single source of truth).
       // Present => routeAndSend resolves via ~/.skcapstone/models/registry.yaml
       // (precedence context > service > role > default) before backend select.
@@ -281,7 +352,7 @@ const server = http.createServer(async (req, res) => {
         method: req.method,
         duration,
         status: result?.status ?? res.statusCode,
-        agent_id: req.headers["x-agent-id"] || "unknown",
+        agent_id: req.agent_id || req.headers["x-agent-id"] || "unknown",
         model: parsedModel || "unknown",
         backend: result?.backendId,
       });
