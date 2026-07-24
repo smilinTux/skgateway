@@ -14,6 +14,9 @@
  * Usage
  * ─────
  *   import { createMetricsCollector } from './metrics/collector.mjs';
+ *   // Pass either the already-extracted metrics config…
+ *   const metrics = createMetricsCollector(config.metrics);
+ *   // …or the full gateway config (both shapes are accepted).
  *   const metrics = createMetricsCollector(config);
  *
  *   const reqId = metrics.recordRequest({ agentId, model, backend, sessionId });
@@ -342,11 +345,20 @@ function calcCost(tokens, pricing) {
 /**
  * Create and return a metrics collector bound to the given config.
  *
- * @param {object} config  The validated gateway config (from `getConfig()`).
+ * Accepts either shape:
+ *   - the already-extracted metrics config, e.g. `config.metrics` (how
+ *     `index.mjs` calls it), or
+ *   - the full validated gateway config, in which case the `.metrics` slice
+ *     is used.
+ * Passing the full config and passing `config.metrics` both work, so a caller
+ * that dereferences one level too many (or too few) can no longer silently
+ * disable metrics.
+ *
+ * @param {object} config  The metrics config, or the full gateway config.
  * @returns {MetricsCollector}
  */
 export function createMetricsCollector(config) {
-  const cfg = config.metrics;
+  const cfg = config?.metrics ?? config ?? {};
 
   // ── open / initialise SQLite ─────────────────────────────────────────────
   let db = null;
