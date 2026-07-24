@@ -18,7 +18,9 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { sendUpstream } from "./upstream.mjs";
+import { createEvent } from "../siem/events.mjs";
 import { isAnthropicBackend, toAnthropicRequest, toOpenAIResponse } from "./anthropic-adapter.mjs";
 import { getPool } from "./connection-pool.mjs";
 import { isRegistryRouted, resolve as resolveRegistry, getAutoConfig, getConfigEpoch } from "./registry.mjs";
@@ -184,6 +186,29 @@ function extractMessages(request, body) {
     // not JSON — no messages
   }
   return [];
+}
+
+/**
+ * Best-effort extraction of OpenAI-style token usage from a (non-streamed)
+ * response body, for SIEM `response` events. Returns {} when the body is not
+ * JSON or carries no `usage` block (e.g. streamed responses).
+ *
+ * @param {Buffer} body
+ * @returns {{ tokens_in?: number, tokens_out?: number }}
+ */
+function extractUsage(body) {
+  try {
+    const o = JSON.parse(body.toString("utf-8"));
+    if (o && o.usage && typeof o.usage === "object") {
+      return {
+        ...(o.usage.prompt_tokens     != null ? { tokens_in:  o.usage.prompt_tokens }     : {}),
+        ...(o.usage.completion_tokens != null ? { tokens_out: o.usage.completion_tokens } : {}),
+      };
+    }
+  } catch {
+    // not JSON / streamed / no usage — nothing to report
+  }
+  return {};
 }
 
 // ---------------------------------------------------------------------------
@@ -967,6 +992,12 @@ function getRegBackend(id, url) {
  * @param {Record<string, string>} clientHeaders  Incoming client headers
  * @param {Buffer}  body           Buffered request body
  * @param {boolean} [usePool=true] Whether to use the connection pool
+ * @param {?function(object): void} [siem=null]
+ *   Optional best-effort SIEM hook. Called with a fully-structured
+ *   {@link module:siem/events.GatewayEvent} at each request lifecycle point
+ *   (auth decision, route/model selected, upstream error, failover, and
+ *   completion with status/latency/tokens). The hook MUST NEVER block or throw
+ *   into the hot path — invocations are guarded and any error is swallowed.
  * @returns {Promise<{
  *   status: number,
  *   headers: Record<string, string>,
@@ -976,8 +1007,28 @@ function getRegBackend(id, url) {
  *   queueWaitMs?: number,
  * }>}
  */
-export async function routeAndSend(router, request, upstreamPath, method, clientHeaders, body, usePool = true) {
+export async function routeAndSend(router, request, upstreamPath, method, clientHeaders, body, usePool = true, siem = null) {
   const pool = usePool ? getPool() : null;
+
+  // ── SIEM: per-request audit correlation ──
+  // Every lifecycle event emitted for this request shares one request_id so a
+  // SIEM/SOC can stitch auth → request → (failover) → response|error together.
+  // The hook is best-effort: guarded (typeof check) and fully swallowed so a
+  // throwing or slow consumer can never break or delay routing.
+  const _siemRequestId = randomUUID();
+  const emitSiem = (type, details = {}, ctx = {}) => {
+    if (typeof siem !== "function") return;
+    try {
+      siem(createEvent(type, details, {
+        request_id: _siemRequestId,
+        ...(request?.agentId ? { agent_id: request.agentId } : {}),
+        ...(request?.model   ? { model:    request.model }   : {}),
+        ...ctx,
+      }));
+    } catch {
+      // SIEM must never break routing.
+    }
+  };
 
   // ── FRONT of backend selection: skmodels registry role/context routing ──
   // If the request opts into logical routing (model="sk-*" or an x-sk-*
@@ -1077,6 +1128,22 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     candidates = await router.route(request);
   }
 
+  // ── SIEM: auth decision + route/model selected (live request path) ──
+  // Emitted once, on the primary candidate, before any upstream call.
+  {
+    const primary = candidates[0] || {};
+    const authType = primary.backend?.auth_type || "none";
+    const authOk = authType === "none" ||
+      (primary.authHeaders && Object.keys(primary.authHeaders).length > 0);
+    emitSiem("auth", { success: !!authOk, method: authType }, { backend: primary.backendId });
+    emitSiem("request", {
+      path: upstreamPath,
+      method,
+      candidate_count: candidates.length,
+      body_bytes: body?.length ?? 0,
+    }, { backend: primary.backendId });
+  }
+
   let lastResult = null;
   let didFailover = false;
 
@@ -1100,6 +1167,11 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         `[router] FAILOVER: ${candidates[i - 1].backendId} → ${backendId}` +
         ` (prev_status=${lastResult?.status})`
       );
+      emitSiem("failover", {
+        from_backend: candidates[i - 1].backendId,
+        to_backend: backendId,
+        reason: `previous_status_${lastResult?.status ?? "error"}`,
+      }, { backend: backendId });
     }
 
     // Merge auth headers into a sanitized copy of client headers
@@ -1128,6 +1200,12 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       } catch (err) {
         // Pool rejected (queue full) — log and fall back to serving a 503
         console.error(`[routeAndSend] pool rejected backend=${backendId}: ${err.message}`);
+        emitSiem("error", {
+          type: "pool_capacity_exceeded",
+          status_code: 503,
+          backend: backendId,
+          message: err.message,
+        }, { backend: backendId });
         return {
           status: 503,
           headers: { "content-type": "application/json" },
@@ -1203,7 +1281,21 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         let detail = "";
         try { detail = res.body?.toString("utf-8").slice(0, 500); } catch { /* ignore */ }
         console.warn(`[router] ${res.status} upstream_error backend=${backendId} body=${detail}`);
+        // 4xx are non-retryable but are client/payload errors the SOC needs.
+        emitSiem("error", {
+          type: "upstream_client_error",
+          status_code: res.status,
+          backend: backendId,
+        }, { backend: backendId });
       }
+      // Completion — status + latency + best-effort token usage.
+      emitSiem("response", {
+        status: res.status,
+        latency_ms: latencyMs,
+        queue_wait_ms: queueWaitMs,
+        failover: didFailover,
+        ...extractUsage(res.body),
+      }, { backend: backendId });
       return lastResult;
     }
 
@@ -1211,8 +1303,20 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       `[router] ${res.status} ERROR backend=${backendId} latency=${latencyMs}ms` +
       (i < candidates.length - 1 ? " — trying next backend" : " — no more backends")
     );
+    // Retryable upstream failure (>=500) — one error event per failed attempt.
+    emitSiem("error", {
+      type: "upstream_error",
+      status_code: res.status,
+      backend: backendId,
+      retry_count: i,
+    }, { backend: backendId });
   }
 
   // All backends failed — return the last response so the caller can relay the error
+  emitSiem("response", {
+    status: lastResult?.status ?? 502,
+    failover: didFailover,
+    all_backends_failed: true,
+  }, { backend: lastResult?.backendId });
   return lastResult;
 }

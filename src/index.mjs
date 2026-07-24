@@ -256,7 +256,7 @@ const server = http.createServer(async (req, res) => {
     };
 
     const result = await routeAndSend(
-      router, routeRequest, req.url, req.method, req.headers, body, true,
+      router, routeRequest, req.url, req.method, req.headers, body, true, siemHook,
     );
 
     if (!result) {
