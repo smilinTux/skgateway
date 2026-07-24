@@ -339,9 +339,13 @@ reload does **not** re-read the EnvironmentFile. See the rotation runbook in
 
 ### claude-* models fail
 
-All `claude-*` traffic depends on the claude-code-api wrapper at
-`127.0.0.1:18782`. If it is down, those requests fail with no fallback. Confirm
-the wrapper is up:
+All `claude-*` traffic is routed PRIMARILY through the claude-code-api wrapper at
+`127.0.0.1:18782` (first-party subscription billing). If it is down or wedged,
+the gateway now fails over to the lower-priority `anthropic-direct` backend
+(direct OAuth to api.anthropic.com) as a degraded last resort, and a fail-fast
+idle timeout on the wrapper backend prevents a wedged wrapper from hanging
+requests (see RUNBOOK "claude-code-api :18782 wrapper dependency + SPOF
+fallback"). Confirm the wrapper is up:
 
 ```bash
 curl -s http://127.0.0.1:18782/v1/models | jq . || echo "wrapper down"
