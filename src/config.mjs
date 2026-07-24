@@ -136,6 +136,19 @@ const DEFAULTS = {
     enabled: true,
     refresh_ms: 5_000,
   },
+
+  // CapAuth agent-identity (SKGateway P2.1). Every /v1/* request is resolved to
+  // a verified agent identity used for routing / metrics / SIEM audit.
+  //   allow_anonymous     — resolve unidentified callers to "anonymous" (default true)
+  //   require_agent_id     — AUTH GATE: reject anonymous requests with 403. OFF by
+  //                          default so the hot path is never blocked unless opted in.
+  //   default_agent        — registry entry used for anonymous callers (or null)
+  //   agents_dir           — override for ~/.skcapstone/agents discovery
+  identity: {
+    enabled: true,
+    allow_anonymous: true,
+    require_agent_id: false,
+  },
 };
 
 // ─── deep merge ───────────────────────────────────────────────────────────────
