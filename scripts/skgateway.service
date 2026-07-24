@@ -1,5 +1,5 @@
 [Unit]
-Description=SKGateway — Enterprise AI Inference Proxy
+Description=SKGateway - Enterprise AI Inference Proxy
 After=network.target
 
 [Service]
@@ -7,6 +7,12 @@ Type=simple
 ExecStart=/usr/bin/node /home/cbrd21/clawd/skcapstone-repos/skgateway/src/index.mjs --port 18780 --config /home/cbrd21/clawd/skcapstone-repos/skgateway/config/skgateway.yaml
 Restart=on-failure
 RestartSec=5
+# Secrets (NVIDIA_API_KEY, etc.) come from a 0600 EnvironmentFile sourced from
+# skvault, never inline here. The leading '-' makes it optional so a missing
+# file does not block startup. See docs/INSTALL.md and docs/RUNBOOK.md.
+# Note: systemd reads this file only at start, so rotating a secret requires a
+# full restart (ExecReload / SIGHUP does not re-read it).
+EnvironmentFile=-%h/.config/skgateway/secrets.env
 Environment=NODE_ENV=production
 Environment=SKCAPSTONE_AGENT=lumina
 Environment=PATH=/home/cbrd21/.skenv/bin:/usr/local/bin:/usr/bin:/bin

@@ -1,15 +1,40 @@
-# SKGateway — Installation Guide
+# SKGateway Installation Guide
 
-SKGateway is an AI inference proxy that sits between your clients (OpenClaw, Claude Code, agents, apps) and any LLM backend (NVIDIA NIM, Anthropic, Ollama). It routes, monitors, audits, and secures all AI API traffic.
+SKGateway is an AI inference proxy that sits between your clients (Claude Code,
+agents, crons, apps) and any LLM backend. It routes by model name with priority
+failover, enforces per-backend concurrency limits, resolves a caller identity,
+records metrics, and writes a SIEM audit stream. It speaks the OpenAI-compatible
+HTTP API on port `18780`, and serves a live SOC dashboard on port `18781`.
+
+This guide takes a bare machine with Node.js 20+ to a running gateway that
+passes a `/health` check. It documents the production install used on the fleet:
+secrets arrive through a `0600` EnvironmentFile sourced from skvault, never in
+plaintext in a shell profile and never inline in the systemd unit.
+
+For day-two operations (health checks, credential rotation, SIEM/syslog, CapAuth,
+failover, and the two proven gotchas), see [RUNBOOK.md](RUNBOOK.md).
 
 ---
 
 ## Prerequisites
 
-- **Node.js 20 or later** — `node --version` must show `v20.x` or higher
-- **npm** — included with Node.js
-- An **NVIDIA API key** if you plan to route through NVIDIA NIM (`nvapi-...`)
-- An **Anthropic credentials file** at `~/.claude/.credentials.json` if you plan to use Anthropic OAuth
+- **Node.js 20 or later.** `node --version` must show `v20.x` or higher. The
+  service is verified on Node 22.
+- **npm**, included with Node.js. Used for a locked, reproducible install.
+- **A C/C++ build toolchain** for the one native dependency, `better-sqlite3`
+  (used by the metrics store). On most Linux hosts a prebuilt binary is fetched
+  automatically; if it has to compile from source you need `python3`, `make`,
+  and a C++ compiler (`build-essential` on Debian/Ubuntu).
+- **An NVIDIA API key** (`nvapi-...`) if you route through NVIDIA NIM. It is read
+  from the `NVIDIA_API_KEY` environment variable, populated by the secrets
+  EnvironmentFile described below.
+- **The local claude-code-api wrapper** on `127.0.0.1:18782` if you route any
+  `claude-*` models. The `anthropic` backend points at this wrapper, not at
+  `api.anthropic.com` directly. See the wrapper section in
+  [RUNBOOK.md](RUNBOOK.md) for why and how.
+- **Optional: the `openpgp` npm package** if you want cryptographic verification
+  of CapAuth PGP signatures. It is not a declared dependency; without it,
+  CapAuth identity still resolves but signatures are never marked `verified`.
 
 To install Node.js 20 on Ubuntu/Debian:
 
@@ -25,146 +50,167 @@ sudo apt-get install -y nodejs
 ```bash
 git clone https://github.com/smilinTux/skgateway.git ~/clawd/skcapstone-repos/skgateway
 cd ~/clawd/skcapstone-repos/skgateway
-npm install
+npm ci
 ```
 
-Verify the install worked:
+`npm ci` installs the exact versions in `package-lock.json` (the reproducible
+path). Use `npm install` only when you are intentionally changing dependencies.
+
+Verify the toolchain and that the entrypoint parses:
 
 ```bash
-node --version        # should be v20+
-node src/index.mjs --help  # prints usage and exits cleanly
+node --version            # must be v20+
+node --check src/index.mjs   # exits 0 with no output if the file parses
 ```
+
+Note: `src/index.mjs` has no `--help` flag. Running it starts the server. Use
+`node --check` to validate syntax without launching.
 
 ---
 
 ## Configuration
 
-Copy the example config and edit it for your environment:
+The shipped reference config is `config/skgateway.yaml`. Every field has a
+code-level default in `src/config.mjs`, so the YAML only needs the entries that
+differ from those defaults. Missing sections fall back to the built-in defaults;
+a syntactically invalid file logs a warning and the gateway falls back to
+defaults rather than crashing.
 
-```bash
-cp config/skgateway.yaml config/skgateway.local.yaml
-```
+### Backends
 
-The config file is YAML. The most important section is `backends`. Open the file and set your values:
+Backends are matched by model name. Each request routes to the highest-priority
+backend that lists a matching model (`priority: 1` beats `priority: 2`), with
+failover to the next eligible backend. The current shipped backends are:
 
 ```yaml
-server:
-  port: 18780           # proxy port — clients point here
-  dashboard_port: 18781 # dashboard web UI port
-  bind: 0.0.0.0         # listen on all interfaces (use 127.0.0.1 for local-only)
-
 backends:
-  nvidia:
-    url: https://integrate.api.nvidia.com/v1
-    auth_type: api_key
-    api_key_env: NVIDIA_API_KEY   # set this env var before starting
+  local:                                   # local ornith server on .100:8082
+    url: http://192.168.0.100:8082/v1
+    auth_type: none
     models:
-      - kimi-k2-instruct
-      - kimi-k2.5
-      - minimax-m2.1
+      - ornith-tiny
+      - ornith-1.0-9b
+      - qwen3.6-27b-abliterated
     priority: 1
 
-  anthropic:
-    url: https://api.anthropic.com/v1
-    auth_type: oauth
-    credentials_path: ~/.claude/.credentials.json
+  tyler-ornith:                            # ornith-1.0-35b, .150 primary
+    url: http://192.168.0.150:8087/v1
+    auth_type: none
     models:
-      - claude-opus-4-6
+      - ornith-1.0-35b
+      - ornith-big
+    priority: 5
+  tyler-ornith-b:                          # ornith-1.0-35b, .153 failover
+    url: http://192.168.0.153:8087/v1
+    auth_type: none
+    models:
+      - ornith-1.0-35b
+      - ornith-big
+    priority: 6
+
+  nvidia:                                  # NVIDIA NIM (hosted)
+    url: https://integrate.api.nvidia.com/v1
+    auth_type: api_key
+    api_key_env: NVIDIA_API_KEY            # name of the env var, not the value
+    models:
+      - moonshotai/kimi-k2.6
+      - qwen/qwen3-next-80b-a3b-instruct
+      - deepseek-ai/deepseek-v4-flash
+      - openai/gpt-oss-120b
+      # ... see config/skgateway.yaml for the full catalog
+    priority: 1
+
+  anthropic:                               # claude-* via LOCAL wrapper, NOT api.anthropic.com
+    url: http://127.0.0.1:18782/v1
+    auth_type: none
+    models:
+      - claude-opus-4-8
+      - claude-opus-4-7
       - claude-sonnet-4-6
+      - claude-haiku-4-5
     priority: 2
 
   ollama:
-    url: http://192.168.0.100:11434/v1  # change to your Ollama host
+    url: http://192.168.0.100:11434/v1
     auth_type: none
     models:
       - "dolphin-*"
     priority: 3
 ```
 
-All fields have sensible defaults — you only need to include entries that differ from the defaults. The full reference config is at `config/skgateway.yaml`.
+The `anthropic` backend routes Claude models through the local claude-code-api
+wrapper at `127.0.0.1:18782` (`auth_type: none`). This bills as genuine
+first-party subscription usage. Hitting `api.anthropic.com` directly with a raw
+OAuth token is treated as a third-party app that draws from extra-usage and
+fails under load, which is why the direct-OAuth mode was abandoned. Do not set
+`auth_type: oauth` with a `credentials_path` for this backend.
 
-**Setting your API key:**
+### Secrets (never inline)
+
+Secrets are never committed, never exported in `~/.bashrc`, and never written
+inline in the systemd unit. They arrive at the process through a `0600`
+EnvironmentFile that the unit sources at start.
+
+Create the secrets directory and file (source the values from skvault, never
+paste them into a doc or a shell history):
 
 ```bash
-export NVIDIA_API_KEY="nvapi-your-key-here"
+mkdir -p ~/.config/skgateway
+umask 077
+# Write NVIDIA_API_KEY (and any other secret env vars) into the file.
+# Pull the value from skvault; do not echo it into your shell history.
+${EDITOR:-nano} ~/.config/skgateway/secrets.env
+chmod 600 ~/.config/skgateway/secrets.env
 ```
 
-Or add it permanently to your shell profile (`~/.bashrc` or `~/.zshrc`):
+The file is plain `KEY=value` lines, one per line, as systemd expects:
 
-```bash
-echo 'export NVIDIA_API_KEY="nvapi-your-key-here"' >> ~/.bashrc
-source ~/.bashrc
 ```
+NVIDIA_API_KEY=nvapi-REPLACED_FROM_SKVAULT
+```
+
+The `.gitignore` already excludes `.env`, `data/`, and `logs/`, so runtime
+state and secrets never enter git. Confirm the file is `0600` and owned by you.
+
+### Environment overrides (optional)
+
+A few settings can be overridden by environment variables without editing YAML
+(handy inside the unit or the secrets file). The full list lives in
+`src/config.mjs`; the common ones are `SKGATEWAY_PORT`,
+`SKGATEWAY_DASHBOARD_PORT`, `SKGATEWAY_BIND`, `SKGATEWAY_CONFIG`,
+`SKGATEWAY_METRICS_DB`, and the `SKGATEWAY_SYSLOG_*` family (see
+[RUNBOOK.md](RUNBOOK.md)).
 
 ---
 
-## Running Standalone
+## Run as a systemd User Service
+
+The repo ships a user service unit at `scripts/skgateway.service`. It runs the
+gateway on port `18780`, restarts on failure, and sources the secrets
+EnvironmentFile (`%h/.config/skgateway/secrets.env`, optional so a missing file
+does not block startup).
+
+**Step 1: Install the unit.**
 
 ```bash
-cd ~/clawd/skcapstone-repos/skgateway
-NVIDIA_API_KEY="nvapi-..." node src/index.mjs
-```
-
-With a custom config file:
-
-```bash
-node src/index.mjs --config config/skgateway.local.yaml
-```
-
-With a port override:
-
-```bash
-node src/index.mjs --port 18780 --config config/skgateway.yaml
-```
-
-You should see output like:
-
-```
-[skgateway] listening on http://0.0.0.0:18780
-[skgateway] backends: nvidia, anthropic, ollama
-[skgateway] metrics collector initialized
-[skgateway] dashboard server started on port 18781
-```
-
-For development with auto-restart on file changes:
-
-```bash
-npm run dev
-```
-
----
-
-## Running as a systemd Service
-
-The repo includes a service file at `scripts/skgateway.service`. This is the recommended way to run SKGateway in production — it starts automatically on login and restarts on failure.
-
-**Step 1: Edit the service file** to match your paths and environment:
-
-```bash
+mkdir -p ~/.config/systemd/user
 cp scripts/skgateway.service ~/.config/systemd/user/skgateway.service
 ```
 
-Open `~/.config/systemd/user/skgateway.service` and update these lines:
+If your checkout is not at `/home/cbrd21/clawd/skcapstone-repos/skgateway`, edit
+the `ExecStart` and `WorkingDirectory` paths in the copied unit to match your
+home and checkout location. The `EnvironmentFile=` line uses `%h`, so it already
+resolves to your home directory and needs no edit.
 
-```ini
-ExecStart=/usr/bin/node /home/YOUR_USER/clawd/skcapstone-repos/skgateway/src/index.mjs \
-  --port 18780 \
-  --config /home/YOUR_USER/clawd/skcapstone-repos/skgateway/config/skgateway.yaml
-
-Environment=NVIDIA_API_KEY=nvapi-your-key-here
-Environment=SKCAPSTONE_AGENT=lumina
-Environment=PATH=/home/YOUR_USER/.skenv/bin:/usr/local/bin:/usr/bin:/bin
-
-WorkingDirectory=/home/YOUR_USER/clawd/skcapstone-repos/skgateway
-```
-
-**Step 2: Enable lingering** so the service starts even without an active login session:
+**Step 2: Enable lingering** so the service runs without an active login
+session (the unit is `WantedBy=default.target`, a user target that only comes up
+when the user has a session unless lingering is enabled):
 
 ```bash
 loginctl enable-linger $USER
 ```
 
-**Step 3: Enable and start the service:**
+**Step 3: Enable and start.**
 
 ```bash
 systemctl --user daemon-reload
@@ -172,63 +218,95 @@ systemctl --user enable skgateway.service
 systemctl --user start skgateway.service
 ```
 
-**Step 4: Check service status:**
+**Step 4: Check status and logs.**
 
 ```bash
 systemctl --user status skgateway.service
-```
-
-**View logs:**
-
-```bash
 journalctl --user -u skgateway.service -f
 ```
+
+On a healthy start you will see lines like:
+
+```
+[skgateway] listening on http://0.0.0.0:18780
+[skgateway] backends: local, tyler-ornith, tyler-ornith-b, nvidia, anthropic, ollama
+[skgateway] metrics collector initialized
+[skgateway] identity registry loaded (N agents, anonymous allowed, auth-gate OFF)
+[skgateway] dashboard server started on port 18781
+```
+
+### Running standalone (development)
+
+For a foreground run without systemd, load the secrets file into the shell
+first so `NVIDIA_API_KEY` is present:
+
+```bash
+set -a; . ~/.config/skgateway/secrets.env; set +a
+node src/index.mjs --config config/skgateway.yaml
+```
+
+`--port` and `--config` are the only CLI flags. Auto-restart on file changes:
+`npm run dev`.
 
 ---
 
 ## Verifying It Works
 
-**Health check endpoint:**
+**Health check.** No auth required:
 
 ```bash
 curl -s http://localhost:18780/health | jq .
 ```
-
-Expected output:
 
 ```json
 {
   "status": "ok",
   "uptime": 42.3,
   "backends": {
-    "nvidia": { "status": "up", "totalRequests": 0, "totalErrors": 0 },
-    "anthropic": { "status": "up", "totalRequests": 0, "totalErrors": 0 }
+    "nvidia":    { "status": "up", "latencyP50": 0 },
+    "anthropic": { "status": "up", "latencyP50": 0 }
   }
 }
 ```
 
-**Full status endpoint** (includes metrics):
+Idle backends report `status: "up"` until a real request exercises them; this is
+passive health, not an active probe.
+
+**Full status** (adds version, pool, and metrics):
 
 ```bash
 curl -s http://localhost:18780/status | jq .
 ```
 
-**Test a proxied request** (requires a valid NVIDIA API key):
+`metrics` should be a non-null object once the collector initialized. A `null`
+here means the metrics store failed to open (see Troubleshooting).
+
+**Model catalog** (aggregated across configured backends):
+
+```bash
+curl -s http://localhost:18780/v1/models | jq '.data[].id'
+```
+
+**A proxied completion** through a real NVIDIA model (requires a valid
+`NVIDIA_API_KEY`):
 
 ```bash
 curl -s http://localhost:18780/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "X-Agent-Id: test" \
   -d '{
-    "model": "moonshotai/kimi-k2-instruct",
+    "model": "moonshotai/kimi-k2.6",
     "messages": [{"role": "user", "content": "Say hello."}],
     "max_tokens": 20
-  }' | jq .choices[0].message.content
+  }' | jq -r .choices[0].message.content
 ```
 
-**Open the dashboard:**
+**Point clients at the gateway, not the wrapper.** Client and cron `base_url`
+must be `http://localhost:18780/v1`. Pointing at `:18782` bypasses routing and
+lands directly on the claude-code-api wrapper. See the gotchas in
+[RUNBOOK.md](RUNBOOK.md).
 
-Navigate to `http://localhost:18781` in your browser. You should see the SOC dashboard with backend health cards and activity panels.
+**Dashboard.** Open `http://localhost:18781` for the live SOC dashboard.
 
 ---
 
@@ -240,52 +318,56 @@ Navigate to `http://localhost:18781` in your browser. You should see the SOC das
 Error: listen EADDRINUSE: address already in use 0.0.0.0:18780
 ```
 
-Find what is using the port and stop it, or choose a different port:
+```bash
+lsof -i :18780                       # find the process
+node src/index.mjs --port 18790      # or run on a different port
+```
+
+### NVIDIA request returns 401
+
+The key is missing, wrong, or revoked. Confirm the process actually received it:
 
 ```bash
-lsof -i :18780           # find the process
-node src/index.mjs --port 18790   # use a different port
+systemctl --user show skgateway.service -p EnvironmentFiles
 ```
 
-### NVIDIA API key missing or invalid
+If the key is present but returns 401 it is likely revoked or expired. Rotate it:
+update the value in skvault, rewrite `~/.config/skgateway/secrets.env`, then do a
+**full restart** (`systemctl --user restart skgateway.service`). A `SIGHUP`
+reload does **not** re-read the EnvironmentFile. See the rotation runbook in
+[RUNBOOK.md](RUNBOOK.md).
 
-```
-[skgateway] upstream error: 401 Unauthorized
-```
+### claude-* models fail
 
-Verify your key is set:
+All `claude-*` traffic depends on the claude-code-api wrapper at
+`127.0.0.1:18782`. If it is down, those requests fail with no fallback. Confirm
+the wrapper is up:
 
 ```bash
-echo $NVIDIA_API_KEY
+curl -s http://127.0.0.1:18782/v1/models | jq . || echo "wrapper down"
 ```
 
-If empty, export it and restart. If set but returning 401, your key may be expired — generate a new one at [build.nvidia.com](https://build.nvidia.com).
+Restart the wrapper (it lives outside this repo) and retry. NVIDIA and local
+models are unaffected.
 
-### Anthropic OAuth credentials not found
-
-```
-[skgateway] anthropic backend: credentials file not found
-```
-
-The OAuth credentials are written by Claude Code when you log in. Run `claude` once to authenticate, which creates `~/.claude/.credentials.json`. Or switch `auth_type` to `api_key` and set `ANTHROPIC_API_KEY`.
-
-### Backend unreachable (Ollama)
+### Backend unreachable (local / ollama)
 
 ```
-[skgateway] upstream error: connect ECONNREFUSED 192.168.0.100:11434
+upstream error: connect ECONNREFUSED 192.168.0.100:11434
 ```
 
-Check that your Ollama instance is running and reachable:
+Check the upstream is running and reachable, and fix the `url` in the config if
+the host or port differs:
 
 ```bash
 curl http://192.168.0.100:11434/api/tags
 ```
 
-Update the `url` in your config if the host or port differs.
+### /status shows "metrics": null, or the dashboard is empty
 
-### Dashboard shows no data
-
-Metrics require the SQLite database directory to be writable. Check that `./data/` exists and is writable, or set `metrics.db_path` to an absolute path you control:
+The metrics SQLite store could not open. `data/` must be writable (it is created
+under the repo root by default, `metrics.db_path: ./data/metrics.db`). Set an
+absolute, writable path if needed:
 
 ```yaml
 metrics:
@@ -294,11 +376,12 @@ metrics:
 
 ### Config file not found
 
-If you see `config file not found`, make sure you are running from the repo root or passing `--config` with an absolute path:
+The loader resolves `config/skgateway.yaml` relative to the repo root, or from
+`SKGATEWAY_CONFIG`, or `--config`. If you run from another directory, pass an
+absolute path:
 
 ```bash
-node /full/path/to/skgateway/src/index.mjs \
-  --config /full/path/to/skgateway/config/skgateway.yaml
+node /abs/path/skgateway/src/index.mjs --config /abs/path/skgateway/config/skgateway.yaml
 ```
 
 ---
@@ -308,25 +391,19 @@ node /full/path/to/skgateway/src/index.mjs \
 ```bash
 cd ~/clawd/skcapstone-repos/skgateway
 git pull
-npm install
-```
-
-Then reload the config without a full restart (SIGHUP is safe for config-only changes):
-
-```bash
-pkill -HUP -f "node.*skgateway"
-# or with systemd:
-systemctl --user kill -s HUP skgateway.service
-```
-
-For code changes (new features, bug fixes), do a full restart:
-
-```bash
+npm ci
 systemctl --user restart skgateway.service
 ```
 
-Verify the new version started:
+Always do a **full restart** for a code upgrade. `SIGHUP` (the unit's
+`ExecReload`) re-reads the YAML config file only, and even then backend topology
+changes (adding, removing, or re-pointing a backend) do not reach the running
+router. Secret (EnvironmentFile) changes are never picked up by `SIGHUP`. Treat
+`SIGHUP` as a narrow live-tuning tool and restart for anything structural. Full
+reload behavior is documented in [RUNBOOK.md](RUNBOOK.md).
+
+Confirm the new process is live:
 
 ```bash
-curl -s http://localhost:18780/status | jq .version
+curl -s http://localhost:18780/status | jq '{version, uptime}'
 ```
