@@ -11,6 +11,10 @@ passes a `/health` check. It documents the production install used on the fleet:
 secrets arrive through a `0600` EnvironmentFile sourced from skvault, never in
 plaintext in a shell profile and never inline in the systemd unit.
 
+For a terse, ordered checklist that ties the secret and config inventory
+together for a fresh box (rendered from `config/skgateway.yaml.example`), see
+[COLD-BOOTSTRAP.md](COLD-BOOTSTRAP.md).
+
 For day-two operations (health checks, credential rotation, SIEM/syslog, CapAuth,
 failover, and the two proven gotchas), see [RUNBOOK.md](RUNBOOK.md).
 
