@@ -15,6 +15,7 @@ import { createProxyServer, handleRequest, buildConfig } from "./proxy/core.mjs"
 import { createRouter, routeAndSend } from "./proxy/router.mjs";
 import { getPool, resetPool } from "./proxy/connection-pool.mjs";
 import { loadAgentRegistry, extractIdentity, ANONYMOUS_AGENT_ID } from "./identity/capauth.mjs";
+import { classifyRequest, toSiemEvent } from "./classifiers/engine.mjs";
 
 // ─── Parse CLI args ───
 const args = process.argv.slice(2);
@@ -311,6 +312,23 @@ const server = http.createServer(async (req, res) => {
         // Carry messages for sk-auto difficulty classification (registry.mjs).
         if (Array.isArray(parsed.messages)) parsedMessages = parsed.messages;
       } catch {}
+    }
+
+    // ── Prompt classification (P3.5) — PASSIVE observability into SIEM ──
+    // Label the request's intent/risk/jailbreak/injection and emit it. Pure
+    // heuristic (no network, sub-10ms), fail-open, and it NEVER changes routing.
+    if (config.classification?.enabled && Array.isArray(parsedMessages)) {
+      try {
+        const classification = classifyRequest(parsedMessages, {
+          classifier: config.classification.classifier,
+        });
+        siemHook(toSiemEvent(classification, {
+          agent_id: identity.agent_id,
+          session_id: identity.session_id,
+          model: parsedModel,
+          path: req.url,
+        }));
+      } catch { /* never let classification break a request */ }
     }
 
     const routeRequest = {
