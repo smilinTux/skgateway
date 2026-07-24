@@ -132,6 +132,21 @@ const DEFAULTS = {
     ],
   },
 
+  // Prompt classification engine (SKGateway P3.5). PASSIVE observability: labels
+  // each request's intent/risk/jailbreak/injection and emits a `prompt.classified`
+  // SIEM event. Deterministic keyword/regex — no network, sub-10ms — so it is safe
+  // on the hot path. It never changes routing (that is the sk-auto DIFFICULTY
+  // router's job); `gate` is a reserved forward-compat flag and defaults OFF so
+  // classification can never block or reroute a request.
+  //   enabled    — run the engine + emit SIEM labels (default true; pure observability)
+  //   classifier — registered classifier name to use (default "heuristic")
+  //   gate       — RESERVED: allow labels to influence routing/policy (default false)
+  classification: {
+    enabled: true,
+    classifier: 'heuristic',
+    gate: false,
+  },
+
   dashboard: {
     enabled: true,
     refresh_ms: 5_000,
