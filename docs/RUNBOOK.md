@@ -297,18 +297,55 @@ sk-alert bus when the skcapstone tree is present.
    resolution lands directly on the wrapper. This bites cold rebuilds because
    the pin lives in client config, not the gateway.
 
-2. **The claude-code-api wrapper is a single dependency for `claude-*`.** The
+2. **The claude-code-api wrapper is the PRIMARY dependency for `claude-*`.** The
    `anthropic` backend points at `127.0.0.1:18782`, the local `claude --print`
    OpenAI-compatible wrapper, so Claude traffic bills as first-party
-   subscription usage. The wrapper lives **outside this repo**, has no health
-   integration, and there is **no fallback** for `claude-*` if it is down. NVIDIA
-   and local models are unaffected. Check it directly:
+   subscription usage. The wrapper lives **outside this repo** and has no health
+   integration of its own. Check it directly:
    ```bash
    curl -s http://127.0.0.1:18782/v1/models | jq . || echo "wrapper down"
    ```
-   Do not "fix" a wrapper outage by switching the backend to direct
-   `api.anthropic.com` OAuth: that mode was abandoned because it draws from
-   extra-usage and 400s under load.
+
+---
+
+## claude-code-api :18782 wrapper dependency + SPOF fallback (card 2b5bcedd)
+
+**What it is.** `claude-code-api` is a local OpenAI-compatible shim around
+`claude --print` (the Claude Code CLI), listening on `127.0.0.1:18782`. It is
+the ONLY path that bills `claude-*` traffic as genuine first-party subscription
+usage, which is why the `anthropic` backend routes through it.
+
+**Where it runs / how skgateway depends on it.** It runs as a separate local
+service on the same host as the gateway (`.158`), outside this repo. The gateway
+`anthropic` backend (`config/skgateway.yaml`, `url: http://127.0.0.1:18782/v1`,
+`auth_type: none`, priority 2) forwards `claude-*` requests to it verbatim.
+
+**How to restart it.** It is not managed by this repo. Restart the
+`claude-code-api` service however it is supervised on the host (systemd user
+unit or the launcher script that started it), then confirm with the `curl`
+probe above. If it is a bare process, relaunch it and re-run the probe.
+
+**Fallback (no more hard SPOF).** Two mitigations now cover a wrapper outage so
+`claude-*` no longer hard-fails or hangs:
+
+- **`anthropic-direct` fallback backend** (`config/skgateway.yaml`, priority 8):
+  same `claude-*` models, `auth_type: oauth` to `https://api.anthropic.com/v1`
+  using `~/.claude/.credentials.json`. Because it serves the same models at a
+  strictly lower priority, the router's existing failover machinery tries the
+  wrapper first and falls over to this backend on a 5xx/504. This is a
+  **degraded, last-resort path**: direct OAuth bills as third-party extra-usage
+  (not the plan) and can 400 under load, so it exists to keep Claude answering
+  during a wrapper outage, not as the steady state. Its health shows in
+  `/health` alongside the wrapper.
+- **Fail-fast idle timeout** (`timeout_ms: 120000` on the wrapper backend): a
+  wedged wrapper that accepts the socket but never replies used to hang the
+  request forever. The gateway now aborts a stalled wrapper call with a 504 so
+  it fails over to `anthropic-direct` instead of blocking.
+
+After a wrapper outage, `/health` reflects the `anthropic` backend degrading to
+`down` (error rate ≥ 50%) while `anthropic-direct` absorbs the traffic. Fix the
+wrapper, then the `anthropic` backend recovers to `up` on the cooldown re-probe
+and reclaims priority automatically.
 
 ---
 
@@ -344,7 +381,7 @@ already contains upstream outages.
 |---|---|---|
 | `/status` shows `metrics: null` | metrics SQLite could not open | make `data/` writable or set an absolute `metrics.db_path`; restart |
 | NVIDIA requests 401 | key missing / revoked | rotate in skvault, rewrite `secrets.env`, full restart |
-| all `claude-*` fail | claude-code-api wrapper down | restart the `:18782` wrapper; NVIDIA/local unaffected |
+| `claude-*` degraded / on `anthropic-direct` | claude-code-api wrapper down or wedged | restart the `:18782` wrapper; failover to `anthropic-direct` keeps Claude answering (degraded); NVIDIA/local unaffected |
 | client hits wrapper directly | `base_url` set to `:18782` | repoint client to `:18780/v1` |
 | backend stuck `down` | error rate exceeded 50% | wait for cooldown re-probe; fix the upstream; check `/queue` |
 | requests queue / stall | per-backend concurrency cap hit | inspect `/queue`; raise `pooling.per_backend.<name>.max` if the upstream allows |

@@ -11,6 +11,10 @@
  *    layer forces `stream: false` on tool requests so this is safe.
  *  - Network errors resolve (not reject) with a synthetic 502 payload so
  *    the calling retry loop can handle them uniformly.
+ *  - A wedged upstream that accepts the TCP connection but never replies
+ *    would otherwise hang the request forever. An optional idle timeout
+ *    (`timeoutMs`) converts that into a fast 504 so the router can fail
+ *    over instead of blocking. Disabled (0) by default — current behavior.
  *  - Hop-by-hop headers (`connection`, `keep-alive`) are stripped from
  *    proxied request headers to avoid confusing the upstream server.
  */
@@ -42,13 +46,23 @@ const httpsAgent = new https.Agent(_agentOpts);
  * @param {URL} targetUrl
  *   Parsed base URL of the upstream origin (e.g. `https://integrate.api.nvidia.com`).
  *   The `reqUrl` path is resolved against this origin.
+ * @param {number} [timeoutMs=0]
+ *   Socket idle timeout in milliseconds. When > 0, if the upstream sends no
+ *   data for this long (connect that never replies, or a wedged wrapper), the
+ *   request is aborted and resolves with `status: 504`. 0 disables the timeout.
  * @returns {Promise<{ status: number, headers: Record<string, string>, body: Buffer }>}
- *   Always resolves.  Network failures resolve with `status: 502` and a
- *   JSON `{ error: { message } }` body.
+ *   Always resolves.  Network failures resolve with `status: 502`; an idle
+ *   timeout resolves with `status: 504`; both carry a JSON `{ error }` body.
  */
-export function sendUpstream(reqUrl, method, headers, body, targetUrl) {
+export function sendUpstream(reqUrl, method, headers, body, targetUrl, timeoutMs = 0) {
   return new Promise((resolve) => {
     const upstream = new URL(reqUrl, targetUrl);
+
+    // Guard against double-resolution: a timeout-triggered destroy() also fires
+    // the 'error' handler, and we must resolve exactly once.
+    let settled = false;
+    const done = (r) => { if (!settled) { settled = true; resolve(r); } };
+    let timedOut = false;
 
     const proxyHeaders = { ...headers };
     proxyHeaders.host = upstream.host;
@@ -72,7 +86,7 @@ export function sendUpstream(reqUrl, method, headers, body, targetUrl) {
         const chunks = [];
         upstreamRes.on("data", (chunk) => chunks.push(chunk));
         upstreamRes.on("end", () => {
-          resolve({
+          done({
             status: upstreamRes.statusCode,
             headers: upstreamRes.headers,
             body: Buffer.concat(chunks),
@@ -81,11 +95,25 @@ export function sendUpstream(reqUrl, method, headers, body, targetUrl) {
       },
     );
 
+    // Idle-timeout the upstream so a wedged backend fails fast (504) and the
+    // router can fail over, instead of hanging the request indefinitely.
+    if (timeoutMs > 0) {
+      upstreamReq.setTimeout(timeoutMs, () => {
+        timedOut = true;
+        upstreamReq.destroy();
+      });
+    }
+
     upstreamReq.on("error", (err) => {
-      resolve({
-        status: 502,
+      done({
+        status: timedOut ? 504 : 502,
         headers: {},
-        body: Buffer.from(JSON.stringify({ error: { message: err.message } })),
+        body: Buffer.from(JSON.stringify({
+          error: {
+            message: timedOut ? `upstream idle timeout after ${timeoutMs}ms` : err.message,
+            code: timedOut ? "upstream_timeout" : "upstream_unreachable",
+          },
+        })),
       });
     });
 

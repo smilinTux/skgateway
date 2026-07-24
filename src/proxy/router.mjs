@@ -75,6 +75,7 @@ const PROBE_TIMEOUT_MS = 8_000;
  * @property {string}   [api_key_env]       Env-var name holding the API key
  * @property {string}   [credentials_file]  Path to JSON credentials (oauth flow)
  * @property {number}   [cooldown_ms]       Cooldown after DOWN before re-probe
+ * @property {number}   [timeout_ms]        Socket idle timeout (fail fast on a wedged upstream; 0 = off)
  *
  * @typedef {Object} HealthSnapshot
  * @property {'up'|'degraded'|'down'} status
@@ -279,6 +280,11 @@ export class Backend {
     this.models = Array.isArray(config.models) ? config.models : [];
     this.priority = typeof config.priority === "number" ? config.priority : 99;
     this.cooldown_ms = config.cooldown_ms || DEFAULT_COOLDOWN_MS;
+    // Optional per-backend idle timeout (ms). 0 = no timeout (default). Used to
+    // fail fast on a wedged upstream (e.g. the claude-code-api :18782 wrapper
+    // accepting the socket but never replying) so the router can fail over
+    // instead of hanging the request. See sendUpstream(timeoutMs).
+    this.timeout_ms = typeof config.timeout_ms === "number" ? config.timeout_ms : 0;
 
     // Auth credentials
     this._api_key = config.api_key || null;
@@ -1089,17 +1095,14 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       body = rewriteBodyModel(body, reg.model);
       body = applyBodyFloor(body, reg.model, reg.minOutputTokens);
       if (reg.anthropic) {
-        // Route via the gateway's EXISTING anthropic backend (oauth creds,
-        // OpenAI→Messages translation). Never loop back to the gateway url.
-        const b = router.getBackend("anthropic");
-        if (b) {
-          candidates = [{
-            backendId: b.id,
-            backendUrl: b.url,
-            authHeaders: await b.buildAuthHeaders(),
-            backend: b,
-          }];
-        } else {
+        // Route via the gateway's configured anthropic backends. Resolve the
+        // FULL priority-ordered chain for the concrete claude model (the
+        // claude-code-api :18782 wrapper primary + any lower-priority direct
+        // fallback) so a wrapper outage fails over instead of hard-failing —
+        // registry routing must not re-introduce the wrapper SPOF. router.route
+        // only returns configured backends, never the gateway's own url.
+        candidates = await router.route({ ...request, model: reg.model, agentId: request.agentId });
+        if (!candidates || candidates.length === 0) {
           console.warn("[router] registry resolved to anthropic but no anthropic backend configured");
         }
       } else {
@@ -1234,7 +1237,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         if (tr) {
           const aHeaders = { ...forwardHeaders, ...tr.headers };
           delete aHeaders["content-length"];
-          const raw = await sendUpstream(tr.path, method, aHeaders, tr.body, targetUrl);
+          const raw = await sendUpstream(tr.path, method, aHeaders, tr.body, targetUrl, backend.timeout_ms);
           if (raw && raw.status >= 400) {
             let d = "";
             try { d = raw.body?.toString("utf-8").slice(0, 600); } catch { /* ignore */ }
@@ -1243,10 +1246,10 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           }
           res = toOpenAIResponse(raw, request.model);
         } else {
-          res = await sendUpstream(upstreamPath, method, forwardHeaders, body, targetUrl);
+          res = await sendUpstream(upstreamPath, method, forwardHeaders, body, targetUrl, backend.timeout_ms);
         }
       } else {
-        res = await sendUpstream(upstreamPath, method, forwardHeaders, body, targetUrl);
+        res = await sendUpstream(upstreamPath, method, forwardHeaders, body, targetUrl, backend.timeout_ms);
       }
     } catch (err) {
       // sendUpstream resolves with 502 on network error, but be defensive
