@@ -1,0 +1,199 @@
+## SKGateway configuration TEMPLATE (cold-machine bootstrap)
+##
+## HOW TO USE
+##   cp config/skgateway.yaml.example config/skgateway.yaml
+##   then edit the copy for this host (backend URLs, model catalog).
+## The live config/skgateway.yaml is committed on the fleet, but on a fresh
+## machine you materialize it from this template. See docs/COLD-BOOTSTRAP.md.
+##
+## SECRETS: this file holds NO secret values. It only names the env var that
+## carries a secret (api_key_env) or the path to a credentials file
+## (credentials_path). Real secrets arrive at runtime through a 0600
+## EnvironmentFile (see docs/COLD-BOOTSTRAP.md), never in this YAML.
+##
+## Every field has a code-level default in src/config.mjs, so a section you
+## delete falls back to that default. Reload the file at runtime with
+## `kill -HUP <pid>` (config only; secrets and backend topology need a full
+## restart).
+
+server:
+  port: 18780
+  dashboard_port: 18781
+  bind: 0.0.0.0
+
+## Connection pooling: per-backend concurrency + queue limits. Keep the nvidia
+## max at or below the upstream NIM concurrency ceiling (20 at time of writing).
+pooling:
+  default_max_concurrent: 20
+  default_max_queue: 1000
+  queue_timeout_ms: 300000
+  per_backend:
+    nvidia:
+      max: 20
+      maxQueue: 500
+    ollama:
+      max: 50
+      maxQueue: 200
+    anthropic:
+      max: 10
+      maxQueue: 200
+
+## Backends are matched by model name. A request routes to the lowest priority
+## NUMBER that lists a matching model (priority 1 wins), failing over to the next
+## eligible backend on 5xx. Replace the example host IPs and ports below with the
+## reachable upstreams on THIS network.
+backends:
+  ## Local OpenAI-compatible server (example: an ornith/llama.cpp box).
+  local:
+    url: http://LOCAL_LLM_HOST:8082/v1        # e.g. http://192.168.0.100:8082/v1
+    auth_type: none
+    models:
+      - ornith-tiny
+      - ornith-1.0-9b
+      - qwen3.6-27b-abliterated
+    priority: 1
+
+  ## NVIDIA NIM (hosted). REQUIRES a secret. auth_type api_key reads the key from
+  ## the env var NAMED by api_key_env (never the value here). Provision
+  ## NVIDIA_API_KEY via the secrets EnvironmentFile (docs/COLD-BOOTSTRAP.md).
+  nvidia:
+    url: https://integrate.api.nvidia.com/v1
+    auth_type: api_key
+    api_key_env: NVIDIA_API_KEY               # env var name only, NOT the key
+    models:
+      - qwen/qwen3.5-122b-a10b
+      - openai/gpt-oss-20b
+      - deepseek-ai/deepseek-v4-flash
+      # Prune to models your NVIDIA account can actually serve.
+    priority: 1
+
+  ## Claude models via the LOCAL claude-code-api wrapper (claude --print on
+  ## 127.0.0.1:18782). auth_type none: the wrapper IS Claude Code and bills as
+  ## first-party subscription. Do NOT point this at api.anthropic.com.
+  anthropic:
+    url: http://127.0.0.1:18782/v1
+    auth_type: none
+    models:
+      - claude-opus-4-8
+      - claude-opus-4-7
+      - claude-sonnet-4-6
+      - claude-haiku-4-5
+    priority: 2
+    timeout_ms: 120000                         # fail fast if the wrapper wedges
+
+  ## OPTIONAL degraded fallback for claude-* when the :18782 wrapper is down.
+  ## auth_type oauth reads the Claude Code OAuth token from credentials_path (a
+  ## file secret, not committed). Higher priority NUMBER = only used after the
+  ## wrapper fails. Direct api.anthropic.com billing is third-party extra-usage,
+  ## so treat this as a last resort, not steady state. Remove if unwanted.
+  anthropic-direct:
+    url: https://api.anthropic.com/v1
+    auth_type: oauth
+    credentials_path: ~/.claude/.credentials.json   # path to creds file, not a token
+    models:
+      - claude-opus-4-8
+      - claude-opus-4-7
+      - claude-sonnet-4-6
+      - claude-haiku-4-5
+    priority: 8
+    timeout_ms: 120000
+
+  ## Optional local Ollama.
+  ollama:
+    url: http://LOCAL_LLM_HOST:11434/v1        # e.g. http://192.168.0.100:11434/v1
+    auth_type: none
+    models:
+      - "dolphin-*"
+    priority: 3
+
+tools:
+  guaranteed:
+    - exec
+    - read
+    - write
+    - edit
+    - message
+  max_budget: 16
+  fallback_budget: 8
+  call_limit: 10
+
+## Streaming to non-streaming auto-flip for upstream stability on large or
+## tool-heavy turns. See src/config.mjs for the full trigger set.
+streaming:
+  default: true
+  force_header: x-skgateway-nonstream
+  auto_nonstream:
+    enabled: true
+    trigger_if_body_bytes_ge: 40000
+    trigger_if_messages_ge: 6
+    trigger_if_tool_call_history_ge: 3
+    aggressive_models:
+      - deepseek-ai/deepseek-v4-flash
+
+sanitizer:
+  max_system_bytes: 40000
+  max_body_bytes: 120000
+  keep_start: 2
+  keep_end: 12
+  strip_thinking: true
+
+## Optional per-model context limits. Formula: max_body_bytes = context_tokens
+## * 4 bytes * 0.80; max_system_bytes = max_body_bytes * 0.40. Add entries as
+## needed; models without an entry use the sanitizer defaults above.
+model_limits:
+  ornith-1.0-9b:   { max_body_bytes: 419000, max_system_bytes: 168000 }
+  ornith-1.0-35b:  { max_body_bytes: 800000, max_system_bytes: 320000 }
+
+metrics:
+  enabled: true
+  db_path: ./data/metrics.db                   # relative resolves under repo root
+  retention_days: 90
+  token_tracking: true
+  cost_tracking: true
+  ## Per-model pricing (USD per 1,000,000 tokens). Local/hosted-free models are 0.
+  pricing:
+    claude-opus-4-7:
+      input: 15.00
+      output: 75.00
+      cache_read: 1.50
+      cache_write: 3.75
+    claude-sonnet-4-6:
+      input: 3.00
+      output: 15.00
+      cache_read: 0.30
+      cache_write: 0.375
+    default_local:
+      input: 0
+      output: 0
+
+siem:
+  enabled: true
+  outputs:
+    - type: file
+      path: ./logs/audit.jsonl                 # relative resolves under repo root
+      rotate_mb: 100
+    ## Optional remote syslog sink (SIEM). Disabled unless present + enabled,
+    ## or turned on via SKGATEWAY_SYSLOG_* env vars. See docs/SIEM.md.
+    # - type: syslog
+    #   enabled: true
+    #   host: SYSLOG_HOST
+    #   port: 514
+    #   protocol: udp            # udp | tcp | tls | unix
+    #   format: cef              # cef | json
+
+## Passive prompt classification (labels only, never reroutes). Safe on hot path.
+classification:
+  enabled: true
+  classifier: heuristic
+  gate: false
+
+## CapAuth agent-identity resolution. require_agent_id is the AUTH GATE: leave
+## false to keep the hot path open; set true to reject anonymous callers (403).
+identity:
+  enabled: true
+  allow_anonymous: true
+  require_agent_id: false
+
+dashboard:
+  enabled: true
+  refresh_ms: 5000
