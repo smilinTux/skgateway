@@ -538,21 +538,30 @@ export function reloadConfig(silent = false) {
 
 /**
  * Lookup the per-1M-token pricing for a given model name.
- * Falls back to `default_local` (all zeros) if no exact or prefix match found.
+ *
+ * A model that is present in the price table (even at $0, e.g. a local backend)
+ * is considered *priced* (`unpriced: false`). Only a model with no exact and no
+ * prefix match falls back to `default_local` and is flagged `unpriced: true` so
+ * callers/dashboards can surface "cost unknown for this model".
  *
  * @param {string} model
- * @returns {{ input: number, output: number, cache_read?: number, cache_write?: number }}
+ * @returns {{ input: number, output: number, cache_read?: number,
+ *   cache_write?: number, unpriced: boolean }}
  */
 export function getPricing(model) {
   const pricing = getConfig().metrics.pricing ?? {};
 
   // Exact match first
-  if (pricing[model]) return pricing[model];
+  if (pricing[model]) return { ...pricing[model], unpriced: false };
 
-  // Prefix match (e.g. "claude-opus" matches "claude-opus-4-6")
+  // Prefix match (e.g. "claude-opus" matches "claude-opus-4-6"). Never treat
+  // the "default_local" sentinel as a prefix — it is the unpriced fallback.
   for (const [key, val] of Object.entries(pricing)) {
-    if (model.startsWith(key)) return val;
+    if (key !== 'default_local' && model && model.startsWith(key)) {
+      return { ...val, unpriced: false };
+    }
   }
 
-  return pricing['default_local'] ?? { input: 0, output: 0 };
+  const fallback = pricing['default_local'] ?? { input: 0, output: 0 };
+  return { ...fallback, unpriced: true };
 }

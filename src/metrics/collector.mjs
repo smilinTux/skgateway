@@ -45,6 +45,11 @@ const FLUSH_BATCH_SIZE   = 100;     // flush early when the buffer reaches this
 const WINDOW_MS          = 5 * 60 * 1000;  // 5-minute in-memory rolling window
 const PURGE_INTERVAL_MS  = 6 * 60 * 60 * 1000; // purge old rows every 6 h
 
+// Bound the in-memory cost breakdown so a churn of distinct agent/model keys
+// can never grow memory without limit. Once the cap is hit, further keys fold
+// into a single "_other" bucket. SQLite (cost_log) keeps full-fidelity history.
+const MAX_COST_KEYS      = 200;
+
 // ─── anomaly detection tunables ────────────────────────────────────────────────
 const ANOMALY_SIGMA       = 3;   // flag samples ≥ this many σ from the running mean
 const ANOMALY_MIN_SAMPLES = 30;  // require a stable baseline before flagging
@@ -481,6 +486,9 @@ export function createMetricsCollector(config) {
     totalInputTokens:  0,
     totalOutputTokens: 0,
     totalCostUsd:    0,
+    // Count of requests whose model was absent from the price table (cost is a
+    // lower-bound estimate — see getPricing `unpriced`).
+    unpricedRequests: 0,
 
     // Rolling 5-min window
     recentRequests: new RollingCounter(WINDOW_MS),
@@ -490,7 +498,34 @@ export function createMetricsCollector(config) {
     // Per-agent active session tracking: { agentId -> Set<sessionId> }
     /** @type {Map<string, Set<string>>} */
     activeSessions: new Map(),
+
+    // Bounded in-memory cost breakdown for the /status surface (SQLite keeps
+    // full history). Key -> { costUsd, requests, unpriced }. Capped at
+    // MAX_COST_KEYS distinct keys; overflow folds into "_other".
+    /** @type {Map<string, { costUsd: number, requests: number, unpriced: boolean }>} */
+    costByAgent: new Map(),
+    /** @type {Map<string, { costUsd: number, requests: number, unpriced: boolean }>} */
+    costByModel: new Map(),
   };
+
+  /**
+   * Fold a request's cost into a bounded per-key breakdown map. New keys beyond
+   * MAX_COST_KEYS collapse into a shared "_other" bucket so memory stays O(cap).
+   *
+   * @param {Map<string, { costUsd: number, requests: number, unpriced: boolean }>} map
+   * @param {string} rawKey
+   * @param {number} costUsd
+   * @param {boolean} unpriced
+   */
+  function bumpCost(map, rawKey, costUsd, unpriced) {
+    let key = rawKey ?? 'unknown';
+    if (!map.has(key) && map.size >= MAX_COST_KEYS) key = '_other';
+    let e = map.get(key);
+    if (!e) { e = { costUsd: 0, requests: 0, unpriced: false }; map.set(key, e); }
+    e.costUsd  += costUsd;
+    e.requests += 1;
+    if (unpriced) e.unpriced = true;
+  }
 
   // Per-backend / per-model percentile estimators
   // Key: `${backend}:${model}` → { p50, p95, p99 }
@@ -705,6 +740,10 @@ export function createMetricsCollector(config) {
         const cost = calcCost(tokens, pricing);
         const totalCost = cost.input_cost + cost.output_cost + cost.cache_read_cost + cost.cache_write_cost;
         counters.totalCostUsd += totalCost;
+        if (pricing.unpriced) counters.unpricedRequests++;
+        // Bounded in-memory breakdown (per verified agent + per model) for /status.
+        bumpCost(counters.costByAgent, agentId ?? 'anonymous', totalCost, pricing.unpriced);
+        bumpCost(counters.costByModel, model   ?? 'unknown',   totalCost, pricing.unpriced);
         costRow = {
           req_id: reqId, agent_id: agentId ?? null, model: model ?? null,
           backend: backend ?? null, session_id: sessionId ?? null,
@@ -752,6 +791,9 @@ export function createMetricsCollector(config) {
    *   totalInputTokens: number,
    *   totalOutputTokens: number,
    *   totalCostUsd: number,
+   *   unpricedRequests: number,
+   *   costByAgent: Record<string, { costUsd: number, requests: number, unpriced: boolean }>,
+   *   costByModel: Record<string, { costUsd: number, requests: number, unpriced: boolean }>,
    *   activeSessions: Record<string, number>,
    *   latency: Record<string, { p50: number, p95: number, p99: number,
    *     mean: number, stddev: number, count: number, anomalies: number }>,
@@ -780,6 +822,18 @@ export function createMetricsCollector(config) {
       activeSessions[agentId] = sessions.size;
     }
 
+    // Materialize the bounded cost breakdowns as plain objects, rounded to a
+    // sane cent-fraction so the JSON payload stays compact.
+    const round6 = (n) => Math.round(n * 1e6) / 1e6;
+    const costByAgent = {};
+    for (const [k, v] of counters.costByAgent) {
+      costByAgent[k] = { costUsd: round6(v.costUsd), requests: v.requests, unpriced: v.unpriced };
+    }
+    const costByModel = {};
+    for (const [k, v] of counters.costByModel) {
+      costByModel[k] = { costUsd: round6(v.costUsd), requests: v.requests, unpriced: v.unpriced };
+    }
+
     return {
       totalRequests:    counters.totalRequests,
       activeRequests:   counters.activeRequests,
@@ -789,7 +843,10 @@ export function createMetricsCollector(config) {
       recentTokens5m:   counters.recentTokens.total(),
       totalInputTokens:  counters.totalInputTokens,
       totalOutputTokens: counters.totalOutputTokens,
-      totalCostUsd:     counters.totalCostUsd,
+      totalCostUsd:     round6(counters.totalCostUsd),
+      unpricedRequests: counters.unpricedRequests,
+      costByAgent,
+      costByModel,
       activeSessions,
       latency,
       anomalies:        recentAnomalies.slice(-ANOMALY_RING_SIZE).map(a => ({ ...a })),

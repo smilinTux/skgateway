@@ -19,6 +19,12 @@ import { mkdtempSync, existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createMetricsCollector } from "../src/metrics/collector.mjs";
+import { loadConfig, getPricing } from "../src/config.mjs";
+
+// Cost tests depend on the default price table via getConfig(). Load pure
+// DEFAULTS (bogus path → no YAML overlay) so pricing is deterministic and
+// independent of any local config/skgateway.yaml. Safe for the other suites.
+await loadConfig({ configPath: "/nonexistent/skgw-cost-test.yaml", silent: true });
 
 /** Build a valid metrics-config slice pointing at a throwaway db file. */
 function metricsCfg(dir, overrides = {}) {
@@ -249,6 +255,185 @@ describe("3-sigma latency anomaly detection (card 27e00648)", () => {
       assert.ok(field in a, `anomaly record exposes ${field}`);
     }
     assert.equal(a.key, "b:m");
+    collector.close?.();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cost tracking: $/request + per-agent/per-model aggregation (card 9bbcd420)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Feed one completed request carrying an OpenAI-style usage body. */
+function feedCost(collector, { agentId, model, backend = "b", usage, statusCode = 200 }) {
+  return collector.recordResponse({
+    reqId: `c-${Math.random().toString(16).slice(2)}`,
+    agentId,
+    model,
+    backend,
+    statusCode,
+    responseBody: { usage },
+  });
+}
+
+describe("cost tracking — price table (card 9bbcd420)", () => {
+  test("getPricing: exact, prefix, priced-at-zero, and unpriced fallback", () => {
+    // Exact match — flagged priced.
+    const opus = getPricing("claude-opus-4-7");
+    assert.equal(opus.input, 15.0);
+    assert.equal(opus.output, 75.0);
+    assert.equal(opus.unpriced, false);
+
+    // Prefix match (e.g. a dated suffix not in the table verbatim).
+    const sonnetPrefixed = getPricing("claude-sonnet-4-6-20260101");
+    assert.equal(sonnetPrefixed.input, 3.0);
+    assert.equal(sonnetPrefixed.unpriced, false);
+
+    // A local backend deliberately priced at $0 is PRICED, not unpriced.
+    const local = getPricing("moonshotai/kimi-k2.6");
+    assert.equal(local.input, 0);
+    assert.equal(local.unpriced, false);
+
+    // A model absent from the table falls back to default_local AND is flagged.
+    const unknown = getPricing("some-brand-new-model-xyz");
+    assert.equal(unknown.input, 0);
+    assert.equal(unknown.output, 0);
+    assert.equal(unknown.unpriced, true);
+  });
+});
+
+describe("cost tracking — per-request cost from tokens × price (card 9bbcd420)", () => {
+  test("cost matches manual calculation (tokens/1e6 × price)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "skgw-cost-"));
+    let collector;
+    try {
+      collector = createMetricsCollector(metricsCfg(dir));
+      // 1M input + 1M output on sonnet ($3 in / $15 out per 1M) → $18.00 exactly.
+      feedCost(collector, {
+        agentId: "lumina", model: "claude-sonnet-4-6",
+        usage: { input_tokens: 1_000_000, output_tokens: 1_000_000 },
+      });
+      const s = collector.getStats();
+      assert.ok(Math.abs(s.totalCostUsd - 18.0) < 1e-9, `expected $18.00, got ${s.totalCostUsd}`);
+
+      // A second request with cache tokens too. opus: in 15, out 75, cache_read
+      // 1.50, cache_write 3.75. 200k in / 100k out / 500k cache_read / 40k cache_write.
+      feedCost(collector, {
+        agentId: "opus", model: "claude-opus-4-7",
+        usage: {
+          input_tokens: 200_000, output_tokens: 100_000,
+          cache_read_input_tokens: 500_000, cache_creation_input_tokens: 40_000,
+        },
+      });
+      const expected2 =
+        (200_000 / 1e6) * 15.0 +   // 3.00
+        (100_000 / 1e6) * 75.0 +   // 7.50
+        (500_000 / 1e6) * 1.5 +    // 0.75
+        (40_000  / 1e6) * 3.75;    // 0.15  → 11.40
+      const s2 = collector.getStats();
+      assert.ok(Math.abs(s2.totalCostUsd - (18.0 + expected2)) < 1e-9,
+        `expected ${18.0 + expected2}, got ${s2.totalCostUsd}`);
+    } finally {
+      collector?.close?.();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("cost tracking — per-agent / per-model aggregation (card 9bbcd420)", () => {
+  test("in-memory breakdown groups spend by agent and by model", () => {
+    const dir = mkdtempSync(join(tmpdir(), "skgw-cost-"));
+    let collector;
+    try {
+      collector = createMetricsCollector(metricsCfg(dir));
+      // lumina: 2 sonnet calls, 1M+1M each → $18 each → $36.
+      feedCost(collector, { agentId: "lumina", model: "claude-sonnet-4-6",
+        usage: { input_tokens: 1_000_000, output_tokens: 1_000_000 } });
+      feedCost(collector, { agentId: "lumina", model: "claude-sonnet-4-6",
+        usage: { input_tokens: 1_000_000, output_tokens: 1_000_000 } });
+      // opus: 1 opus call, 1M in only → $15.
+      feedCost(collector, { agentId: "opus", model: "claude-opus-4-7",
+        usage: { input_tokens: 1_000_000, output_tokens: 0 } });
+
+      const s = collector.getStats();
+
+      // Per-agent
+      assert.ok(Math.abs(s.costByAgent.lumina.costUsd - 36.0) < 1e-9, `lumina $36, got ${s.costByAgent.lumina.costUsd}`);
+      assert.equal(s.costByAgent.lumina.requests, 2);
+      assert.ok(Math.abs(s.costByAgent.opus.costUsd - 15.0) < 1e-9, `opus $15, got ${s.costByAgent.opus.costUsd}`);
+      assert.equal(s.costByAgent.opus.requests, 1);
+
+      // Per-model
+      assert.ok(Math.abs(s.costByModel["claude-sonnet-4-6"].costUsd - 36.0) < 1e-9);
+      assert.equal(s.costByModel["claude-sonnet-4-6"].requests, 2);
+      assert.ok(Math.abs(s.costByModel["claude-opus-4-7"].costUsd - 15.0) < 1e-9);
+
+      // Grand total ties out.
+      assert.ok(Math.abs(s.totalCostUsd - 51.0) < 1e-9, `total $51, got ${s.totalCostUsd}`);
+
+      // SQLite aggregation (getCosts) agrees per agent.
+      const rows = collector.getCosts({ agentId: "lumina" });
+      const luminaTotal = rows.reduce((a, r) => a + r.total_cost, 0);
+      assert.ok(Math.abs(luminaTotal - 36.0) < 1e-9, `getCosts lumina $36, got ${luminaTotal}`);
+    } finally {
+      collector?.close?.();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("cost tracking — unknown model handling (card 9bbcd420)", () => {
+  test("unknown model is priced at $0 and flagged unpriced", () => {
+    const dir = mkdtempSync(join(tmpdir(), "skgw-cost-"));
+    let collector;
+    try {
+      collector = createMetricsCollector(metricsCfg(dir));
+      feedCost(collector, { agentId: "lumina", model: "mystery-model-99",
+        usage: { input_tokens: 500_000, output_tokens: 500_000 } });
+      // Plus a priced call so we can prove the flag is per-key, not global.
+      feedCost(collector, { agentId: "lumina", model: "claude-sonnet-4-6",
+        usage: { input_tokens: 1_000_000, output_tokens: 1_000_000 } });
+
+      const s = collector.getStats();
+      assert.equal(s.unpricedRequests, 1, "one unpriced request counted");
+      // Unknown model contributes $0 to the total → total is just the sonnet $18.
+      assert.ok(Math.abs(s.totalCostUsd - 18.0) < 1e-9, `total $18, got ${s.totalCostUsd}`);
+      assert.equal(s.costByModel["mystery-model-99"].unpriced, true, "unknown model flagged unpriced");
+      assert.equal(s.costByModel["mystery-model-99"].costUsd, 0);
+      assert.equal(s.costByModel["claude-sonnet-4-6"].unpriced, false, "priced model not flagged");
+    } finally {
+      collector?.close?.();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("cost tracking — bounded memory + /status exposure (card 9bbcd420)", () => {
+  test("cost breakdown is exposed via getStats() (the /status surface)", () => {
+    const collector = createMetricsCollector({ enabled: false, token_tracking: true, cost_tracking: true });
+    feedCost(collector, { agentId: "a1", model: "claude-sonnet-4-6",
+      usage: { input_tokens: 1_000_000, output_tokens: 0 } });
+    const s = collector.getStats();
+    // These are the fields /status (index.mjs) serializes from metrics.getStats().
+    assert.ok("costByAgent" in s && "costByModel" in s && "unpricedRequests" in s,
+      "getStats exposes cost breakdown fields");
+    assert.ok(Math.abs(s.costByAgent.a1.costUsd - 3.0) < 1e-9);
+    collector.close?.();
+  });
+
+  test("per-key breakdown stays bounded under high key cardinality", () => {
+    const collector = createMetricsCollector({ enabled: false, token_tracking: true, cost_tracking: true });
+    // 5000 distinct agents → far above MAX_COST_KEYS(200). Overflow folds to "_other".
+    for (let i = 0; i < 5000; i++) {
+      feedCost(collector, { agentId: `agent-${i}`, model: "claude-sonnet-4-6",
+        usage: { input_tokens: 1_000, output_tokens: 0 } });
+    }
+    const s = collector.getStats();
+    const keys = Object.keys(s.costByAgent);
+    assert.ok(keys.length <= 201, `bounded key set (≤200 + _other), got ${keys.length}`);
+    assert.ok(keys.includes("_other"), "overflow keys folded into _other bucket");
+    // No spend is lost to the bound: total across the breakdown ties to grand total.
+    const sumAgents = Object.values(s.costByAgent).reduce((a, v) => a + v.costUsd, 0);
+    assert.ok(Math.abs(sumAgents - s.totalCostUsd) < 1e-6, "bounded breakdown conserves total spend");
     collector.close?.();
   });
 });
