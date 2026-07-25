@@ -46,11 +46,25 @@ backends:
       - qwen3.6-27b-abliterated  # legacy alias -> same :8082 (ornith)
     priority: 1
 
-  ## Tyler's ornith-1.0-35b (Q4_K_M) — llama.cpp, 256K ctx, reasoning model.
-  ## Two boxes = active/standby: .150 primary → .153 failover (router fails
-  ## over on 5xx by priority). High priority NUMBERS (5/6) keep these OUT of
-  ## the unmatched-model fallback pool; they remain the SOLE match for the
-  ## exact id `ornith-1.0-35b`, so they never shadow other routing.
+  ## ornith-1.0-35b (Q4_K_M) — llama.cpp, 256K ctx, reasoning model.
+  ## Three boxes, active/standby by priority (router fails over on 5xx):
+  ## chiap08 (4) primary → Tyler .150 (5) → Tyler .153 (6). High priority
+  ## NUMBERS keep these OUT of the unmatched-model fallback pool (fronted by
+  ## priority 1); they remain the SOLE match for the exact id `ornith-1.0-35b`,
+  ## so they never shadow other routing.
+  ##
+  ## 2026-07-21: chiap08 added as PRIMARY. Both of Tyler's boxes were verified
+  ## EHOSTUNREACH, so `ornith-1.0-35b` was advertised in /v1/models but routed
+  ## to nothing (502). chiap08:11436 serves the identical
+  ## deepreinforce-ai_Ornith-1.0-35B-Q4_K_M.gguf at n_ctx=262144, so the
+  ## existing model_limits (800000/320000) apply unchanged.
+  chiap08-ornith:
+    url: http://100.81.238.58:11436/v1
+    auth_type: none
+    models:
+      - ornith-1.0-35b
+      - ornith-big            # short alias -> same backend (llama.cpp serves name-agnostically)
+    priority: 4
   tyler-ornith:
     url: http://192.168.0.150:8087/v1
     auth_type: none
@@ -70,33 +84,33 @@ backends:
     auth_type: api_key
     api_key_env: NVIDIA_API_KEY
     models:
-      ## ── Moonshot / Kimi ──────────────────────────────────────────────────
-      - moonshotai/kimi-k2.6
-      ## ── Qwen ─────────────────────────────────────────────────────────────
-      - qwen/qwen3-next-80b-a3b-instruct
-      - qwen/qwen3-next-80b-a3b-thinking
-      - qwen/qwen3-coder-480b-a35b-instruct
+      ## Validated live 2026-07-15 via one-word completion probe. Dead and
+      ## decommissioned models pruned (see note at end of list).
+      ## Qwen
       - qwen/qwen3.5-122b-a10b
       - qwen/qwen3.5-397b-a17b
-      ## ── OpenAI OSS ───────────────────────────────────────────────────────
-      - openai/gpt-oss-120b
+      ## OpenAI OSS
       - openai/gpt-oss-20b
-      ## ── DeepSeek ─────────────────────────────────────────────────────────
+      ## DeepSeek
       - deepseek-ai/deepseek-v4-flash
-      - deepseek-ai/deepseek-v4-pro
-      ## ── Mistral ──────────────────────────────────────────────────────────
+      - deepseek-ai/deepseek-v4-pro                    # slow (~46s), batch/cron use
+      ## Mistral
       - mistralai/mistral-medium-3.5-128b
       - mistralai/mistral-large-3-675b-instruct-2512
-      - mistralai/ministral-14b-instruct-2512
-      ## ── Meta / NVIDIA ────────────────────────────────────────────────────
-      - meta/llama-3.3-70b-instruct
+      ## NVIDIA
       - nvidia/llama-3.3-nemotron-super-49b-v1.5
-      ## ── Google ───────────────────────────────────────────────────────────
-      - google/gemma-4-31b-it
-      ## ── ByteDance ────────────────────────────────────────────────────────
-      - bytedance/seed-oss-36b-instruct
-      ## ── MiniMax ──────────────────────────────────────────────────────────
-      - minimaxai/minimax-m2.7
+      ## MiniMax
+      - minimaxai/minimax-m2.7                         # slow (~40s), batch/cron use
+      ## PRUNED 2026-07-15 (validated dead, all failed a warm one-word probe):
+      ##   moonshotai/kimi-k2.6                    404 Function not found (account)
+      ##   qwen/qwen3-next-80b-a3b-instruct        hang > 60s
+      ##   qwen/qwen3-next-80b-a3b-thinking        410 Gone (decommissioned)
+      ##   qwen/qwen3-coder-480b-a35b-instruct     410 Gone (decommissioned)
+      ##   openai/gpt-oss-120b                     hang > 60s
+      ##   meta/llama-3.3-70b-instruct             hang > 60s
+      ##   google/gemma-4-31b-it                   hang > 90s
+      ##   bytedance/seed-oss-36b-instruct         hang > 90s
+      ##   mistralai/ministral-14b-instruct-2512   hang > 60s
     priority: 1
 
   anthropic:
@@ -150,6 +164,13 @@ backends:
     models:
       - "dolphin-*"
     priority: 3
+
+  openrouter:
+    url: https://openrouter.ai/api/v1
+    auth_type: api_key
+    api_key_env: OPENROUTER_API_KEY
+    discovery: free
+    max_concurrent: 10
 
 tools:
   guaranteed:
@@ -288,3 +309,14 @@ siem:
 dashboard:
   enabled: true
   refresh_ms: 5000
+
+## Dynamic provider model discovery: periodically polls each declared
+## backend's model-list endpoint and folds newly seen models into the
+## effective model set, instead of relying solely on the static `models`
+## arrays above.
+discovery:
+  enabled: true
+  refresh_seconds: 3600
+  providers:
+    nvidia:     { enabled: true, free_only: true, chat_only: true }
+    openrouter: { enabled: true, free_only: true, chat_only: true }

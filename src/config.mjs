@@ -73,6 +73,13 @@ const DEFAULTS = {
       models: ['dolphin-*'],
       priority: 3,
     },
+    openrouter: {
+      url: 'https://openrouter.ai/api/v1',
+      auth_type: 'api_key',
+      api_key_env: 'OPENROUTER_API_KEY',
+      discovery: 'free', // free | all
+      max_concurrent: 10,
+    },
   },
 
   tools: {
@@ -193,6 +200,24 @@ const DEFAULTS = {
     enabled: true,
     allow_anonymous: true,
     require_agent_id: false,
+  },
+
+  // Dynamic provider model discovery (SKGateway dynamic-provider-model-discovery).
+  // Periodically queries each declared backend's model-list endpoint and folds
+  // newly seen models into the effective model set, instead of relying solely
+  // on the static `models` arrays above.
+  //   enabled: run the discovery poller (default true)
+  //   refresh_seconds: how often to re-poll each provider (default 3600 = 1h)
+  //   providers.<name>.enabled: include this provider in discovery
+  //   providers.<name>.free_only: keep only models with zero listed cost
+  //   providers.<name>.chat_only: drop non-chat-completions model types
+  discovery: {
+    enabled: true,
+    refresh_seconds: 3600,
+    providers: {
+      nvidia: { enabled: true, free_only: true, chat_only: true },
+      openrouter: { enabled: true, free_only: true, chat_only: true },
+    },
   },
 };
 
@@ -516,10 +541,17 @@ function validate(cfg) {
         errs.push(`backends.${name}.url must be a non-empty string`);
       if (!VALID_AUTH_TYPES.has(backend.auth_type))
         errs.push(`backends.${name}.auth_type must be one of: ${[...VALID_AUTH_TYPES].join(', ')}`);
-      if (!Array.isArray(backend.models) || backend.models.length === 0)
-        errs.push(`backends.${name}.models must be a non-empty array`);
-      if (!Number.isInteger(backend.priority) || backend.priority < 1)
-        errs.push(`backends.${name}.priority must be a positive integer`);
+      // Discovery-driven backends (e.g. openrouter) intentionally have no
+      // static `models` list, their catalog is populated at runtime by
+      // discovery.mjs. Backend.matches() already treats an empty models list
+      // as "accept everything", and Backend defaults a missing priority to
+      // 99, so skip both checks for them rather than forcing a fake list.
+      if (!backend.discovery) {
+        if (!Array.isArray(backend.models) || backend.models.length === 0)
+          errs.push(`backends.${name}.models must be a non-empty array`);
+        if (!Number.isInteger(backend.priority) || backend.priority < 1)
+          errs.push(`backends.${name}.priority must be a positive integer`);
+      }
     }
   }
 

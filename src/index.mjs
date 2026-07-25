@@ -10,10 +10,13 @@
  */
 
 import http from "node:http";
-import { loadConfig } from "./config.mjs";
+import { loadConfig, getConfig } from "./config.mjs";
 import { createProxyServer, handleRequest, buildConfig } from "./proxy/core.mjs";
 import { createRouter, routeAndSend } from "./proxy/router.mjs";
+import { isAnthropicBackend } from "./proxy/anthropic-adapter.mjs";
 import { buildModelCatalog, reconcileModeFromConfig } from "./proxy/advertise.mjs";
+import { loadAllowlist, saveAllowlist, applyAllowlist } from "./advertise.mjs";
+import { discoverCatalog, loadCache, saveCache, fetchNvidia, fetchOpenRouter } from "./discovery.mjs";
 import { getPool, resetPool } from "./proxy/connection-pool.mjs";
 import { loadAgentRegistry, extractIdentity, ANONYMOUS_AGENT_ID } from "./identity/capauth.mjs";
 import { classifyRequest, toSiemEvent } from "./classifiers/engine.mjs";
@@ -51,6 +54,124 @@ const router = createRouter({ backends: _routerBackends, quarantine: config.quar
 // non-breaking (annotate status, hide nothing). See src/proxy/advertise.mjs.
 const advertiseReconcileMode = reconcileModeFromConfig(config);
 console.log(`[skgateway] advertised-catalog reconcile mode: ${advertiseReconcileMode}`);
+
+// ─── Dynamic provider-model discovery (Task 5, wiring Tasks 1-4) ───
+// Periodically polls the live NVIDIA + OpenRouter free-chat catalogs (see
+// src/discovery.mjs) and merges them with the statically-configured local
+// backends into one in-memory catalog. GET /v1/models and GET /admin/models
+// both read this catalog through getDiscoveredCatalog(); the on-disk
+// allowlist (src/advertise.mjs) then filters what actually gets advertised.
+// Fail-soft end to end: a provider fetch error falls back to the on-disk
+// cache (loadCache/saveCache) and never blocks startup or breaks /v1/models.
+let _catalog = [];
+const _discoveryCache = loadCache();
+
+/**
+ * The static/local backend model lists already declared in config.backends
+ * (ornith/beellama/ollama/anthropic/...), tagged like a discovery result.
+ * Excludes nvidia/openrouter, whose ids come from the live discovery fetch
+ * below instead of the (mostly hand-curated) static list.
+ *
+ * Each id is tagged with the OWNING backend's name as `provider` (not a
+ * blanket "local"), and `free` is set per-backend rather than hardcoded true:
+ * a paid cloud backend (anthropic, detected via isAnthropicBackend: oauth
+ * auth_type or an api.anthropic.com URL) must NOT be advertised as free+local,
+ * since /v1/models feeds the skchat model picker, which groups by provider
+ * and marks "free" models for cost-free use. Mislabeling paid Claude models
+ * that way is a cost footgun, not just a display nit. Genuinely-local
+ * backends (ornith/beellama/ollama/...) keep free:true. This tagging is
+ * catalog-display only; routing itself is driven by the reconciled
+ * `owned_by` field from buildModelCatalog(), not by this provider/free tag.
+ */
+function localModels(cfg) {
+  const out = [];
+  for (const [name, b] of Object.entries(cfg.backends || {})) {
+    if (["nvidia", "openrouter"].includes(name)) continue;
+    const paidCloud = isAnthropicBackend(b);
+    for (const id of b.models || []) {
+      if (typeof id === "string" && !id.includes("*")) {
+        out.push({ id, provider: name, free: !paidCloud });
+      }
+    }
+  }
+  return out;
+}
+
+function providerBackend(provider) {
+  return provider === "nvidia" ? "nvidia" : provider === "openrouter" ? "openrouter" : null;
+}
+
+/**
+ * Wire discovered ids into the actual routing table. The router has no
+ * dynamic "registerModel" call (see src/proxy/router.mjs): a Backend decides
+ * what it serves purely from its own `models` array (Backend#supportsModel),
+ * so we set that array directly on the live Backend instance the router
+ * already holds (router.getBackend(name)). Each refresh RECOMPUTES the array
+ * as (config-declared static models) union (this cycle's discovered ids) for
+ * that provider, instead of appending, so a model that drops out of a
+ * provider's catalog also drops out of routing instead of accumulating
+ * forever.
+ */
+function registerDiscoveredRoutes(cfg, catalog) {
+  const byProvider = new Map();
+  for (const m of catalog) {
+    const be = providerBackend(m.provider);
+    if (!be) continue;
+    if (!byProvider.has(be)) byProvider.set(be, new Set());
+    byProvider.get(be).add(m.id);
+  }
+  for (const [name, ids] of byProvider) {
+    const backend = router.getBackend(name);
+    if (!backend) continue; // provider not configured as a router backend, nothing to route to
+    const staticModels = (cfg.backends?.[name]?.models || []).filter((x) => typeof x === "string");
+    backend.models = [...new Set([...staticModels, ...ids])];
+  }
+}
+
+async function refreshCatalog(cfg) {
+  const d = cfg.discovery || {};
+  const nvEnabled = d.providers?.nvidia?.enabled !== false;
+  const orEnabled = d.providers?.openrouter?.enabled !== false;
+  const nvidiaKey = process.env[cfg.backends?.nvidia?.api_key_env || "NVIDIA_API_KEY"];
+  const { models } = await discoverCatalog({
+    localModels: localModels(cfg),
+    nvidiaFetch: nvEnabled ? () => fetchNvidia(nvidiaKey) : async () => ({ data: [] }),
+    openrouterFetch: orEnabled ? () => fetchOpenRouter() : async () => ({ data: [] }),
+    cache: _discoveryCache,
+  });
+  _catalog = models;
+  registerDiscoveredRoutes(cfg, models);
+  saveCache(_discoveryCache);
+  return models;
+}
+
+/** Current merged discovery catalog, used by both /v1/models and /admin/models. */
+export async function getDiscoveredCatalog() {
+  // Honor the discovery.enabled master switch on the lazy path too. Without
+  // this check, a cold first request to /v1/models would still call
+  // refreshCatalog() (and therefore hit the network) even with discovery
+  // disabled, because the eager-startup gate above only skips the initial
+  // call and the interval, not this lazy fallback.
+  if (getConfig().discovery?.enabled === false) return localModels(getConfig());
+  if (_catalog.length === 0) await refreshCatalog(getConfig());
+  return _catalog;
+}
+
+// Kick off discovery on startup and on an interval thereafter (default
+// hourly, config.discovery.refresh_seconds). A failure here is logged and
+// swallowed: the gateway keeps serving on whatever catalog it already has
+// (empty on a fresh install until the first successful refresh, or stale
+// cache thereafter).
+if (config.discovery?.enabled !== false) {
+  refreshCatalog(getConfig()).catch((e) => {
+    console.warn("[skgateway] initial catalog discovery failed (fail-soft, will retry):", e.message);
+  });
+  setInterval(() => {
+    refreshCatalog(getConfig()).catch((e) => {
+      console.warn("[skgateway] catalog discovery refresh failed (fail-soft, serving stale):", e.message);
+    });
+  }, (config.discovery?.refresh_seconds || 3600) * 1000).unref();
+}
 
 // Initialize connection pool with per-backend limits from config
 const poolConfig = {
@@ -190,6 +311,21 @@ function buildModelLimits(raw) {
   return out;
 }
 
+// ─── Loopback check for admin routes ───
+// The admin allowlist endpoints (GET/PUT /admin/models*) have no dedicated
+// privileged-route auth gate in this codebase (the CapAuth identity gate above
+// is opt-in and scoped to /v1/*), so bind admin behavior to loopback callers
+// only, same posture as the default server bind (127.0.0.1).
+function isLoopback(req) {
+  const addr = req.socket?.remoteAddress || "";
+  return addr === "127.0.0.1" || addr === "::1" || addr === "::ffff:127.0.0.1";
+}
+
+// Body size cap for PUT /admin/models/advertise: the payload is just a list of
+// model id strings, 64KB is generous headroom and keeps a malformed/hostile
+// loopback PUT from buffering unbounded memory.
+const ADVERTISE_MAX_BODY_BYTES = 64 * 1024;
+
 // ─── Build proxy config ───
 // Explicitly map YAML snake_case keys → core.mjs camelCase to avoid silent misses.
 const s = config.sanitizer || {};
@@ -262,15 +398,128 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // ── Aggregated model catalog from configured backends ──
+  // ── Aggregated model catalog: discovered + statically-configured backends ──
   // Reconciled against live backend health/quarantine (card 5c680ee9): a model
   // whose only serving backend(s) are down or quarantined is flagged
   // (status: "unavailable") or hidden per config.advertise.reconcile, so callers
   // are not offered dead models. Recovery re-admits automatically.
+  //
+  // buildModelCatalog() only sees the models literally declared in
+  // config.backends[*].models, so it never carries NVIDIA/OpenRouter's live
+  // discovered ids (Task 5), but it IS the source of truth for health/status
+  // on the ids it does know about, and that must not be lost. The merge below
+  // keeps every reconciled field (id/object/created/owned_by/status) for ids
+  // known to both, and layers the discovered provider/free/stale tags on top;
+  // an id known only to discovery (the common case for dynamic NVIDIA/
+  // OpenRouter models) is admitted using its discovered shape. The allowlist
+  // (src/advertise.mjs) is applied last, exactly as on /admin/models.
   if (req.url === "/v1/models" && req.method === "GET") {
-    const data = buildModelCatalog(config.backends || {}, router, advertiseReconcileMode);
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ object: "list", data }));
+    // Local fail-soft net: every callee below already traps its own errors,
+    // but this handler sits outside the file's proxy-path try/catch (below),
+    // so an unforeseen throw here (e.g. a future change to getDiscoveredCatalog
+    // or buildModelCatalog) must not become an unhandled rejection that takes
+    // the process down. /v1/models must always answer 200 with whatever
+    // catalog it can assemble, never 500, never crash.
+    try {
+      const discovered = await getDiscoveredCatalog();
+      const reconciled = buildModelCatalog(config.backends || {}, router, advertiseReconcileMode);
+      const byId = new Map(reconciled.map((m) => [m.id, { ...m }]));
+      for (const { id, ...tags } of discovered) {
+        const base = byId.get(id) || { id, object: "model", created: 0, owned_by: tags.provider || "discovery" };
+        byId.set(id, { ...base, ...tags, id });
+      }
+      const data = applyAllowlist([...byId.values()], loadAllowlist());
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ object: "list", data }));
+    } catch (e) {
+      console.warn("[skgateway] /v1/models discovery merge failed, falling back to static catalog:", e.message);
+      let data = [];
+      try {
+        data = buildModelCatalog(config.backends || {}, router, advertiseReconcileMode);
+      } catch (e2) {
+        console.warn("[skgateway] /v1/models static catalog fallback also failed, serving empty list:", e2.message);
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ object: "list", data }));
+    }
+    return;
+  }
+
+  // ── Admin: discovered-catalog view + advertise allowlist (Task 4/5) ──
+  // Loopback only (no dedicated privileged-route gate exists yet, see
+  // isLoopback() above).
+  if (req.url === "/admin/models" && req.method === "GET") {
+    if (!isLoopback(req)) {
+      res.writeHead(403, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "Admin routes are loopback only", code: 403 } }));
+      return;
+    }
+    try {
+      const full = await getDiscoveredCatalog();          // Task 5 provides this
+      const allow = loadAllowlist();
+      const set = new Set(allow);
+      const data = full.map((m) => ({ ...m, advertised: allow.length === 0 || set.has(m.id) }));
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ object: "list", data }));
+    } catch (e) {
+      console.warn("[skgateway] /admin/models failed:", e.message);
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "internal error building model catalog", code: 500 } }));
+    }
+    return;
+  }
+  if (req.url === "/admin/models/advertise" && req.method === "PUT") {
+    if (!isLoopback(req)) {
+      res.writeHead(403, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "Admin routes are loopback only", code: 403 } }));
+      return;
+    }
+    // Bound the body read: a malformed/hostile loopback PUT should not be able
+    // to buffer an unlimited amount of memory before we even get to parsing.
+    let bodyBytes = 0;
+    const bodyChunks = [];
+    let tooLarge = false;
+    for await (const chunk of req) {
+      bodyBytes += chunk.length;
+      if (bodyBytes > ADVERTISE_MAX_BODY_BYTES) {
+        tooLarge = true;
+        break;
+      }
+      bodyChunks.push(chunk);
+    }
+    if (tooLarge) {
+      res.writeHead(413, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: `body too large (max ${ADVERTISE_MAX_BODY_BYTES} bytes)` }));
+      return;
+    }
+    const body = Buffer.concat(bodyChunks).toString("utf-8");
+    let parsed;
+    try {
+      parsed = JSON.parse(body || "{}");
+    } catch (e) {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "invalid JSON body" }));
+      return;
+    }
+    // `enabled` feeds straight into new Set(...) on the GET /admin/models path
+    // (and gets persisted to disk), so a non-array (or an array with non-string
+    // entries) must be rejected here rather than allowed to corrupt the
+    // allowlist and blow up that later `new Set(...)` call.
+    const enabled = (parsed && typeof parsed === "object" && "enabled" in parsed) ? parsed.enabled : [];
+    if (!Array.isArray(enabled) || !enabled.every((x) => typeof x === "string")) {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "enabled must be an array of strings" }));
+      return;
+    }
+    try {
+      saveAllowlist(enabled);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, enabled }));
+    } catch (e) {
+      console.warn("[skgateway] /admin/models/advertise failed:", e.message);
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "internal error saving allowlist", code: 500 } }));
+    }
     return;
   }
 
