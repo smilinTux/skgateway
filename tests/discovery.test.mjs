@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { isChatModel, parseNvidia, parseOpenRouterFree } from '../src/discovery.mjs';
+import { isChatModel, parseNvidia, parseOpenRouterFree, mergeCatalog, discoverCatalog } from '../src/discovery.mjs';
 
 test('isChatModel drops embeddings, vision, safety', () => {
   assert.equal(isChatModel('meta/llama-3.3-70b-instruct'), true);
@@ -23,4 +23,30 @@ test('parseOpenRouterFree keeps only free chat models', () => {
   ] };
   const out = parseOpenRouterFree(json).map(m => m.id);
   assert.deepEqual(out, ['google/gemma-4-31b-it:free']);
+});
+
+test('mergeCatalog dedups by id, local wins', () => {
+  const out = mergeCatalog(
+    [{ id: 'ornith-tiny', provider: 'local', free: true }],
+    [{ id: 'ornith-tiny', provider: 'nvidia', free: true }, { id: 'qwen/x', provider: 'nvidia', free: true }],
+    [{ id: 'g/y:free', provider: 'openrouter', free: true }],
+  );
+  const byId = Object.fromEntries(out.map((m) => [m.id, m.provider]));
+  assert.equal(byId['ornith-tiny'], 'local');
+  assert.equal(byId['qwen/x'], 'nvidia');
+  assert.equal(byId['g/y:free'], 'openrouter');
+});
+
+test('discoverCatalog serves cache + marks stale when a provider throws', async () => {
+  const cache = { models: [{ id: 'cached', provider: 'nvidia', free: true }] };
+  const res = await discoverCatalog({
+    localModels: [{ id: 'ornith-tiny', provider: 'local', free: true }],
+    nvidiaFetch: async () => { throw new Error('down'); },
+    openrouterFetch: async () => ({ data: [] }),
+    cache,
+  });
+  assert.equal(res.stale, true);
+  const ids = res.models.map((m) => m.id);
+  assert.ok(ids.includes('ornith-tiny'));
+  assert.ok(ids.includes('cached'));
 });
