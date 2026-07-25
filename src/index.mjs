@@ -311,7 +311,15 @@ const server = http.createServer(async (req, res) => {
     }
     let body = "";
     for await (const chunk of req) body += chunk;
-    const enabled = (JSON.parse(body || "{}").enabled) || [];
+    let parsed;
+    try {
+      parsed = JSON.parse(body || "{}");
+    } catch (e) {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "invalid JSON body" }));
+      return;
+    }
+    const enabled = parsed.enabled || [];
     saveAllowlist(enabled);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true, enabled }));
