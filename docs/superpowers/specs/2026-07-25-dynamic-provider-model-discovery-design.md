@@ -101,6 +101,27 @@ discovery:
 `free_only: true` for both is the "for now" default; flipping OpenRouter to
 `false` later widens to paid without code changes.
 
+### 3.5 Advertise allowlist + admin API (console-ready)
+
+Discovery finds *everything*; the operator chooses what is actually advertised.
+SKGateway persists an **advertise allowlist** so a management console (card
+`e7cde8f1`, SKDashboard) can toggle models on/off without a redeploy.
+
+- Store: `~/.config/skgateway/advertise.json` -> `{ "enabled": ["<id>", ...] }`.
+  **Empty/absent = advertise-all** (back-compat; nothing hidden until the
+  operator curates).
+- `/v1/models` returns `discovered ∩ allowlist` (or all discovered when the
+  allowlist is empty), still health-reconciled.
+- Admin API (loopback/operator-gated, mirrors the gateway's existing auth
+  posture):
+  - `GET /admin/models` -> full discovered catalog with `{id, provider, free,
+    available, advertised}` so the console can render toggles.
+  - `PUT /admin/models/advertise` `{enabled: [...]}` -> replace the allowlist.
+- Role -> model mapping stays in the `skos.models` registry (the console edits
+  that registry directly); this spec only owns the advertise allowlist + the
+  discovered catalog the console reads. The console UI + left-nav are W4
+  (SKDashboard), tracked separately.
+
 ## 4. Testing / acceptance
 
 - **Unit (fixtures, no live HTTP):** `fetchNvidiaModels`/`fetchOpenRouterFreeModels`
