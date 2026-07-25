@@ -1,5 +1,5 @@
 /**
- * upstream.mjs — Upstream relay for SKGateway
+ * upstream.mjs - Upstream relay for SKGateway
  *
  * Provides `sendUpstream`, a thin HTTP/HTTPS relay that forwards a
  * buffered request body to an upstream API endpoint and returns the
@@ -14,7 +14,7 @@
  *  - A wedged upstream that accepts the TCP connection but never replies
  *    would otherwise hang the request forever. An optional idle timeout
  *    (`timeoutMs`) converts that into a fast 504 so the router can fail
- *    over instead of blocking. Disabled (0) by default — current behavior.
+ *    over instead of blocking. Disabled (0) by default: current behavior.
  *  - Hop-by-hop headers (`connection`, `keep-alive`) are stripped from
  *    proxied request headers to avoid confusing the upstream server.
  */
@@ -28,6 +28,50 @@ import { URL } from "node:url";
 const _agentOpts = { keepAlive: true, keepAliveMsecs: 30000, maxSockets: 64, maxFreeSockets: 16 };
 const httpAgent = new http.Agent(_agentOpts);
 const httpsAgent = new https.Agent(_agentOpts);
+
+// Matches a leading /v<digits> path segment, e.g. /v1/chat/completions -> /v1
+const LEADING_VERSION_SEGMENT = /^\/v\d+(?=\/|$)/;
+
+/**
+ * Build the upstream request URL from an incoming request path and the
+ * backend's configured base URL, preserving the base URL's full path.
+ *
+ * `new URL(reqPath, base)` cannot be used directly here: reqPath is an
+ * ABSOLUTE path (e.g. `/v1/chat/completions`), and per the WHATWG URL spec
+ * an absolute path resolved against a base discards any base path beyond
+ * the origin. That happens to be harmless for a backend base URL whose
+ * path is just `/v1` (NVIDIA), but silently drops any extra prefix on a
+ * base like OpenRouter's `https://openrouter.ai/api/v1` (the `/api` is
+ * lost, producing a 404).
+ *
+ * Instead, treat the base URL as the API root: append reqPath's pathname
+ * to the base's pathname, first stripping reqPath's leading `/vN` segment
+ * if the base's pathname already ends with that exact `/vN` segment (so
+ * the version is not duplicated). The query string from reqUrl is always
+ * preserved.
+ *
+ * @param {string} reqUrl - path+query as received by the proxy, e.g. `/v1/chat/completions`.
+ * @param {URL} targetUrl - parsed base URL of the upstream backend, e.g. `https://openrouter.ai/api/v1`.
+ * @returns {URL} the resolved upstream URL.
+ */
+export function buildUpstreamUrl(reqUrl, targetUrl) {
+  // Parse reqUrl against the origin alone so we can pull apart its
+  // pathname/search without the base's path interfering.
+  const req = new URL(reqUrl, targetUrl.origin);
+
+  const basePath = targetUrl.pathname.replace(/\/$/, ""); // strip trailing slash
+  const versionMatch = req.pathname.match(LEADING_VERSION_SEGMENT);
+  const baseEndsWithVersion = versionMatch && basePath.endsWith(versionMatch[0]);
+
+  const reqPathToAppend = baseEndsWithVersion
+    ? req.pathname.slice(versionMatch[0].length)
+    : req.pathname;
+
+  const upstream = new URL(targetUrl.origin);
+  upstream.pathname = basePath + reqPathToAppend;
+  upstream.search = req.search;
+  return upstream;
+}
 
 /**
  * Forward one HTTP request to the upstream origin and collect the full
@@ -56,7 +100,7 @@ const httpsAgent = new https.Agent(_agentOpts);
  */
 export function sendUpstream(reqUrl, method, headers, body, targetUrl, timeoutMs = 0) {
   return new Promise((resolve) => {
-    const upstream = new URL(reqUrl, targetUrl);
+    const upstream = buildUpstreamUrl(reqUrl, targetUrl);
 
     // Guard against double-resolution: a timeout-triggered destroy() also fires
     // the 'error' handler, and we must resolve exactly once.
