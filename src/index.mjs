@@ -14,6 +14,7 @@ import { loadConfig } from "./config.mjs";
 import { createProxyServer, handleRequest, buildConfig } from "./proxy/core.mjs";
 import { createRouter, routeAndSend } from "./proxy/router.mjs";
 import { buildModelCatalog, reconcileModeFromConfig } from "./proxy/advertise.mjs";
+import { loadAllowlist, saveAllowlist, applyAllowlist } from "./advertise.mjs";
 import { getPool, resetPool } from "./proxy/connection-pool.mjs";
 import { loadAgentRegistry, extractIdentity, ANONYMOUS_AGENT_ID } from "./identity/capauth.mjs";
 import { classifyRequest, toSiemEvent } from "./classifiers/engine.mjs";
@@ -190,6 +191,16 @@ function buildModelLimits(raw) {
   return out;
 }
 
+// ─── Loopback check for admin routes ───
+// The admin allowlist endpoints (GET/PUT /admin/models*) have no dedicated
+// privileged-route auth gate in this codebase (the CapAuth identity gate above
+// is opt-in and scoped to /v1/*), so bind admin behavior to loopback callers
+// only, same posture as the default server bind (127.0.0.1).
+function isLoopback(req) {
+  const addr = req.socket?.remoteAddress || "";
+  return addr === "127.0.0.1" || addr === "::1" || addr === "::ffff:127.0.0.1";
+}
+
 // ─── Build proxy config ───
 // Explicitly map YAML snake_case keys → core.mjs camelCase to avoid silent misses.
 const s = config.sanitizer || {};
@@ -271,6 +282,39 @@ const server = http.createServer(async (req, res) => {
     const data = buildModelCatalog(config.backends || {}, router, advertiseReconcileMode);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ object: "list", data }));
+    return;
+  }
+
+  // ── Admin: discovered-catalog view + advertise allowlist (Task 4/5) ──
+  // Loopback only (no dedicated privileged-route gate exists yet, see
+  // isLoopback() above). getDiscoveredCatalog() is provided by Task 5;
+  // it is intentionally undefined until that lands.
+  if (req.url === "/admin/models" && req.method === "GET") {
+    if (!isLoopback(req)) {
+      res.writeHead(403, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "Admin routes are loopback only", code: 403 } }));
+      return;
+    }
+    const full = await getDiscoveredCatalog();          // Task 5 provides this
+    const allow = loadAllowlist();
+    const set = new Set(allow);
+    const data = full.map((m) => ({ ...m, advertised: allow.length === 0 || set.has(m.id) }));
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ object: "list", data }));
+    return;
+  }
+  if (req.url === "/admin/models/advertise" && req.method === "PUT") {
+    if (!isLoopback(req)) {
+      res.writeHead(403, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "Admin routes are loopback only", code: 403 } }));
+      return;
+    }
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    const enabled = (JSON.parse(body || "{}").enabled) || [];
+    saveAllowlist(enabled);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true, enabled }));
     return;
   }
 
