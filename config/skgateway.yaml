@@ -7,6 +7,17 @@ server:
   dashboard_port: 18781
   bind: 0.0.0.0
 
+## Advertised-vs-working reconciliation (card 5c680ee9)
+## The GET /v1/models catalog is reconciled against live backend health so
+## callers are not offered models whose only backend(s) are down or quarantined.
+## Composes with the quarantine layer via Backend.isAvailable(); recovery
+## re-admits a model automatically. Runtime view only, config is never mutated.
+##   reconcile: flag  (default) advertise all, annotate status available/unavailable
+##              hide           omit models with no available serving backend
+##              off            legacy behavior, advertise everything, no status
+# advertise:
+#   reconcile: flag
+
 ## Connection Pooling — enforces per-backend concurrency limits
 ## NVIDIA NIM allows 20 concurrent requests max. We enforce this here
 ## so the gateway never exceeds the upstream limit.

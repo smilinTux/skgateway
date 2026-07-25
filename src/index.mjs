@@ -13,6 +13,7 @@ import http from "node:http";
 import { loadConfig } from "./config.mjs";
 import { createProxyServer, handleRequest, buildConfig } from "./proxy/core.mjs";
 import { createRouter, routeAndSend } from "./proxy/router.mjs";
+import { buildModelCatalog, reconcileModeFromConfig } from "./proxy/advertise.mjs";
 import { getPool, resetPool } from "./proxy/connection-pool.mjs";
 import { loadAgentRegistry, extractIdentity, ANONYMOUS_AGENT_ID } from "./identity/capauth.mjs";
 import { classifyRequest, toSiemEvent } from "./classifiers/engine.mjs";
@@ -43,6 +44,13 @@ for (const [id, b] of Object.entries(config.backends || {})) {
   }
 }
 const router = createRouter({ backends: _routerBackends, quarantine: config.quarantine, routing: config.routing });
+
+// Advertised-vs-working reconciliation mode (card 5c680ee9). The /v1/models
+// catalog is reconciled against live backend health so callers are not offered
+// models whose only backend(s) are down or quarantined. Default "flag" is
+// non-breaking (annotate status, hide nothing). See src/proxy/advertise.mjs.
+const advertiseReconcileMode = reconcileModeFromConfig(config);
+console.log(`[skgateway] advertised-catalog reconcile mode: ${advertiseReconcileMode}`);
 
 // Initialize connection pool with per-backend limits from config
 const poolConfig = {
@@ -255,16 +263,12 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ── Aggregated model catalog from configured backends ──
+  // Reconciled against live backend health/quarantine (card 5c680ee9): a model
+  // whose only serving backend(s) are down or quarantined is flagged
+  // (status: "unavailable") or hidden per config.advertise.reconcile, so callers
+  // are not offered dead models. Recovery re-admits automatically.
   if (req.url === "/v1/models" && req.method === "GET") {
-    const seen = new Set();
-    const data = [];
-    for (const [id, b] of Object.entries(config.backends || {})) {
-      for (const m of (b.models || [])) {
-        if (m.includes("*") || seen.has(m)) continue;
-        seen.add(m);
-        data.push({ id: m, object: "model", created: 0, owned_by: id });
-      }
-    }
+    const data = buildModelCatalog(config.backends || {}, router, advertiseReconcileMode);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ object: "list", data }));
     return;
