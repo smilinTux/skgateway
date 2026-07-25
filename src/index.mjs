@@ -132,6 +132,12 @@ async function refreshCatalog(cfg) {
 
 /** Current merged discovery catalog, used by both /v1/models and /admin/models. */
 export async function getDiscoveredCatalog() {
+  // Honor the discovery.enabled master switch on the lazy path too. Without
+  // this check, a cold first request to /v1/models would still call
+  // refreshCatalog() (and therefore hit the network) even with discovery
+  // disabled, because the eager-startup gate above only skips the initial
+  // call and the interval, not this lazy fallback.
+  if (getConfig().discovery?.enabled === false) return localModels(getConfig());
   if (_catalog.length === 0) await refreshCatalog(getConfig());
   return _catalog;
 }
@@ -388,16 +394,34 @@ const server = http.createServer(async (req, res) => {
   // OpenRouter models) is admitted using its discovered shape. The allowlist
   // (src/advertise.mjs) is applied last, exactly as on /admin/models.
   if (req.url === "/v1/models" && req.method === "GET") {
-    const discovered = await getDiscoveredCatalog();
-    const reconciled = buildModelCatalog(config.backends || {}, router, advertiseReconcileMode);
-    const byId = new Map(reconciled.map((m) => [m.id, { ...m }]));
-    for (const { id, ...tags } of discovered) {
-      const base = byId.get(id) || { id, object: "model", created: 0, owned_by: tags.provider || "discovery" };
-      byId.set(id, { ...base, ...tags, id });
+    // Local fail-soft net: every callee below already traps its own errors,
+    // but this handler sits outside the file's proxy-path try/catch (below),
+    // so an unforeseen throw here (e.g. a future change to getDiscoveredCatalog
+    // or buildModelCatalog) must not become an unhandled rejection that takes
+    // the process down. /v1/models must always answer 200 with whatever
+    // catalog it can assemble, never 500, never crash.
+    try {
+      const discovered = await getDiscoveredCatalog();
+      const reconciled = buildModelCatalog(config.backends || {}, router, advertiseReconcileMode);
+      const byId = new Map(reconciled.map((m) => [m.id, { ...m }]));
+      for (const { id, ...tags } of discovered) {
+        const base = byId.get(id) || { id, object: "model", created: 0, owned_by: tags.provider || "discovery" };
+        byId.set(id, { ...base, ...tags, id });
+      }
+      const data = applyAllowlist([...byId.values()], loadAllowlist());
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ object: "list", data }));
+    } catch (e) {
+      console.warn("[skgateway] /v1/models discovery merge failed, falling back to static catalog:", e.message);
+      let data = [];
+      try {
+        data = buildModelCatalog(config.backends || {}, router, advertiseReconcileMode);
+      } catch (e2) {
+        console.warn("[skgateway] /v1/models static catalog fallback also failed, serving empty list:", e2.message);
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ object: "list", data }));
     }
-    const data = applyAllowlist([...byId.values()], loadAllowlist());
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ object: "list", data }));
     return;
   }
 
@@ -410,12 +434,18 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: { message: "Admin routes are loopback only", code: 403 } }));
       return;
     }
-    const full = await getDiscoveredCatalog();          // Task 5 provides this
-    const allow = loadAllowlist();
-    const set = new Set(allow);
-    const data = full.map((m) => ({ ...m, advertised: allow.length === 0 || set.has(m.id) }));
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ object: "list", data }));
+    try {
+      const full = await getDiscoveredCatalog();          // Task 5 provides this
+      const allow = loadAllowlist();
+      const set = new Set(allow);
+      const data = full.map((m) => ({ ...m, advertised: allow.length === 0 || set.has(m.id) }));
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ object: "list", data }));
+    } catch (e) {
+      console.warn("[skgateway] /admin/models failed:", e.message);
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "internal error building model catalog", code: 500 } }));
+    }
     return;
   }
   if (req.url === "/admin/models/advertise" && req.method === "PUT") {
@@ -434,10 +464,16 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: "invalid JSON body" }));
       return;
     }
-    const enabled = parsed.enabled || [];
-    saveAllowlist(enabled);
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ ok: true, enabled }));
+    try {
+      const enabled = parsed.enabled || [];
+      saveAllowlist(enabled);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, enabled }));
+    } catch (e) {
+      console.warn("[skgateway] /admin/models/advertise failed:", e.message);
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "internal error saving allowlist", code: 500 } }));
+    }
     return;
   }
 
