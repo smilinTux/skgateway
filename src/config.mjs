@@ -171,8 +171,15 @@ const DEFAULTS = {
   // Explicit x-sk-context / x-sk-service / x-sk-role headers still win; only the
   // model field is pinned. Empty map = no rules, routing behaviour unchanged.
   //   per_agent: { <agent-id>: <model-or-alias> } (agent ids are case-insensitive)
+  //
+  // strict_targets: PROVIDER-ROUTE ASSERTION (card 7ec1d18a). When true
+  // (default), the boot + reload config validation fails fast if any per_agent
+  // routing target is a dangling reference: neither an sk-* registry alias nor a
+  // model served by a declared backend. Set false to allow targets that only a
+  // live skmodels registry role-key resolves (validated at first request instead).
   routing: {
     per_agent: {},
+    strict_targets: true,
   },
 
   // CapAuth agent-identity (SKGateway P2.1). Every /v1/* request is resolved to
@@ -378,6 +385,108 @@ function applyElasticsearchEnv(cfg, e) {
 const VALID_AUTH_TYPES = new Set(['api_key', 'oauth', 'bearer', 'none']);
 
 /**
+ * Test whether a model id matches a backend `models` pattern. Patterns may use
+ * `*` as a wildcard (e.g. "dolphin-*"); an exact match is also accepted. Mirrors
+ * the router's modelMatches() so the boot assertion agrees with live routing.
+ *
+ * @param {string} pattern
+ * @param {string} model
+ * @returns {boolean}
+ */
+function modelMatchesPattern(pattern, model) {
+  if (!pattern || !model) return false;
+  if (pattern === model) return true;
+  const reStr = '^' + pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$';
+  return new RegExp(reStr, 'i').test(model);
+}
+
+/**
+ * Provider-route consistency assertion (card 7ec1d18a).
+ *
+ * Runs at boot AND on every SIGHUP reload (both flow through validate()). Catches
+ * a mis-wired provider route immediately (fail fast) instead of at first request:
+ *
+ *   1. auth completeness: a backend whose route can never authenticate is dead.
+ *        oauth            requires credentials_path / credentials_file
+ *        api_key | bearer requires api_key or api_key_env
+ *   2. pooling.per_backend: every per-backend concurrency limit must name a
+ *      declared backend (a limit on a nonexistent provider is dead config).
+ *   3. routing.per_agent: every pinned target must resolve to a known route,
+ *      an sk-* registry alias, or a model served by at least one declared
+ *      backend. A dangling target (typo'd model / removed backend) is rejected.
+ *      Gated by routing.strict_targets (default true) so registry-only role-keys
+ *      can opt out with strict_targets: false.
+ *
+ * Problems are appended to `errs`; the caller (validate) throws a single
+ * ConfigError naming every bad route. Non-breaking for a valid config.
+ *
+ * Exposed for testing so the assertion can be exercised directly; it is also
+ * invoked by validate() on every boot + reload.
+ *
+ * @param {object}   cfg
+ * @param {string[]} [errs]  Mutable error accumulator (created if omitted).
+ * @returns {string[]} The accumulated problems (empty when the routes are valid).
+ */
+export function assertProviderRoutes(cfg, errs = []) {
+  const backends = (cfg.backends && typeof cfg.backends === 'object') ? cfg.backends : {};
+  const backendIds = new Set(Object.keys(backends));
+
+  // 1. Auth completeness per backend: a route that can never authenticate is a
+  //    misconfiguration best caught at boot, not at the first 401/empty-header.
+  for (const [name, backend] of Object.entries(backends)) {
+    if (!backend || typeof backend !== 'object') continue;
+    const auth = backend.auth_type;
+    if (auth === 'oauth' && !backend.credentials_path && !backend.credentials_file) {
+      errs.push(`backends.${name}.auth_type is "oauth" but no credentials_path/credentials_file is set`);
+    }
+    if ((auth === 'api_key' || auth === 'bearer') && !backend.api_key && !backend.api_key_env) {
+      errs.push(`backends.${name}.auth_type is "${auth}" but neither api_key nor api_key_env is set`);
+    }
+  }
+
+  // 2. pooling.per_backend keys must reference a declared backend.
+  const perBackend = cfg.pooling && typeof cfg.pooling === 'object' ? cfg.pooling.per_backend : null;
+  if (perBackend && typeof perBackend === 'object') {
+    for (const id of Object.keys(perBackend)) {
+      if (!backendIds.has(id)) {
+        errs.push(
+          `pooling.per_backend.${id} references an unknown backend ` +
+          `(declared backends: ${[...backendIds].join(', ') || 'none'})`,
+        );
+      }
+    }
+  }
+
+  // 3. routing.per_agent targets must resolve to a known route.
+  const routing = cfg.routing && typeof cfg.routing === 'object' ? cfg.routing : {};
+  const strict = routing.strict_targets !== false; // default strict
+  const perAgent = routing.per_agent || routing.perAgent;
+  if (strict && perAgent && typeof perAgent === 'object') {
+    // A target resolves if it is an sk-* alias or is served by a declared backend.
+    const servedByBackend = (target) => {
+      for (const backend of Object.values(backends)) {
+        const models = Array.isArray(backend?.models) ? backend.models : [];
+        if (models.some((pat) => modelMatchesPattern(pat, target))) return true;
+      }
+      return false;
+    };
+    for (const [agent, target] of Object.entries(perAgent)) {
+      if (typeof target !== 'string' || !target.trim()) continue; // router drops these
+      const t = target.trim();
+      if (t.startsWith('sk-')) continue;           // registry alias, resolved live
+      if (servedByBackend(t)) continue;             // concrete model on a backend
+      errs.push(
+        `routing.per_agent.${agent} -> "${t}" is a dangling route: no declared ` +
+        `backend serves it and it is not an sk-* alias ` +
+        `(set routing.strict_targets: false to allow a registry-only role-key)`,
+      );
+    }
+  }
+
+  return errs;
+}
+
+/**
  * Throw a descriptive ConfigError if the merged config has obviously bad values.
  * This is intentionally lenient — it catches mis-types and clearly wrong values
  * rather than attempting a full JSON-Schema style validation.
@@ -443,6 +552,11 @@ function validate(cfg) {
   // dashboard
   if (typeof cfg.dashboard.refresh_ms !== 'number' || cfg.dashboard.refresh_ms < 100)
     errs.push('dashboard.refresh_ms must be >= 100');
+
+  // Provider-route consistency (card 7ec1d18a): assert routes map to known
+  // backends / resolvable aliases at boot AND reload, so a mis-wired route fails
+  // fast here rather than silently mis-routing at first request.
+  assertProviderRoutes(cfg, errs);
 
   if (errs.length) throw new ConfigError(errs);
 }
