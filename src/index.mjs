@@ -13,6 +13,7 @@ import http from "node:http";
 import { loadConfig, getConfig } from "./config.mjs";
 import { createProxyServer, handleRequest, buildConfig } from "./proxy/core.mjs";
 import { createRouter, routeAndSend } from "./proxy/router.mjs";
+import { isAnthropicBackend } from "./proxy/anthropic-adapter.mjs";
 import { buildModelCatalog, reconcileModeFromConfig } from "./proxy/advertise.mjs";
 import { loadAllowlist, saveAllowlist, applyAllowlist } from "./advertise.mjs";
 import { discoverCatalog, loadCache, saveCache, fetchNvidia, fetchOpenRouter } from "./discovery.mjs";
@@ -70,13 +71,27 @@ const _discoveryCache = loadCache();
  * (ornith/beellama/ollama/anthropic/...), tagged like a discovery result.
  * Excludes nvidia/openrouter, whose ids come from the live discovery fetch
  * below instead of the (mostly hand-curated) static list.
+ *
+ * Each id is tagged with the OWNING backend's name as `provider` (not a
+ * blanket "local"), and `free` is set per-backend rather than hardcoded true:
+ * a paid cloud backend (anthropic, detected via isAnthropicBackend: oauth
+ * auth_type or an api.anthropic.com URL) must NOT be advertised as free+local,
+ * since /v1/models feeds the skchat model picker, which groups by provider
+ * and marks "free" models for cost-free use. Mislabeling paid Claude models
+ * that way is a cost footgun, not just a display nit. Genuinely-local
+ * backends (ornith/beellama/ollama/...) keep free:true. This tagging is
+ * catalog-display only; routing itself is driven by the reconciled
+ * `owned_by` field from buildModelCatalog(), not by this provider/free tag.
  */
 function localModels(cfg) {
   const out = [];
   for (const [name, b] of Object.entries(cfg.backends || {})) {
     if (["nvidia", "openrouter"].includes(name)) continue;
+    const paidCloud = isAnthropicBackend(b);
     for (const id of b.models || []) {
-      if (typeof id === "string" && !id.includes("*")) out.push({ id, provider: "local", free: true });
+      if (typeof id === "string" && !id.includes("*")) {
+        out.push({ id, provider: name, free: !paidCloud });
+      }
     }
   }
   return out;
@@ -306,6 +321,11 @@ function isLoopback(req) {
   return addr === "127.0.0.1" || addr === "::1" || addr === "::ffff:127.0.0.1";
 }
 
+// Body size cap for PUT /admin/models/advertise: the payload is just a list of
+// model id strings, 64KB is generous headroom and keeps a malformed/hostile
+// loopback PUT from buffering unbounded memory.
+const ADVERTISE_MAX_BODY_BYTES = 64 * 1024;
+
 // ─── Build proxy config ───
 // Explicitly map YAML snake_case keys → core.mjs camelCase to avoid silent misses.
 const s = config.sanitizer || {};
@@ -454,8 +474,25 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: { message: "Admin routes are loopback only", code: 403 } }));
       return;
     }
-    let body = "";
-    for await (const chunk of req) body += chunk;
+    // Bound the body read: a malformed/hostile loopback PUT should not be able
+    // to buffer an unlimited amount of memory before we even get to parsing.
+    let bodyBytes = 0;
+    const bodyChunks = [];
+    let tooLarge = false;
+    for await (const chunk of req) {
+      bodyBytes += chunk.length;
+      if (bodyBytes > ADVERTISE_MAX_BODY_BYTES) {
+        tooLarge = true;
+        break;
+      }
+      bodyChunks.push(chunk);
+    }
+    if (tooLarge) {
+      res.writeHead(413, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: `body too large (max ${ADVERTISE_MAX_BODY_BYTES} bytes)` }));
+      return;
+    }
+    const body = Buffer.concat(bodyChunks).toString("utf-8");
     let parsed;
     try {
       parsed = JSON.parse(body || "{}");
@@ -464,8 +501,17 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: "invalid JSON body" }));
       return;
     }
+    // `enabled` feeds straight into new Set(...) on the GET /admin/models path
+    // (and gets persisted to disk), so a non-array (or an array with non-string
+    // entries) must be rejected here rather than allowed to corrupt the
+    // allowlist and blow up that later `new Set(...)` call.
+    const enabled = (parsed && typeof parsed === "object" && "enabled" in parsed) ? parsed.enabled : [];
+    if (!Array.isArray(enabled) || !enabled.every((x) => typeof x === "string")) {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "enabled must be an array of strings" }));
+      return;
+    }
     try {
-      const enabled = parsed.enabled || [];
       saveAllowlist(enabled);
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true, enabled }));

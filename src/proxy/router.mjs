@@ -89,6 +89,9 @@ const DEFAULT_QUARANTINE_COOLDOWN_MS = 30_000;
  * @property {string}   url                 Base URL including /v1 suffix
  * @property {AuthType} auth_type           Authentication strategy
  * @property {string[]} models              Model IDs or glob patterns served by this backend
+ * @property {string}   [discovery]         Set on discovery-driven backends (e.g. "free"/"all" for
+ *                                           openrouter) whose catalog is populated at runtime instead
+ *                                           of via a hand-written `models` list. See supportsModel().
  * @property {number}   priority            Lower = higher priority (1 beats 2)
  * @property {string}   [api_key]           Literal key (less preferred than env var)
  * @property {string}   [api_key_env]       Env-var name holding the API key
@@ -330,6 +333,12 @@ export class Backend {
     this.url = config.url.replace(/\/$/, ""); // strip trailing slash
     this.auth_type = config.auth_type || "none";
     this.models = Array.isArray(config.models) ? config.models : [];
+    // Marks a discovery-driven backend (e.g. openrouter, see config.mjs
+    // backends.*.discovery). Its `models` array starts empty and is populated
+    // at runtime by registerDiscoveredRoutes() once a discovery fetch
+    // succeeds. See supportsModel(): an empty list on a discovery backend must
+    // NOT wildcard-match, unlike an ordinary statically-configured backend.
+    this.discovery = config.discovery || null;
     this.priority = typeof config.priority === "number" ? config.priority : 99;
     this.cooldown_ms = config.cooldown_ms || DEFAULT_COOLDOWN_MS;
     // Optional per-backend idle timeout (ms). 0 = no timeout (default). Used to
@@ -399,13 +408,21 @@ export class Backend {
 
   /**
    * Returns true if this backend can serve the given model ID.
-   * An empty models list is treated as "accept everything".
+   * An empty models list is treated as "accept everything", EXCEPT for a
+   * discovery-driven backend (this.discovery set, e.g. openrouter), whose
+   * empty `models` list before the first successful discovery fetch (or
+   * after a failed fetch with no cache) means "nothing registered yet", not
+   * "accept everything". Wildcard-matching there would make an unknown model
+   * id resolve solely to a backend that cannot actually serve it (400/401)
+   * instead of falling back to candidatesFor()'s all-available behavior, so a
+   * discovery backend only matches ids explicitly registered via discovery.
    *
    * @param {string} model
    * @returns {boolean}
    */
   supportsModel(model) {
-    if (!model || this.models.length === 0) return true;
+    if (!model) return true;
+    if (this.models.length === 0) return !this.discovery;
     return this.models.some((pattern) => modelMatches(pattern, model));
   }
 
