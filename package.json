@@ -4,6 +4,9 @@
   "description": "Enterprise AI inference proxy — routes, throttles, audits and observes AI API traffic",
   "type": "module",
   "main": "src/index.mjs",
+  "bin": {
+    "skgateway": "bin/skgateway.mjs"
+  },
   "scripts": {
     "start": "node src/index.mjs",
     "dev": "node --watch src/index.mjs",
