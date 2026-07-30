@@ -65,7 +65,7 @@ export async function fetchOpenRouter() {
 }
 
 export async function discoverCatalog(opts) {
-  const { localModels = [], nvidiaFetch, openrouterFetch, cache = {} } = opts;
+  const { localModels = [], nvidiaFetch, openrouterFetch, cache = {}, now = Date.now } = opts;
   let stale = false;
   let nvidia = [];
   let openrouter = [];
@@ -83,7 +83,45 @@ export async function discoverCatalog(opts) {
   }
   const models = mergeCatalog(localModels, nvidia, openrouter).map((m) => ({ ...m, stale }));
   cache.models = models;
-  return { models, stale };
+  // Freshness observability: record when this discovery cycle completed. The
+  // cycle is fail-soft (a throwing provider falls back to cache above and only
+  // flips `stale`), so a completed cycle always advances the timestamp, even a
+  // partially-stale one. `lastRefreshedAt` is unix ms; `now` is injectable so
+  // tests can drive the clock deterministically.
+  cache.lastRefreshedAt = now();
+  return { models, stale, lastRefreshedAt: cache.lastRefreshedAt };
+}
+
+/**
+ * Pure freshness summary for the operator/model-picker: how current the
+ * discovered catalog is and what it contains. No network, no module state;
+ * everything is passed in so it is trivially testable.
+ *
+ * @param {object} args
+ * @param {Array}  args.catalog        current merged catalog (each entry tagged with `provider` and `free`)
+ * @param {object} args.cache          discovery cache carrying `lastRefreshedAt`
+ * @param {number} args.refreshSeconds configured discovery.refresh_seconds
+ * @param {Function} [args.now]        clock (defaults to Date.now)
+ * @returns {{lastRefreshedAt:(number|null), ageSeconds:(number|null), refreshSeconds:number, providerCounts:object, total:number, freeCount:number}}
+ */
+export function catalogStatus({ catalog = [], cache = {}, refreshSeconds = 0, now = Date.now } = {}) {
+  const lastRefreshedAt = typeof cache.lastRefreshedAt === 'number' ? cache.lastRefreshedAt : null;
+  const ageSeconds = lastRefreshedAt == null ? null : Math.max(0, Math.round((now() - lastRefreshedAt) / 1000));
+  const providerCounts = {};
+  let freeCount = 0;
+  for (const m of catalog) {
+    const p = m.provider || m.owned_by || 'unknown';
+    providerCounts[p] = (providerCounts[p] || 0) + 1;
+    if (m.free) freeCount += 1;
+  }
+  return {
+    lastRefreshedAt,
+    ageSeconds,
+    refreshSeconds,
+    providerCounts,
+    total: catalog.length,
+    freeCount,
+  };
 }
 
 export function loadCache(path = CACHE_PATH) {
