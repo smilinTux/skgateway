@@ -15,7 +15,7 @@ import { createProxyServer, handleRequest, buildConfig } from "./proxy/core.mjs"
 import { createRouter, routeAndSend } from "./proxy/router.mjs";
 import { buildModelCatalog, reconcileModeFromConfig, tagLocalModels, mergeDiscoveredCatalog } from "./proxy/advertise.mjs";
 import { loadAllowlist, saveAllowlist, applyAllowlist } from "./advertise.mjs";
-import { discoverCatalog, loadCache, saveCache, fetchNvidia, fetchOpenRouter } from "./discovery.mjs";
+import { discoverCatalog, loadCache, saveCache, fetchNvidia, fetchOpenRouter, catalogStatus } from "./discovery.mjs";
 import { getPool, resetPool } from "./proxy/connection-pool.mjs";
 import { loadAgentRegistry, extractIdentity, ANONYMOUS_AGENT_ID } from "./identity/capauth.mjs";
 import { classifyRequest, toSiemEvent } from "./classifiers/engine.mjs";
@@ -136,6 +136,25 @@ async function refreshCatalog(cfg) {
   registerDiscoveredRoutes(cfg, models);
   saveCache(_discoveryCache);
   return models;
+}
+
+/**
+ * Freshness summary of the discovered catalog for operator observability
+ * (GET /admin/models/status, POST /admin/models/refresh). Reads the live
+ * in-memory catalog + the discovery cache's `lastRefreshedAt`; the pure
+ * computation lives in discovery.mjs (catalogStatus). Fail-soft: any error
+ * degrades to a best-effort summary rather than throwing into the request path.
+ */
+export async function getDiscoveredStatus() {
+  const cfg = getConfig();
+  const refreshSeconds = cfg.discovery?.refresh_seconds || 3600;
+  let catalog = [];
+  try {
+    catalog = await getDiscoveredCatalog();
+  } catch {
+    catalog = _catalog;
+  }
+  return catalogStatus({ catalog, cache: _discoveryCache, refreshSeconds });
 }
 
 /** Current merged discovery catalog, used by both /v1/models and /admin/models. */
@@ -512,6 +531,64 @@ const server = http.createServer(async (req, res) => {
       console.warn("[skgateway] /admin/models/advertise failed:", e.message);
       res.writeHead(500, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: { message: "internal error saving allowlist", code: 500 } }));
+    }
+    return;
+  }
+
+  // ── Admin: catalog freshness status (additive observability) ──
+  // Shows how current the discovered NVIDIA/OpenRouter free-model listing is
+  // (lastRefreshedAt/ageSeconds vs the configured refreshSeconds) plus counts,
+  // so an operator (and the app model picker) can gauge freshness at a glance.
+  // Loopback only, same posture as the other /admin/models* routes. Never
+  // touches the network on its own; reads the in-memory catalog + cache. This
+  // is additive: the /v1/models response shape is unchanged.
+  if (req.url === "/admin/models/status" && req.method === "GET") {
+    if (!isLoopback(req)) {
+      res.writeHead(403, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "Admin routes are loopback only", code: 403 } }));
+      return;
+    }
+    try {
+      const status = await getDiscoveredStatus();
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(status));
+    } catch (e) {
+      console.warn("[skgateway] /admin/models/status failed:", e.message);
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "internal error building catalog status", code: 500 } }));
+    }
+    return;
+  }
+
+  // ── Admin: force an immediate re-discovery, bypassing the refresh interval ──
+  // Kicks a fresh NVIDIA+OpenRouter fetch now and returns the updated status
+  // (lastRefreshedAt advances on success). Fail-soft: refreshCatalog() is built
+  // on discoverCatalog(), which traps each provider fetch and falls back to the
+  // on-disk cache (flipping `stale`) rather than throwing, so a provider outage
+  // yields a stale-but-served catalog, never a crash or a 5xx. Loopback only,
+  // mirroring how /admin/models/advertise is gated.
+  if (req.url === "/admin/models/refresh" && req.method === "POST") {
+    if (!isLoopback(req)) {
+      res.writeHead(403, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "Admin routes are loopback only", code: 403 } }));
+      return;
+    }
+    try {
+      await refreshCatalog(getConfig());
+    } catch (e) {
+      // refreshCatalog is fail-soft internally, but guard the wiring around it
+      // (route registration, cache persistence) so the gateway never crashes on
+      // a forced refresh. We still return the best-effort status below.
+      console.warn("[skgateway] /admin/models/refresh discovery error (fail-soft):", e.message);
+    }
+    try {
+      const status = await getDiscoveredStatus();
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, ...status }));
+    } catch (e) {
+      console.warn("[skgateway] /admin/models/refresh status failed:", e.message);
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "internal error building catalog status", code: 500 } }));
     }
     return;
   }
