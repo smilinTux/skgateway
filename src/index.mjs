@@ -19,6 +19,7 @@ import { discoverCatalog, loadCache, saveCache, fetchNvidia, fetchOpenRouter, ca
 import { getPool, resetPool } from "./proxy/connection-pool.mjs";
 import { loadAgentRegistry, extractIdentity, ANONYMOUS_AGENT_ID } from "./identity/capauth.mjs";
 import { classifyRequest, toSiemEvent } from "./classifiers/engine.mjs";
+import { handleModuleManifest } from "./operator/manifest.mjs";
 
 // ─── Parse CLI args ───
 const args = process.argv.slice(2);
@@ -357,6 +358,16 @@ const proxyConfig = buildConfig({
 // ─── Create HTTP server ───
 const server = http.createServer(async (req, res) => {
   const startTime = Date.now();
+
+  // ── SKWorld module manifest (operator-facet discovery) ──
+  // Unauthenticated public discovery, like the other subapps: the fleet control
+  // plane reads this to learn skgateway is a first-class service and how Atlas's
+  // operator adapter watches/steers it. Built from the request origin so the
+  // health URL resolves against wherever the caller reached the gateway.
+  if (req.url === "/.well-known/skworld-module.json" && req.method === "GET") {
+    handleModuleManifest(req, res);
+    return;
+  }
 
   // ── Health check endpoint ──
   if (req.url === "/health" || req.url === "/healthz") {
