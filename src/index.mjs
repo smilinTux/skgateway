@@ -13,8 +13,7 @@ import http from "node:http";
 import { loadConfig, getConfig } from "./config.mjs";
 import { createProxyServer, handleRequest, buildConfig } from "./proxy/core.mjs";
 import { createRouter, routeAndSend } from "./proxy/router.mjs";
-import { isAnthropicBackend } from "./proxy/anthropic-adapter.mjs";
-import { buildModelCatalog, reconcileModeFromConfig } from "./proxy/advertise.mjs";
+import { buildModelCatalog, reconcileModeFromConfig, tagLocalModels, mergeDiscoveredCatalog } from "./proxy/advertise.mjs";
 import { loadAllowlist, saveAllowlist, applyAllowlist } from "./advertise.mjs";
 import { discoverCatalog, loadCache, saveCache, fetchNvidia, fetchOpenRouter } from "./discovery.mjs";
 import { getPool, resetPool } from "./proxy/connection-pool.mjs";
@@ -82,19 +81,13 @@ const _discoveryCache = loadCache();
  * backends (ornith/beellama/ollama/...) keep free:true. This tagging is
  * catalog-display only; routing itself is driven by the reconciled
  * `owned_by` field from buildModelCatalog(), not by this provider/free tag.
+ *
+ * The per-model free/provider tagging is the pure tagLocalModels() helper in
+ * src/proxy/advertise.mjs (unit-tested there); this wrapper just feeds it the
+ * live config's backends.
  */
 function localModels(cfg) {
-  const out = [];
-  for (const [name, b] of Object.entries(cfg.backends || {})) {
-    if (["nvidia", "openrouter"].includes(name)) continue;
-    const paidCloud = isAnthropicBackend(b);
-    for (const id of b.models || []) {
-      if (typeof id === "string" && !id.includes("*")) {
-        out.push({ id, provider: name, free: !paidCloud });
-      }
-    }
-  }
-  return out;
+  return tagLocalModels(cfg.backends || {});
 }
 
 function providerBackend(provider) {
@@ -423,12 +416,12 @@ const server = http.createServer(async (req, res) => {
     try {
       const discovered = await getDiscoveredCatalog();
       const reconciled = buildModelCatalog(config.backends || {}, router, advertiseReconcileMode);
-      const byId = new Map(reconciled.map((m) => [m.id, { ...m }]));
-      for (const { id, ...tags } of discovered) {
-        const base = byId.get(id) || { id, object: "model", created: 0, owned_by: tags.provider || "discovery" };
-        byId.set(id, { ...base, ...tags, id });
-      }
-      const data = applyAllowlist([...byId.values()], loadAllowlist());
+      // mergeDiscoveredCatalog() layers the discovered provider/free/stale tags
+      // onto the reconciled health/status entries and GUARANTEES every model
+      // carries a non-empty provider (see src/proxy/advertise.mjs). The
+      // allowlist is applied last, exactly as on /admin/models.
+      const merged = mergeDiscoveredCatalog(reconciled, discovered);
+      const data = applyAllowlist(merged, loadAllowlist());
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ object: "list", data }));
     } catch (e) {
