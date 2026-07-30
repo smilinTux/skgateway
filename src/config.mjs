@@ -26,6 +26,7 @@ import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import { load as yamlLoad } from 'js-yaml';
+import { isRegistryRouted } from './proxy/registry.mjs';
 
 // ─── paths ────────────────────────────────────────────────────────────────────
 
@@ -437,10 +438,13 @@ function modelMatchesPattern(pattern, model) {
  *   2. pooling.per_backend: every per-backend concurrency limit must name a
  *      declared backend (a limit on a nonexistent provider is dead config).
  *   3. routing.per_agent: every pinned target must resolve to a known route,
- *      an sk-* registry alias, or a model served by at least one declared
- *      backend. A dangling target (typo'd model / removed backend) is rejected.
- *      Gated by routing.strict_targets (default true) so registry-only role-keys
- *      can opt out with strict_targets: false.
+ *      a registry role (sk-* alias OR a named role-key in the skmodels registry
+ *      `roles:` map, judged with the router's own isRegistryRouted predicate so
+ *      config validation and the router agree), or a model served by at least
+ *      one declared backend. A dangling target (typo'd model / removed backend)
+ *      is rejected. Gated by routing.strict_targets (default true) so a
+ *      registry-only role-key resolved from a registry the boot process cannot
+ *      read can still opt out with strict_targets: false.
  *
  * Problems are appended to `errs`; the caller (validate) throws a single
  * ConfigError naming every bad route. Non-breaking for a valid config.
@@ -450,9 +454,12 @@ function modelMatchesPattern(pattern, model) {
  *
  * @param {object}   cfg
  * @param {string[]} [errs]  Mutable error accumulator (created if omitted).
+ * @param {string}   [registryPath]  Registry file override (tests only); the
+ *   live default (~/.skcapstone/models/registry.yaml or $SKMODELS_REGISTRY) is
+ *   used at boot/reload.
  * @returns {string[]} The accumulated problems (empty when the routes are valid).
  */
-export function assertProviderRoutes(cfg, errs = []) {
+export function assertProviderRoutes(cfg, errs = [], registryPath = undefined) {
   const backends = (cfg.backends && typeof cfg.backends === 'object') ? cfg.backends : {};
   const backendIds = new Set(Object.keys(backends));
 
@@ -487,7 +494,16 @@ export function assertProviderRoutes(cfg, errs = []) {
   const strict = routing.strict_targets !== false; // default strict
   const perAgent = routing.per_agent || routing.perAgent;
   if (strict && perAgent && typeof perAgent === 'object') {
-    // A target resolves if it is an sk-* alias or is served by a declared backend.
+    // A target resolves if it is a concrete model served by a declared backend
+    // OR the router would registry-route it. "Registry-routed" is judged with
+    // the SAME predicate the router uses at request time (isRegistryRouted):
+    // that covers both "sk-*" prefixed roles AND named role-keys declared in the
+    // registry `roles:` map (e.g. "ornith-tiny": ornith). Using the sk-* prefix
+    // alone would DISAGREE with the router: a bare role-key like `ornith-tiny`
+    // is a real role the router rewrites to its backend's concrete model, yet a
+    // prefix check would flag it as dangling. Deferring to isRegistryRouted() is
+    // what makes the two paths agree on what `ornith-tiny` is (a role), so it no
+    // longer has to double as a config-backend model just to pass this gate.
     const servedByBackend = (target) => {
       for (const backend of Object.values(backends)) {
         const models = Array.isArray(backend?.models) ? backend.models : [];
@@ -498,11 +514,12 @@ export function assertProviderRoutes(cfg, errs = []) {
     for (const [agent, target] of Object.entries(perAgent)) {
       if (typeof target !== 'string' || !target.trim()) continue; // router drops these
       const t = target.trim();
-      if (t.startsWith('sk-')) continue;           // registry alias, resolved live
+      if (isRegistryRouted({ model: t }, registryPath)) continue; // sk-* role or named registry role-key, resolved live
       if (servedByBackend(t)) continue;             // concrete model on a backend
       errs.push(
         `routing.per_agent.${agent} -> "${t}" is a dangling route: no declared ` +
-        `backend serves it and it is not an sk-* alias ` +
+        `backend serves it and it is not a registry role (sk-* or a role-key ` +
+        `in the skmodels registry) ` +
         `(set routing.strict_targets: false to allow a registry-only role-key)`,
       );
     }

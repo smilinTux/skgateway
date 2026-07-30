@@ -34,6 +34,28 @@ export function isAnthropicBackend(backend) {
 }
 
 /**
+ * Does this MODEL ID belong to a paid Anthropic/Claude family, regardless of
+ * which backend serves it?
+ *
+ * The gateway routes claude-* through a LOCAL wrapper backend (claude-code-api
+ * :18782, auth_type "none", loopback url) so it bills as first-party
+ * subscription usage. That backend is OpenAI-compatible, so isAnthropicBackend()
+ * deliberately does NOT flag it (no Messages-API translation needed). But the
+ * completions still cost real money (they draw down the Claude plan), so the
+ * free flag on /v1/models must be decided by the MODEL, not only the backend
+ * shape: otherwise the skchat model picker offers paid Claude models as "free"
+ * (a cost footgun). Detect the family by id so it holds under any backend.
+ *
+ * @param {string} id
+ * @returns {boolean}
+ */
+export function isAnthropicModelId(id) {
+  if (typeof id !== "string") return false;
+  const s = id.toLowerCase();
+  return s.startsWith("claude-") || s.startsWith("claude.") || s.includes("anthropic/");
+}
+
+/**
  * Translate an OpenAI chat-completions request body into an Anthropic Messages
  * request.  Returns { path, headers, body } to hand to sendUpstream, or null
  * if the body is not a translatable JSON chat request (passed through as-is).

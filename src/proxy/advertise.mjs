@@ -26,6 +26,8 @@
  * is caller-agnostic, and allowsAgent() still enforces access at call time.
  */
 
+import { isAnthropicBackend, isAnthropicModelId } from "./anthropic-adapter.mjs";
+
 /** Valid reconcile modes. */
 export const RECONCILE_MODES = new Set(["flag", "hide", "off"]);
 
@@ -101,6 +103,70 @@ export function isModelAvailable(model, router) {
  * @param {string}  [mode]    "flag" | "hide" | "off"
  * @returns {Array<{id:string,object:string,created:number,owned_by:string,status?:string}>}
  */
+/**
+ * Tag the statically-declared, LOCAL backend models (everything except the
+ * nvidia/openrouter live-discovery providers) like a discovery result:
+ * `{ id, provider, free }`.
+ *
+ * `provider` is the OWNING backend name (never a blanket "local"). `free` is
+ * decided per model, not by a blanket default:
+ *   - a paid cloud backend (isAnthropicBackend: oauth or api.anthropic.com), OR
+ *   - a paid model family by id (isAnthropicModelId: claude-*), even when the
+ *     serving backend is the OpenAI-compatible local Claude wrapper that
+ *     isAnthropicBackend() does not flag,
+ * is NOT free. Genuinely-local backends (ornith/beellama/ollama/...) stay free.
+ * Wildcard entries (e.g. "dolphin-*") are skipped: they are patterns, not ids.
+ *
+ * @param {Record<string, {models?: string[], url?: string, auth_type?: string}>} [backends]
+ * @returns {Array<{id:string, provider:string, free:boolean}>}
+ */
+export function tagLocalModels(backends = {}) {
+  const out = [];
+  for (const [name, b] of Object.entries(backends || {})) {
+    if (name === "nvidia" || name === "openrouter") continue;
+    const paidBackend = isAnthropicBackend(b);
+    for (const id of (b?.models || [])) {
+      if (typeof id === "string" && !id.includes("*")) {
+        const paid = paidBackend || isAnthropicModelId(id);
+        out.push({ id, provider: name, free: !paid });
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Merge the reconciled static catalog (buildModelCatalog output: id / object /
+ * created / owned_by / status) with the discovery catalog (tagLocalModels +
+ * live nvidia/openrouter: id / provider / free / stale), then GUARANTEE every
+ * advertised model carries a non-empty `provider`.
+ *
+ * Discovery tags are layered on top of a reconciled entry of the same id, so a
+ * model known to both keeps its health/status AND gains provider/free. A model
+ * known only to discovery is admitted with its discovered shape. A model known
+ * only to the reconciled static catalog (e.g. a nvidia/openrouter model declared
+ * in config but not returned by this cycle's live fetch) never got a discovery
+ * `provider`, so we fall back to its owning backend (owned_by), then a literal
+ * "discovery". /v1/models must never advertise a blank/undefined provider: the
+ * skchat model picker groups by provider, so an untagged model lands in a
+ * mystery bucket.
+ *
+ * @param {Array<object>} [reconciled]
+ * @param {Array<object>} [discovered]
+ * @returns {Array<object>}
+ */
+export function mergeDiscoveredCatalog(reconciled = [], discovered = []) {
+  const byId = new Map(reconciled.map((m) => [m.id, { ...m }]));
+  for (const { id, ...tags } of discovered) {
+    const base = byId.get(id) || { id, object: "model", created: 0, owned_by: tags.provider || "discovery" };
+    byId.set(id, { ...base, ...tags, id });
+  }
+  return [...byId.values()].map((m) => ({
+    ...m,
+    provider: m.provider || m.owned_by || "discovery",
+  }));
+}
+
 export function buildModelCatalog(backends = {}, router = null, mode = DEFAULT_RECONCILE_MODE) {
   const m = normalizeReconcileMode(mode);
   const seen = new Set();
