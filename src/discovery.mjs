@@ -64,22 +64,58 @@ export async function fetchOpenRouter() {
   return r.json();
 }
 
+/**
+ * Record the outcome of one provider's fetch cycle onto the cache so the
+ * freshness endpoint can report per-provider health (last success, last error,
+ * whether it is currently being served from cache). This is pure bookkeeping on
+ * the injected cache object; it never throws and never touches the network.
+ *
+ * @param {object} cache   the discovery cache (mutated in place)
+ * @param {string} name    provider name ("nvidia" | "openrouter")
+ * @param {object} outcome
+ * @param {boolean} outcome.ok    true if the live fetch succeeded
+ * @param {number}  outcome.count models retained for this provider this cycle
+ * @param {number}  outcome.at    unix ms of this cycle
+ * @param {string} [outcome.error] error message when ok is false
+ */
+function recordProvider(cache, name, { ok, count, at, error }) {
+  cache.providers = cache.providers || {};
+  const prev = cache.providers[name] || {};
+  const entry = {
+    ok: Boolean(ok),
+    count,
+    lastAttemptAt: at,
+    // Preserve the last SUCCESSFUL fetch time across failures so operators can
+    // see how long a provider has actually been degraded, not just when it was
+    // last probed.
+    lastSuccessAt: ok ? at : (prev.lastSuccessAt ?? null),
+    lastError: ok ? null : (error ?? 'unknown error'),
+    lastErrorAt: ok ? (prev.lastErrorAt ?? null) : at,
+  };
+  cache.providers[name] = entry;
+}
+
 export async function discoverCatalog(opts) {
   const { localModels = [], nvidiaFetch, openrouterFetch, cache = {}, now = Date.now } = opts;
+  const at = now();
   let stale = false;
   let nvidia = [];
   let openrouter = [];
   try {
     nvidia = parseNvidia(await nvidiaFetch());
-  } catch {
+    recordProvider(cache, 'nvidia', { ok: true, count: nvidia.length, at });
+  } catch (e) {
     stale = true;
     nvidia = (cache.models || []).filter((m) => m.provider === 'nvidia');
+    recordProvider(cache, 'nvidia', { ok: false, count: nvidia.length, at, error: String(e?.message || e) });
   }
   try {
     openrouter = parseOpenRouterFree(await openrouterFetch());
-  } catch {
+    recordProvider(cache, 'openrouter', { ok: true, count: openrouter.length, at });
+  } catch (e) {
     stale = true;
     openrouter = (cache.models || []).filter((m) => m.provider === 'openrouter');
+    recordProvider(cache, 'openrouter', { ok: false, count: openrouter.length, at, error: String(e?.message || e) });
   }
   const models = mergeCatalog(localModels, nvidia, openrouter).map((m) => ({ ...m, stale }));
   cache.models = models;
@@ -88,7 +124,7 @@ export async function discoverCatalog(opts) {
   // flips `stale`), so a completed cycle always advances the timestamp, even a
   // partially-stale one. `lastRefreshedAt` is unix ms; `now` is injectable so
   // tests can drive the clock deterministically.
-  cache.lastRefreshedAt = now();
+  cache.lastRefreshedAt = at;
   return { models, stale, lastRefreshedAt: cache.lastRefreshedAt };
 }
 
@@ -102,11 +138,12 @@ export async function discoverCatalog(opts) {
  * @param {object} args.cache          discovery cache carrying `lastRefreshedAt`
  * @param {number} args.refreshSeconds configured discovery.refresh_seconds
  * @param {Function} [args.now]        clock (defaults to Date.now)
- * @returns {{lastRefreshedAt:(number|null), ageSeconds:(number|null), refreshSeconds:number, providerCounts:object, total:number, freeCount:number}}
+ * @returns {{lastRefreshedAt:(number|null), ageSeconds:(number|null), refreshSeconds:number, providerCounts:object, total:number, freeCount:number, stale:boolean, providers:object}}
  */
 export function catalogStatus({ catalog = [], cache = {}, refreshSeconds = 0, now = Date.now } = {}) {
+  const nowMs = now();
   const lastRefreshedAt = typeof cache.lastRefreshedAt === 'number' ? cache.lastRefreshedAt : null;
-  const ageSeconds = lastRefreshedAt == null ? null : Math.max(0, Math.round((now() - lastRefreshedAt) / 1000));
+  const ageSeconds = lastRefreshedAt == null ? null : Math.max(0, Math.round((nowMs - lastRefreshedAt) / 1000));
   const providerCounts = {};
   let freeCount = 0;
   for (const m of catalog) {
@@ -114,6 +151,35 @@ export function catalogStatus({ catalog = [], cache = {}, refreshSeconds = 0, no
     providerCounts[p] = (providerCounts[p] || 0) + 1;
     if (m.free) freeCount += 1;
   }
+
+  // Per-provider health from the discovery cache (recordProvider). Each entry
+  // reports whether its last live fetch succeeded, the last error string and
+  // when it happened, and how long ago the provider last returned live data.
+  // The live `count` prefers what the current catalog actually carries (which
+  // includes cache-fallback entries) and falls back to the recorded count.
+  const providers = {};
+  let anyProviderDown = false;
+  for (const [name, p] of Object.entries(cache.providers || {})) {
+    const successAgeSeconds =
+      typeof p.lastSuccessAt === 'number' ? Math.max(0, Math.round((nowMs - p.lastSuccessAt) / 1000)) : null;
+    providers[name] = {
+      ok: p.ok !== false,
+      count: providerCounts[name] ?? (typeof p.count === 'number' ? p.count : 0),
+      lastSuccessAt: typeof p.lastSuccessAt === 'number' ? p.lastSuccessAt : null,
+      successAgeSeconds,
+      lastError: p.ok === false ? (p.lastError ?? 'unknown error') : null,
+      lastErrorAt: typeof p.lastErrorAt === 'number' ? p.lastErrorAt : null,
+    };
+    if (p.ok === false) anyProviderDown = true;
+  }
+
+  // The catalog is "stale" (serving something less than fully live) when either
+  // a provider is currently failing its fetch (served from cache) OR the whole
+  // catalog has aged well past its refresh window (poller wedged / never ran).
+  const overdue =
+    lastRefreshedAt != null && refreshSeconds > 0 && ageSeconds != null && ageSeconds > refreshSeconds * 2;
+  const stale = anyProviderDown || overdue;
+
   return {
     lastRefreshedAt,
     ageSeconds,
@@ -121,6 +187,8 @@ export function catalogStatus({ catalog = [], cache = {}, refreshSeconds = 0, no
     providerCounts,
     total: catalog.length,
     freeCount,
+    stale,
+    providers,
   };
 }
 

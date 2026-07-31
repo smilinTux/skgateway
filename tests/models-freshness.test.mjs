@@ -106,3 +106,83 @@ test('fail-soft: a throwing provider still completes, stamps, and marks stale', 
   assert.equal(status.ageSeconds, 5);
   assert.equal(status.providerCounts.nvidia, 1);
 });
+
+test('discoverCatalog records per-provider health (ok on success)', async () => {
+  const cache = {};
+  await discoverCatalog({
+    localModels: local,
+    nvidiaFetch: async () => nvJson(['qwen/a', 'qwen/b']),
+    openrouterFetch: async () => orJson(['g/c:free']),
+    cache,
+    now: () => 1000,
+  });
+  assert.equal(cache.providers.nvidia.ok, true);
+  assert.equal(cache.providers.nvidia.count, 2);
+  assert.equal(cache.providers.nvidia.lastSuccessAt, 1000);
+  assert.equal(cache.providers.nvidia.lastError, null);
+  assert.equal(cache.providers.openrouter.ok, true);
+  assert.equal(cache.providers.openrouter.lastSuccessAt, 1000);
+});
+
+test('discoverCatalog records the last error and preserves last-success time on a provider outage', async () => {
+  // First cycle succeeds so we have a known-good lastSuccessAt for nvidia.
+  const cache = {};
+  await discoverCatalog({
+    localModels: local,
+    nvidiaFetch: async () => nvJson(['qwen/a']),
+    openrouterFetch: async () => orJson(['g/c:free']),
+    cache,
+    now: () => 1000,
+  });
+  assert.equal(cache.providers.nvidia.lastSuccessAt, 1000);
+
+  // Second cycle: nvidia is down. Its lastError is captured, lastErrorAt is set,
+  // but the earlier lastSuccessAt is preserved so operators can see the gap.
+  await discoverCatalog({
+    localModels: local,
+    nvidiaFetch: async () => { throw new Error('nvidia 503'); },
+    openrouterFetch: async () => orJson(['g/c:free']),
+    cache,
+    now: () => 5000,
+  });
+  assert.equal(cache.providers.nvidia.ok, false);
+  assert.equal(cache.providers.nvidia.lastError, 'nvidia 503');
+  assert.equal(cache.providers.nvidia.lastErrorAt, 5000);
+  assert.equal(cache.providers.nvidia.lastSuccessAt, 1000, 'last successful fetch time preserved across the outage');
+  assert.equal(cache.providers.openrouter.ok, true, 'openrouter unaffected by nvidia outage (per-upstream isolation)');
+});
+
+test('catalogStatus surfaces per-provider health, last error, and flips stale when a provider is down', async () => {
+  const cache = {};
+  const res = await discoverCatalog({
+    localModels: local,
+    nvidiaFetch: async () => { throw new Error('nvidia down'); },
+    openrouterFetch: async () => orJson(['g/c:free']),
+    cache,
+    now: () => 1000,
+  });
+  const status = catalogStatus({
+    catalog: res.models,
+    cache,
+    refreshSeconds: 60,
+    now: () => 1000 + 4000, // 4s later
+  });
+  assert.equal(status.stale, true, 'a downed provider marks the catalog stale');
+  assert.equal(status.providers.nvidia.ok, false);
+  assert.equal(status.providers.nvidia.lastError, 'nvidia down');
+  assert.equal(status.providers.openrouter.ok, true);
+  assert.equal(status.providers.openrouter.lastError, null);
+  assert.equal(status.providers.openrouter.successAgeSeconds, 4);
+});
+
+test('catalogStatus flips stale when the catalog is overdue past twice its refresh window', () => {
+  // All providers healthy, but the last refresh is ancient: the poller is wedged.
+  const cache = {
+    lastRefreshedAt: 0,
+    providers: { nvidia: { ok: true, count: 3, lastSuccessAt: 0 } },
+  };
+  const fresh = catalogStatus({ catalog: [], cache, refreshSeconds: 60, now: () => 200 * 1000 });
+  assert.equal(fresh.stale, true, '200s age vs 60s window (>2x=120s) is overdue');
+  const ok = catalogStatus({ catalog: [], cache, refreshSeconds: 60, now: () => 90 * 1000 });
+  assert.equal(ok.stale, false, '90s age vs 60s window (<2x=120s) is not yet overdue');
+});
