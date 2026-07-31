@@ -24,6 +24,7 @@ import { createEvent } from "../siem/events.mjs";
 import { isAnthropicBackend, toAnthropicRequest, toOpenAIResponse } from "./anthropic-adapter.mjs";
 import { getPool } from "./connection-pool.mjs";
 import { isRegistryRouted, resolve as resolveRegistry, getAutoConfig, getConfigEpoch } from "./registry.mjs";
+import { getFailoverConfig, isLocalUrl, probeLocalHealth, recordLocalOutcome } from "./local-failover.mjs";
 import { applyReasoningFloor } from "./core.mjs";
 import { createDecisionCache, decisionKey } from "./decision-cache.mjs";
 
@@ -1334,12 +1335,65 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         // Kept in an ISOLATED pool so it never joins normal model-name routing
         // (would otherwise shadow concrete-model backends via wildcard match).
         const b = getRegBackend("reg:" + reg.backend, reg.url);
-        candidates = [{
+        const localCandidate = {
           backendId: b.id,
           backendUrl: b.url,
           authHeaders: {},
           backend: b,
-        }];
+          localUrl: reg.url, // tag: record the health outcome of this attempt
+        };
+        candidates = [localCandidate];
+
+        // ── Health-aware, sovereign-first local failover ──
+        // A local sovereign backend is a single point of failure: when the GPU
+        // wedges (broken driver, llama-server hung, /chat/completions never
+        // replies) this single-candidate route stalls every caller to a
+        // multi-minute timeout. Gate the local route on a fast, cached liveness
+        // probe AND a bounded completion timeout, transparently failing over to a
+        // known-good cloud FREE model when the local backend is unreachable or
+        // hangs. Defaults ON; env-tunable (see local-failover.mjs). Sovereign
+        // first: cloud is only used while the local backend is unhealthy, and
+        // traffic routes back automatically once the probe verdict recovers.
+        const fc = getFailoverConfig();
+        const fb = fc.enabled && isLocalUrl(reg.url) ? router.getBackend(fc.fallbackBackend) : null;
+        if (fb) {
+          // Bound the local completion so a wedged upstream (accepts the socket,
+          // never replies) 504s and the candidate loop fails over, instead of
+          // hanging. Idempotent on the shared reg backend instance.
+          b.timeout_ms = fc.completionTimeoutMs;
+          const fallbackCandidate = {
+            backendId: fb.id,
+            backendUrl: fb.url,
+            authHeaders: await fb.buildAuthHeaders(),
+            backend: fb,
+            // Rewrite the outgoing model to the cloud fallback so the cloud
+            // backend receives a model it actually serves (the body currently
+            // carries the local concrete model, which cloud would 400 on).
+            bodyOverride: rewriteBodyModel(body, fc.fallbackModel),
+            isCloudFallback: true,
+          };
+          const healthy = await probeLocalHealth(reg.url, fc);
+          if (healthy) {
+            // Local looks alive: try it first, cloud as a bounded safety net for
+            // a mid-request hang.
+            candidates = [localCandidate, fallbackCandidate];
+          } else {
+            // Local is unreachable/wedged: skip it entirely this window and serve
+            // from cloud. Logged + audited as a failover.
+            console.warn(
+              `[router] local backend ${reg.backend} (${reg.url}) UNHEALTHY — ` +
+              `failing over to ${fc.fallbackBackend}/${fc.fallbackModel} ` +
+              `(sovereign-first, cloud-fallback)`
+            );
+            emitSiem("failover", {
+              from_backend: "reg:" + reg.backend,
+              to_backend: fb.id,
+              reason: "local_backend_unhealthy",
+              fallback_model: fc.fallbackModel,
+            }, { backend: fb.id });
+            candidates = [fallbackCandidate];
+          }
+        }
       }
       // Route the resolved model through the normal metrics/health path.
       request = { ...request, model: reg.model };
@@ -1376,6 +1430,10 @@ export async function routeAndSend(router, request, upstreamPath, method, client
 
   for (let i = 0; i < candidates.length; i++) {
     const { backendId, backendUrl, authHeaders, backend } = candidates[i];
+    // A candidate may carry a per-attempt body (e.g. the cloud-fallback
+    // candidate rewrites the model to a cloud-served id). Default to the shared
+    // body when no override is present.
+    const attemptBody = candidates[i].bodyOverride || body;
 
     if (i > 0) {
       didFailover = true;
@@ -1455,7 +1513,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     try {
       if (isAnthropicBackend(backend)) {
         // Translate OpenAI chat-completions → Anthropic Messages API.
-        const tr = toAnthropicRequest(body, {
+        const tr = toAnthropicRequest(attemptBody, {
           authorization: forwardHeaders.authorization,
         });
         if (tr) {
@@ -1470,10 +1528,10 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           }
           res = toOpenAIResponse(raw, request.model);
         } else {
-          res = await sendUpstream(upstreamPath, method, forwardHeaders, body, targetUrl, backend.timeout_ms);
+          res = await sendUpstream(upstreamPath, method, forwardHeaders, attemptBody, targetUrl, backend.timeout_ms);
         }
       } else {
-        res = await sendUpstream(upstreamPath, method, forwardHeaders, body, targetUrl, backend.timeout_ms);
+        res = await sendUpstream(upstreamPath, method, forwardHeaders, attemptBody, targetUrl, backend.timeout_ms);
       }
     } catch (err) {
       // sendUpstream resolves with 502 on network error, but be defensive
@@ -1492,6 +1550,12 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     const latencyMs = Date.now() - queueStart;
     const success = res.status < 500;
     const qTransition = backend.recordOutcome(success, latencyMs);
+
+    // Feed the real completion outcome back into the local-health verdict so a
+    // wedged local backend that got past the probe but then hung/errored is
+    // marked unhealthy immediately (subsequent requests skip it), and a healthy
+    // completion keeps it live — faster convergence than the probe TTL alone.
+    if (candidates[i].localUrl) recordLocalOutcome(candidates[i].localUrl, success);
 
     // Dead-alias auto-quarantine transitions (card 2d1f3a2c). Mirror the
     // failover pattern: a stdout JSON line (always) plus a structured SIEM

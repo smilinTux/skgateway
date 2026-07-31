@@ -213,6 +213,32 @@ backends:
     priority: 3
 ```
 
+### Local-backend health failover (sovereign-first)
+
+Logical roles (`sk-default`, `ornith-tiny`, …) resolved by the skmodels registry
+to a sovereign LOCAL backend (e.g. ornith on `192.168.0.100:8082`) are a single
+point of failure: if that GPU wedges (broken driver, `llama-server` hung,
+`/chat/completions` never replies) the route would stall every caller to a
+multi-minute timeout. The gateway makes that route HEALTH-AWARE and transparently
+fails over to a known-good cloud FREE model while the local backend is unhealthy,
+routing back automatically once it recovers. The client-visible response shape is
+unchanged (a standard OpenAI chat completion). Two guards, both sovereign-first:
+
+- a fast, cached liveness probe (`GET {base}/models`, short timeout), and
+- a bounded completion timeout so a request that hangs mid-flight still fails over.
+
+Configured entirely by env (defaults shown), and only applies to local/private
+backends (loopback, RFC1918, tailnet):
+
+| Env var | Default | Meaning |
+| --- | --- | --- |
+| `SKGATEWAY_LOCAL_FAILOVER` | `1` (ON) | Master switch. `0`/`false`/`off`/`no` disables it. |
+| `SKGATEWAY_LOCAL_FALLBACK_MODEL` | `deepseek-ai/deepseek-v4-flash` | Cloud model served during a local outage. |
+| `SKGATEWAY_LOCAL_FALLBACK_BACKEND` | `nvidia` | Router backend id that serves the fallback model. |
+| `SKGATEWAY_LOCAL_HEALTH_TIMEOUT_MS` | `3000` | Liveness-probe timeout (ms). |
+| `SKGATEWAY_LOCAL_COMPLETION_TIMEOUT_MS` | `10000` | Bounded local completion timeout (ms) before failover. |
+| `SKGATEWAY_LOCAL_HEALTH_TTL_MS` | `20000` | How long a health verdict is cached (ms) so requests do not re-probe. |
+
 ### Tool Reduction
 
 ```yaml
