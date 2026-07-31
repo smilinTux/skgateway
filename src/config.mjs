@@ -275,6 +275,7 @@ function deepClone(obj) {
  * | SKGATEWAY_NVIDIA_KEY_ENV | backends.nvidia.api_key_env |
  * | SKGATEWAY_METRICS_DB     | metrics.db_path           |
  * | SKGATEWAY_RETENTION_DAYS | metrics.retention_days    |
+ * | SKGATEWAY_MODELS_REFRESH_S | discovery.refresh_seconds (positive number) |
  * | SKGATEWAY_SYSLOG_ENABLED | siem syslog output (on/off) |
  * | SKGATEWAY_SYSLOG_HOST    | syslog output host        |
  * | SKGATEWAY_SYSLOG_PORT    | syslog output port        |
@@ -293,7 +294,7 @@ function deepClone(obj) {
  * @param {object} cfg  Mutable merged config object.
  * @returns {object} Same object, mutated in place.
  */
-function applyEnvOverrides(cfg) {
+export function applyEnvOverrides(cfg) {
   const e = process.env;
 
   if (e.SKGATEWAY_PORT)           cfg.server.port            = Number(e.SKGATEWAY_PORT);
@@ -303,6 +304,19 @@ function applyEnvOverrides(cfg) {
   if (e.SKGATEWAY_NVIDIA_KEY_ENV) cfg.backends.nvidia.api_key_env = e.SKGATEWAY_NVIDIA_KEY_ENV;
   if (e.SKGATEWAY_METRICS_DB)     cfg.metrics.db_path        = e.SKGATEWAY_METRICS_DB;
   if (e.SKGATEWAY_RETENTION_DAYS) cfg.metrics.retention_days = Number(e.SKGATEWAY_RETENTION_DAYS);
+
+  // Discovery refresh interval (seconds). Lets ops retune how often the dynamic
+  // NVIDIA/OpenRouter free-model catalog is re-polled without editing the yaml,
+  // e.g. shorten it while a provider is churning. Ignored unless it parses to a
+  // positive finite number, so a fat-fingered value can never disable the poller
+  // or feed setInterval a NaN/negative delay.
+  if (e.SKGATEWAY_MODELS_REFRESH_S !== undefined) {
+    const secs = Number(e.SKGATEWAY_MODELS_REFRESH_S);
+    if (Number.isFinite(secs) && secs > 0) {
+      cfg.discovery = cfg.discovery || {};
+      cfg.discovery.refresh_seconds = secs;
+    }
+  }
 
   applySyslogEnv(cfg, e);
   applyElasticsearchEnv(cfg, e);
