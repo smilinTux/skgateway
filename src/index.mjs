@@ -20,6 +20,8 @@ import { getPool, resetPool } from "./proxy/connection-pool.mjs";
 import { loadAgentRegistry, extractIdentity, ANONYMOUS_AGENT_ID } from "./identity/capauth.mjs";
 import { classifyRequest, toSiemEvent } from "./classifiers/engine.mjs";
 import { handleModuleManifest } from "./operator/manifest.mjs";
+import { fromAnthropicRequest, toAnthropicMessage } from "./proxy/anthropic-frontend.mjs";
+import { SSEWriter, jsonToSSE } from "./proxy/stream.mjs";
 
 // ─── Parse CLI args ───
 const args = process.argv.slice(2);
@@ -659,11 +661,33 @@ const server = http.createServer(async (req, res) => {
     for await (const chunk of req) chunks.push(chunk);
     const body = Buffer.concat(chunks);
 
+    // ── Anthropic Messages FRONTEND (POST /v1/messages) ──
+    // Accept the Anthropic wire format and route it through the SAME OpenAI path
+    // as /v1/chat/completions, so a `claude` CLI pointed at
+    // ANTHROPIC_BASE_URL=http://<gw>:18780 reaches ANY gateway model (local
+    // ornith, nvidia-free, openrouter-free, or the claude wrapper). We translate
+    // the request here, route it, then translate the buffered OpenAI result back
+    // to an Anthropic Messages response below. Internal routing is non-streaming;
+    // if the client asked for stream:true we re-serialise via jsonToSSE.
+    let anthropicWant = false;
+    let anthropicStream = false;
+    let routeBody = body;
+    let routePath = req.url;
+    if (req.url === "/v1/messages" && req.method === "POST") {
+      const conv = fromAnthropicRequest(body);
+      if (conv) {
+        anthropicWant = true;
+        anthropicStream = conv.stream;
+        routeBody = conv.body;
+        routePath = "/v1/chat/completions";
+      }
+    }
+
     let parsedModel = req.headers["x-model"] || undefined;
     let parsedMessages = undefined;
-    if (req.headers["content-type"]?.includes("application/json") && body.length) {
+    if (anthropicWant || (req.headers["content-type"]?.includes("application/json") && routeBody.length)) {
       try {
-        const parsed = JSON.parse(body.toString("utf-8"));
+        const parsed = JSON.parse(routeBody.toString("utf-8"));
         parsedModel = parsed.model || parsedModel;
         // Carry messages for sk-auto difficulty classification (registry.mjs).
         if (Array.isArray(parsed.messages)) parsedMessages = parsed.messages;
@@ -701,13 +725,41 @@ const server = http.createServer(async (req, res) => {
     };
 
     const result = await routeAndSend(
-      router, routeRequest, req.url, req.method, req.headers, body, true, siemHook,
+      router, routeRequest, routePath, req.method, req.headers, routeBody, true, siemHook,
     );
 
     if (!result) {
       if (!res.headersSent) {
         res.writeHead(502, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: { message: "No backend produced a response", code: 502 } }));
+      }
+    } else if (anthropicWant) {
+      // Translate the buffered OpenAI result back to the Anthropic wire format.
+      let oai = null;
+      try { oai = JSON.parse((result.body || "").toString("utf-8")); } catch {}
+      if (result.status >= 300 || !oai) {
+        // Upstream error / unparseable — pass it through so the Anthropic client
+        // sees the real status rather than a fabricated success.
+        const headers = { ...result.headers };
+        delete headers["content-length"];
+        delete headers["transfer-encoding"];
+        delete headers["content-encoding"];
+        res.writeHead(result.status, headers);
+        res.end(result.body);
+      } else {
+        const amsg = toAnthropicMessage(oai, parsedModel);
+        if (anthropicStream) {
+          // Serialise the complete Anthropic message as the streaming event
+          // sequence (message_start -> content_block_* -> message_delta ->
+          // message_stop -> [DONE]); jsonToSSE auto-detects the Anthropic shape.
+          const writer = new SSEWriter(res, { keepAliveMs: 0 });
+          writer.start();
+          jsonToSSE(writer, amsg);
+        } else {
+          const outBuf = Buffer.from(JSON.stringify(amsg), "utf-8");
+          res.writeHead(200, { "content-type": "application/json", "content-length": outBuf.length });
+          res.end(outBuf);
+        }
       }
     } else {
       const headers = { ...result.headers };
