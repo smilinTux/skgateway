@@ -360,6 +360,7 @@ const proxyConfig = buildConfig({
 // ─── Create HTTP server ───
 const server = http.createServer(async (req, res) => {
   const startTime = Date.now();
+  if (process.env.SKGW_REQLOG) { console.log("[REQLOG]", req.method, req.url); }
 
   // ── SKWorld module manifest (operator-facet discovery) ──
   // Unauthenticated public discovery, like the other subapps: the fleet control
@@ -379,6 +380,18 @@ const server = http.createServer(async (req, res) => {
       uptime: process.uptime(),
       backends: router.getHealth(),
     }));
+    return;
+  }
+
+  // ── Anthropic client connectivity probe: HEAD/GET /api/hello ──
+  // Claude Code (pointed here via ANTHROPIC_BASE_URL) probes /api/hello to
+  // verify the endpoint before it will use it. Without a 200 the probe falls
+  // through to the proxy, routes to a backend, and 404s, so the client treats
+  // the endpoint/model as unavailable. Answer 200 (loopback, unauthenticated,
+  // like /health).
+  if (req.url.split("?")[0] === "/api/hello") {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(req.method === "HEAD" ? undefined : JSON.stringify({ ok: true }));
     return;
   }
 
@@ -715,7 +728,10 @@ const server = http.createServer(async (req, res) => {
     let anthropicStream = false;
     let routeBody = body;
     let routePath = req.url;
-    if (req.url === "/v1/messages" && req.method === "POST") {
+    // Match by PATHNAME: Claude Code posts to /v1/messages?beta=true (query
+    // string), so an exact === "/v1/messages" check would miss it and the
+    // Anthropic body would fall through to the raw OpenAI proxy untranslated.
+    if (req.method === "POST" && req.url.split("?")[0] === "/v1/messages") {
       const conv = fromAnthropicRequest(body);
       if (conv) {
         anthropicWant = true;
