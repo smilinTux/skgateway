@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   fromAnthropicRequest,
   toAnthropicMessage,
+  modelRetrieveObject,
 } from "../src/proxy/anthropic-frontend.mjs";
 
 // ─── fromAnthropicRequest: Anthropic Messages request -> OpenAI chat body ───
@@ -241,4 +242,24 @@ test("empty content -> a single empty text block (never empty content array)", (
   }, "ornith-big");
   assert.equal(a.content.length, 1);
   assert.deepEqual(a.content[0], { type: "text", text: "" });
+});
+
+// ─── modelRetrieveObject: GET /v1/models/:id body (Claude Code model preflight) ───
+
+test("model retrieve object carries id + type:model (Anthropic shape)", () => {
+  const m = modelRetrieveObject("ornith-big", { provider: "chiap08-ornith", owned_by: "chiap08-ornith" });
+  assert.equal(m.id, "ornith-big");
+  assert.equal(m.type, "model");        // Anthropic model-object type (Claude Code checks this)
+  assert.equal(m.object, "model");      // OpenAI compat
+  assert.equal(m.display_name, "ornith-big");
+  assert.equal(m.owned_by, "chiap08-ornith");
+  assert.equal(m.provider, "chiap08-ornith");
+});
+
+test("model retrieve object works with no entry (synthesized for a registry role)", () => {
+  const m = modelRetrieveObject("sk-default", null);
+  assert.equal(m.id, "sk-default");
+  assert.equal(m.type, "model");
+  assert.equal(m.display_name, "sk-default");
+  assert.ok("created_at" in m, "carries a created_at");
 });

@@ -172,6 +172,32 @@ function flushContent(messages, role, blocks) {
   }
 }
 
+/**
+ * Build the body for GET /v1/models/:id (a single-model retrieve). Claude Code
+ * preflights every selected model here to validate it before a completion; if
+ * the gateway does not answer this (it 404s via the catch-all), Claude Code
+ * rejects the model as "may not exist". We answer with a hybrid Anthropic
+ * (type:"model") + OpenAI (object:"model") model object so both client families
+ * accept it.
+ *
+ * @param {string} id - the model id from the path.
+ * @param {object|null} entry - the matching /v1/models catalog entry, if any.
+ * @returns {object} model-retrieve body.
+ */
+export function modelRetrieveObject(id, entry) {
+  const e = entry || {};
+  return {
+    id,
+    type: "model",
+    object: "model",
+    display_name: e.display_name || id,
+    created: e.created ?? 0,
+    created_at: e.created_at || "2025-01-01T00:00:00Z",
+    owned_by: e.owned_by || e.provider || "skgateway",
+    provider: e.provider || "skgateway",
+  };
+}
+
 /** OpenAI finish_reason -> Anthropic stop_reason. */
 const STOP_REASON = {
   stop: "end_turn",

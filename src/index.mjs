@@ -20,7 +20,7 @@ import { getPool, resetPool } from "./proxy/connection-pool.mjs";
 import { loadAgentRegistry, extractIdentity, ANONYMOUS_AGENT_ID } from "./identity/capauth.mjs";
 import { classifyRequest, toSiemEvent } from "./classifiers/engine.mjs";
 import { handleModuleManifest } from "./operator/manifest.mjs";
-import { fromAnthropicRequest, toAnthropicMessage } from "./proxy/anthropic-frontend.mjs";
+import { fromAnthropicRequest, toAnthropicMessage, modelRetrieveObject } from "./proxy/anthropic-frontend.mjs";
 import { SSEWriter, jsonToSSE } from "./proxy/stream.mjs";
 
 // ─── Parse CLI args ───
@@ -466,6 +466,48 @@ const server = http.createServer(async (req, res) => {
       }
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ object: "list", data }));
+    }
+    return;
+  }
+
+  // ── Per-model retrieve: GET /v1/models/:id ──
+  // Claude Code (and other Anthropic clients) PREFLIGHT the selected model here
+  // to validate it before sending a completion. Without this handler the request
+  // falls through to the proxy catch-all, routes to a backend, 404s, and the
+  // client rejects the model as "may not exist" (this is exactly what broke a
+  // `claude --model ornith-big` session against the gateway). Answer 200 with a
+  // model object when the id is in the catalog OR is an sk-* registry role (a
+  // valid route not present as a concrete catalog id); 404 otherwise. Fail-soft:
+  // never 500, never crash the process (same discipline as /v1/models).
+  if (req.method === "GET" && req.url.startsWith("/v1/models/")) {
+    const id = decodeURIComponent(req.url.slice("/v1/models/".length).split("?")[0]);
+    const notFound = () => {
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ type: "error", error: { type: "not_found_error", message: `model ${id} not found` } }));
+    };
+    if (!id) { notFound(); return; }
+    try {
+      const discovered = await getDiscoveredCatalog();
+      const reconciled = buildModelCatalog(config.backends || {}, router, advertiseReconcileMode);
+      const merged = mergeDiscoveredCatalog(reconciled, discovered);
+      const data = applyAllowlist(merged, loadAllowlist());
+      const entry = data.find((m) => m.id === id);
+      // Registry role (sk-default/sk-auto/sk-creative/...): a valid routing
+      // target resolved by ~/.skcapstone/models/registry.yaml, not a concrete
+      // catalog id. Synthesize a 200 so clients accept it; the completion call
+      // is the real validation.
+      if (entry || /^sk-/.test(id)) {
+        // Build the body BEFORE writing headers so a serialisation error cannot
+        // half-send a response (this handler is outside the proxy try/catch).
+        const bodyStr = JSON.stringify(modelRetrieveObject(id, entry || null));
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(bodyStr);
+        return;
+      }
+      notFound();
+    } catch (e) {
+      console.warn("[skgateway] /v1/models/:id lookup failed:", e.message);
+      notFound();
     }
     return;
   }
