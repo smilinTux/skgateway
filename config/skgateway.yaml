@@ -46,18 +46,23 @@ backends:
       - qwen3.6-27b-abliterated  # legacy alias -> same :8082 (ornith)
     priority: 1
 
-  ## ornith-1.0-35b (Q4_K_M) — llama.cpp, 256K ctx, reasoning model.
-  ## Three boxes, active/standby by priority (router fails over on 5xx):
-  ## chiap08 (4) primary → Tyler .150 (5) → Tyler .153 (6). High priority
-  ## NUMBERS keep these OUT of the unmatched-model fallback pool (fronted by
-  ## priority 1); they remain the SOLE match for the exact id `ornith-1.0-35b`,
-  ## so they never shadow other routing.
+  ## ornith-1.0-35b (Q4_K_M) — llama.cpp (llama-server :11436, sm120) on chiap08,
+  ## 256K ctx, reasoning model. High priority NUMBER keeps this OUT of the
+  ## unmatched-model fallback pool (fronted by priority 1); it remains the SOLE
+  ## match for the exact id `ornith-1.0-35b`, so it never shadows other routing.
   ##
-  ## 2026-07-21: chiap08 added as PRIMARY. Both of Tyler's boxes were verified
-  ## EHOSTUNREACH, so `ornith-1.0-35b` was advertised in /v1/models but routed
-  ## to nothing (502). chiap08:11436 serves the identical
-  ## deepreinforce-ai_Ornith-1.0-35B-Q4_K_M.gguf at n_ctx=262144, so the
-  ## existing model_limits (800000/320000) apply unchanged.
+  ## 2026-07-21: chiap08 added as PRIMARY. chiap08:11436 serves
+  ## deepreinforce-ai_Ornith-1.0-35B-Q4_K_M.gguf at n_ctx=262144, so the existing
+  ## model_limits (800000/320000) apply unchanged.
+  ##
+  ## 2026-08-05: REMOVED the two Tyler failover backends (tyler-ornith .150:8087,
+  ## tyler-ornith-b .153:8087). Both have been EHOSTUNREACH since 2026-07-21 and
+  ## were the ONLY failover targets, so a transient chiap08 5xx failed over to two
+  ## dead boxes -> a hard request failure, and the router marked chiap08 DEGRADED
+  ## on the resulting error-rate blip (the observed "flakiness"). chiap08 is
+  ## verified healthy (plain + concurrent + 39KB tool-laden payloads all 200), so
+  ## it is now the SOLE ornith-1.0-35b backend and a blip retries it instead of
+  ## cascading to nothing. Re-add the Tyler boxes (priority 5/6) if they return.
   chiap08-ornith:
     url: http://100.81.238.58:11436/v1
     auth_type: none
@@ -65,20 +70,6 @@ backends:
       - ornith-1.0-35b
       - ornith-big            # short alias -> same backend (llama.cpp serves name-agnostically)
     priority: 4
-  tyler-ornith:
-    url: http://192.168.0.150:8087/v1
-    auth_type: none
-    models:
-      - ornith-1.0-35b
-      - ornith-big            # short alias -> same Tyler backend (llama.cpp serves name-agnostically)
-    priority: 5
-  tyler-ornith-b:
-    url: http://192.168.0.153:8087/v1
-    auth_type: none
-    models:
-      - ornith-1.0-35b
-      - ornith-big            # short alias -> same Tyler backend
-    priority: 6
   nvidia:
     url: https://integrate.api.nvidia.com/v1
     auth_type: api_key
