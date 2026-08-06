@@ -18,6 +18,9 @@ import { loadAllowlist, saveAllowlist, applyAllowlist } from "./advertise.mjs";
 import { discoverCatalog, loadCache, saveCache, fetchNvidia, fetchOpenRouter, catalogStatus } from "./discovery.mjs";
 import { getPool, resetPool } from "./proxy/connection-pool.mjs";
 import { loadAgentRegistry, extractIdentity, ANONYMOUS_AGENT_ID } from "./identity/capauth.mjs";
+import { createAuthzClient } from "./policy/authz_decide.mjs";
+import { classifyRoute } from "./policy/authz_routes.mjs";
+import { authzEnforceEnabled, authorizeRequest } from "./policy/authz_gate.mjs";
 import { classifyRequest, toSiemEvent } from "./classifiers/engine.mjs";
 import { handleModuleManifest } from "./operator/manifest.mjs";
 import { fromAnthropicRequest, toAnthropicMessage, modelRetrieveObject } from "./proxy/anthropic-frontend.mjs";
@@ -232,6 +235,72 @@ if (identityEnabled) {
   }
 }
 
+// ─── SKWorld authorization PDP delegation (L1.8) — OFF BY DEFAULT ───
+// skgateway is the one non-Python PEP: authenticate locally, then delegate the
+// allow/deny to the capauth service's POST /v1/authz/decide (never port the PDP).
+// The MASTER GATE is SKGATEWAY_AUTHZ_ENFORCE (env) OR config.authz.enforce. When
+// OFF (the default) NONE of the enforcement code below runs and the gateway is
+// byte-identical to today: no decide call, no added latency, no behavior change.
+// The client is still constructed (cheap, no I/O) so it is ready the instant the
+// flag flips, but it is only ever consulted inside the `if (authzEnforce)` guard.
+const authzCfg = config.authz || {};
+const authzEnforce = authzEnforceEnabled(process.env, config);
+const authzClient = createAuthzClient({
+  url: authzCfg.url,
+  cacheTtlMs: authzCfg.cache_ttl_ms,
+  timeoutMs: authzCfg.timeout_ms,
+});
+if (authzEnforce) {
+  console.log(
+    `[skgateway] authz ENFORCE ON — delegating to capauth decide endpoint ` +
+    `(${authzClient.configured ? "configured" : "NOT configured → all gated routes DENY"})`,
+  );
+} else {
+  console.log("[skgateway] authz enforce OFF (byte-identical passthrough; no decide call)");
+}
+
+/**
+ * Enforce PDP authorization for one request when the flag is ON. Returns true if
+ * the request was DENIED and a 403 was already written (caller must stop). Returns
+ * false to let the request proceed normally. NEVER called when authzEnforce is off.
+ *
+ * Fail-closed everywhere: any transport/HTTP fault from the PDP is a deny (handled
+ * inside authzClient.decide). A gated route whose capability is unmapped is a 403
+ * by construction (coverage-gap guard, standard §3).
+ */
+async function enforceAuthz(req, res, identity) {
+  const verdict = await authorizeRequest({
+    method: req.method,
+    url: req.url,
+    identity,
+    client: authzClient,
+  });
+  if (verdict.kind === "public") return false;
+
+  siemHook({
+    ts: new Date().toISOString(),
+    event: "authz.decide",
+    agent_id: identity?.agent_id ?? null,
+    subject: verdict.subject,
+    capability: verdict.capability,
+    decision: verdict.allowed ? "allow" : "deny",
+    reason: verdict.reason,
+    path: (req.url || "").split("?")[0],
+    method: (req.method || "GET").toUpperCase(),
+    remote: req.socket?.remoteAddress ?? null,
+  });
+
+  if (verdict.allowed) return false;
+
+  if (!res.headersSent) {
+    res.writeHead(403, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      error: { message: "Forbidden by authorization policy", reason: verdict.reason, code: 403 },
+    }));
+  }
+  return true;
+}
+
 // Dashboard server
 let dashboard = null;
 try {
@@ -365,6 +434,44 @@ const proxyConfig = buildConfig({
 const server = http.createServer(async (req, res) => {
   const startTime = Date.now();
   if (process.env.SKGW_REQLOG) { console.log("[REQLOG]", req.method, req.url); }
+
+  // ── SKWorld authorization gate (L1.8) — OFF BY DEFAULT ──
+  // This ENTIRE block is skipped unless SKGATEWAY_AUTHZ_ENFORCE / config.authz.
+  // enforce is on, so with the flag off the handler below runs exactly as it did
+  // before this feature existed (byte-identical: no identity double-resolve, no
+  // decide call, no new headers, no added latency). When ON: classify the route,
+  // resolve the subject from the authenticated identity, delegate allow/deny to
+  // the capauth PDP, and 403 a gated-route deny before any handler runs. Public
+  // routes (health/status/discovery/model-listing) pass straight through.
+  if (authzEnforce) {
+    let gateIdentity = {
+      agent_id: req.headers["x-agent-id"] || ANONYMOUS_AGENT_ID,
+      method: req.headers["x-agent-id"] ? "header" : "anonymous",
+      agent: null,
+    };
+    if (identityRegistry) {
+      try {
+        gateIdentity = await extractIdentity(req, identityRegistry);
+      } catch {
+        gateIdentity = { agent_id: ANONYMOUS_AGENT_ID, method: "anonymous", agent: null };
+      }
+    }
+    try {
+      if (await enforceAuthz(req, res, gateIdentity)) return; // denied → 403 already written
+    } catch (e) {
+      // Fail closed: an unexpected fault in the gate itself denies rather than
+      // silently allowing a gated route through.
+      console.warn("[skgateway] authz gate error (fail-closed deny):", e.message);
+      const route = classifyRoute(req.method, req.url);
+      if (route.kind === "gated") {
+        if (!res.headersSent) {
+          res.writeHead(403, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: { message: "Forbidden by authorization policy", reason: "gate error", code: 403 } }));
+        }
+        return;
+      }
+    }
+  }
 
   // ── SKWorld module manifest (operator-facet discovery) ──
   // Unauthenticated public discovery, like the other subapps: the fleet control

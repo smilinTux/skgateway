@@ -230,6 +230,25 @@ const DEFAULTS = {
     require_agent_id: false,
   },
 
+  // SKWorld authorization (PDP delegation, SKWorld Authorization Standard §1 /
+  // design doc L1.8). skgateway is the one non-Python PEP: it authenticates
+  // locally (identity above), then delegates allow/deny to the capauth service's
+  // POST /v1/authz/decide (never ports the PDP). Fail-closed on any error.
+  //   enforce  — MASTER GATE. OFF by default (env SKGATEWAY_AUTHZ_ENFORCE or this
+  //              flag). When OFF the gateway is byte-identical to today: no decide
+  //              call, no behavior change. Only when ON are gated routes checked.
+  //   url      — decide endpoint (or $CAPAUTH_AUTHZ_URL); base or full path.
+  //   token    — bearer service token is read from $CAPAUTH_AUTHZ_TOKEN (never
+  //              committed to config); missing token → every gated route denies.
+  //   cache_ttl_ms — short ALLOW-only cache for hot paths (denies never cached).
+  //   timeout_ms   — per-call transport timeout; a hung PDP denies, never stalls.
+  authz: {
+    enforce: false,
+    url: null,
+    cache_ttl_ms: 5000,
+    timeout_ms: 2000,
+  },
+
   // Dynamic provider model discovery (SKGateway dynamic-provider-model-discovery).
   // Periodically queries each declared backend's model-list endpoint and folds
   // newly seen models into the effective model set, instead of relying solely
