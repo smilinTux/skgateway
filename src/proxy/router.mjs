@@ -23,7 +23,7 @@ import { sendUpstream } from "./upstream.mjs";
 import { createEvent } from "../siem/events.mjs";
 import { isAnthropicBackend, toAnthropicRequest, toOpenAIResponse } from "./anthropic-adapter.mjs";
 import { getPool } from "./connection-pool.mjs";
-import { isRegistryRouted, resolve as resolveRegistry, getAutoConfig, getConfigEpoch } from "./registry.mjs";
+import { isRegistryRouted, resolve as resolveRegistry, getAutoConfig, getConfigEpoch, loadRegistry } from "./registry.mjs";
 import { getFailoverConfig, isLocalUrl, probeLocalHealth, recordLocalOutcome } from "./local-failover.mjs";
 import { applyReasoningFloor } from "./core.mjs";
 import { createDecisionCache, decisionKey } from "./decision-cache.mjs";
@@ -123,35 +123,6 @@ const DEFAULT_QUARANTINE_COOLDOWN_MS = 30_000;
 // ---------------------------------------------------------------------------
 // Per-agent model routing (card 45509bf5)
 // ---------------------------------------------------------------------------
-
-/**
- * Normalise a `routing.per_agent` config map into a lowercase-keyed Map of
- * agent id -> routing target (a concrete model id OR an alias/role that the
- * skmodels registry resolves, e.g. "sk-default", "ornith-tiny").
- *
- * Agent ids are lowercased to match the CapAuth identity layer, which lowercases
- * every resolved agent_id. Non-string / blank keys or targets are dropped so a
- * malformed entry can never silently override routing. An absent or empty map =
- * no rules, and routing behaviour is unchanged.
- *
- * @param {object} [routingCfg]  The `routing` config block (accepts per_agent or perAgent).
- * @returns {Map<string, string>}
- */
-function buildPerAgentRouting(routingCfg) {
-  const out = new Map();
-  const src = routingCfg && typeof routingCfg === "object"
-    ? (routingCfg.per_agent || routingCfg.perAgent)
-    : null;
-  if (src && typeof src === "object") {
-    for (const [agent, target] of Object.entries(src)) {
-      if (typeof agent === "string" && typeof target === "string" &&
-          agent.trim() && target.trim()) {
-        out.set(agent.trim().toLowerCase(), target.trim());
-      }
-    }
-  }
-  return out;
-}
 
 // ---------------------------------------------------------------------------
 // Glob matching helper
@@ -844,9 +815,12 @@ export function createRouter(config = {}) {
     }
   }
 
-  // Per-agent model routing rules (card 45509bf5). Maps a resolved agent id to a
-  // pinned model or alias/role. Empty map = no rules (routing unchanged).
-  const perAgentRouting = buildPerAgentRouting(config.routing);
+  // Per-agent model routing (cards 45509bf5 / 7ec1d18a; folded into the registry
+  // by CR-5.1). The per-agent pin is the `agent:<id>` CONTEXT in the skmodels
+  // registry (the single source of truth), resolved live per request (see
+  // resolveAgentTarget below). An optional registry_path override lets tests
+  // point at a fixture; production uses the module default (REGISTRY_PATH).
+  const registryPath = config.registry_path || undefined;
 
   /** @type {Map<string, Backend>} */
   const backends = new Map();
@@ -1060,16 +1034,24 @@ export function createRouter(config = {}) {
   }
 
   /**
-   * Resolve the per-agent routing target for an agent id (card 45509bf5).
-   * Returns the configured model/alias string when a rule exists, else null.
-   * Lookup is case-insensitive to match the lowercased CapAuth identity.
+   * Resolve the per-agent routing target for an agent id (CR-5.1).
+   *
+   * Reads the `agent:<id>` CONTEXT from the skmodels registry (the single
+   * source of truth), so a `skmodels set agent:<id> <target>` (or a skchat
+   * picker change) takes effect live (registry.mjs re-parses on mtime change).
+   * Returns the context target string (a role or a concrete model id) when set,
+   * else null (routing unchanged). Lookup is lowercased to match the CapAuth
+   * identity layer, and registry `agent:*` keys are written lowercased.
    *
    * @param {string|undefined} agentId
    * @returns {string|null}
    */
   function resolveAgentTarget(agentId) {
-    if (!agentId || perAgentRouting.size === 0) return null;
-    return perAgentRouting.get(String(agentId).trim().toLowerCase()) || null;
+    if (!agentId) return null;
+    const key = "agent:" + String(agentId).trim().toLowerCase();
+    const { contexts } = loadRegistry(registryPath);
+    const target = contexts && contexts[key];
+    return typeof target === "string" && target.trim() ? target.trim() : null;
   }
 
   // -------------------------------------------------------------------------
@@ -1230,8 +1212,9 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     }
   };
 
-  // ── Per-agent model routing rules (card 45509bf5) ──
-  // Map the resolved CapAuth agent identity to a pinned model or alias/role,
+  // ── Per-agent model routing (CR-5.1: registry agent:<id> context) ──
+  // Map the resolved CapAuth agent identity to its pinned target read LIVE from
+  // the skmodels registry `agent:<id>` context (the single source of truth),
   // overriding the model the caller asked for. This runs BEFORE registry +
   // backend selection, and only rewrites the target MODEL, so it composes with
   // everything downstream unchanged: an alias target flows through the registry

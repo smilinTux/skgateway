@@ -1,5 +1,6 @@
 /**
- * ornith-tiny-disambig.test.mjs role-vs-model-id disambiguation (card 31631c4f).
+ * ornith-tiny-disambig.test.mjs role-vs-model-id disambiguation (card 31631c4f;
+ * per-agent source moved to the registry by CR-5.1).
  *
  * `ornith-tiny` is BOTH a skos role name (registry `roles: { ornith-tiny: ornith }`)
  * and, historically, a model id listed under a config backend. The router's
@@ -9,8 +10,8 @@
  * accident of it also being a backend model (an inconsistency).
  *
  * Resolution: `ornith-tiny` is a ROLE. Both paths now decide that with the SAME
- * predicate (isRegistryRouted), so a per_agent target of `ornith-tiny` validates
- * as a registry role WITHOUT having to also be a backend model.
+ * predicate (isRegistryRouted), so an `agent:<id>` context target of `ornith-tiny`
+ * validates as a registry role WITHOUT having to also be a backend model.
  *
  * Run with:  node --test tests/ornith-tiny-disambig.test.mjs
  */
@@ -23,13 +24,11 @@ import { join } from "node:path";
 import { isRegistryRouted } from "../src/proxy/registry.mjs";
 import { assertProviderRoutes } from "../src/config.mjs";
 
-// Fixture registry: ornith-tiny is a role -> ornith backend. No config backend
-// lists ornith-tiny as a model, so ONLY the role identity is in play here.
 const dir = mkdtempSync(join(tmpdir(), "skgw-ornith-"));
-const fixture = join(dir, "registry.yaml");
-writeFileSync(
-  fixture,
-  `backends:
+
+// Shared backends+roles block: ornith-tiny is a role -> ornith backend. No config
+// backend lists ornith-tiny as a model, so ONLY the role identity is in play.
+const REG_HEAD = `backends:
   ornith:
     url: http://192.168.0.100:8082/v1
     model: ornith-1.0-9b
@@ -40,8 +39,17 @@ roles:
   sk-default: ornith
 defaults:
   role: sk-default
-`,
-);
+`;
+
+let _n = 0;
+/** Write a registry fixture (standard backends+roles) with the given contexts. */
+function registryFile(contexts = {}) {
+  const p = join(dir, `registry-${_n++}.yaml`);
+  const lines = [REG_HEAD, "contexts:"];
+  for (const [k, v] of Object.entries(contexts)) lines.push(`  ${k}: ${v}`);
+  writeFileSync(p, lines.join("\n") + "\n");
+  return p;
+}
 
 // A config whose backends DO NOT serve `ornith-tiny` as a concrete model.
 const backends = {
@@ -50,14 +58,16 @@ const backends = {
 
 describe("ornith-tiny is a ROLE, consistently across both paths", () => {
   test("classify/registry path: isRegistryRouted treats ornith-tiny as a role", () => {
+    const fixture = registryFile();
     assert.equal(isRegistryRouted({ model: "ornith-tiny" }, fixture), true);
     // a bare concrete model id is NOT registry-routed (raw callers unaffected)
     assert.equal(isRegistryRouted({ model: "ornith-1.0-9b" }, fixture), false);
   });
 
-  test("config route-assertion accepts ornith-tiny as a registry role (not a dangling model)", () => {
+  test("route-assertion accepts an agent context of ornith-tiny as a role (not dangling)", () => {
+    const fixture = registryFile({ "agent:lumina": "ornith-tiny" });
     const errs = assertProviderRoutes(
-      { backends, routing: { per_agent: { lumina: "ornith-tiny" }, strict_targets: true } },
+      { backends, routing: { strict_targets: true } },
       [],
       fixture,
     );
@@ -66,9 +76,10 @@ describe("ornith-tiny is a ROLE, consistently across both paths", () => {
 
   test("the two paths AGREE: whatever isRegistryRouted routes, the assertion accepts", () => {
     for (const target of ["ornith-tiny", "sk-default"]) {
+      const fixture = registryFile({ "agent:a": target });
       const routed = isRegistryRouted({ model: target }, fixture);
       const errs = assertProviderRoutes(
-        { backends, routing: { per_agent: { a: target }, strict_targets: true } },
+        { backends, routing: { strict_targets: true } },
         [],
         fixture,
       );
@@ -77,10 +88,11 @@ describe("ornith-tiny is a ROLE, consistently across both paths", () => {
     }
   });
 
-  test("a genuinely-unknown target is still rejected as dangling", () => {
+  test("a genuinely-unknown agent-context target is still rejected as dangling", () => {
+    const fixture = registryFile({ "agent:a": "not-a-role" });
     assert.equal(isRegistryRouted({ model: "not-a-role" }, fixture), false);
     const errs = assertProviderRoutes(
-      { backends, routing: { per_agent: { a: "not-a-role" }, strict_targets: true } },
+      { backends, routing: { strict_targets: true } },
       [],
       fixture,
     );

@@ -26,7 +26,7 @@ import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import { load as yamlLoad } from 'js-yaml';
-import { isRegistryRouted } from './proxy/registry.mjs';
+import { isRegistryRouted, loadRegistry } from './proxy/registry.mjs';
 
 // ─── paths ────────────────────────────────────────────────────────────────────
 
@@ -200,21 +200,20 @@ const DEFAULTS = {
     cooldown_ms: 30_000,
   },
 
-  // Per-agent model routing rules (SKGateway P4.3, card 45509bf5). Maps a
-  // resolved agent identity to a pinned routing target that overrides the model
-  // the caller asked for. The target is either a concrete model id or an
-  // alias/role the skmodels registry resolves (e.g. "sk-default", "ornith-tiny").
-  // Explicit x-sk-context / x-sk-service / x-sk-role headers still win; only the
-  // model field is pinned. Empty map = no rules, routing behaviour unchanged.
-  //   per_agent: { <agent-id>: <model-or-alias> } (agent ids are case-insensitive)
+  // Per-agent model routing (SKGateway P4.3, cards 45509bf5 / 7ec1d18a; folded
+  // into the skmodels registry by CR-5.1). The per-agent pin is now the
+  // `agent:<id>` CONTEXT in the skmodels registry (~/.skcapstone/models/
+  // registry.yaml): the single source of truth the gateway already resolves
+  // from (precedence context > service > role > default). There is no longer a
+  // redundant `routing.per_agent` config copy: set an agent's model with
+  //   skmodels set agent:<id> <role-or-model>
+  // or via the skchat picker (skchat.agent_model), which writes the same key.
   //
-  // strict_targets: PROVIDER-ROUTE ASSERTION (card 7ec1d18a). When true
-  // (default), the boot + reload config validation fails fast if any per_agent
-  // routing target is a dangling reference: neither an sk-* registry alias nor a
-  // model served by a declared backend. Set false to allow targets that only a
-  // live skmodels registry role-key resolves (validated at first request instead).
+  // strict_targets: PROVIDER-ROUTE ASSERTION. When true (default) the boot +
+  // reload config validation fails fast if any registry `agent:*` context target
+  // is a dangling reference (neither a registry role nor a model served by a
+  // declared backend). Set false to defer that check to first request.
   routing: {
-    per_agent: {},
     strict_targets: true,
   },
 
@@ -479,14 +478,15 @@ function modelMatchesPattern(pattern, model) {
  *        api_key | bearer requires api_key or api_key_env
  *   2. pooling.per_backend: every per-backend concurrency limit must name a
  *      declared backend (a limit on a nonexistent provider is dead config).
- *   3. routing.per_agent: every pinned target must resolve to a known route,
- *      a registry role (sk-* alias OR a named role-key in the skmodels registry
- *      `roles:` map, judged with the router's own isRegistryRouted predicate so
- *      config validation and the router agree), or a model served by at least
- *      one declared backend. A dangling target (typo'd model / removed backend)
- *      is rejected. Gated by routing.strict_targets (default true) so a
- *      registry-only role-key resolved from a registry the boot process cannot
- *      read can still opt out with strict_targets: false.
+ *   3. registry `agent:*` contexts (CR-5.1): the per-agent pin now lives in the
+ *      skmodels registry, not config. Every `agent:<id>` context target must
+ *      resolve to a known route: a registry role (sk-* alias OR a named role-key
+ *      in the registry `roles:` map, judged with the router's own
+ *      isRegistryRouted predicate so config validation and the router agree), or
+ *      a model served by at least one declared backend. A dangling target
+ *      (typo'd model / removed backend) is rejected. Gated by
+ *      routing.strict_targets (default true) so a deploy can opt out with
+ *      strict_targets: false and defer the check to first request.
  *
  * Problems are appended to `errs`; the caller (validate) throws a single
  * ConfigError naming every bad route. Non-breaking for a valid config.
@@ -531,21 +531,20 @@ export function assertProviderRoutes(cfg, errs = [], registryPath = undefined) {
     }
   }
 
-  // 3. routing.per_agent targets must resolve to a known route.
+  // 3. registry `agent:*` context targets must resolve to a known route (CR-5.1).
+  //    The per-agent pin moved from config `routing.per_agent` into the skmodels
+  //    registry `agent:<id>` contexts (the single source of truth). We validate
+  //    the SAME property the old config check did, just read from the registry.
   const routing = cfg.routing && typeof cfg.routing === 'object' ? cfg.routing : {};
   const strict = routing.strict_targets !== false; // default strict
-  const perAgent = routing.per_agent || routing.perAgent;
-  if (strict && perAgent && typeof perAgent === 'object') {
+  if (strict) {
     // A target resolves if it is a concrete model served by a declared backend
     // OR the router would registry-route it. "Registry-routed" is judged with
     // the SAME predicate the router uses at request time (isRegistryRouted):
     // that covers both "sk-*" prefixed roles AND named role-keys declared in the
-    // registry `roles:` map (e.g. "ornith-tiny": ornith). Using the sk-* prefix
-    // alone would DISAGREE with the router: a bare role-key like `ornith-tiny`
-    // is a real role the router rewrites to its backend's concrete model, yet a
-    // prefix check would flag it as dangling. Deferring to isRegistryRouted() is
-    // what makes the two paths agree on what `ornith-tiny` is (a role), so it no
-    // longer has to double as a config-backend model just to pass this gate.
+    // registry `roles:` map (e.g. "ornith-tiny": ornith). Deferring to
+    // isRegistryRouted() is what makes config validation and the router agree on
+    // what `ornith-tiny` is (a role), not a dangling model.
     const servedByBackend = (target) => {
       for (const backend of Object.values(backends)) {
         const models = Array.isArray(backend?.models) ? backend.models : [];
@@ -553,16 +552,23 @@ export function assertProviderRoutes(cfg, errs = [], registryPath = undefined) {
       }
       return false;
     };
-    for (const [agent, target] of Object.entries(perAgent)) {
-      if (typeof target !== 'string' || !target.trim()) continue; // router drops these
+    let contexts = {};
+    try {
+      contexts = loadRegistry(registryPath).contexts || {};
+    } catch {
+      contexts = {}; // unreadable registry -> nothing to assert (fail open at boot)
+    }
+    for (const [key, target] of Object.entries(contexts)) {
+      if (!key.startsWith('agent:')) continue;      // only per-agent pins here
+      if (typeof target !== 'string' || !target.trim()) continue;
       const t = target.trim();
-      if (isRegistryRouted({ model: t }, registryPath)) continue; // sk-* role or named registry role-key, resolved live
+      if (isRegistryRouted({ model: t }, registryPath)) continue; // sk-* role or named registry role-key
       if (servedByBackend(t)) continue;             // concrete model on a backend
       errs.push(
-        `routing.per_agent.${agent} -> "${t}" is a dangling route: no declared ` +
+        `registry context "${key}" -> "${t}" is a dangling route: no declared ` +
         `backend serves it and it is not a registry role (sk-* or a role-key ` +
         `in the skmodels registry) ` +
-        `(set routing.strict_targets: false to allow a registry-only role-key)`,
+        `(set routing.strict_targets: false to defer this to first request)`,
       );
     }
   }
