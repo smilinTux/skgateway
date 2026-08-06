@@ -605,9 +605,27 @@ export function getEngine() {
 
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath }    from 'node:url';
+import { homedir }          from 'node:os';
 
-/** @returns {string} Absolute path to the default policies.yaml */
+/** Expand a leading `~/` (systemd Environment= does not expand it). */
+function _expandHome(p) {
+  if (typeof p !== 'string') return p;
+  return p.startsWith('~/') ? resolve(homedir(), p.slice(2)) : p;
+}
+
+/** Syncthing-synced policies path (mirrors the skgateway.yaml pattern, CR-1.5). */
+export const SYNCED_POLICIES_PATH = resolve(homedir(), '.skcapstone', 'gateway', 'policies.yaml');
+
+/**
+ * Resolve which policies.yaml to load, in precedence order:
+ *   1. `$SKGATEWAY_POLICIES` if set
+ *   2. the Syncthing-synced path (SYNCED_POLICIES_PATH) if it exists
+ *   3. the in-repo `config/policies.yaml` (pre-migration fallback)
+ * @returns {string} Absolute path to the default policies.yaml
+ */
 function _defaultPoliciesPath() {
+  if (process.env.SKGATEWAY_POLICIES) return _expandHome(process.env.SKGATEWAY_POLICIES);
+  if (existsSync(SYNCED_POLICIES_PATH)) return SYNCED_POLICIES_PATH;
   const __dirname = dirname(fileURLToPath(import.meta.url));
   return resolve(__dirname, '..', '..', 'config', 'policies.yaml');
 }

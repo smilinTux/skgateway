@@ -25,7 +25,11 @@ import { SSEWriter, jsonToSSE } from "./proxy/stream.mjs";
 
 // ─── Parse CLI args ───
 const args = process.argv.slice(2);
-let configPath = "./config/skgateway.yaml";
+// Left null so config.mjs resolveConfigPath() can apply its precedence:
+//   --config > $SKGATEWAY_CONFIG > ~/.skcapstone/gateway/skgateway.yaml (synced)
+//   > in-repo config/skgateway.yaml. Forcing the in-repo path here would pin
+//   every host to the hand-edited, drift-prone in-repo file (CR-1.5).
+let configPath = null;
 let portOverride = null;
 
 for (let i = 0; i < args.length; i++) {

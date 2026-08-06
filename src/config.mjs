@@ -43,6 +43,34 @@ function expandHome(p) {
   return p.startsWith('~/') ? resolve(homedir(), p.slice(2)) : p;
 }
 
+/**
+ * Runtime config path used when no explicit path and no SKGATEWAY_CONFIG env is
+ * set. This is the Syncthing-synced location (same pattern the model registry
+ * uses at ~/.skcapstone/models/registry.yaml). Editing this file on one host
+ * and letting Syncthing propagate it replaces the old drift-prone workflow of
+ * hand-editing the in-repo config/skgateway.yaml on every checkout.
+ * @type {string}
+ */
+export const SYNCED_CONFIG_PATH = resolve(homedir(), '.skcapstone', 'gateway', 'skgateway.yaml');
+
+/**
+ * Resolve which skgateway.yaml to load, in precedence order:
+ *   1. `explicit` (a function-arg / --config override) if provided
+ *   2. `$SKGATEWAY_CONFIG` if set
+ *   3. the Syncthing-synced path (SYNCED_CONFIG_PATH) if it exists on disk
+ *   4. the in-repo `config/skgateway.yaml` (pre-migration fallback)
+ * `~/` is expanded in 1 and 2 (systemd Environment= does not expand it).
+ *
+ * @param {string} [explicit]  Optional explicit override.
+ * @returns {string} Absolute path to the config file to load.
+ */
+export function resolveConfigPath(explicit) {
+  if (explicit) return expandHome(explicit);
+  if (process.env.SKGATEWAY_CONFIG) return expandHome(process.env.SKGATEWAY_CONFIG);
+  if (existsSync(SYNCED_CONFIG_PATH)) return SYNCED_CONFIG_PATH;
+  return resolve(REPO_ROOT, 'config', 'skgateway.yaml');
+}
+
 // ─── defaults ─────────────────────────────────────────────────────────────────
 
 /** @type {import('./config-types.d.ts').GatewayConfig} */
@@ -696,9 +724,7 @@ let _configFilePath = null;
  * @returns {Promise<EventEmitter & { current: () => object }>}
  */
 export async function loadConfig({ configPath, silent = false } = {}) {
-  _configFilePath = configPath
-    ?? process.env.SKGATEWAY_CONFIG
-    ?? resolve(REPO_ROOT, 'config', 'skgateway.yaml');
+  _configFilePath = resolveConfigPath(configPath);
 
   _current = _readAndBuild(_configFilePath, silent);
 
