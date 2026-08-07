@@ -60,13 +60,28 @@ export function authzEnforceEnabled(env = process.env, config = {}) {
  * @param {{ decide: Function }} args.client  The authz PDP client.
  * @returns {Promise<AuthzVerdict>}
  */
-export async function authorizeRequest({ method, url, identity, client }) {
+export async function authorizeRequest({ method, url, identity, client, internal = false }) {
   const route = classifyRoute(method, url);
   if (route.kind === "public") {
     return { kind: "public", allowed: true, capability: null, subject: "", reason: "public route", obligations: [] };
   }
 
   const subject = subjectFromIdentity(identity);
+
+  // Allow-internal, gate-external: a trusted internal peer is allowed on any gated
+  // route with NO PDP call. The verdict still carries the capability so the audit
+  // trail records what was accessed; only the external path consults the PDP.
+  if (internal) {
+    return {
+      kind: "gated",
+      allowed: true,
+      capability: route.capability ?? null,
+      subject,
+      reason: "internal-trusted peer",
+      obligations: [],
+    };
+  }
+
   if (!route.capability) {
     return {
       kind: "gated",

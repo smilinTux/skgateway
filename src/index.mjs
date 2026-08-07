@@ -21,6 +21,7 @@ import { loadAgentRegistry, extractIdentity, ANONYMOUS_AGENT_ID } from "./identi
 import { createAuthzClient } from "./policy/authz_decide.mjs";
 import { classifyRoute } from "./policy/authz_routes.mjs";
 import { authzEnforceEnabled, authorizeRequest } from "./policy/authz_gate.mjs";
+import { isInternalRemote } from "./policy/net_trust.mjs";
 import { classifyRequest, toSiemEvent } from "./classifiers/engine.mjs";
 import { handleModuleManifest } from "./operator/manifest.mjs";
 import { fromAnthropicRequest, toAnthropicMessage, modelRetrieveObject } from "./proxy/anthropic-frontend.mjs";
@@ -245,6 +246,14 @@ if (identityEnabled) {
 // flag flips, but it is only ever consulted inside the `if (authzEnforce)` guard.
 const authzCfg = config.authz || {};
 const authzEnforce = authzEnforceEnabled(process.env, config);
+// "Allow internal, gate external" posture: a request from a trusted internal peer
+// (loopback / Tailscale CGNAT / RFC1918) is allowed without a PDP call; only
+// external peers are delegated to the PDP. Default ON; set authz.trust_internal
+// or $SKGATEWAY_AUTHZ_TRUST_INTERNAL=0 to gate ALL callers (strict mode).
+const authzTrustInternal =
+  (process.env.SKGATEWAY_AUTHZ_TRUST_INTERNAL ?? "").trim() === "0"
+    ? false
+    : authzCfg.trust_internal !== false;
 const authzClient = createAuthzClient({
   url: authzCfg.url,
   cacheTtlMs: authzCfg.cache_ttl_ms,
@@ -269,11 +278,17 @@ if (authzEnforce) {
  * by construction (coverage-gap guard, standard §3).
  */
 async function enforceAuthz(req, res, identity) {
+  // Allow-internal, gate-external: a trusted internal TCP peer (loopback/tailnet/
+  // RFC1918) is authorized without a PDP call. remoteAddress is the real peer (no
+  // trusted proxy in front), so this is a network-layer boundary, not a spoofable
+  // header. The verdict still flows to the SIEM hook below for the audit trail.
+  const internal = authzTrustInternal && isInternalRemote(req.socket?.remoteAddress);
   const verdict = await authorizeRequest({
     method: req.method,
     url: req.url,
     identity,
     client: authzClient,
+    internal,
   });
   if (verdict.kind === "public") return false;
 

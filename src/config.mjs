@@ -242,11 +242,17 @@ const DEFAULTS = {
   //              committed to config); missing token → every gated route denies.
   //   cache_ttl_ms — short ALLOW-only cache for hot paths (denies never cached).
   //   timeout_ms   — per-call transport timeout; a hung PDP denies, never stalls.
+  //   trust_internal — "allow internal, gate external": when true (default) a
+  //              request whose TCP peer is loopback / Tailscale CGNAT (100.64/10)
+  //              / RFC1918 is allowed with NO PDP call; only external peers are
+  //              delegated to the decide endpoint. Set false (or env
+  //              SKGATEWAY_AUTHZ_TRUST_INTERNAL=0) for strict mode (gate all).
   authz: {
     enforce: false,
     url: null,
     cache_ttl_ms: 5000,
     timeout_ms: 2000,
+    trust_internal: true,
   },
 
   // Dynamic provider model discovery (SKGateway dynamic-provider-model-discovery).

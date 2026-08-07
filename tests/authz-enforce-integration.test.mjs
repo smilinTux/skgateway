@@ -111,7 +111,15 @@ describe("authz enforce — flag ON fails closed without a PDP token (live serve
       port: ON_PORT,
       dashPort: ON_DASH,
       // enforce ON, but no CAPAUTH_AUTHZ_URL/TOKEN → client is unconfigured → deny.
-      env: { SKGATEWAY_AUTHZ_ENFORCE: "1", CAPAUTH_AUTHZ_URL: "", CAPAUTH_AUTHZ_TOKEN: "" },
+      // Strict mode (TRUST_INTERNAL=0) so the loopback test client is gated and
+      // the fail-closed PDP path is exercised (default trust_internal would allow
+      // loopback as internal; that default is covered by its own block below).
+      env: {
+        SKGATEWAY_AUTHZ_ENFORCE: "1",
+        SKGATEWAY_AUTHZ_TRUST_INTERNAL: "0",
+        CAPAUTH_AUTHZ_URL: "",
+        CAPAUTH_AUTHZ_TOKEN: "",
+      },
     });
   });
   after(() => stop(handle));
@@ -130,5 +138,32 @@ describe("authz enforce — flag ON fails closed without a PDP token (live serve
   });
   test("public /v1/models → 200 (read-only listing is public)", async () => {
     assert.equal(await http("GET", ON_PORT, "/v1/models"), 200);
+  });
+});
+
+// Fixed loopback ports for the internal-allow (default posture) block.
+const INT_PORT = 18946, INT_DASH = 18947;
+
+describe("authz enforce ON — allow-internal default authorizes a loopback caller", () => {
+  let handle;
+  before(async () => {
+    handle = await bootGateway({
+      port: INT_PORT,
+      dashPort: INT_DASH,
+      // enforce ON, PDP UNCONFIGURED (would deny), but trust_internal DEFAULT (on).
+      // The test client connects from 127.0.0.1 = internal, so it is allowed with
+      // NO PDP call — proving the "allow internal, gate external" posture: enforce
+      // can be flipped without denying trusted-network inference traffic.
+      env: { SKGATEWAY_AUTHZ_ENFORCE: "1", CAPAUTH_AUTHZ_URL: "", CAPAUTH_AUTHZ_TOKEN: "" },
+    });
+  });
+  after(() => stop(handle));
+
+  test("gated inference route from loopback is NOT 403ed (internal-allowed)", async () => {
+    const status = await http("POST", INT_PORT, "/v1/chat/completions", { model: "x", messages: [] });
+    assert.notEqual(status, 403, "internal peer must be allowed even with enforce ON + no PDP token");
+  });
+  test("gated admin route from loopback is NOT 403ed (internal-allowed)", async () => {
+    assert.notEqual(await http("GET", INT_PORT, "/admin/models"), 403);
   });
 });
