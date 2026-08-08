@@ -25,7 +25,8 @@ import { isAnthropicBackend, toAnthropicRequest, toOpenAIResponse } from "./anth
 import { getPool } from "./connection-pool.mjs";
 import { isRegistryRouted, resolve as resolveRegistry, getAutoConfig, getConfigEpoch, loadRegistry } from "./registry.mjs";
 import { getFailoverConfig, isLocalUrl, probeLocalHealth, recordLocalOutcome } from "./local-failover.mjs";
-import { recordModelOutcome } from "../discovery/model_catalog_store.mjs";
+import { recordModelOutcome, getLifecycle } from "../discovery/model_catalog_store.mjs";
+import { isRoutable } from "../discovery/lifecycle.mjs";
 import { applyReasoningFloor } from "./core.mjs";
 import { createDecisionCache, decisionKey } from "./decision-cache.mjs";
 
@@ -59,6 +60,25 @@ const DEFAULT_COOLDOWN_MS = 60_000;
 
 /** Timeout (ms) used for liveness probe requests during recovery. */
 const PROBE_TIMEOUT_MS = 8_000;
+
+/**
+ * Thrown by `route()` when a request names a concrete model id that the
+ * lifecycle store (model_catalog_store.mjs) knows is `eol`/`dead` and no
+ * backend explicitly declares it (card P1.6, arch doc 7.3). Lets
+ * `routeAndSend()` answer with a clean 404 + `eol_reason` instead of
+ * spraying the request across every configured backend. An UNKNOWN id (never
+ * recorded, or still `active`/`suspect`) never triggers this: it keeps
+ * today's fall-through behavior, backward-compat.
+ */
+export class ModelEolError extends Error {
+  constructor(model, eolReason) {
+    super(`model "${model}" is end-of-life (${eolReason || "unknown reason"})`);
+    this.name = "ModelEolError";
+    this.model = model;
+    this.eolReason = eolReason || null;
+    this.status = 404;
+  }
+}
 
 /**
  * Dead-alias auto-quarantine (card 2d1f3a2c).
@@ -866,9 +886,23 @@ export function createRouter(config = {}) {
     const matched = available.filter((b) => b.supportsModel(model));
     if (matched.length > 0) return matched;
 
-    // No backend claims this model — fall back to all available backends
-    // (the upstream will return 404/400 for unsupported models, which the
-    // retry loop will treat as a hard error and move on).
+    // No backend explicitly claims this model. A KNOWN eol|dead id (per the
+    // lifecycle store, card P1.6) is gated here instead of falling through:
+    // tag an empty result so route() can answer with a clean 404 +
+    // eol_reason and make no backend attempt at all. An UNKNOWN id (never
+    // recorded, or still active/suspect, including every id the store has
+    // never seen, since defaultLifecycle() starts `active`) keeps today's
+    // fall-through to all available backends unchanged (the upstream will
+    // return 404/400 for unsupported models, which the retry loop will treat
+    // as a hard error and move on).
+    const lc = getLifecycle(model);
+    if (!isRoutable(lc)) {
+      const gated = [];
+      gated.eolGated = true;
+      gated.eolReason = lc.eol_reason;
+      return gated;
+    }
+
     return available;
   }
 
@@ -921,7 +955,9 @@ export function createRouter(config = {}) {
    * @returns {Promise<RouteResult[]>}
    *   Ordered list of RouteResult objects to try, primary first.
    *   Guaranteed non-empty as long as at least one backend is registered.
-   *   Throws if the registry is empty.
+   *   Throws if the registry is empty. Throws `ModelEolError` (card P1.6) if
+   *   `model` is a concrete id the lifecycle store knows is eol/dead and no
+   *   backend explicitly claims it: no backend is attempted in that case.
    */
   async function route(request) {
     const { model, agentId } = request;
@@ -931,6 +967,11 @@ export function createRouter(config = {}) {
     }
 
     const candidates = candidatesFor(model, agentId);
+
+    if (candidates.eolGated) {
+      siemEvent("model_eol_gated", { model, agentId, eol_reason: candidates.eolReason });
+      throw new ModelEolError(model, candidates.eolReason);
+    }
 
     if (candidates.length === 0) {
       // All backends are down or restricted for this agent — return all backends
@@ -1160,6 +1201,28 @@ function getRegBackend(id, url) {
 }
 
 /**
+ * Build the clean 404 response `routeAndSend()` returns for a `ModelEolError`
+ * (card P1.6), the same `{status, headers, body, backendId, failover}` shape as
+ * every other `routeAndSend()` result, so the caller (src/index.mjs) needs no
+ * special-casing. No backend was attempted.
+ *
+ * @param {ModelEolError} err
+ */
+function eolGatedResponse(err) {
+  const payload = JSON.stringify({
+    error: { message: err.message, code: 404 },
+    eol_reason: err.eolReason,
+  });
+  return {
+    status: 404,
+    headers: { "content-type": "application/json" },
+    body: Buffer.from(payload, "utf-8"),
+    backendId: null,
+    failover: false,
+  };
+}
+
+/**
  * High-level helper used by the proxy request handler.
  * Tries each candidate backend in order, acquires a pool slot, sends the
  * request, records outcomes, and returns the first successful response.
@@ -1310,7 +1373,12 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         // fallback) so a wrapper outage fails over instead of hard-failing —
         // registry routing must not re-introduce the wrapper SPOF. router.route
         // only returns configured backends, never the gateway's own url.
-        candidates = await router.route({ ...request, model: reg.model, agentId: request.agentId });
+        try {
+          candidates = await router.route({ ...request, model: reg.model, agentId: request.agentId });
+        } catch (err) {
+          if (err instanceof ModelEolError) return eolGatedResponse(err);
+          throw err;
+        }
         if (!candidates || candidates.length === 0) {
           console.warn("[router] registry resolved to anthropic but no anthropic backend configured");
         }
@@ -1390,7 +1458,12 @@ export async function routeAndSend(router, request, upstreamPath, method, client
   }
 
   if (!candidates) {
-    candidates = await router.route(request);
+    try {
+      candidates = await router.route(request);
+    } catch (err) {
+      if (err instanceof ModelEolError) return eolGatedResponse(err);
+      throw err;
+    }
   }
 
   // ── SIEM: auth decision + route/model selected (live request path) ──
