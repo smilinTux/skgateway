@@ -54,6 +54,15 @@ const config = _cfgEmitter.current();
 const port = portOverride || config.server?.port || 18780;
 const bind = config.server?.bind || "127.0.0.1";
 
+// ─── Capability-aware routing master gate (design 7.2), DEFAULT OFF ───
+// Governs BOTH the `@match` role ranking branch (router.mjs, card P4.2) and
+// this file's `x-sk-require` header escape hatch (card P4.3). With it off,
+// the header below is never attached to routeRequest: the hot path stays
+// byte-identical to before this card existed (no rank call, no new
+// candidates, no added latency). Exported (read-only) for tests, same
+// testability discipline as this file's other pure/config-derived helpers.
+export const matchRoutingEnabled = !!(config.routing && config.routing.match_enabled);
+
 // ─── Initialize subsystems ───
 // Map YAML credentials_path → credentials_file (Backend reads credentials_file)
 const _routerBackends = {};
@@ -646,6 +655,64 @@ export function parseRequireSpec(spec) {
     requirements.require[key] = value !== "" && Number.isFinite(num) ? num : value;
   }
   return requirements;
+}
+
+// ─── x-sk-require header escape hatch (card P4.3, design 7.1) ───
+// A one-off caller can declare ranker requirements per-request without
+// editing the registry, alongside the existing x-sk-context/x-sk-service/
+// x-sk-role headers: `x-sk-require: tool_use,min_ctx=64000,
+// tier=local|free-remote`. Reuses parseRequireSpec()'s exact grammar above
+// rather than reimplementing it, so the header and the suggest-only rank
+// API's inline `require=` spec (P3.3) agree on syntax by construction.
+
+/**
+ * Parse the `x-sk-require` header into the same requirements shape the
+ * ranker (and this route's sibling, `/admin/models/rank?require=`) consume:
+ * `{require, prefer?, tier?}`. Pure, no I/O.
+ *
+ * Fail-soft (design 7.1): anything that is not a single non-blank string
+ * header value (missing, blank, or a non-string such as an array from a
+ * duplicated header) is "malformed" and yields `null`, so the caller falls
+ * through to normal resolution (role/context/service headers, or the
+ * registry default) instead of a broken requirements object corrupting
+ * routing. A present-but-nonsense header never throws (parseRequireSpec()'s
+ * own fail-soft grammar handles that): an unrecognized require key just
+ * degrades to a no-op downstream (rank.mjs's requireFailureReason() only
+ * inspects the keys it knows), never a 500.
+ *
+ * @param {string|string[]|undefined} headerValue raw req.headers["x-sk-require"]
+ * @returns {{require:object, prefer?:string[], tier?:string[]}|null}
+ */
+export function parseSkRequireHeader(headerValue) {
+  if (typeof headerValue !== "string" || !headerValue.trim()) return null;
+  try {
+    return parseRequireSpec(headerValue);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The routing.match_enabled gate composition (design 7.2): resolves what
+ * (if anything) routeRequest's `requirements` field should be for one
+ * request. Pure aside from the injected `matchEnabled` flag, so the OFF case
+ * is asserted directly without needing a second server boot against a
+ * different config.
+ *
+ * With the flag off, ALWAYS returns `undefined`, regardless of the header's
+ * validity: routeRequest gains no `requirements` field at all, keeping the
+ * flag-off shape byte-identical to before this card existed. With the flag
+ * on, returns `parseSkRequireHeader(headerValue)`, normalizing its `null`
+ * (malformed/absent) to `undefined` so a caller can rely on a single falsy
+ * check either way.
+ *
+ * @param {string|string[]|undefined} headerValue raw req.headers["x-sk-require"]
+ * @param {boolean} matchEnabled the routing.match_enabled config flag
+ * @returns {{require:object, prefer?:string[], tier?:string[]}|undefined}
+ */
+export function resolveRequestRequirements(headerValue, matchEnabled) {
+  if (!matchEnabled) return undefined;
+  return parseSkRequireHeader(headerValue) || undefined;
 }
 
 /**
@@ -1262,6 +1329,13 @@ export const server = http.createServer(async (req, res) => {
       context: req.headers["x-sk-context"] || undefined,
       service: req.headers["x-sk-service"] || undefined,
       role:    req.headers["x-sk-role"]    || undefined,
+      // x-sk-require escape hatch (card P4.3): DEFAULT OFF via
+      // matchRoutingEnabled (routing.match_enabled). With the flag off this
+      // is always `undefined` (no field added, no parse run): byte-identical
+      // to before this card. router.mjs's @match branch (card P4.2) is the
+      // only consumer; unconsumed today, this composes inertly with
+      // context/service/role above.
+      requirements: resolveRequestRequirements(req.headers["x-sk-require"], matchRoutingEnabled),
     };
 
     const result = await routeAndSend(
