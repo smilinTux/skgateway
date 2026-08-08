@@ -1,5 +1,16 @@
 // Pure provider parsing/filtering. Network + cache live in this file too (Task 2)
 // but these three functions never touch the network.
+//
+// isChatModel/parseNvidia/parseOpenRouterFree predate the provider-adapter
+// split (card P2.1, src/discovery/providers/{nvidia,openrouter}.mjs). They
+// are kept here, byte-for-byte behavior-compatible, because tests/discovery.
+// test.mjs imports and asserts their exact id-only output shape directly.
+// discoverCatalog() below no longer calls them: it calls the adapters'
+// normalize() so the merged catalog carries the full ModelCard (design doc
+// 4.1) instead of discarding everything but the id. The adapters duplicate
+// the same NON_CHAT/isFree filters (see the doc comment in each adapter for
+// why: importing them from here would make discovery.mjs and the adapters it
+// imports circularly dependent).
 
 const NON_CHAT = [
   /embed/i, /\bbge\b/i, /rerank/i, /content-safety/i, /guard/i,
@@ -39,6 +50,8 @@ import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { defaultLifecycle, applyCatalogPresence, THRESHOLDS as LIFECYCLE_THRESHOLDS } from './discovery/lifecycle.mjs';
 import { STORE_PATH as LIFECYCLE_STORE_PATH } from './discovery/model_catalog_store.mjs';
+import * as nvidiaAdapter from './discovery/providers/nvidia.mjs';
+import * as openrouterAdapter from './discovery/providers/openrouter.mjs';
 
 const CACHE_PATH = join(homedir(), '.config', 'skgateway', 'model_catalog_cache.json');
 
@@ -126,18 +139,16 @@ export function mergeCatalog(local, nvidia, openrouter) {
   return [...seen.values()];
 }
 
+// fetchNvidia/fetchOpenRouter now delegate to the provider adapters (card
+// P2.1); kept as named exports here because src/index.mjs's refreshCatalog()
+// imports them by these names to build discoverCatalog()'s injected
+// nvidiaFetch/openrouterFetch opts.
 export async function fetchNvidia(apiKey) {
-  const r = await fetch('https://integrate.api.nvidia.com/v1/models', {
-    headers: { authorization: `Bearer ${apiKey}` },
-  });
-  if (!r.ok) throw new Error(`nvidia ${r.status}`);
-  return r.json();
+  return nvidiaAdapter.fetch(apiKey);
 }
 
 export async function fetchOpenRouter() {
-  const r = await fetch('https://openrouter.ai/api/v1/models');
-  if (!r.ok) throw new Error(`openrouter ${r.status}`);
-  return r.json();
+  return openrouterAdapter.fetch();
 }
 
 /**
@@ -194,7 +205,9 @@ export async function discoverCatalog(opts) {
   let nvidiaOk = false;
   let openrouterOk = false;
   try {
-    nvidia = parseNvidia(await nvidiaFetch());
+    // Card P2.1: normalize() (not the legacy parseNvidia()) so the merged
+    // catalog carries the full ModelCard, not just the id.
+    nvidia = nvidiaAdapter.normalize(await nvidiaFetch(), { now: () => at });
     nvidiaOk = true;
     recordProvider(cache, 'nvidia', { ok: true, count: nvidia.length, at });
   } catch (e) {
@@ -203,7 +216,10 @@ export async function discoverCatalog(opts) {
     recordProvider(cache, 'nvidia', { ok: false, count: nvidia.length, at, error: String(e?.message || e) });
   }
   try {
-    openrouter = parseOpenRouterFree(await openrouterFetch());
+    // Card P2.1: normalize() (not the legacy parseOpenRouterFree()); the free
+    // filter and non-chat filter are unchanged, only the discarded fields
+    // are now kept (design doc 5.1).
+    openrouter = openrouterAdapter.normalize(await openrouterFetch(), { now: () => at });
     openrouterOk = true;
     recordProvider(cache, 'openrouter', { ok: true, count: openrouter.length, at });
   } catch (e) {
