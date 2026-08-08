@@ -37,6 +37,14 @@ const REG_DIR = mkdtempSync(join(tmpdir(), "skgw-localfailover-"));
 const REG_PATH = join(REG_DIR, "registry.yaml");
 process.env.SKMODELS_REGISTRY = REG_PATH;
 
+// Pin the model-lifecycle catalog store to a fixed temp path too (card P1.5):
+// getFailoverConfig() now consults it to filter the registry-resolved
+// fallback candidate to lifecycle 'active'. Pinning keeps these unit tests
+// isolated from any real ~/.config/skgateway/model_catalog_store.json.
+const STORE_DIR = mkdtempSync(join(tmpdir(), "skgw-localfailover-store-"));
+const STORE_PATH = join(STORE_DIR, "model_catalog_store.json");
+process.env.SKGATEWAY_MODEL_CATALOG_STORE_PATH = STORE_PATH;
+
 const {
   getFailoverConfig,
   isLocalUrl,
@@ -46,21 +54,99 @@ const {
   resetLocalHealth,
 } = await import("../src/proxy/local-failover.mjs");
 
+const { recordModelOutcome } = await import("../src/discovery/model_catalog_store.mjs");
+
 const { createRouter, routeAndSend } = await import("../src/proxy/router.mjs");
 
 // ── 1. getFailoverConfig ─────────────────────────────────────────────────────
 
 describe("getFailoverConfig", () => {
-  test("sensible defaults, enabled ON", () => {
+  before(() => {
+    // registry.failover.local_fallback (card P1.5): a role name resolved to
+    // its backend's concrete model + backend id. Deliberately NOT the old
+    // hardcoded "openai/gpt-oss-20b" literal, so a passing test proves the
+    // value came from the registry rather than surviving in code by accident.
+    writeFileSync(
+      REG_PATH,
+      `backends:
+  nv-fallback:
+    url: https://integrate.api.nvidia.com/v1
+    model: meta/free-fallback-model
+    kind: chat
+roles:
+  sk-cheap-fast: nv-fallback
+failover:
+  local_fallback: sk-cheap-fast
+`,
+      "utf8",
+    );
+  });
+
+  test("sensible defaults, enabled ON, fallback resolved from the registry", () => {
     const c = getFailoverConfig({});
     assert.equal(c.enabled, true);
-    // A LIVE free model: the previous default (deepseek-v4-flash) reached EOL and
-    // returned 410 Gone, turning a transient local blip into a hard failure.
-    assert.equal(c.fallbackModel, "openai/gpt-oss-20b");
-    assert.equal(c.fallbackBackend, "nvidia");
+    // No env override and the store has never recorded an outcome for this
+    // model, so it defaults to lifecycle 'active' and is picked.
+    assert.equal(c.fallbackModel, "meta/free-fallback-model");
+    assert.equal(c.fallbackBackend, "nv-fallback");
     assert.equal(c.probeTimeoutMs, 3000);
     assert.equal(c.completionTimeoutMs, 10000);
     assert.equal(c.verdictTtlMs, 20000);
+  });
+
+  test("an eol registry candidate is skipped in favour of the next active one", () => {
+    writeFileSync(
+      REG_PATH,
+      `backends:
+  dead-one:
+    url: https://x/v1
+    model: nvidia/dead-fallback-model
+    kind: chat
+  live-one:
+    url: https://y/v1
+    model: nvidia/live-fallback-model
+    kind: chat
+roles:
+  sk-fb-a: dead-one
+  sk-fb-b: live-one
+failover:
+  local_fallback: [sk-fb-a, sk-fb-b]
+`,
+      "utf8",
+    );
+    recordModelOutcome("nvidia/dead-fallback-model", { status: 410, now: 1 });
+    recordModelOutcome("nvidia/dead-fallback-model", { status: 410, now: 2 });
+    recordModelOutcome("nvidia/dead-fallback-model", { status: 410, now: 3 }); // 3rd 410 -> eol
+
+    const c = getFailoverConfig({});
+    assert.equal(c.fallbackModel, "nvidia/live-fallback-model", "the eol candidate is never picked");
+    assert.equal(c.fallbackBackend, "live-one");
+  });
+
+  test("no active registry candidate → fallbackModel is null (no dead hardcoded id)", () => {
+    writeFileSync(
+      REG_PATH,
+      `backends:
+  only-dead:
+    url: https://x/v1
+    model: nvidia/only-dead-model
+    kind: chat
+roles:
+  sk-fb-only: only-dead
+failover:
+  local_fallback: sk-fb-only
+`,
+      "utf8",
+    );
+    recordModelOutcome("nvidia/only-dead-model", { status: 410, now: 10 });
+    recordModelOutcome("nvidia/only-dead-model", { status: 410, now: 20 });
+    recordModelOutcome("nvidia/only-dead-model", { status: 410, now: 30 });
+
+    const c = getFailoverConfig({});
+    assert.equal(c.fallbackModel, null);
+    // Backend id still defaults so a caller that only checks the backend
+    // does not see undefined; the model is the actual "no fallback" signal.
+    assert.equal(c.fallbackBackend, "nvidia");
   });
 
   test("the on/off switch disables via 0/false/off/no (case-insensitive)", () => {
