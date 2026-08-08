@@ -220,6 +220,73 @@ export function lifecycleCounts(catalog, getLifecycleFn = getLifecycle) {
   return counts;
 }
 
+/**
+ * Additive picker-badge fields derived from a discovered model's card (card
+ * P2.4, design doc 4.1/5.1). `card.context_length` -> `ctx_tokens`,
+ * `card.supported_parameters` including `"tools"` -> `tools`,
+ * `card.modality` containing `"image"` -> `vision`. Pure; returns `{}` when
+ * there is no usable card (a local-backend entry never gets one; a heuristic
+ * NVIDIA card still yields `tools`/`vision` booleans since `nvidia.mjs`
+ * always declares `supported_parameters`/`modality`, but omits `ctx_tokens`
+ * since it never claims a `context_length` it doesn't actually know, per
+ * design 6.1 basis honesty). Spreading the result onto an existing
+ * `/v1/models` entry can therefore only ADD keys, never null/undefined one
+ * out, which is what keeps `/v1/models` a strict superset of its pre-card
+ * shape (the skchat picker and any other consumer of the existing fields is
+ * unaffected).
+ *
+ * @param {object|null|undefined} card
+ * @returns {{ctx_tokens?: number, tools?: boolean, vision?: boolean}}
+ */
+export function deriveModelBadges(card) {
+  if (!card || typeof card !== "object") return {};
+  const badges = {};
+  if (typeof card.context_length === "number") badges.ctx_tokens = card.context_length;
+  if (Array.isArray(card.supported_parameters)) badges.tools = card.supported_parameters.includes("tools");
+  if (typeof card.modality === "string") badges.vision = card.modality.includes("image");
+  return badges;
+}
+
+/**
+ * Layer the additive `/v1/models` picker badges onto a catalog. Pure;
+ * intended to run AFTER `applyLifecycleView` (badges never affect which ids
+ * are hidden/flagged, only which fields a surviving entry carries), same
+ * ordering discipline as the allowlist -> lifecycle pipeline already in the
+ * `/v1/models` handler.
+ *
+ * @param {Array<object>} data
+ * @returns {Array<object>}
+ */
+export function applyPickerBadges(data) {
+  return data.map((m) => ({ ...m, ...deriveModelBadges(m.card) }));
+}
+
+/**
+ * Build the `/admin/models` payload (card P2.4): every discovered catalog
+ * entry (carrying `card` already, when the provider adapter attached one -
+ * card P2.1) plus the existing `advertised` allowlist flag and a NEW
+ * `lifecycle` field: the full lifecycle record from the model catalog store,
+ * so the console (card `e7cde8f1`) can render state/last_verified_at/
+ * eol_reason/etc without a second round trip. Pure aside from the injected
+ * lookup, same testability discipline as `applyLifecycleView`/
+ * `lifecycleCounts` above. Deliberately does NOT hide eol/dead ids the way
+ * `applyLifecycleView` does for `/v1/models`: the admin/operator view needs
+ * to see every known id's lifecycle, including the ones being pruned.
+ *
+ * @param {Array<object>} full
+ * @param {string[]} allow
+ * @param {(id: string) => object} [getLifecycleFn]
+ * @returns {Array<object>}
+ */
+export function buildAdminModelsView(full, allow, getLifecycleFn = getLifecycle) {
+  const set = new Set(allow);
+  return full.map((m) => ({
+    ...m,
+    advertised: allow.length === 0 || set.has(m.id),
+    lifecycle: getLifecycleFn(m.id),
+  }));
+}
+
 async function refreshCatalog(cfg) {
   const d = cfg.discovery || {};
   const nvEnabled = d.providers?.nvidia?.enabled !== false;
@@ -691,14 +758,16 @@ export const server = http.createServer(async (req, res) => {
       const allowed = applyAllowlist(merged, loadAllowlist());
       // Lifecycle view (card P1.4): hide eol/dead ids, flag suspect ones.
       // Composes with (does not replace) the allowlist filter above.
-      const data = applyLifecycleView(allowed);
+      // Picker badges (card P2.4): additive ctx_tokens/tools/vision derived
+      // from each surviving entry's card, if it has one. Superset-only.
+      const data = applyPickerBadges(applyLifecycleView(allowed));
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ object: "list", data }));
     } catch (e) {
       console.warn("[skgateway] /v1/models discovery merge failed, falling back to static catalog:", e.message);
       let data = [];
       try {
-        data = applyLifecycleView(buildModelCatalog(config.backends || {}, router, advertiseReconcileMode));
+        data = applyPickerBadges(applyLifecycleView(buildModelCatalog(config.backends || {}, router, advertiseReconcileMode)));
       } catch (e2) {
         console.warn("[skgateway] /v1/models static catalog fallback also failed, serving empty list:", e2.message);
       }
@@ -762,8 +831,10 @@ export const server = http.createServer(async (req, res) => {
     try {
       const full = await getDiscoveredCatalog();          // Task 5 provides this
       const allow = loadAllowlist();
-      const set = new Set(allow);
-      const data = full.map((m) => ({ ...m, advertised: allow.length === 0 || set.has(m.id) }));
+      // Card P2.4: each entry keeps its `card` (already carried through by
+      // getDiscoveredCatalog since card P2.1) and gains a `lifecycle`
+      // record alongside the existing `advertised` allowlist flag.
+      const data = buildAdminModelsView(full, allow);
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ object: "list", data }));
     } catch (e) {
