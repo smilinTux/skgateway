@@ -25,6 +25,7 @@ import { isAnthropicBackend, toAnthropicRequest, toOpenAIResponse } from "./anth
 import { getPool } from "./connection-pool.mjs";
 import { isRegistryRouted, resolve as resolveRegistry, getAutoConfig, getConfigEpoch, loadRegistry } from "./registry.mjs";
 import { getFailoverConfig, isLocalUrl, probeLocalHealth, recordLocalOutcome } from "./local-failover.mjs";
+import { recordModelOutcome } from "../discovery/model_catalog_store.mjs";
 import { applyReasoningFloor } from "./core.mjs";
 import { createDecisionCache, decisionKey } from "./decision-cache.mjs";
 
@@ -1533,6 +1534,15 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     const latencyMs = Date.now() - queueStart;
     const success = res.status < 500;
     const qTransition = backend.recordOutcome(success, latencyMs);
+
+    // Model-granular lifecycle bookkeeping (card P1.2, section 4.2 of the
+    // model-ranking design doc): record this concrete model's completion
+    // status as the passive signal for the EOL state machine (a 404/410
+    // counts toward eol, a 2xx resets toward active). This is purely a
+    // bookkeeping side effect on a fail-soft store, it does NOT change the
+    // `success` failover decision above (the shipped 410->backend_error
+    // stopgap already makes 410 fail over).
+    recordModelOutcome(request.model, { status: res.status, now: Date.now() });
 
     // Feed the real completion outcome back into the local-health verdict so a
     // wedged local backend that got past the probe but then hung/errored is
