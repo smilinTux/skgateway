@@ -47,13 +47,20 @@ export function parseOpenRouterFree(json) {
 
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { join, dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { load as yamlLoad } from 'js-yaml';
 import { defaultLifecycle, applyCatalogPresence, THRESHOLDS as LIFECYCLE_THRESHOLDS } from './discovery/lifecycle.mjs';
 import { STORE_PATH as LIFECYCLE_STORE_PATH } from './discovery/model_catalog_store.mjs';
 import * as nvidiaAdapter from './discovery/providers/nvidia.mjs';
 import * as openrouterAdapter from './discovery/providers/openrouter.mjs';
 
 const CACHE_PATH = join(homedir(), '.config', 'skgateway', 'model_catalog_cache.json');
+
+// Card P2.2: the committed manual card overlay (config/model-cards.overrides.yaml),
+// resolved relative to this file so it works the same from any cwd.
+const __dirname = dirname(fileURLToPath(import.meta.url));
+export const CARD_OVERRIDES_PATH = resolve(__dirname, '..', 'config', 'model-cards.overrides.yaml');
 
 export { LIFECYCLE_STORE_PATH };
 
@@ -129,6 +136,59 @@ function saveLifecycleStore(store, path) {
   }
 }
 
+/**
+ * Load the manual card overlay (card P2.2, design doc 5.1 item 2 / section
+ * 2.6): Chef's validated per-model knowledge (context windows, known-slow
+ * flags) preserved as committed data instead of living only in YAML
+ * comments. Fail-soft, matching every other store loader in this module: a
+ * missing file, malformed YAML, or a file with no top-level `overrides:` map
+ * all yield `{}` so a broken overlay never breaks a discovery cycle.
+ *
+ * @param {string} [path]
+ * @returns {Record<string, object>} model id -> override fields (e.g. `{context_length, notes}`)
+ */
+export function loadCardOverrides(path = CARD_OVERRIDES_PATH) {
+  try {
+    const parsed = yamlLoad(readFileSync(path, 'utf8'));
+    const overrides = parsed && typeof parsed === 'object' ? parsed.overrides : null;
+    return overrides && typeof overrides === 'object' && !Array.isArray(overrides) ? overrides : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Apply the manual overlay to one merged-catalog entry (card P2.2).
+ * Precedence (design doc 5.1): fresh provider card > manual overlay >
+ * heuristic. A "fresh provider card" is any card whose `source` is not
+ * `'heuristic'` (OpenRouter's adapter always ships a full provider-declared
+ * card, so it is left untouched here). A `source:'heuristic'` card (NVIDIA's
+ * bare-id parsing) with a matching override id is enriched and re-tagged
+ * `source:'manual'`, since the values are now Chef-validated, not guessed.
+ * Pure: no I/O, returns a new object rather than mutating `model`.
+ *
+ * @param {object} model a merged-catalog entry, `{id, provider, free, card}`
+ * @param {Record<string, object>} overrides id -> override fields
+ * @returns {object} `model`, overlaid when applicable
+ */
+export function applyCardOverlay(model, overrides) {
+  const override = overrides && overrides[model.id];
+  if (!override || !model.card || model.card.source !== 'heuristic') return model;
+  return {
+    ...model,
+    card: {
+      ...model.card,
+      ...override,
+      source: 'manual',
+    },
+  };
+}
+
+/** Apply the manual overlay across a whole merged catalog (card P2.2). */
+export function applyCardOverlays(models, overrides) {
+  return models.map((m) => applyCardOverlay(m, overrides));
+}
+
 export function mergeCatalog(local, nvidia, openrouter) {
   const seen = new Map();
   for (const group of [local || [], nvidia || [], openrouter || []]) {
@@ -197,6 +257,13 @@ export async function discoverCatalog(opts) {
     // tests/router-model-outcome.test.mjs) or by passing this opt directly.
     lifecycleStorePath = LIFECYCLE_STORE_PATH,
     thresholds = LIFECYCLE_THRESHOLDS,
+    // Card P2.2: manual card overlay. `cardOverrides`, when provided
+    // (tests), is used as-is; otherwise it is loaded fresh from
+    // `cardOverridesPath` every cycle (hourly cadence, cheap to re-read, and
+    // keeps a config edit picked up without a process restart, matching
+    // config.mjs's SIGHUP-reload philosophy elsewhere in this codebase).
+    cardOverridesPath = CARD_OVERRIDES_PATH,
+    cardOverrides,
   } = opts;
   const at = now();
   let stale = false;
@@ -264,7 +331,8 @@ export async function discoverCatalog(opts) {
     }
   }
 
-  const models = mergeCatalog(localModels, nvidia, openrouter).map((m) => ({ ...m, stale }));
+  const overrides = cardOverrides || loadCardOverrides(cardOverridesPath);
+  const models = applyCardOverlays(mergeCatalog(localModels, nvidia, openrouter), overrides).map((m) => ({ ...m, stale }));
   cache.models = models;
   // Freshness observability: record when this discovery cycle completed. The
   // cycle is fail-soft (a throwing provider falls back to cache above and only
