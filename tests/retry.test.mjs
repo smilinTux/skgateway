@@ -112,6 +112,16 @@ describe("classifyError", () => {
   test("504 → timeout", () => {
     assert.equal(classifyError(504), "timeout");
   });
+
+  test("410 → backend_error (permanent model-gone must fail over, not 410 the client)", () => {
+    // A model that reached end-of-life returns 410 Gone. Before the fix this fell
+    // through to "unknown" (non-retriable) and the 410 was returned to the caller,
+    // turning a recoverable failover into a hard failure. It must fail over to the
+    // next backend instead.
+    assert.equal(classifyError(410), "backend_error");
+    assert.equal(classifyError(410, '{"title":"Gone","detail":"end of life"}'),
+                 "backend_error");
+  });
 });
 
 // ---------------------------------------------------------------------------

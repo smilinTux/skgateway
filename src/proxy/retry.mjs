@@ -52,6 +52,13 @@ export function classifyError(status, body = "") {
       return "overloaded";    // Anthropic-specific → backoff then failover
     case 504:
       return "timeout";       // upstream timeout → failover
+    case 410:
+      // Model reached end-of-life (410 Gone). This is PERMANENT, but from the
+      // router's view it must behave like a backend_error so the request FAILS
+      // OVER to the next backend instead of returning 410 to the caller. (Pruning
+      // the EOL id from the catalog so it is never selected is the discovery/
+      // advertise layer's job; this is the safety net.)
+      return "backend_error";
     default:
       // NVIDIA returns 400 "single tool-calls" for parallel tool call rejections
       if (status === 400 && body.includes("single tool-calls")) return "bad_payload";

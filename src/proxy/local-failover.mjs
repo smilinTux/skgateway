@@ -11,7 +11,8 @@
  * This module makes the local route HEALTH-AWARE so it keeps answering during a
  * local outage by transparently failing over to a known-good cloud FREE model
  * (default deepseek-ai/deepseek-v4-flash via the nvidia backend). Two independent
- * guards, sovereign-first:
+ * guards, sovereign-first (the default free model is kept LIVE; the old default
+ * deepseek-ai/deepseek-v4-flash reached EOL and 410'd, see GTD 6cf41f1382c4):
  *
  *   1. Liveness probe — a fast, cached GET {base}/models with a short timeout.
  *      When the local backend is unreachable or slow to even list models, the
@@ -49,7 +50,7 @@ function intEnv(v, dflt) {
  *   SKGATEWAY_LOCAL_FAILOVER              on/off master switch (default ON;
  *                                         "0"/"false"/"off"/"no" disable it)
  *   SKGATEWAY_LOCAL_FALLBACK_MODEL        cloud fallback model id
- *                                         (default "deepseek-ai/deepseek-v4-flash")
+ *                                         (default "openai/gpt-oss-20b", a live free model)
  *   SKGATEWAY_LOCAL_FALLBACK_BACKEND      router backend id serving the fallback
  *                                         model (default "nvidia")
  *   SKGATEWAY_LOCAL_HEALTH_TIMEOUT_MS     liveness-probe timeout ms (default 3000)
@@ -72,7 +73,12 @@ export function getFailoverConfig(env = process.env) {
   const off = raw != null && ["0", "false", "off", "no"].includes(String(raw).trim().toLowerCase());
   return {
     enabled: !off,
-    fallbackModel: env.SKGATEWAY_LOCAL_FALLBACK_MODEL || "deepseek-ai/deepseek-v4-flash",
+    // A LIVE free model. The previous default (deepseek-ai/deepseek-v4-flash)
+    // reached end-of-life and now returns 410 Gone, so a transient local outage
+    // failed over straight into a hard failure. openai/gpt-oss-20b is a currently
+    // advertised free NVIDIA model (verified 200). See GTD 6cf41f1382c4; keeping
+    // this default LIVE is the discovery/advertise layer's ongoing job.
+    fallbackModel: env.SKGATEWAY_LOCAL_FALLBACK_MODEL || "openai/gpt-oss-20b",
     fallbackBackend: env.SKGATEWAY_LOCAL_FALLBACK_BACKEND || "nvidia",
     probeTimeoutMs: intEnv(env.SKGATEWAY_LOCAL_HEALTH_TIMEOUT_MS, 3000),
     completionTimeoutMs: intEnv(env.SKGATEWAY_LOCAL_COMPLETION_TIMEOUT_MS, 10000),

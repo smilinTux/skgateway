@@ -54,7 +54,9 @@ describe("getFailoverConfig", () => {
   test("sensible defaults, enabled ON", () => {
     const c = getFailoverConfig({});
     assert.equal(c.enabled, true);
-    assert.equal(c.fallbackModel, "deepseek-ai/deepseek-v4-flash");
+    // A LIVE free model: the previous default (deepseek-v4-flash) reached EOL and
+    // returned 410 Gone, turning a transient local blip into a hard failure.
+    assert.equal(c.fallbackModel, "openai/gpt-oss-20b");
     assert.equal(c.fallbackBackend, "nvidia");
     assert.equal(c.probeTimeoutMs, 3000);
     assert.equal(c.completionTimeoutMs, 10000);
