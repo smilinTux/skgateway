@@ -13,7 +13,7 @@ import http from "node:http";
 import { loadConfig, getConfig } from "./config.mjs";
 import { createProxyServer, handleRequest, buildConfig } from "./proxy/core.mjs";
 import { createRouter, routeAndSend } from "./proxy/router.mjs";
-import { buildModelCatalog, reconcileModeFromConfig, tagLocalModels, mergeDiscoveredCatalog } from "./proxy/advertise.mjs";
+import { buildModelCatalog, reconcileModeFromConfig, tagLocalModels, mergeDiscoveredCatalog, isModelAvailable } from "./proxy/advertise.mjs";
 import { loadAllowlist, saveAllowlist, applyAllowlist } from "./advertise.mjs";
 import { discoverCatalog, loadCache, saveCache, fetchNvidia, fetchOpenRouter, catalogStatus } from "./discovery.mjs";
 import { getPool, resetPool } from "./proxy/connection-pool.mjs";
@@ -28,6 +28,11 @@ import { fromAnthropicRequest, toAnthropicMessage, modelRetrieveObject } from ".
 import { SSEWriter, jsonToSSE } from "./proxy/stream.mjs";
 import { getLifecycle } from "./discovery/model_catalog_store.mjs";
 import { isRoutable, LIFECYCLE_STATES } from "./discovery/lifecycle.mjs";
+import { rankModels } from "./ranking/rank.mjs";
+import { deriveCapabilities } from "./ranking/capabilities.mjs";
+import { REGISTRY_PATH } from "./proxy/registry.mjs";
+import { readFileSync } from "node:fs";
+import { load as yamlLoad } from "js-yaml";
 
 // ─── Parse CLI args ───
 const args = process.argv.slice(2);
@@ -580,7 +585,7 @@ function buildModelLimits(raw) {
 // privileged-route auth gate in this codebase (the CapAuth identity gate above
 // is opt-in and scoped to /v1/*), so bind admin behavior to loopback callers
 // only, same posture as the default server bind (127.0.0.1).
-function isLoopback(req) {
+export function isLoopback(req) {
   const addr = req.socket?.remoteAddress || "";
   return addr === "127.0.0.1" || addr === "::1" || addr === "::ffff:127.0.0.1";
 }
@@ -589,6 +594,141 @@ function isLoopback(req) {
 // model id strings, 64KB is generous headroom and keeps a malformed/hostile
 // loopback PUT from buffering unbounded memory.
 const ADVERTISE_MAX_BODY_BYTES = 64 * 1024;
+
+// ─── GET /admin/models/rank (card P3.3): suggest-only rank API ───
+// Wraps the pure P3.2 ranker (src/ranking/rank.mjs) with the two ways a
+// caller declares what it needs (design 7.1): a registry `@match` role name
+// (looked up in registry.yaml's `requirements:` block, design 4.3) OR an
+// inline `require=` spec using the same comma-separated mini-grammar as the
+// future `x-sk-require` header (card P4.3): `tool_use,min_ctx=64000,
+// tier=local|free-remote`. This route NEVER routes a completion: it only
+// reads the discovered catalog + lifecycle store and calls the pure ranker,
+// same read-only posture as GET /admin/models.
+
+/**
+ * Parse an inline `require=` query spec into a `requirements` object
+ * (design 6.2 shape: `{require, prefer, tier}`). Pure string parsing, no I/O.
+ *
+ * Grammar (comma-separated tokens):
+ *   - a bare word (no `=`)         -> `require.<word> = true`
+ *   - `key=value`, key is `tier`   -> `tier = value.split('|')`
+ *   - `key=value`, key is `prefer` -> `prefer = value.split('|')`
+ *   - `key=value`, otherwise       -> `require.<key> = Number(value)` when
+ *     `value` parses as a finite number, else the raw string.
+ *
+ * Unknown/malformed tokens are ignored rather than throwing (fail-soft, same
+ * discipline the future `x-sk-require` header parser (P4.3) is specified to
+ * use): a caller typo should degrade the require spec, not 500 the route.
+ *
+ * @param {string} spec
+ * @returns {{require:object, prefer?:string[], tier?:string[]}}
+ */
+export function parseRequireSpec(spec) {
+  const requirements = { require: {} };
+  if (typeof spec !== "string" || !spec.trim()) return requirements;
+  for (const rawToken of spec.split(",")) {
+    const token = rawToken.trim();
+    if (!token) continue;
+    const eq = token.indexOf("=");
+    if (eq === -1) {
+      requirements.require[token] = true;
+      continue;
+    }
+    const key = token.slice(0, eq).trim();
+    const value = token.slice(eq + 1).trim();
+    if (!key) continue;
+    if (key === "tier" || key === "prefer") {
+      const list = value.split("|").map((s) => s.trim()).filter(Boolean);
+      if (list.length) requirements[key] = list;
+      continue;
+    }
+    const num = Number(value);
+    requirements.require[key] = value !== "" && Number.isFinite(num) ? num : value;
+  }
+  return requirements;
+}
+
+/**
+ * Look up a `@match` role's requirement block from registry.yaml's
+ * `requirements:` top-level section (design 4.3). registry.mjs's
+ * `loadRegistry()` does not (yet, card P4.1) parse this block, so this reads
+ * it directly rather than reimplementing registry.mjs's mtime cache for a
+ * loopback-only, low-volume admin route: correctness over micro-caching here.
+ * Fail-soft: a missing/malformed registry file yields `null` (unknown role),
+ * never a throw.
+ *
+ * @param {string} role
+ * @param {string} [path]
+ * @returns {object|null} the role's `{require?, prefer?, tier?}` block, or
+ *   `null` when the role has no requirements entry (unknown, or a plain
+ *   non-`@match` role).
+ */
+export function loadRoleRequirements(role, path = REGISTRY_PATH) {
+  try {
+    const parsed = yamlLoad(readFileSync(path, "utf8")) || {};
+    const reqs = parsed.requirements || {};
+    return Object.prototype.hasOwnProperty.call(reqs, role) ? reqs[role] : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolve the ranker `requirements` object for one `/admin/models/rank`
+ * request from its `role`/`require` query params (mutually exclusive; design
+ * 7.1's two `@match`-role vs inline-spec surfaces). Pure aside from the
+ * injected `loadRoleRequirementsFn` (defaults to the real registry read
+ * above), same testability discipline as the rest of this file's admin
+ * helpers.
+ *
+ * @param {{role?:string|null, require?:string|null}} query
+ * @param {{loadRoleRequirementsFn?:(role:string)=>object|null}} [opts]
+ * @returns {{requirements?:object, role?:string, error?:string}}
+ */
+export function resolveRankRequirements(query = {}, opts = {}) {
+  const role = query.role || null;
+  const requireSpec = query.require || null;
+  const loadRoleRequirementsFn = opts.loadRoleRequirementsFn || loadRoleRequirements;
+
+  if (role && requireSpec) {
+    return { error: "pass either role or require, not both" };
+  }
+  if (role) {
+    const requirements = loadRoleRequirementsFn(role);
+    if (!requirements) {
+      return { error: `unknown @match role or no requirements defined: ${role}` };
+    }
+    return { requirements, role };
+  }
+  if (requireSpec) {
+    return { requirements: parseRequireSpec(requireSpec) };
+  }
+  return { error: "query parameter role or require is required" };
+}
+
+/**
+ * Assemble the ranker's catalog input (design 4.1 shape: `{id, free,
+ * lifecycle:{state}, capabilities}`) from the same discovered-catalog
+ * entries `/admin/models` and `/v1/models` already read
+ * (`getDiscoveredCatalog()`). Reuses `getLifecycle()` (P1.x) and
+ * `deriveCapabilities()` (P3.1) exactly as-is: this function does not
+ * rebuild either. Pure aside from the injected lookups, same testability
+ * discipline as `buildAdminModelsView`/`applyLifecycleView` above.
+ *
+ * @param {Array<object>} full
+ * @param {{getLifecycleFn?:(id:string)=>object, deriveCapabilitiesFn?:(card:object, opts:object)=>object, metricsFn?:(id:string)=>object}} [opts]
+ * @returns {Array<object>}
+ */
+export function buildRankCatalog(full, opts = {}) {
+  const getLifecycleFn = opts.getLifecycleFn || getLifecycle;
+  const deriveCapabilitiesFn = opts.deriveCapabilitiesFn || deriveCapabilities;
+  const metricsFn = opts.metricsFn || (() => ({}));
+  return full.map((entry) => ({
+    ...entry,
+    lifecycle: getLifecycleFn(entry.id),
+    capabilities: deriveCapabilitiesFn(entry, { metrics: metricsFn(entry.id) }),
+  }));
+}
 
 // ─── Build proxy config ───
 // Explicitly map YAML snake_case keys → core.mjs camelCase to avoid silent misses.
@@ -953,6 +1093,47 @@ export const server = http.createServer(async (req, res) => {
       console.warn("[skgateway] /admin/models/refresh status failed:", e.message);
       res.writeHead(500, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: { message: "internal error building catalog status", code: 500 } }));
+    }
+    return;
+  }
+
+  // ── Admin: suggest-only rank API (card P3.3) ──
+  // GET /admin/models/rank?role=<name> or ?require=<spec>. Loopback only,
+  // same posture as the other /admin/models* routes. Returns the ranked
+  // chain + per-model breakdowns from the pure P3.2 ranker; ROUTES NOTHING
+  // (no candidate loop, no upstream call, no completion is ever triggered
+  // by this route, design 7.1's "suggest-only API").
+  if (req.url.split("?")[0] === "/admin/models/rank" && req.method === "GET") {
+    if (!isLoopback(req)) {
+      res.writeHead(403, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "Admin routes are loopback only", code: 403 } }));
+      return;
+    }
+    const queryString = req.url.includes("?") ? req.url.slice(req.url.indexOf("?") + 1) : "";
+    const params = new URLSearchParams(queryString);
+    const { requirements, role, error } = resolveRankRequirements({
+      role: params.get("role"),
+      require: params.get("require"),
+    });
+    if (error) {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: error, code: 400 } }));
+      return;
+    }
+    try {
+      const full = await getDiscoveredCatalog();
+      const catalog = buildRankCatalog(full);
+      const allow = loadAllowlist();
+      const chain = rankModels(catalog, requirements, {
+        allowlist: allow,
+        isModelAvailable: (id) => isModelAvailable(id, router),
+      });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ role: role || null, requirements, chain }));
+    } catch (e) {
+      console.warn("[skgateway] /admin/models/rank failed:", e.message);
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "internal error building rank chain", code: 500 } }));
     }
     return;
   }
