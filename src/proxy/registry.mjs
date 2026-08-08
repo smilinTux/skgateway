@@ -69,12 +69,26 @@ export function loadRegistry(path = REGISTRY_PATH) {
       // use, replacing the hardcoded model id that used to live in
       // local-failover.mjs. Empty {} => resolveFailoverCandidates() returns [].
       failover: parsed.failover || {},
+      // Optional per-role requirement blocks (card P4.1, design 4.3): keyed
+      // by role name, each value is `{require?, prefer?, tier?}`, consumed
+      // by the ranker (rank.mjs, card P3.2) for roles whose target is the
+      // "@match" marker (see resolve() below). Empty {} => getRequirements()
+      // returns null for every role (no @match roles configured).
+      requirements: parsed.requirements || {},
     };
     _cacheMtime = st.mtimeMs;
     _cachePath = path;
   } catch (err) {
     if (!_cache) {
-      _cache = { backends: {}, roles: {}, contexts: {}, defaults: {}, auto: {}, failover: {} };
+      _cache = {
+        backends: {},
+        roles: {},
+        contexts: {},
+        defaults: {},
+        auto: {},
+        failover: {},
+        requirements: {},
+      };
       _cachePath = path;
     }
     // else: keep the last good cache
@@ -92,6 +106,25 @@ export function loadRegistry(path = REGISTRY_PATH) {
  */
 export function getAutoConfig(path = REGISTRY_PATH) {
   return loadRegistry(path).auto || {};
+}
+
+/**
+ * Return one role's requirement block from the registry's top-level
+ * `requirements:` section (design 4.3), consumed by the ranker (`rank.mjs`,
+ * card P3.2) for `@match` roles. Shares `loadRegistry()`'s mtime cache (no
+ * extra file read per call).
+ *
+ * @param {string} role
+ * @param {string} [path]  Registry path override (for tests)
+ * @returns {{require?:object, prefer?:string[], tier?:string[]}|null}
+ *   The role's raw requirement block as parsed from YAML, or `null` when the
+ *   role has no `requirements` entry (unknown role, or a role that does not
+ *   declare requirements).
+ */
+export function getRequirements(role, path = REGISTRY_PATH) {
+  const { requirements } = loadRegistry(path);
+  if (!role || !requirements) return null;
+  return Object.prototype.hasOwnProperty.call(requirements, role) ? requirements[role] : null;
 }
 
 /**
@@ -207,6 +240,29 @@ export function resolve({ model, context, service, role } = {}, path = REGISTRY_
       anthropic: false,
       via,
       role: "sk-auto",
+    };
+  }
+
+  // ── @match marker (card P4.1, design 4.3) ──
+  // A role's target may be the literal string "@match" instead of a backend
+  // name, e.g. `roles: { sk-tools: "@match" }`. Exactly parallel to the
+  // sk-auto marker above: "@match" is NOT a real backend, it signals the
+  // gateway to rank candidates by the role's `requirements:` block (the
+  // ranker, rank.mjs card P3.2) instead of resolving a single pinned
+  // backend. Surfacing `requirements` here too (in addition to the standalone
+  // getRequirements() export) saves the caller (router.mjs, card P4.2) a
+  // second registry lookup.
+  if (backendName === "@match" || target === "@match") {
+    const matchRole = roleName || target;
+    return {
+      match: true,
+      backend: null,
+      model: null,
+      vision: false,
+      anthropic: false,
+      via,
+      role: matchRole,
+      requirements: getRequirements(matchRole, path),
     };
   }
 
