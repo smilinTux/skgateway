@@ -54,6 +54,14 @@ import { defaultLifecycle, applyCatalogPresence, THRESHOLDS as LIFECYCLE_THRESHO
 import { STORE_PATH as LIFECYCLE_STORE_PATH } from './discovery/model_catalog_store.mjs';
 import * as nvidiaAdapter from './discovery/providers/nvidia.mjs';
 import * as openrouterAdapter from './discovery/providers/openrouter.mjs';
+import {
+  probeModels,
+  DEFAULT_PROBE_BUDGET,
+  DEFAULT_PROBE_TIMEOUT_MS,
+  DEFAULT_MAX_TOKENS as DEFAULT_PROBE_MAX_TOKENS,
+  DEFAULT_POOL_BACKEND_ID,
+} from './discovery/probe.mjs';
+import { getPool } from './proxy/connection-pool.mjs';
 
 const CACHE_PATH = join(homedir(), '.config', 'skgateway', 'model_catalog_cache.json');
 
@@ -242,6 +250,39 @@ function recordProvider(cache, name, { ok, count, at, error }) {
   cache.providers[name] = entry;
 }
 
+/**
+ * Real (network) implementation of the probe sweep's `runProbe` (card P2.3,
+ * design 5.2): one warm one-word completion against NVIDIA's chat-completions
+ * endpoint, aborted at `timeoutMs`. This is the same "warm one-word probe"
+ * methodology Chef previously ran by hand with curl. Used only as the
+ * production default when `discoverCatalog()` isn't given an explicit
+ * `probeRunProbe` (tests always inject one, so this never runs under test).
+ * Fail-soft: any error (including no api key) resolves `{ ok: false }`
+ * rather than throwing, matching every other network call in this module.
+ */
+async function nvidiaCompletionProbe(id, { timeoutMs, maxTokens }, apiKey) {
+  if (!apiKey) return { ok: false };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const r = await globalThis.fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${apiKey}`, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: id,
+        max_tokens: maxTokens,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+      signal: controller.signal,
+    });
+    return { ok: r.ok, status: r.status };
+  } catch {
+    return { ok: false };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export async function discoverCatalog(opts) {
   const {
     localModels = [],
@@ -264,6 +305,29 @@ export async function discoverCatalog(opts) {
     // config.mjs's SIGHUP-reload philosophy elsewhere in this codebase).
     cardOverridesPath = CARD_OVERRIDES_PATH,
     cardOverrides,
+    // Card P2.3 (EOL probe sweep, design 5.2): piggybacks on this same
+    // (hourly) refresh cadence rather than a new timer. Each cycle checks
+    // `cache.lastProbedAt` against `probeSeconds` and only runs the sweep
+    // when it is actually due; `probeSeconds <= 0` disables it entirely.
+    // Defaults to OFF (0), not `DEFAULT_PROBE_SECONDS`: this keeps every
+    // existing caller of `discoverCatalog()` (production call sites that
+    // don't yet thread `discovery.probe_seconds` through, and every
+    // pre-P2.3 test) behavior-identical unless a caller explicitly opts in.
+    // `DEFAULT_PROBE_SECONDS` (daily, design 5.2) is exported from probe.mjs
+    // for that future opt-in wiring (`probeSeconds: cfg.discovery
+    // ?.probe_seconds ?? DEFAULT_PROBE_SECONDS`) to use as its own default.
+    // All of `probeBudget`/`probeTimeoutMs`/`probeMaxTokens`/`probePool`/
+    // `probeRunProbe`/`probeProvider`/`nvidiaApiKey` are injectable so tests
+    // never touch the network; production leaves them at their defaults
+    // (the real NVIDIA connection pool + a real warm-probe completion call).
+    probeSeconds = 0,
+    probeBudget = DEFAULT_PROBE_BUDGET,
+    probeTimeoutMs = DEFAULT_PROBE_TIMEOUT_MS,
+    probeMaxTokens = DEFAULT_PROBE_MAX_TOKENS,
+    probePool,
+    probeRunProbe,
+    probeProvider = 'nvidia',
+    nvidiaApiKey = process.env.NVIDIA_API_KEY,
   } = opts;
   const at = now();
   let stale = false;
@@ -326,6 +390,39 @@ export async function discoverCatalog(opts) {
         updated = { ...updated, ...reconciled };
       }
       if (nvidiaOk || openrouterOk) saveLifecycleStore(updated, lifecycleStorePath);
+    } catch {
+      // fail-soft, see doc comment above.
+    }
+  }
+
+  // EOL probe sweep (card P2.3, design 5.2): off the request path, budgeted,
+  // and cadenced independently of this (hourly) refresh interval. Runs at
+  // most once every `probeSeconds`, tracked via `cache.lastProbedAt` the same
+  // way `cache.lastRefreshedAt` tracks the refresh cadence, so it needs no
+  // timer of its own. Reads the freshly-reconciled store (after the
+  // catalog-absence block above) so probe candidates reflect this cycle's
+  // presence signals, not last cycle's. Fail-soft throughout: a probe or
+  // store failure here must never break a discovery cycle.
+  if (lifecycleStorePath && probeSeconds > 0) {
+    try {
+      const dueAt = (typeof cache.lastProbedAt === 'number' ? cache.lastProbedAt : -Infinity) + probeSeconds * 1000;
+      if (at >= dueAt) {
+        const storeForProbe = loadLifecycleStoreFresh(lifecycleStorePath);
+        const runProbe =
+          probeRunProbe || ((id, o) => nvidiaCompletionProbe(id, o, nvidiaApiKey));
+        const probed = await probeModels(storeForProbe, {
+          budget: probeBudget,
+          timeoutMs: probeTimeoutMs,
+          maxTokens: probeMaxTokens,
+          provider: probeProvider,
+          pool: probePool || getPool(),
+          poolBackendId: DEFAULT_POOL_BACKEND_ID,
+          now: () => at,
+          runProbe,
+        });
+        saveLifecycleStore(probed, lifecycleStorePath);
+        cache.lastProbedAt = at;
+      }
     } catch {
       // fail-soft, see doc comment above.
     }
