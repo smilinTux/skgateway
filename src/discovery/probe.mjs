@@ -1,5 +1,5 @@
 /**
- * probe.mjs — EOL probe sweep (card P2.3, design doc
+ * probe.mjs: EOL probe sweep (card P2.3, design doc
  * docs/specs/2026-08-08-model-ranking-routing-intelligence-arch.md, section
  * 5.2). Automates the manual "warm one-word probe" prune Chef previously did
  * by hand with curl.
@@ -107,7 +107,7 @@ export function selectProbeCandidates(
  * `runProbe(id, {timeoutMs, maxTokens}) -> Promise<{ok:boolean, status?:number}>`
  * is the actual completion call. It is required to do anything: with no
  * `runProbe` supplied (or a `budget`/selection of zero candidates), this is a
- * no-op that returns `store` unchanged — the disable path (`probe_seconds: 0`
+ * no-op that returns `store` unchanged. The disable path (`probe_seconds: 0`
  * at the caller) short-circuits before ever reaching here, but this function
  * is safe to call with nothing wired up regardless.
  *
@@ -116,11 +116,11 @@ export function selectProbeCandidates(
  * src/proxy/connection-pool.mjs) so a sweep can never fan out past the
  * pool's concurrency limit alongside live traffic. A pool is optional (tests
  * may omit it); when present, a failed `acquire` (queue full/timeout) skips
- * that id for this sweep rather than probing unbounded — it is retried next
+ * that id for this sweep rather than probing unbounded: it is retried next
  * cycle, and a pool failure is never treated as evidence the model is dead.
  *
  * Never throws: a `runProbe` rejection is treated as a failed (non-410)
- * probe outcome, which — per `applyProbeOutcome` — only demotes an `active`
+ * probe outcome, which, per `applyProbeOutcome`, only demotes an `active`
  * model to `suspect` and never escalates a model that already needs
  * investigation.
  *

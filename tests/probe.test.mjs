@@ -1,5 +1,5 @@
 /**
- * probe.test.mjs — EOL probe sweep (card P2.3).
+ * probe.test.mjs: EOL probe sweep (card P2.3).
  *
  * Covers `selectProbeCandidates()` / `probeModels()` (src/discovery/probe.mjs)
  * directly with an injected fake completion runner + fake pool + fake clock,
