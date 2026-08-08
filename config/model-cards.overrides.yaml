@@ -1,54 +1,191 @@
-# model-cards.overrides.yaml
+# model-cards.overrides.yaml  --  SKWorld Model Dex (curated cards)
 #
-# Manual card overlay (card P2.2, design doc section 2.6 / 5.1 item 2).
+# Our own hand-curated model cards. Two jobs:
+#  1. FEED THE RANKER. Static models (claude, ornith, qwen-vl) and heuristic
+#     NVIDIA cards have no provider-declared capabilities, so the capability
+#     deriver (src/ranking/capabilities.mjs) reads the machine fields below:
+#       context_length          -> capabilities.ctx_tokens
+#       supported_parameters    -> capabilities.tool_use (contains "tools")
+#       modality / vision       -> capabilities.vision
+#  2. BE READABLE (the "dex"). The human fields (display_name, org, summary,
+#     good_at, params, quant, speed, tier, license, released, notes) are ignored
+#     by the ranker and rendered for people to read through. Keep them accurate
+#     and geeky: this is the place to track the latest-and-greatest capabilities.
 #
-# NVIDIA NIM's /v1/models is bare ids (no context window, no pricing card),
-# so src/discovery/providers/nvidia.mjs can only heuristically parse the id
-# (source:'heuristic'). This file folds in Chef's validated per-model
-# knowledge that used to live only as skgateway.yaml comments and the
-# model_limits: block (context windows verified 2026-07-15 via a warm
-# one-word completion probe) plus known-slow flags, as committed data
-# instead of losing it in YAML comments.
+# Precedence (discovery.mjs applyCardOverlay): a live provider card (OpenRouter,
+# source:'openrouter') is never clobbered. A heuristic NVIDIA card is enriched.
+# A card-LESS static model (claude/ornith) gets a card CREATED from its entry.
+# Once overlaid, source becomes 'manual' (Chef-validated, not guessed).
 #
-# Precedence (discovery.mjs applyCardOverlay(), design 5.1): fresh provider
-# card > this overlay > heuristic. A model whose adapter already returns a
-# full provider-declared card (OpenRouter, source:'openrouter') is left
-# untouched; only a heuristic card (source:'heuristic') with a matching id
-# below is enriched here, and its source is re-tagged 'manual' once
-# overlaid, since the values are now Chef-validated, not guessed.
-#
-# Only currently-active NVIDIA models are listed. Ids pruned 2026-07-15 as
-# dead (see config/skgateway.yaml's nvidia: models comment) are deliberately
-# absent: the lifecycle state machine (card P1.1) is now the source of truth
-# for EOL, not this file. Do not resurrect a pruned id here.
+# EOL is NOT tracked here: the lifecycle state machine (card P1.1) owns that.
+# Do not resurrect a pruned id. Keep the numbers honest; if you are not sure of
+# a value, leave it out rather than guessing (a null field beats a wrong one).
 
 overrides:
-  # 262K context (Qwen3.5 + Mistral family, verified 2026-07-15)
-  qwen/qwen3.5-122b-a10b:
+
+  # ───────────────────────── OUR CLAUDE FLEET (paid cloud) ────────────────────
+  # Reached via the Anthropic backend (OAuth + OpenAI<->Messages translation).
+  # All support tools, vision, and extended thinking. Context per the registry
+  # 'opus' backend (500K); output caps are conservative practical ceilings.
+  claude-opus-4-8:
+    display_name: "Claude Opus 4.8"
+    org: Anthropic
+    summary: "Flagship reasoning + agentic-coding model. The heavy-tier brain behind sk-heavy."
+    good_at: [deep reasoning, agentic coding, long-context synthesis, tool use, vision]
+    context_length: 500000
+    max_output_tokens: 64000
+    supported_parameters: [tools, tool_choice, structured_outputs, reasoning]
+    modality: "text+image->text"
+    tier: paid-cloud
+    quant: "n/a (hosted)"
+    speed: "medium; premium quality"
+    license: proprietary
+    notes: "Pinned to role sk-heavy and the sk-auto hard tier. Costs real money, use the tier ladder to keep it off cheap jobs."
+
+  claude-opus-4-7:
+    display_name: "Claude Opus 4.7"
+    org: Anthropic
+    summary: "Previous Opus generation. Strong reasoning; kept as a fallback / comparison point."
+    good_at: [deep reasoning, coding, tool use, vision]
+    context_length: 500000
+    max_output_tokens: 64000
+    supported_parameters: [tools, tool_choice, structured_outputs, reasoning]
+    modality: "text+image->text"
+    tier: paid-cloud
+
+  claude-sonnet-4-6:
+    display_name: "Claude Sonnet 4.6"
+    org: Anthropic
+    summary: "Balanced speed/quality workhorse. Great default for agentic coding when Opus is overkill."
+    good_at: [coding, tool use, everyday reasoning, vision]
+    context_length: 500000
+    max_output_tokens: 64000
+    supported_parameters: [tools, tool_choice, structured_outputs, reasoning]
+    modality: "text+image->text"
+    tier: paid-cloud
+    speed: "fast"
+
+  claude-haiku-4-5:
+    display_name: "Claude Haiku 4.5"
+    org: Anthropic
+    summary: "Fastest, cheapest Claude. Good for high-volume, latency-sensitive tool use."
+    good_at: [fast tool use, classification, short tasks, vision]
+    context_length: 200000
+    max_output_tokens: 32000
+    supported_parameters: [tools, tool_choice, structured_outputs]
+    modality: "text+image->text"
+    tier: paid-cloud
+    speed: "very fast"
+
+  # ──────────────────────── OUR ORNITH FLEET (local, sovereign) ───────────────
+  # DeepReinforce Ornith 1.0, self-hosted on our own GPUs. Cloud-free, private.
+  # Tool use PROVEN end-to-end through the gateway (Bash tool round-trip, after
+  # the streaming content_block_start fix 9e23c62). Reasoning models: they emit
+  # <think> before content, so keep an 8192 output floor (registry does this).
+  ornith-1.0-35b:
+    display_name: "Ornith 1.0 35B"
+    org: DeepReinforce (self-hosted)
+    summary: "Our sovereign 35B reasoning model on chiap08. The cloud-free brain behind sk-default."
+    good_at: [reasoning, coding, tool use, sovereign/private work]
     context_length: 262144
+    max_output_tokens: 32768
+    supported_parameters: [tools, tool_choice, reasoning]
+    modality: "text->text"
+    params: "35B dense"
+    quant: "Q4_K_M / NVFP4 (aeon)"
+    tier: local
+    speed: "medium (~1-3s warm); NVFP4 aeon variant is the current default"
+    license: open-weights
+    notes: "Registry role sk-default -> ornith-big -> ornith-1.0-35b-aeon-nvfp4 on chiap08 :11436. Reasoning model: needs max_tokens >= 2048 (8192 floor) or content starves under <think>."
+
+  ornith-big:
+    display_name: "Ornith 1.0 35B (role alias)"
+    org: DeepReinforce (self-hosted)
+    summary: "Registry alias for the 35B, routed across chiap08 (primary) + standby with 5xx failover."
+    good_at: [reasoning, coding, tool use, sovereign/private work]
+    context_length: 262144
+    max_output_tokens: 32768
+    supported_parameters: [tools, tool_choice, reasoning]
+    modality: "text->text"
+    tier: local
+
+  ornith-1.0-9b:
+    display_name: "Ornith 1.0 9B (ornith-tiny)"
+    org: DeepReinforce (self-hosted)
+    summary: "The small, fast sovereign reasoner on the .100 5060 Ti. NVFP4 + MTP. Pairs with the 35B."
+    good_at: [fast reasoning, cheap sovereign inference, drafts]
+    context_length: 131072
+    max_output_tokens: 16384
+    supported_parameters: [tools, tool_choice, reasoning]
+    modality: "text->text"
+    params: "9B"
+    quant: "NVFP4 + MTP"
+    tier: local
+    speed: "fast"
+    notes: "Registry role ornith-tiny. Default reply model for lumina/opus agent contexts."
+
+  # ───────────────────────── OUR VISION MODEL (local) ─────────────────────────
+  qwen3.6-27b-abliterated:
+    display_name: "Qwen3.6 27B abliterated (vision)"
+    org: "Qwen (abliterated, self-hosted)"
+    summary: "Sovereign vision + uncensored-text brain on chiap08 (mmproj loaded, OCR-verified)."
+    good_at: [vision, OCR, uncensored/creative text, image understanding]
+    context_length: 32768
+    max_output_tokens: 8192
+    modality: "text+image->text"
+    params: "27B"
+    quant: "Q4_K_M"
+    tier: local
+    notes: "Registry roles sk-vision + sk-creative. Abliterated: minimal refusals, used as a text personality brain too."
+
+  # ──────────────────── KEY FREE REMOTE MODELS (enriched) ─────────────────────
+  # NVIDIA NIM free tier. supported_parameters here is best-effort curation
+  # (NIM's /v1/models does not declare it), tag it only where verified.
+  openai/gpt-oss-20b:
+    display_name: "GPT-OSS 20B"
+    org: OpenAI (open weights, NVIDIA NIM)
+    summary: "OpenAI's open 20B. Reliable free general model; our live local-failover cloud fallback."
+    good_at: [general chat, drafting, cheap tool use]
+    context_length: 131072
+    supported_parameters: [tools, tool_choice]
+    modality: "text->text"
+    tier: free-remote
+    notes: "First in registry failover.local_fallback (verified live). Free via NIM."
+
+  meta/llama-3.3-70b-instruct:
+    display_name: "Llama 3.3 70B Instruct"
+    org: Meta (NVIDIA NIM)
+    summary: "Solid free 70B instruct. Second in our local-failover chain."
+    good_at: [general chat, instruction following, tool use]
+    context_length: 131072
+    supported_parameters: [tools, tool_choice]
+    modality: "text->text"
+    tier: free-remote
+
+  nvidia/llama-3.3-nemotron-super-49b-v1.5:
+    display_name: "Llama 3.3 Nemotron Super 49B v1.5"
+    org: NVIDIA
+    summary: "NVIDIA's tuned 49B. Good free reasoning option."
+    good_at: [reasoning, general chat]
+    context_length: 131072
+    tier: free-remote
+
+  # ── Context-window facts for other live NVIDIA models (from the 2026-07-15
+  #    validated model_limits, kept honest; add dex fields as you verify them) ──
   qwen/qwen3.5-397b-a17b:
     context_length: 262144
+    tier: free-remote
   mistralai/mistral-medium-3.5-128b:
     context_length: 262144
+    tier: free-remote
   mistralai/mistral-large-3-675b-instruct-2512:
     context_length: 262144
-
-  # 128K context
-  openai/gpt-oss-20b:
-    context_length: 131072
-
-  # 131K context (Nemotron Super 49B)
-  nvidia/llama-3.3-nemotron-super-49b-v1.5:
-    context_length: 131072
-
-  # 1M context (DeepSeek V4)
-  deepseek-ai/deepseek-v4-flash:
-    context_length: 1048576
+    tier: free-remote
   deepseek-ai/deepseek-v4-pro:
     context_length: 1048576
+    tier: free-remote
     notes: "slow (~46s), batch/cron use"
-
-  # 204K context (MiniMax M2.7)
   minimaxai/minimax-m2.7:
     context_length: 204800
+    tier: free-remote
     notes: "slow (~40s), batch/cron use"

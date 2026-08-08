@@ -166,26 +166,35 @@ export function loadCardOverrides(path = CARD_OVERRIDES_PATH) {
 }
 
 /**
- * Apply the manual overlay to one merged-catalog entry (card P2.2).
- * Precedence (design doc 5.1): fresh provider card > manual overlay >
- * heuristic. A "fresh provider card" is any card whose `source` is not
- * `'heuristic'` (OpenRouter's adapter always ships a full provider-declared
- * card, so it is left untouched here). A `source:'heuristic'` card (NVIDIA's
- * bare-id parsing) with a matching override id is enriched and re-tagged
- * `source:'manual'`, since the values are now Chef-validated, not guessed.
+ * Apply the manual overlay to one merged-catalog entry (card P2.2, extended by
+ * the model-dex work). Precedence (design doc 5.1): fresh provider card >
+ * manual overlay > heuristic > (nothing). A "fresh provider card" is any card
+ * whose `source` is a live provider (e.g. OpenRouter, whose adapter always
+ * ships a full provider-declared card): it is left untouched. Everything else
+ * is created-or-enriched from the operator-curated overlay and tagged
+ * `source:'manual'`:
+ *   - a `source:'heuristic'` card (NVIDIA bare-id parsing) is enriched;
+ *   - a card-LESS entry (a static/config model like claude or a local ornith,
+ *     which discovery never gives a card) has a card CREATED from the overlay,
+ *     so our own curated cards can feed the ranker + the model dex.
  * Pure: no I/O, returns a new object rather than mutating `model`.
  *
- * @param {object} model a merged-catalog entry, `{id, provider, free, card}`
+ * @param {object} model a merged-catalog entry, `{id, provider, free, card?}`
  * @param {Record<string, object>} overrides id -> override fields
  * @returns {object} `model`, overlaid when applicable
  */
+const _FRESH_PROVIDER_SOURCES = new Set(["openrouter"]);
+
 export function applyCardOverlay(model, overrides) {
   const override = overrides && overrides[model.id];
-  if (!override || !model.card || model.card.source !== 'heuristic') return model;
+  if (!override) return model;
+  const src = model.card && model.card.source;
+  // Never clobber a live provider's authoritative card.
+  if (src && _FRESH_PROVIDER_SOURCES.has(src)) return model;
   return {
     ...model,
     card: {
-      ...model.card,
+      ...(model.card || {}),
       ...override,
       source: 'manual',
     },
