@@ -213,8 +213,17 @@ const DEFAULTS = {
   // reload config validation fails fast if any registry `agent:*` context target
   // is a dangling reference (neither a registry role nor a model served by a
   // declared backend). Set false to defer that check to first request.
+  //
+  // match_enabled: CAPABILITY-AWARE ROUTING MASTER GATE (design 7.2, cards
+  // P4.1-P4.4), DEFAULT OFF. Governs BOTH the registry `@match` role ranking
+  // branch (router.mjs) and the `x-sk-require` header escape hatch
+  // (index.mjs). With it off the hot path is byte-identical to before those
+  // cards existed: no rank call, no new candidates, no added latency. This
+  // ships dark; the Phase 3 suggest-only `/admin/models/rank` API is the
+  // soak period for observing rankings before they route a single request.
   routing: {
     strict_targets: true,
+    match_enabled: false,
   },
 
   // CapAuth agent-identity (SKGateway P2.1). Every /v1/* request is resolved to

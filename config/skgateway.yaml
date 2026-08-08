@@ -297,6 +297,18 @@ siem:
       path: ./logs/audit.jsonl
       rotate_mb: 100
 
+## Capability-aware routing master gate (design doc 2026-08-08, cards
+## P4.1-P4.4). Governs BOTH the registry `@match` role ranking branch
+## (rankModels() picks a candidate chain for roles targeting "@match" in
+## ~/.skcapstone/models/registry.yaml) and the per-request `x-sk-require`
+## header escape hatch. Default OFF (commented, matching code default in
+## src/config.mjs): with it off the hot path is byte-identical to before
+## those cards existed, no rank call, no new candidates, no added latency.
+## The Phase 3 suggest-only GET /admin/models/rank API (loopback) is the
+## soak period, observe rankings there before flipping this on.
+# routing:
+#   match_enabled: true
+
 dashboard:
   enabled: true
   refresh_ms: 5000

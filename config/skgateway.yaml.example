@@ -217,11 +217,21 @@ identity:
 ## x-sk-role request headers still win; only the model field is pinned. Leave
 ## per_agent empty (the default) for unchanged routing. NO secrets here, just
 ## agent names mapped to model/alias labels.
+## Capability-aware routing master gate (design doc 2026-08-08, cards
+## P4.1-P4.4). Governs BOTH a registry role whose target is the "@match"
+## marker (rankModels() picks a ranked candidate chain from the discovered
+## catalog against that role's requirements block) and the per-request
+## x-sk-require header escape hatch. Default OFF (code default in
+## src/config.mjs): with it off, an "@match" role and the header are both
+## inert, no rank call, no new candidates, no added latency. Observe
+## rankings via the loopback-only GET /admin/models/rank suggest-only API
+## before turning this on.
 routing:
   per_agent: {}
     # lumina: sk-default            # Queen routes to the default model
     # jarvis: qwen/qwen3.5-122b-a10b  # pin an agent to a concrete model
     # herald: ornith-tiny           # mechanical/aux agent → small non-thinking model
+  # match_enabled: true
 
 dashboard:
   enabled: true
