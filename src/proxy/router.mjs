@@ -18,6 +18,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { sendUpstream } from "./upstream.mjs";
 import { createEvent } from "../siem/events.mjs";
@@ -29,9 +30,23 @@ import { recordModelOutcome, getLifecycle } from "../discovery/model_catalog_sto
 import { isRoutable } from "../discovery/lifecycle.mjs";
 import { applyReasoningFloor } from "./core.mjs";
 import { createDecisionCache, decisionKey } from "./decision-cache.mjs";
+// card P4.2 (@match routing): reuse the existing ranker + capability deriver
+// + discovery cache reader + allowlist/availability checks as-is, no
+// reimplementation. getConfig() gates the whole branch behind
+// routing.match_enabled (config.mjs, unmodified: the DEFAULTS already carry
+// a `routing:` block, card P4.4 adds match_enabled to it later).
+import { getConfig } from "../config.mjs";
+import { loadCache as loadDiscoveryCache } from "../discovery.mjs";
+import { rankModels } from "../ranking/rank.mjs";
+import { deriveCapabilities } from "../ranking/capabilities.mjs";
+import { loadAllowlist } from "../advertise.mjs";
+import { isModelAvailable } from "./advertise.mjs";
 
 // sk-auto routing decision cache (TTL+LRU); keyed by request fingerprint + config epoch.
 const _autoDecisionCache = createDecisionCache({ ttlMs: 60_000, maxEntries: 500 });
+// @match ranked-pick decision cache (card P4.2). Separate from the sk-auto
+// cache above so entries never collide; same TTL/LRU discipline.
+const _matchDecisionCache = createDecisionCache({ ttlMs: 60_000, maxEntries: 500 });
 import { classifyDifficulty } from "../classifiers/difficulty.mjs";
 import { adjustWithEmpirical, promptClassFromResult } from "../classifiers/empirical.mjs";
 
@@ -60,6 +75,24 @@ const DEFAULT_COOLDOWN_MS = 60_000;
 
 /** Timeout (ms) used for liveness probe requests during recovery. */
 const PROBE_TIMEOUT_MS = 8_000;
+
+/**
+ * Max ranked candidates mapped into the router's candidate array for an
+ * `@match` role (card P4.2, design 7.2: "the ranked chain IS the failover
+ * chain"). Bounds the number of `router.route()` lookups a single `@match`
+ * request performs.
+ */
+const MATCH_TOP_K = 5;
+
+/**
+ * Discovery catalog cache path the `@match` ranker reads (card P4.2). Mirrors
+ * discovery.mjs's own (unexported) default path exactly, so production reads
+ * the SAME file discovery cycles already write; env-overridable so tests
+ * never touch the real per-node cache.
+ */
+const MATCH_CATALOG_CACHE_PATH =
+  process.env.SKGATEWAY_MODEL_CATALOG_CACHE_PATH ||
+  path.join(homedir(), ".config", "skgateway", "model_catalog_cache.json");
 
 /**
  * Thrown by `route()` when a request names a concrete model id that the
@@ -1200,6 +1233,169 @@ function getRegBackend(id, url) {
   return b;
 }
 
+// ---------------------------------------------------------------------------
+// @match routing (card P4.2, design doc 7.2): rank the discovered catalog
+// against a role's requirements and map the ranked chain onto the EXISTING
+// candidate/failover/quarantine/pool machinery. Gated behind config
+// `routing.match_enabled` (default OFF), see routeAndSend()'s call site.
+// ---------------------------------------------------------------------------
+
+/**
+ * Is `routing.match_enabled` set in the loaded gateway config? Fail-soft to
+ * `false` (the required default) when config.mjs's `loadConfig()` has never
+ * run (e.g. most router.mjs unit tests) or the key is simply absent: this
+ * function must never throw into the request path.
+ *
+ * @returns {boolean}
+ */
+function isMatchRoutingEnabled() {
+  try {
+    return getConfig()?.routing?.match_enabled === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Config epoch for `@match` decisions: the later of the registry's own mtime
+ * (`getConfigEpoch()`, already used by the sk-auto decision cache) and the
+ * discovery catalog store's mtime (`MATCH_CATALOG_CACHE_PATH`, the same file
+ * discovery.mjs's `discoverCatalog()` writes every refresh cycle (the epic's
+ * own vocabulary for this file: "the discovery cache ... evolves into a
+ * machine-owned FACTS store"). A discovery cycle (new/dropped models, a
+ * catalog-presence reconcile flipping a model toward `eol`, card P1.3) always
+ * rewrites this file, so its mtime is a faithful "the catalog changed" signal
+ * (design 7.2's decision-cache composition: "a catalog refresh or EOL flip
+ * invalidates cached picks").
+ *
+ * Deliberately NOT the model_catalog_store.mjs lifecycle file: that file is
+ * also rewritten by `recordModelOutcome()` on every completed request (P1.2),
+ * so using its mtime here would invalidate the @match cache on every single
+ * request (the very last request's own bookkeeping write), defeating the
+ * cache entirely rather than reacting to genuine catalog/lifecycle events.
+ *
+ * Never throws: an as-yet-uncreated catalog cache file contributes 0.
+ *
+ * @returns {number}
+ */
+function matchConfigEpoch() {
+  let catalogMtime = 0;
+  try {
+    catalogMtime = fs.statSync(MATCH_CATALOG_CACHE_PATH).mtimeMs;
+  } catch {
+    // cache not created yet, contributes nothing to the epoch.
+  }
+  return Math.max(getConfigEpoch(), catalogMtime);
+}
+
+/**
+ * Assemble the ranker's catalog input (design 4.1 shape: `{id, free,
+ * lifecycle:{state}, capabilities}`) straight off the on-disk discovery
+ * cache (the same file discovery.mjs's refresh cycle writes), so the router
+ * never depends on index.mjs's in-memory catalog or triggers a network
+ * fetch. Mirrors index.mjs's `buildRankCatalog()` (card P3.3) at a smaller
+ * scope (no injectable metrics here, same `{}` default that route already
+ * uses for the suggest-only rank API). Never throws: a missing/unreadable
+ * cache file yields an empty catalog.
+ *
+ * @returns {Array<object>}
+ */
+function buildMatchCatalog() {
+  let cache;
+  try {
+    cache = loadDiscoveryCache(MATCH_CATALOG_CACHE_PATH);
+  } catch {
+    cache = {};
+  }
+  const models = Array.isArray(cache && cache.models) ? cache.models : [];
+  return models.map((entry) => ({
+    ...entry,
+    lifecycle: getLifecycle(entry.id),
+    capabilities: deriveCapabilities(entry, { metrics: {} }),
+  }));
+}
+
+/**
+ * Build the router candidates array for an `@match` role (card P4.2, design
+ * 7.2): rank the discovered catalog against the role's requirements (the
+ * pure P3.2 ranker), cache the RANKED ID ORDER (not the resolved backends,
+ * those must stay fresh: health/auth can change independent of ranking),
+ * then resolve each ranked id to a real backend via the router's own
+ * model-matching (`router.route()`), taking each id's primary candidate and
+ * attaching the exact `bodyOverride` model-rewrite mechanism the
+ * cloud-fallback candidate already uses (router.mjs's local-failover
+ * branch). Because every entry lands in the same `{backendId, backendUrl,
+ * authHeaders, backend, bodyOverride}` shape the existing candidate loop
+ * already understands, failover/quarantine/pool/SIEM all apply unchanged.
+ *
+ * @param {ReturnType<typeof createRouter>} router
+ * @param {{match:true, role:string, requirements:?object}} reg
+ * @param {RouteRequest} request
+ * @param {Buffer} body
+ * @returns {Promise<{candidates:Array<object>, picks:string[]}>}
+ */
+async function buildMatchCandidates(router, reg, request, body) {
+  const requirements = reg.requirements || {};
+  const messages = extractMessages(request, body);
+  const epoch = matchConfigEpoch();
+  const cacheKey = `match:${reg.role}:${decisionKey(messages, epoch)}`;
+
+  let picks = _matchDecisionCache.get(cacheKey);
+  if (!picks) {
+    const catalog = buildMatchCatalog();
+    const allow = loadAllowlist();
+    const chain = rankModels(catalog, requirements, {
+      allowlist: allow,
+      isModelAvailable: (id) => isModelAvailable(id, router),
+    });
+    picks = chain
+      .filter((c) => c.excluded_reason === null)
+      .slice(0, MATCH_TOP_K)
+      .map((c) => c.id);
+    _matchDecisionCache.set(cacheKey, picks);
+  }
+
+  const candidates = [];
+  for (const id of picks) {
+    let results;
+    try {
+      results = await router.route({ ...request, model: id, agentId: request.agentId });
+    } catch {
+      // e.g. ModelEolError from a mid-flight lifecycle flip the ranker's
+      // own catalog read hadn't seen yet, or a request with no backends at
+      // all: skip this ranked pick, the next one (or the caller's own
+      // empty-chain fallback) takes over.
+      continue;
+    }
+    if (!results || results.length === 0) continue;
+    candidates.push({ ...results[0], bodyOverride: rewriteBodyModel(body, id) });
+  }
+
+  if (picks.length) {
+    console.log(
+      `[router] @match role=${reg.role} ranked=[${picks.join(",")}] ` +
+      `candidates=[${candidates.map((c) => c.backendId).join(",")}]`
+    );
+  }
+
+  return { candidates, picks };
+}
+
+/**
+ * Test-only: `{hits, misses, size}` on the `@match` ranked-pick decision
+ * cache (card P4.2). Mirrors `model_catalog_store.mjs`'s `_resetCacheForTests`
+ * introspection convention; not used by production code.
+ * @returns {{hits:number, misses:number, size:number}}
+ */
+export function _matchDecisionCacheStats() {
+  return { hits: _matchDecisionCache.hits, misses: _matchDecisionCache.misses, size: _matchDecisionCache.size };
+}
+
+/** Test-only: clear the `@match` ranked-pick decision cache (card P4.2). */
+export function _resetMatchDecisionCacheForTests() {
+  _matchDecisionCache.clear();
+}
+
 /**
  * Build the clean 404 response `routeAndSend()` returns for a `ModelEolError`
  * (card P1.6), the same `{status, headers, body, backendId, failover}` shape as
@@ -1360,6 +1556,34 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         `signals=[${d.signals.join(",")}]${_cached ? " (cached)" : ""} -> backend=${picked ? picked.backend : "(unresolved)"}`
       );
       reg = picked;
+    }
+
+    // ── @match: capability-aware ranked routing (card P4.2, design 7.2) ──
+    // resolve() returns a { match:true, role, requirements } marker (card
+    // P4.1) for a role whose target is "@match", exactly parallel to the
+    // sk-auto marker above. GATED behind routing.match_enabled (default OFF,
+    // ships dark, card P4.4 flips it on per-role later). With the flag off
+    // this whole branch is a no-op: `reg` is nulled out and the request falls
+    // through to today's default resolution EXACTLY as if the role's target
+    // had never resolved at all (no rank call, no new candidates, no added
+    // latency: byte-identical to today).
+    if (reg && reg.match) {
+      if (isMatchRoutingEnabled()) {
+        const built = await buildMatchCandidates(router, reg, request, body);
+        candidates = built.candidates;
+        if (!candidates.length) {
+          console.warn(
+            `[router] @match role=${reg.role} produced no live ranked candidates, falling back to default routing`
+          );
+          candidates = await router.route(request);
+        } else {
+          // Route the top-ranked pick through the normal metrics/health path
+          // (mirrors the plain-role `request.model = reg.model` assignment
+          // below, which this branch skips since reg is nulled out next).
+          request = { ...request, model: built.picks[0] };
+        }
+      }
+      reg = null; // either routed above, or inert, nothing left for the legacy reg block below.
     }
 
     if (reg) {
