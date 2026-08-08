@@ -64,12 +64,17 @@ export function loadRegistry(path = REGISTRY_PATH) {
       // Optional tuning block for sk-auto difficulty routing (thresholds +
       // keyword lists). Empty {} => difficulty.mjs uses its built-in defaults.
       auto: parsed.auto || {},
+      // Optional failover policy block (card P1.5): `failover.local_fallback`
+      // names the LIVE model the local-backend health-aware failover should
+      // use, replacing the hardcoded model id that used to live in
+      // local-failover.mjs. Empty {} => resolveFailoverCandidates() returns [].
+      failover: parsed.failover || {},
     };
     _cacheMtime = st.mtimeMs;
     _cachePath = path;
   } catch (err) {
     if (!_cache) {
-      _cache = { backends: {}, roles: {}, contexts: {}, defaults: {}, auto: {} };
+      _cache = { backends: {}, roles: {}, contexts: {}, defaults: {}, auto: {}, failover: {} };
       _cachePath = path;
     }
     // else: keep the last good cache
@@ -238,4 +243,50 @@ export function resolve({ model, context, service, role } = {}, path = REGISTRY_
     via,
     role: roleName,
   };
+}
+
+/**
+ * Resolve `registry.failover.local_fallback` (card P1.5) into an ordered
+ * list of candidate `{ model, backend }` pairs for the local-backend
+ * health-aware failover (`proxy/local-failover.mjs`). This replaces the
+ * hardcoded cloud fallback model id that used to live in that module.
+ *
+ * `failover.local_fallback` may be:
+ *   - a single string, or
+ *   - an array of strings (ordered preference; local-failover.mjs picks the
+ *     first one whose lifecycle is `active`, see `model_catalog_store.mjs`).
+ *
+ * Each string names either:
+ *   - a role declared in `roles:`, resolved to its backend's concrete
+ *     `model` (and the backend name, so local-failover.mjs knows which
+ *     router backend serves it), or
+ *   - a concrete model id used as-is (`backend: null`; the router backend
+ *     that serves it is left to `SKGATEWAY_LOCAL_FALLBACK_BACKEND` / the
+ *     caller's own default).
+ *
+ * Never throws: an unset/empty/malformed `failover` block yields `[]`.
+ *
+ * @param {string} [path]  Registry path override (for tests)
+ * @returns {{model: string, backend: string|null}[]}
+ */
+export function resolveFailoverCandidates(path = REGISTRY_PATH) {
+  const { roles, backends, failover } = loadRegistry(path);
+  const raw = failover && failover.local_fallback;
+  if (raw == null) return [];
+  const names = Array.isArray(raw) ? raw : [raw];
+
+  const out = [];
+  for (const name of names) {
+    if (typeof name !== "string" || !name.trim()) continue;
+    const backendName = roles && Object.prototype.hasOwnProperty.call(roles, name) ? roles[name] : null;
+    const bcfg = backendName ? backends && backends[backendName] : null;
+    if (bcfg && bcfg.model) {
+      out.push({ model: bcfg.model, backend: backendName });
+      continue;
+    }
+    // Not a known role (or its backend has no concrete model): treat the
+    // name itself as a concrete model id.
+    out.push({ model: name, backend: null });
+  }
+  return out;
 }

@@ -31,6 +31,9 @@
  * @module proxy/local-failover
  */
 
+import { resolveFailoverCandidates } from "./registry.mjs";
+import { getLifecycle } from "../discovery/model_catalog_store.mjs";
+
 /**
  * Parse an integer env value, falling back to `dflt` on absent/blank/NaN.
  * @param {string|undefined} v
@@ -44,24 +47,61 @@ function intEnv(v, dflt) {
 }
 
 /**
- * Read the local-failover configuration from the environment.
+ * Resolve the cloud fallback model + backend for the local-failover route.
+ *
+ * Priority (highest first):
+ *   1. `SKGATEWAY_LOCAL_FALLBACK_MODEL` / `_BACKEND` env override.
+ *   2. `registry.failover.local_fallback` (card P1.5): resolved via
+ *      `resolveFailoverCandidates()` into an ordered candidate list, then
+ *      filtered here to the first candidate whose catalog lifecycle is
+ *      `active` (`model_catalog_store.getLifecycle()`). A model that is
+ *      `suspect`, `eol`, or `dead` can never be picked, so a dead model can
+ *      never be a fallback target again: no re-probing needed, the store is
+ *      the same passive signal the router already feeds via
+ *      `recordModelOutcome()`.
+ *
+ * When neither source yields a model (no env override and no registry
+ * `failover.local_fallback`, or every registry candidate is non-active),
+ * `fallbackModel` is `null`; callers already guard on it (`rewriteBodyModel`
+ * no-ops on a falsy model, and the caller only wires the cloud candidate in
+ * when `router.getBackend(fallbackBackend)` resolves), so this fails soft
+ * rather than routing to a hardcoded id that may itself be dead.
+ *
+ * @param {string[]} candidates  `{model, backend}` pairs, most-preferred first
+ * @returns {{model: string, backend: string|null}|null}
+ */
+function firstActiveCandidate(candidates) {
+  for (const c of candidates) {
+    const lc = getLifecycle(c.model);
+    if (lc && lc.state === "active") return c;
+  }
+  return null;
+}
+
+/**
+ * Read the local-failover configuration from the environment + registry.
  *
  * Env knobs (all optional):
  *   SKGATEWAY_LOCAL_FAILOVER              on/off master switch (default ON;
  *                                         "0"/"false"/"off"/"no" disable it)
  *   SKGATEWAY_LOCAL_FALLBACK_MODEL        cloud fallback model id
- *                                         (default "openai/gpt-oss-20b", a live free model)
+ *                                         (overrides the registry resolution below)
  *   SKGATEWAY_LOCAL_FALLBACK_BACKEND      router backend id serving the fallback
- *                                         model (default "nvidia")
+ *                                         model (default "nvidia"; overrides the
+ *                                         backend the registry candidate names)
  *   SKGATEWAY_LOCAL_HEALTH_TIMEOUT_MS     liveness-probe timeout ms (default 3000)
  *   SKGATEWAY_LOCAL_COMPLETION_TIMEOUT_MS bounded local completion timeout ms
  *                                         (default 10000)
  *   SKGATEWAY_LOCAL_HEALTH_TTL_MS         health-verdict cache TTL ms (default 20000)
  *
+ * With no env override, `fallbackModel`/`fallbackBackend` are resolved from
+ * `registry.failover.local_fallback` (see `firstActiveCandidate()` above)
+ * instead of a hardcoded model id.
+ *
  * @param {NodeJS.ProcessEnv} [env=process.env]
  * @returns {{
  *   enabled: boolean,
- *   fallbackModel: string,
+ *   fallbackModel: string|null,
  *   fallbackBackend: string,
  *   probeTimeoutMs: number,
  *   completionTimeoutMs: number,
@@ -71,15 +111,22 @@ function intEnv(v, dflt) {
 export function getFailoverConfig(env = process.env) {
   const raw = env.SKGATEWAY_LOCAL_FAILOVER;
   const off = raw != null && ["0", "false", "off", "no"].includes(String(raw).trim().toLowerCase());
+
+  let fallbackModel = env.SKGATEWAY_LOCAL_FALLBACK_MODEL || null;
+  let fallbackBackend = env.SKGATEWAY_LOCAL_FALLBACK_BACKEND || null;
+
+  if (!fallbackModel) {
+    const picked = firstActiveCandidate(resolveFailoverCandidates());
+    if (picked) {
+      fallbackModel = picked.model;
+      if (!fallbackBackend && picked.backend) fallbackBackend = picked.backend;
+    }
+  }
+
   return {
     enabled: !off,
-    // A LIVE free model. The previous default (deepseek-ai/deepseek-v4-flash)
-    // reached end-of-life and now returns 410 Gone, so a transient local outage
-    // failed over straight into a hard failure. openai/gpt-oss-20b is a currently
-    // advertised free NVIDIA model (verified 200). See GTD 6cf41f1382c4; keeping
-    // this default LIVE is the discovery/advertise layer's ongoing job.
-    fallbackModel: env.SKGATEWAY_LOCAL_FALLBACK_MODEL || "openai/gpt-oss-20b",
-    fallbackBackend: env.SKGATEWAY_LOCAL_FALLBACK_BACKEND || "nvidia",
+    fallbackModel,
+    fallbackBackend: fallbackBackend || "nvidia",
     probeTimeoutMs: intEnv(env.SKGATEWAY_LOCAL_HEALTH_TIMEOUT_MS, 3000),
     completionTimeoutMs: intEnv(env.SKGATEWAY_LOCAL_COMPLETION_TIMEOUT_MS, 10000),
     verdictTtlMs: intEnv(env.SKGATEWAY_LOCAL_HEALTH_TTL_MS, 20000),
