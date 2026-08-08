@@ -196,6 +196,21 @@ describe('sovereignty', () => {
     const card = { id: 'claude-sonnet-4-6', provider: 'claude-code-api', free: false, url: 'http://127.0.0.1:18782', card: {} };
     assert.equal(deriveCapabilities(card, {}).sovereignty, 'paid-cloud');
   });
+
+  test('a curated card.tier is authoritative (static models carry no serving url)', () => {
+    // local ornith is a static entry with no url, so isLocalUrl() cannot see
+    // it; the operator-declared overlay tier decides so the local-first ladder
+    // orders it correctly.
+    const ornith = { id: 'ornith-1.0-35b', provider: 'ornith', free: true, card: { tier: 'local' } };
+    assert.equal(deriveCapabilities(ornith, {}).sovereignty, 'local');
+    const claude = { id: 'claude-opus-4-8', provider: 'anthropic', free: true, card: { tier: 'paid-cloud' } };
+    assert.equal(deriveCapabilities(claude, {}).sovereignty, 'paid-cloud');
+  });
+
+  test('an invalid card.tier falls back to the url/free heuristic', () => {
+    const card = { id: 'x', provider: 'nvidia', free: true, card: { tier: 'bogus' } };
+    assert.equal(deriveCapabilities(card, {}).sovereignty, 'free-remote');
+  });
 });
 
 describe('full shape', () => {
