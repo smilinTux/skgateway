@@ -1,0 +1,54 @@
+# model-cards.overrides.yaml
+#
+# Manual card overlay (card P2.2, design doc section 2.6 / 5.1 item 2).
+#
+# NVIDIA NIM's /v1/models is bare ids (no context window, no pricing card),
+# so src/discovery/providers/nvidia.mjs can only heuristically parse the id
+# (source:'heuristic'). This file folds in Chef's validated per-model
+# knowledge that used to live only as skgateway.yaml comments and the
+# model_limits: block (context windows verified 2026-07-15 via a warm
+# one-word completion probe) plus known-slow flags, as committed data
+# instead of losing it in YAML comments.
+#
+# Precedence (discovery.mjs applyCardOverlay(), design 5.1): fresh provider
+# card > this overlay > heuristic. A model whose adapter already returns a
+# full provider-declared card (OpenRouter, source:'openrouter') is left
+# untouched; only a heuristic card (source:'heuristic') with a matching id
+# below is enriched here, and its source is re-tagged 'manual' once
+# overlaid, since the values are now Chef-validated, not guessed.
+#
+# Only currently-active NVIDIA models are listed. Ids pruned 2026-07-15 as
+# dead (see config/skgateway.yaml's nvidia: models comment) are deliberately
+# absent: the lifecycle state machine (card P1.1) is now the source of truth
+# for EOL, not this file. Do not resurrect a pruned id here.
+
+overrides:
+  # 262K context (Qwen3.5 + Mistral family, verified 2026-07-15)
+  qwen/qwen3.5-122b-a10b:
+    context_length: 262144
+  qwen/qwen3.5-397b-a17b:
+    context_length: 262144
+  mistralai/mistral-medium-3.5-128b:
+    context_length: 262144
+  mistralai/mistral-large-3-675b-instruct-2512:
+    context_length: 262144
+
+  # 128K context
+  openai/gpt-oss-20b:
+    context_length: 131072
+
+  # 131K context (Nemotron Super 49B)
+  nvidia/llama-3.3-nemotron-super-49b-v1.5:
+    context_length: 131072
+
+  # 1M context (DeepSeek V4)
+  deepseek-ai/deepseek-v4-flash:
+    context_length: 1048576
+  deepseek-ai/deepseek-v4-pro:
+    context_length: 1048576
+    notes: "slow (~46s), batch/cron use"
+
+  # 204K context (MiniMax M2.7)
+  minimaxai/minimax-m2.7:
+    context_length: 204800
+    notes: "slow (~40s), batch/cron use"

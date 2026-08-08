@@ -1,5 +1,16 @@
 // Pure provider parsing/filtering. Network + cache live in this file too (Task 2)
 // but these three functions never touch the network.
+//
+// isChatModel/parseNvidia/parseOpenRouterFree predate the provider-adapter
+// split (card P2.1, src/discovery/providers/{nvidia,openrouter}.mjs). They
+// are kept here, byte-for-byte behavior-compatible, because tests/discovery.
+// test.mjs imports and asserts their exact id-only output shape directly.
+// discoverCatalog() below no longer calls them: it calls the adapters'
+// normalize() so the merged catalog carries the full ModelCard (design doc
+// 4.1) instead of discarding everything but the id. The adapters duplicate
+// the same NON_CHAT/isFree filters (see the doc comment in each adapter for
+// why: importing them from here would make discovery.mjs and the adapters it
+// imports circularly dependent).
 
 const NON_CHAT = [
   /embed/i, /\bbge\b/i, /rerank/i, /content-safety/i, /guard/i,
@@ -36,11 +47,28 @@ export function parseOpenRouterFree(json) {
 
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { join, dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { load as yamlLoad } from 'js-yaml';
 import { defaultLifecycle, applyCatalogPresence, THRESHOLDS as LIFECYCLE_THRESHOLDS } from './discovery/lifecycle.mjs';
 import { STORE_PATH as LIFECYCLE_STORE_PATH } from './discovery/model_catalog_store.mjs';
+import * as nvidiaAdapter from './discovery/providers/nvidia.mjs';
+import * as openrouterAdapter from './discovery/providers/openrouter.mjs';
+import {
+  probeModels,
+  DEFAULT_PROBE_BUDGET,
+  DEFAULT_PROBE_TIMEOUT_MS,
+  DEFAULT_MAX_TOKENS as DEFAULT_PROBE_MAX_TOKENS,
+  DEFAULT_POOL_BACKEND_ID,
+} from './discovery/probe.mjs';
+import { getPool } from './proxy/connection-pool.mjs';
 
 const CACHE_PATH = join(homedir(), '.config', 'skgateway', 'model_catalog_cache.json');
+
+// Card P2.2: the committed manual card overlay (config/model-cards.overrides.yaml),
+// resolved relative to this file so it works the same from any cwd.
+const __dirname = dirname(fileURLToPath(import.meta.url));
+export const CARD_OVERRIDES_PATH = resolve(__dirname, '..', 'config', 'model-cards.overrides.yaml');
 
 export { LIFECYCLE_STORE_PATH };
 
@@ -116,6 +144,59 @@ function saveLifecycleStore(store, path) {
   }
 }
 
+/**
+ * Load the manual card overlay (card P2.2, design doc 5.1 item 2 / section
+ * 2.6): Chef's validated per-model knowledge (context windows, known-slow
+ * flags) preserved as committed data instead of living only in YAML
+ * comments. Fail-soft, matching every other store loader in this module: a
+ * missing file, malformed YAML, or a file with no top-level `overrides:` map
+ * all yield `{}` so a broken overlay never breaks a discovery cycle.
+ *
+ * @param {string} [path]
+ * @returns {Record<string, object>} model id -> override fields (e.g. `{context_length, notes}`)
+ */
+export function loadCardOverrides(path = CARD_OVERRIDES_PATH) {
+  try {
+    const parsed = yamlLoad(readFileSync(path, 'utf8'));
+    const overrides = parsed && typeof parsed === 'object' ? parsed.overrides : null;
+    return overrides && typeof overrides === 'object' && !Array.isArray(overrides) ? overrides : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Apply the manual overlay to one merged-catalog entry (card P2.2).
+ * Precedence (design doc 5.1): fresh provider card > manual overlay >
+ * heuristic. A "fresh provider card" is any card whose `source` is not
+ * `'heuristic'` (OpenRouter's adapter always ships a full provider-declared
+ * card, so it is left untouched here). A `source:'heuristic'` card (NVIDIA's
+ * bare-id parsing) with a matching override id is enriched and re-tagged
+ * `source:'manual'`, since the values are now Chef-validated, not guessed.
+ * Pure: no I/O, returns a new object rather than mutating `model`.
+ *
+ * @param {object} model a merged-catalog entry, `{id, provider, free, card}`
+ * @param {Record<string, object>} overrides id -> override fields
+ * @returns {object} `model`, overlaid when applicable
+ */
+export function applyCardOverlay(model, overrides) {
+  const override = overrides && overrides[model.id];
+  if (!override || !model.card || model.card.source !== 'heuristic') return model;
+  return {
+    ...model,
+    card: {
+      ...model.card,
+      ...override,
+      source: 'manual',
+    },
+  };
+}
+
+/** Apply the manual overlay across a whole merged catalog (card P2.2). */
+export function applyCardOverlays(models, overrides) {
+  return models.map((m) => applyCardOverlay(m, overrides));
+}
+
 export function mergeCatalog(local, nvidia, openrouter) {
   const seen = new Map();
   for (const group of [local || [], nvidia || [], openrouter || []]) {
@@ -126,18 +207,16 @@ export function mergeCatalog(local, nvidia, openrouter) {
   return [...seen.values()];
 }
 
+// fetchNvidia/fetchOpenRouter now delegate to the provider adapters (card
+// P2.1); kept as named exports here because src/index.mjs's refreshCatalog()
+// imports them by these names to build discoverCatalog()'s injected
+// nvidiaFetch/openrouterFetch opts.
 export async function fetchNvidia(apiKey) {
-  const r = await fetch('https://integrate.api.nvidia.com/v1/models', {
-    headers: { authorization: `Bearer ${apiKey}` },
-  });
-  if (!r.ok) throw new Error(`nvidia ${r.status}`);
-  return r.json();
+  return nvidiaAdapter.fetch(apiKey);
 }
 
 export async function fetchOpenRouter() {
-  const r = await fetch('https://openrouter.ai/api/v1/models');
-  if (!r.ok) throw new Error(`openrouter ${r.status}`);
-  return r.json();
+  return openrouterAdapter.fetch();
 }
 
 /**
@@ -171,6 +250,39 @@ function recordProvider(cache, name, { ok, count, at, error }) {
   cache.providers[name] = entry;
 }
 
+/**
+ * Real (network) implementation of the probe sweep's `runProbe` (card P2.3,
+ * design 5.2): one warm one-word completion against NVIDIA's chat-completions
+ * endpoint, aborted at `timeoutMs`. This is the same "warm one-word probe"
+ * methodology Chef previously ran by hand with curl. Used only as the
+ * production default when `discoverCatalog()` isn't given an explicit
+ * `probeRunProbe` (tests always inject one, so this never runs under test).
+ * Fail-soft: any error (including no api key) resolves `{ ok: false }`
+ * rather than throwing, matching every other network call in this module.
+ */
+async function nvidiaCompletionProbe(id, { timeoutMs, maxTokens }, apiKey) {
+  if (!apiKey) return { ok: false };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const r = await globalThis.fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${apiKey}`, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: id,
+        max_tokens: maxTokens,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+      signal: controller.signal,
+    });
+    return { ok: r.ok, status: r.status };
+  } catch {
+    return { ok: false };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export async function discoverCatalog(opts) {
   const {
     localModels = [],
@@ -186,6 +298,36 @@ export async function discoverCatalog(opts) {
     // tests/router-model-outcome.test.mjs) or by passing this opt directly.
     lifecycleStorePath = LIFECYCLE_STORE_PATH,
     thresholds = LIFECYCLE_THRESHOLDS,
+    // Card P2.2: manual card overlay. `cardOverrides`, when provided
+    // (tests), is used as-is; otherwise it is loaded fresh from
+    // `cardOverridesPath` every cycle (hourly cadence, cheap to re-read, and
+    // keeps a config edit picked up without a process restart, matching
+    // config.mjs's SIGHUP-reload philosophy elsewhere in this codebase).
+    cardOverridesPath = CARD_OVERRIDES_PATH,
+    cardOverrides,
+    // Card P2.3 (EOL probe sweep, design 5.2): piggybacks on this same
+    // (hourly) refresh cadence rather than a new timer. Each cycle checks
+    // `cache.lastProbedAt` against `probeSeconds` and only runs the sweep
+    // when it is actually due; `probeSeconds <= 0` disables it entirely.
+    // Defaults to OFF (0), not `DEFAULT_PROBE_SECONDS`: this keeps every
+    // existing caller of `discoverCatalog()` (production call sites that
+    // don't yet thread `discovery.probe_seconds` through, and every
+    // pre-P2.3 test) behavior-identical unless a caller explicitly opts in.
+    // `DEFAULT_PROBE_SECONDS` (daily, design 5.2) is exported from probe.mjs
+    // for that future opt-in wiring (`probeSeconds: cfg.discovery
+    // ?.probe_seconds ?? DEFAULT_PROBE_SECONDS`) to use as its own default.
+    // All of `probeBudget`/`probeTimeoutMs`/`probeMaxTokens`/`probePool`/
+    // `probeRunProbe`/`probeProvider`/`nvidiaApiKey` are injectable so tests
+    // never touch the network; production leaves them at their defaults
+    // (the real NVIDIA connection pool + a real warm-probe completion call).
+    probeSeconds = 0,
+    probeBudget = DEFAULT_PROBE_BUDGET,
+    probeTimeoutMs = DEFAULT_PROBE_TIMEOUT_MS,
+    probeMaxTokens = DEFAULT_PROBE_MAX_TOKENS,
+    probePool,
+    probeRunProbe,
+    probeProvider = 'nvidia',
+    nvidiaApiKey = process.env.NVIDIA_API_KEY,
   } = opts;
   const at = now();
   let stale = false;
@@ -194,7 +336,9 @@ export async function discoverCatalog(opts) {
   let nvidiaOk = false;
   let openrouterOk = false;
   try {
-    nvidia = parseNvidia(await nvidiaFetch());
+    // Card P2.1: normalize() (not the legacy parseNvidia()) so the merged
+    // catalog carries the full ModelCard, not just the id.
+    nvidia = nvidiaAdapter.normalize(await nvidiaFetch(), { now: () => at });
     nvidiaOk = true;
     recordProvider(cache, 'nvidia', { ok: true, count: nvidia.length, at });
   } catch (e) {
@@ -203,7 +347,10 @@ export async function discoverCatalog(opts) {
     recordProvider(cache, 'nvidia', { ok: false, count: nvidia.length, at, error: String(e?.message || e) });
   }
   try {
-    openrouter = parseOpenRouterFree(await openrouterFetch());
+    // Card P2.1: normalize() (not the legacy parseOpenRouterFree()); the free
+    // filter and non-chat filter are unchanged, only the discarded fields
+    // are now kept (design doc 5.1).
+    openrouter = openrouterAdapter.normalize(await openrouterFetch(), { now: () => at });
     openrouterOk = true;
     recordProvider(cache, 'openrouter', { ok: true, count: openrouter.length, at });
   } catch (e) {
@@ -248,7 +395,41 @@ export async function discoverCatalog(opts) {
     }
   }
 
-  const models = mergeCatalog(localModels, nvidia, openrouter).map((m) => ({ ...m, stale }));
+  // EOL probe sweep (card P2.3, design 5.2): off the request path, budgeted,
+  // and cadenced independently of this (hourly) refresh interval. Runs at
+  // most once every `probeSeconds`, tracked via `cache.lastProbedAt` the same
+  // way `cache.lastRefreshedAt` tracks the refresh cadence, so it needs no
+  // timer of its own. Reads the freshly-reconciled store (after the
+  // catalog-absence block above) so probe candidates reflect this cycle's
+  // presence signals, not last cycle's. Fail-soft throughout: a probe or
+  // store failure here must never break a discovery cycle.
+  if (lifecycleStorePath && probeSeconds > 0) {
+    try {
+      const dueAt = (typeof cache.lastProbedAt === 'number' ? cache.lastProbedAt : -Infinity) + probeSeconds * 1000;
+      if (at >= dueAt) {
+        const storeForProbe = loadLifecycleStoreFresh(lifecycleStorePath);
+        const runProbe =
+          probeRunProbe || ((id, o) => nvidiaCompletionProbe(id, o, nvidiaApiKey));
+        const probed = await probeModels(storeForProbe, {
+          budget: probeBudget,
+          timeoutMs: probeTimeoutMs,
+          maxTokens: probeMaxTokens,
+          provider: probeProvider,
+          pool: probePool || getPool(),
+          poolBackendId: DEFAULT_POOL_BACKEND_ID,
+          now: () => at,
+          runProbe,
+        });
+        saveLifecycleStore(probed, lifecycleStorePath);
+        cache.lastProbedAt = at;
+      }
+    } catch {
+      // fail-soft, see doc comment above.
+    }
+  }
+
+  const overrides = cardOverrides || loadCardOverrides(cardOverridesPath);
+  const models = applyCardOverlays(mergeCatalog(localModels, nvidia, openrouter), overrides).map((m) => ({ ...m, stale }));
   cache.models = models;
   // Freshness observability: record when this discovery cycle completed. The
   // cycle is fail-soft (a throwing provider falls back to cache above and only
