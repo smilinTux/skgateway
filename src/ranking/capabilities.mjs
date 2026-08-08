@@ -168,7 +168,16 @@ function deriveQualityDim(modelCard, promptClass, boostTokens, ratingsOpts) {
  * @param {object} modelCard
  * @returns {'local'|'free-remote'|'paid-cloud'}
  */
+const _SOVEREIGNTY_TIERS = new Set(['local', 'free-remote', 'paid-cloud']);
+
 function deriveSovereignty(modelCard) {
+  // An explicit curated tier wins. A static model (local ornith, the claude
+  // fleet) has no serving url on its catalog entry, so isLocalUrl() cannot see
+  // it and every one would fall through to 'free-remote'. The operator-declared
+  // tier in the overlay card is authoritative when present, so the sovereignty
+  // ladder (local-first) actually orders our own models correctly.
+  const declared = (modelCard.card && modelCard.card.tier) || modelCard.tier;
+  if (_SOVEREIGNTY_TIERS.has(declared)) return declared;
   const url = modelCard.url || (modelCard.card && modelCard.card.url) || null;
   const local = url ? isLocalUrl(url) : false;
   const paid = modelCard.free === false;
