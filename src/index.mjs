@@ -26,6 +26,8 @@ import { classifyRequest, toSiemEvent } from "./classifiers/engine.mjs";
 import { handleModuleManifest } from "./operator/manifest.mjs";
 import { fromAnthropicRequest, toAnthropicMessage, modelRetrieveObject } from "./proxy/anthropic-frontend.mjs";
 import { SSEWriter, jsonToSSE } from "./proxy/stream.mjs";
+import { getLifecycle } from "./discovery/model_catalog_store.mjs";
+import { isRoutable, LIFECYCLE_STATES } from "./discovery/lifecycle.mjs";
 
 // ─── Parse CLI args ───
 const args = process.argv.slice(2);
@@ -106,6 +108,22 @@ function providerBackend(provider) {
 }
 
 /**
+ * Filter a list of model ids down to the ones whose lifecycle state is
+ * routable (active|suspect). Card P1.4: an id already known eol/dead must
+ * never be wired into a Backend's candidate list. Pure aside from the
+ * injected lookup (defaults to the real on-disk store,
+ * model_catalog_store.getLifecycle), so callers stay unit-testable without
+ * booting the whole gateway.
+ *
+ * @param {string[]} ids
+ * @param {(id: string) => object} [getLifecycleFn]
+ * @returns {string[]}
+ */
+export function filterRoutableModelIds(ids, getLifecycleFn = getLifecycle) {
+  return ids.filter((id) => isRoutable(getLifecycleFn(id)));
+}
+
+/**
  * Wire discovered ids into the actual routing table. The router has no
  * dynamic "registerModel" call (see src/proxy/router.mjs): a Backend decides
  * what it serves purely from its own `models` array (Backend#supportsModel),
@@ -115,8 +133,24 @@ function providerBackend(provider) {
  * that provider, instead of appending, so a model that drops out of a
  * provider's catalog also drops out of routing instead of accumulating
  * forever.
+ *
+ * Card P1.4: before writing that union into Backend.models, it is filtered
+ * to only `active|suspect` ids (filterRoutableModelIds above). An id already
+ * known eol/dead therefore can never be picked, or failed over to, by the
+ * EXISTING candidatesFor()/failover loop in router.mjs, with zero changes to
+ * that loop itself.
+ *
+ * `opts.getBackend`/`opts.getLifecycleFn` default to the real router/store
+ * and exist purely so this function stays unit-testable without booting the
+ * whole gateway (see tests/advertise-lifecycle.test.mjs).
+ *
+ * @param {object} cfg
+ * @param {Array<{id:string, provider?:string}>} catalog
+ * @param {{getBackend?: (name:string)=>object, getLifecycleFn?: (id:string)=>object}} [opts]
  */
-function registerDiscoveredRoutes(cfg, catalog) {
+export function registerDiscoveredRoutes(cfg, catalog, opts = {}) {
+  const getBackend = opts.getBackend || ((name) => router.getBackend(name));
+  const getLifecycleFn = opts.getLifecycleFn || getLifecycle;
   const byProvider = new Map();
   for (const m of catalog) {
     const be = providerBackend(m.provider);
@@ -125,11 +159,65 @@ function registerDiscoveredRoutes(cfg, catalog) {
     byProvider.get(be).add(m.id);
   }
   for (const [name, ids] of byProvider) {
-    const backend = router.getBackend(name);
+    const backend = getBackend(name);
     if (!backend) continue; // provider not configured as a router backend, nothing to route to
     const staticModels = (cfg.backends?.[name]?.models || []).filter((x) => typeof x === "string");
-    backend.models = [...new Set([...staticModels, ...ids])];
+    const merged = [...new Set([...staticModels, ...ids])];
+    backend.models = filterRoutableModelIds(merged, getLifecycleFn);
+    // Lifecycle pruning can legitimately empty this list (every known id for
+    // this provider is currently eol/dead). Backend#supportsModel() treats an
+    // EMPTY models array as "wildcard match everything" UNLESS the backend is
+    // flagged `discovery`-managed (router.mjs:398), and this function IS the
+    // discovery route registrar for nvidia/openrouter, whether or not the
+    // operator also set config.backends.<name>.discovery in YAML. Without
+    // this guard an all-eol provider would flip from "serves nothing"
+    // (correct) to "serves everything" (exactly what P1.4 exists to prevent).
+    if (backend.models.length === 0) backend.discovery = backend.discovery || name;
   }
+}
+
+/**
+ * Layer the lifecycle view on top of a merged /v1/models-shaped catalog
+ * (card P1.4): `eol`/`dead` ids are hidden entirely, `suspect` ids stay
+ * present but gain a `lifecycle: "suspect"` flag (mirrors the existing
+ * `status: "unavailable"` reconcile convention in src/proxy/advertise.mjs:
+ * annotate, don't silently disappear, for a state that can still recover).
+ * `active` ids (the overwhelming common case) pass through unchanged, so
+ * `/v1/models` stays an additive superset. Composes with (does not replace)
+ * the existing allowlist filter (apply after applyAllowlist()), same as the
+ * lifecycle filter composing with the reconcile-mode status field. Pure
+ * aside from the injected lookup, for the same testability reason as
+ * filterRoutableModelIds above.
+ *
+ * @param {Array<object>} data
+ * @param {(id: string) => object} [getLifecycleFn]
+ * @returns {Array<object>}
+ */
+export function applyLifecycleView(data, getLifecycleFn = getLifecycle) {
+  const out = [];
+  for (const m of data) {
+    const lc = getLifecycleFn(m.id);
+    if (!isRoutable(lc)) continue; // hide eol/dead
+    out.push(lc.state === LIFECYCLE_STATES.SUSPECT ? { ...m, lifecycle: "suspect" } : m);
+  }
+  return out;
+}
+
+/**
+ * Lifecycle state counts over a catalog (card P1.4, GET /admin/models/status).
+ * Pure aside from the injected lookup, same reason as above.
+ *
+ * @param {Array<{id:string}>} catalog
+ * @param {(id: string) => object} [getLifecycleFn]
+ * @returns {{active:number, suspect:number, eol:number, dead:number}}
+ */
+export function lifecycleCounts(catalog, getLifecycleFn = getLifecycle) {
+  const counts = { active: 0, suspect: 0, eol: 0, dead: 0 };
+  for (const m of catalog) {
+    const state = getLifecycleFn(m.id)?.state;
+    if (state && Object.prototype.hasOwnProperty.call(counts, state)) counts[state] += 1;
+  }
+  return counts;
 }
 
 async function refreshCatalog(cfg) {
@@ -165,7 +253,10 @@ export async function getDiscoveredStatus() {
   } catch {
     catalog = _catalog;
   }
-  return catalogStatus({ catalog, cache: _discoveryCache, refreshSeconds });
+  const status = catalogStatus({ catalog, cache: _discoveryCache, refreshSeconds });
+  // Lifecycle counts (card P1.4): additive field, does not change any
+  // existing key catalogStatus() already returns.
+  return { ...status, lifecycle: lifecycleCounts(catalog) };
 }
 
 /** Current merged discovery catalog, used by both /v1/models and /admin/models. */
@@ -317,7 +408,10 @@ async function enforceAuthz(req, res, identity) {
 }
 
 // Dashboard server
-let dashboard = null;
+// Exported (like `server` below) purely so tests can close it after a direct
+// import of this module (see tests/advertise-lifecycle.test.mjs's
+// registerDiscoveredRoutes group); no production code depends on the export.
+export let dashboard = null;
 try {
   const { createDashboardServer } = await import("./dashboard/server.mjs");
   const dashPort = config.dashboard?.port || config.server?.dashboard_port || 18781;
@@ -446,7 +540,9 @@ const proxyConfig = buildConfig({
 });
 
 // ─── Create HTTP server ───
-const server = http.createServer(async (req, res) => {
+// Exported purely so tests can close it after a direct import of this module
+// (see tests/advertise-lifecycle.test.mjs); no production code depends on it.
+export const server = http.createServer(async (req, res) => {
   const startTime = Date.now();
   if (process.env.SKGW_REQLOG) { console.log("[REQLOG]", req.method, req.url); }
 
@@ -592,14 +688,17 @@ const server = http.createServer(async (req, res) => {
       // carries a non-empty provider (see src/proxy/advertise.mjs). The
       // allowlist is applied last, exactly as on /admin/models.
       const merged = mergeDiscoveredCatalog(reconciled, discovered);
-      const data = applyAllowlist(merged, loadAllowlist());
+      const allowed = applyAllowlist(merged, loadAllowlist());
+      // Lifecycle view (card P1.4): hide eol/dead ids, flag suspect ones.
+      // Composes with (does not replace) the allowlist filter above.
+      const data = applyLifecycleView(allowed);
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ object: "list", data }));
     } catch (e) {
       console.warn("[skgateway] /v1/models discovery merge failed, falling back to static catalog:", e.message);
       let data = [];
       try {
-        data = buildModelCatalog(config.backends || {}, router, advertiseReconcileMode);
+        data = applyLifecycleView(buildModelCatalog(config.backends || {}, router, advertiseReconcileMode));
       } catch (e2) {
         console.warn("[skgateway] /v1/models static catalog fallback also failed, serving empty list:", e2.message);
       }
