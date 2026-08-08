@@ -1,0 +1,422 @@
+<title>SKWorld Model Dex</title>
+<style>
+  :root {
+    --ground: #f4f6f9;
+    --panel: #ffffff;
+    --card: #ffffff;
+    --line: #dbe1ea;
+    --line-soft: #e8edf3;
+    --ink: #1a2330;
+    --ink-dim: #56616f;
+    --ink-faint: #8b96a5;
+    --accent: #0d9488;
+    --accent-soft: #0d948814;
+    --local: #047857;
+    --local-soft: #04785715;
+    --free: #0369a1;
+    --free-soft: #0369a115;
+    --cloud: #7c3aed;
+    --cloud-soft: #7c3aed15;
+    --shadow: 0 1px 2px rgba(16,24,40,.06), 0 8px 24px rgba(16,24,40,.05);
+    --mono: ui-monospace, "SFMono-Regular", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground: #0b0e13;
+      --panel: #10151d;
+      --card: #151b25;
+      --line: #26303f;
+      --line-soft: #1d2531;
+      --ink: #e7eef6;
+      --ink-dim: #93a1b3;
+      --ink-faint: #5f6b7d;
+      --accent: #2dd4bf;
+      --accent-soft: #2dd4bf1a;
+      --local: #34d399;
+      --local-soft: #34d39916;
+      --free: #38bdf8;
+      --free-soft: #38bdf816;
+      --cloud: #c084fc;
+      --cloud-soft: #c084fc18;
+      --shadow: 0 1px 2px rgba(0,0,0,.3), 0 10px 30px rgba(0,0,0,.35);
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground: #0b0e13;
+    --panel: #10151d;
+    --card: #151b25;
+    --line: #26303f;
+    --line-soft: #1d2531;
+    --ink: #e7eef6;
+    --ink-dim: #93a1b3;
+    --ink-faint: #5f6b7d;
+    --accent: #2dd4bf;
+    --accent-soft: #2dd4bf1a;
+    --local: #34d399;
+    --local-soft: #34d39916;
+    --free: #38bdf8;
+    --free-soft: #38bdf816;
+    --cloud: #c084fc;
+    --cloud-soft: #c084fc18;
+    --shadow: 0 1px 2px rgba(0,0,0,.3), 0 10px 30px rgba(0,0,0,.35);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--sans);
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 0 20px 80px; }
+
+  /* Header */
+  header { padding: 44px 0 26px; border-bottom: 1px solid var(--line); margin-bottom: 26px; }
+  .eyebrow {
+    font-family: var(--mono); font-size: 12px; letter-spacing: .22em; text-transform: uppercase;
+    color: var(--accent); margin: 0 0 10px;
+  }
+  h1 {
+    font-family: var(--mono); font-weight: 700; font-size: clamp(28px, 5vw, 44px);
+    letter-spacing: -.01em; margin: 0; color: var(--ink); text-wrap: balance;
+  }
+  .lede { color: var(--ink-dim); max-width: 62ch; margin: 12px 0 0; font-size: 15.5px; }
+
+  /* Summary stat strip */
+  .stats { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 26px; }
+  .stat {
+    flex: 1 1 120px; background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 12px 14px;
+  }
+  .stat .n { font-family: var(--mono); font-size: 24px; font-weight: 700; color: var(--ink); font-variant-numeric: tabular-nums; }
+  .stat .l { font-size: 11.5px; letter-spacing: .08em; text-transform: uppercase; color: var(--ink-faint); margin-top: 2px; }
+  .stat.local .n { color: var(--local); }
+  .stat.free .n { color: var(--free); }
+  .stat.cloud .n { color: var(--cloud); }
+
+  /* Controls */
+  .controls {
+    position: sticky; top: 0; z-index: 5; background: var(--ground);
+    padding: 16px 0; margin: 26px 0 8px; border-bottom: 1px solid var(--line-soft);
+    display: flex; flex-wrap: wrap; gap: 12px; align-items: center;
+  }
+  .search {
+    flex: 1 1 260px; display: flex; align-items: center; gap: 8px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 9px; padding: 9px 12px;
+  }
+  .search input {
+    border: 0; background: transparent; color: var(--ink); font-family: var(--sans);
+    font-size: 14px; width: 100%; outline: none;
+  }
+  .search svg { flex: none; color: var(--ink-faint); }
+  .pills { display: flex; flex-wrap: wrap; gap: 6px; }
+  .pill {
+    font-family: var(--mono); font-size: 12px; letter-spacing: .04em;
+    padding: 8px 13px; border-radius: 8px; border: 1px solid var(--line);
+    background: var(--panel); color: var(--ink-dim); cursor: pointer; user-select: none;
+    transition: border-color .12s, color .12s, background .12s;
+  }
+  .pill:hover { color: var(--ink); border-color: var(--ink-faint); }
+  .pill[aria-pressed="true"] { color: var(--ink); border-color: var(--accent); background: var(--accent-soft); }
+  .pill.local[aria-pressed="true"] { border-color: var(--local); color: var(--local); background: var(--local-soft); }
+  .pill.free[aria-pressed="true"] { border-color: var(--free); color: var(--free); background: var(--free-soft); }
+  .pill.cloud[aria-pressed="true"] { border-color: var(--cloud); color: var(--cloud); background: var(--cloud-soft); }
+
+  .count { font-family: var(--mono); font-size: 12px; color: var(--ink-faint); margin: 4px 0 20px; }
+
+  /* Tier group */
+  .group-h {
+    display: flex; align-items: baseline; gap: 12px; margin: 30px 0 14px;
+    font-family: var(--mono);
+  }
+  .group-h .dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+  .group-h.local .dot { background: var(--local); }
+  .group-h.free .dot { background: var(--free); }
+  .group-h.cloud .dot { background: var(--cloud); }
+  .group-h .t { font-size: 14px; letter-spacing: .12em; text-transform: uppercase; color: var(--ink); }
+  .group-h .d { font-size: 12.5px; color: var(--ink-faint); font-family: var(--sans); }
+
+  /* Card grid */
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 14px; }
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 13px;
+    padding: 16px 16px 14px; box-shadow: var(--shadow); position: relative; overflow: hidden;
+    display: flex; flex-direction: column; gap: 12px;
+  }
+  .card::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--line); }
+  .card.local::before { background: var(--local); }
+  .card.free::before { background: var(--free); }
+  .card.cloud::before { background: var(--cloud); }
+
+  .card-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; }
+  .name { font-family: var(--mono); font-size: 16.5px; font-weight: 700; color: var(--ink); letter-spacing: -.01em; }
+  .org { font-size: 12.5px; color: var(--ink-faint); margin-top: 3px; }
+  .badge {
+    font-family: var(--mono); font-size: 10.5px; letter-spacing: .1em; text-transform: uppercase;
+    padding: 4px 8px; border-radius: 6px; white-space: nowrap; flex: none; font-weight: 600;
+  }
+  .badge.local { color: var(--local); background: var(--local-soft); border: 1px solid var(--local); }
+  .badge.free { color: var(--free); background: var(--free-soft); border: 1px solid var(--free); }
+  .badge.cloud { color: var(--cloud); background: var(--cloud-soft); border: 1px solid var(--cloud); }
+
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip {
+    font-family: var(--mono); font-size: 11px; padding: 3px 8px; border-radius: 6px;
+    border: 1px solid var(--line); color: var(--ink-dim); display: inline-flex; gap: 5px; align-items: center;
+  }
+  .chip.on { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+  .chip.off { opacity: .5; }
+
+  .summary { font-size: 13.5px; color: var(--ink-dim); margin: 0; }
+
+  .statgrid {
+    display: grid; grid-template-columns: repeat(2, 1fr); gap: 1px;
+    background: var(--line-soft); border: 1px solid var(--line-soft); border-radius: 9px; overflow: hidden;
+  }
+  .cell { background: var(--card); padding: 8px 11px; }
+  .cell .k { font-size: 10px; letter-spacing: .09em; text-transform: uppercase; color: var(--ink-faint); }
+  .cell .v { font-family: var(--mono); font-size: 13.5px; color: var(--ink); font-variant-numeric: tabular-nums; margin-top: 1px; }
+
+  .tags { display: flex; flex-wrap: wrap; gap: 5px; }
+  .tag { font-size: 11.5px; color: var(--ink-dim); background: var(--panel); border: 1px solid var(--line-soft); border-radius: 20px; padding: 2px 10px; }
+
+  .notes {
+    font-size: 12px; color: var(--ink-faint); border-top: 1px dashed var(--line);
+    padding-top: 10px; margin-top: 2px; line-height: 1.45;
+  }
+  .notes b { color: var(--ink-dim); font-weight: 600; }
+
+  .empty { text-align: center; color: var(--ink-faint); font-family: var(--mono); padding: 60px 0; }
+  footer { margin-top: 46px; padding-top: 18px; border-top: 1px solid var(--line); color: var(--ink-faint); font-size: 12.5px; font-family: var(--mono); }
+  footer a { color: var(--accent); text-decoration: none; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 6px; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<div class="wrap">
+  <header>
+    <p class="eyebrow">SKWorld &middot; skgateway fleet</p>
+    <h1>Model Dex</h1>
+    <p class="lede">Our own curated cards for every model the gateway routes to. Sovereign local brains, free remote workhorses, and the paid cloud heavy tier, with the stats that matter. This is the source that feeds the ranker and the reference you read to keep up with what each one is good at.</p>
+    <div class="stats" id="stats"></div>
+  </header>
+
+  <div class="controls">
+    <label class="search">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><circle cx="11" cy="11" r="7"></circle><path d="M21 21l-4.3-4.3"></path></svg>
+      <input id="q" type="search" placeholder="Search models, orgs, capabilities..." autocomplete="off" aria-label="Search models">
+    </label>
+    <div class="pills" id="tierPills">
+      <span class="pill" data-tier="all" aria-pressed="true" role="button" tabindex="0">All tiers</span>
+      <span class="pill local" data-tier="local" aria-pressed="false" role="button" tabindex="0">Sovereign</span>
+      <span class="pill free" data-tier="free-remote" aria-pressed="false" role="button" tabindex="0">Free remote</span>
+      <span class="pill cloud" data-tier="paid-cloud" aria-pressed="false" role="button" tabindex="0">Paid cloud</span>
+    </div>
+    <div class="pills" id="capPills">
+      <span class="pill" data-cap="tools" aria-pressed="false" role="button" tabindex="0">Tools</span>
+      <span class="pill" data-cap="vision" aria-pressed="false" role="button" tabindex="0">Vision</span>
+    </div>
+  </div>
+  <div class="count" id="count"></div>
+
+  <div id="dex"></div>
+
+  <footer>
+    Cards live in <a href="#">config/model-cards.overrides.yaml</a>. Honest values only: a blank field beats a wrong one. EOL is tracked separately by the lifecycle state machine, not here.
+  </footer>
+</div>
+
+<script>
+  var MODELS = [
+    { id: "ornith-1.0-35b", name: "Ornith 1.0 35B", org: "DeepReinforce (self-hosted)", tier: "local",
+      summary: "Our sovereign 35B reasoning model on chiap08. The cloud-free brain behind sk-default.",
+      good_at: ["reasoning","coding","tool use","sovereign/private work"],
+      ctx: 262144, out: 32768, params: "35B dense", quant: "Q4_K_M / NVFP4 (aeon)", speed: "medium, ~1-3s warm",
+      tools: true, vision: false, reasoning: true, license: "open-weights",
+      notes: "Role sk-default -> ornith-big -> ornith-1.0-35b-aeon-nvfp4 on chiap08 :11436. Reasoning model: needs max_tokens >= 2048 (8192 floor) or content starves under &lt;think&gt;." },
+    { id: "ornith-1.0-9b", name: "Ornith 1.0 9B", org: "DeepReinforce (self-hosted)", tier: "local",
+      summary: "The small, fast sovereign reasoner on the .100 5060 Ti. NVFP4 + MTP. Pairs with the 35B.",
+      good_at: ["fast reasoning","cheap sovereign inference","drafts"],
+      ctx: 131072, out: 16384, params: "9B", quant: "NVFP4 + MTP", speed: "fast",
+      tools: true, vision: false, reasoning: true,
+      notes: "Role ornith-tiny. Default reply model for lumina/opus agent contexts." },
+    { id: "ornith-big", name: "Ornith 1.0 35B (alias)", org: "DeepReinforce (self-hosted)", tier: "local",
+      summary: "Registry alias for the 35B, routed across chiap08 (primary) + standby with 5xx failover.",
+      good_at: ["reasoning","coding","tool use","sovereign/private work"],
+      ctx: 262144, out: 32768, tools: true, vision: false, reasoning: true },
+    { id: "qwen3.6-27b-abliterated", name: "Qwen3.6 27B abliterated", org: "Qwen (abliterated, self-hosted)", tier: "local",
+      summary: "Sovereign vision + uncensored-text brain on chiap08 (mmproj loaded, OCR-verified).",
+      good_at: ["vision","OCR","uncensored/creative text","image understanding"],
+      ctx: 32768, out: 8192, params: "27B", quant: "Q4_K_M",
+      tools: false, vision: true,
+      notes: "Roles sk-vision + sk-creative. Abliterated: minimal refusals, used as a text personality brain too." },
+
+    { id: "openai/gpt-oss-20b", name: "GPT-OSS 20B", org: "OpenAI (open weights, NVIDIA NIM)", tier: "free-remote",
+      summary: "OpenAI's open 20B. Reliable free general model; our live local-failover cloud fallback.",
+      good_at: ["general chat","drafting","cheap tool use"],
+      ctx: 131072, tools: true, vision: false,
+      notes: "First in registry failover.local_fallback (verified live). Free via NIM." },
+    { id: "meta/llama-3.3-70b-instruct", name: "Llama 3.3 70B Instruct", org: "Meta (NVIDIA NIM)", tier: "free-remote",
+      summary: "Solid free 70B instruct. Second in our local-failover chain.",
+      good_at: ["general chat","instruction following","tool use"],
+      ctx: 131072, tools: true, vision: false },
+    { id: "nvidia/llama-3.3-nemotron-super-49b-v1.5", name: "Llama 3.3 Nemotron Super 49B", org: "NVIDIA", tier: "free-remote",
+      summary: "NVIDIA's tuned 49B. Good free reasoning option.",
+      good_at: ["reasoning","general chat"], ctx: 131072 },
+    { id: "qwen/qwen3.5-397b-a17b", name: "Qwen3.5 397B A17B", org: "Qwen (NVIDIA NIM)", tier: "free-remote",
+      summary: "Large MoE (397B total, 17B active). Big context.", ctx: 262144, params: "397B MoE / 17B active" },
+    { id: "mistralai/mistral-medium-3.5-128b", name: "Mistral Medium 3.5 128B", org: "Mistral (NVIDIA NIM)", tier: "free-remote",
+      summary: "Mistral medium tier, 262K context.", ctx: 262144, params: "128B" },
+    { id: "mistralai/mistral-large-3-675b-instruct-2512", name: "Mistral Large 3 675B", org: "Mistral (NVIDIA NIM)", tier: "free-remote",
+      summary: "Mistral's large instruct, 262K context.", ctx: 262144, params: "675B" },
+    { id: "deepseek-ai/deepseek-v4-pro", name: "DeepSeek V4 Pro", org: "DeepSeek (NVIDIA NIM)", tier: "free-remote",
+      summary: "Huge 1M context. Slow, so batch/cron use.", ctx: 1048576, speed: "slow, ~46s",
+      notes: "Batch/cron use only." },
+    { id: "minimaxai/minimax-m2.7", name: "MiniMax M2.7", org: "MiniMax (NVIDIA NIM)", tier: "free-remote",
+      summary: "204K context. Slow, batch/cron use.", ctx: 204800, speed: "slow, ~40s",
+      notes: "Batch/cron use only." },
+
+    { id: "claude-opus-4-8", name: "Claude Opus 4.8", org: "Anthropic", tier: "paid-cloud",
+      summary: "Flagship reasoning + agentic-coding model. The heavy-tier brain behind sk-heavy.",
+      good_at: ["deep reasoning","agentic coding","long-context synthesis","tool use","vision"],
+      ctx: 500000, out: 64000, speed: "medium, premium", license: "proprietary",
+      tools: true, vision: true, reasoning: true,
+      notes: "Pinned to sk-heavy + the sk-auto hard tier. Costs real money, keep the tier ladder tight." },
+    { id: "claude-opus-4-7", name: "Claude Opus 4.7", org: "Anthropic", tier: "paid-cloud",
+      summary: "Previous Opus generation. Strong reasoning; kept as a fallback / comparison point.",
+      good_at: ["deep reasoning","coding","tool use","vision"],
+      ctx: 500000, out: 64000, tools: true, vision: true, reasoning: true },
+    { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", org: "Anthropic", tier: "paid-cloud",
+      summary: "Balanced speed/quality workhorse. Great default for agentic coding when Opus is overkill.",
+      good_at: ["coding","tool use","everyday reasoning","vision"],
+      ctx: 500000, out: 64000, speed: "fast", tools: true, vision: true, reasoning: true },
+    { id: "claude-haiku-4-5", name: "Claude Haiku 4.5", org: "Anthropic", tier: "paid-cloud",
+      summary: "Fastest, cheapest Claude. Good for high-volume, latency-sensitive tool use.",
+      good_at: ["fast tool use","classification","short tasks","vision"],
+      ctx: 200000, out: 32000, speed: "very fast", tools: true, vision: true }
+  ];
+
+  var TIERS = [
+    { key: "local", label: "Sovereign", desc: "Self-hosted on our own GPUs. Cloud-free, private." },
+    { key: "free-remote", label: "Free remote", desc: "Free-tier hosted models (NVIDIA NIM, OpenRouter)." },
+    { key: "paid-cloud", label: "Paid cloud", desc: "Metered API. The heavy tier, used deliberately." }
+  ];
+
+  var dex = document.getElementById("dex");
+  var state = { q: "", tier: "all", caps: {} };
+
+  function fmtTokens(n) {
+    if (!n && n !== 0) return "n/a";
+    if (n >= 1e6) return (n / 1e6).toFixed(n % 1e6 ? 1 : 0) + "M";
+    if (n >= 1e3) return Math.round(n / 1e3) + "K";
+    return String(n);
+  }
+  function esc(s) { var d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
+  function tierLabel(k) { var t = TIERS.find(function (x) { return x.key === k; }); return t ? t.label : k; }
+
+  function chip(label, on) {
+    return '<span class="chip ' + (on ? "on" : "off") + '">' + (on ? "✓ " : "✕ ") + label + "</span>";
+  }
+
+  function statCell(k, v) {
+    return '<div class="cell"><div class="k">' + k + '</div><div class="v">' + v + "</div></div>";
+  }
+
+  function cardHTML(m) {
+    var chips =
+      chip("tools", !!m.tools) +
+      chip("vision", !!m.vision) +
+      chip("reasoning", !!m.reasoning);
+
+    var cells =
+      statCell("context", fmtTokens(m.ctx)) +
+      statCell("max output", fmtTokens(m.out)) +
+      statCell("params", m.params ? esc(m.params) : "n/a") +
+      statCell("quant", m.quant ? esc(m.quant) : "n/a");
+    if (m.speed) cells += statCell("speed", esc(m.speed)) + statCell("license", m.license ? esc(m.license) : "n/a");
+
+    var tags = (m.good_at || []).map(function (g) { return '<span class="tag">' + esc(g) + "</span>"; }).join("");
+
+    return '<article class="card ' + m.tier + '">' +
+      '<div class="card-top"><div><div class="name">' + esc(m.name) + '</div><div class="org">' + esc(m.org) + " &middot; <span style=\"font-family:var(--mono)\">" + esc(m.id) + '</span></div></div>' +
+      '<span class="badge ' + m.tier + '">' + tierLabel(m.tier) + "</span></div>" +
+      '<div class="chips">' + chips + "</div>" +
+      (m.summary ? '<p class="summary">' + m.summary + "</p>" : "") +
+      '<div class="statgrid">' + cells + "</div>" +
+      (tags ? '<div class="tags">' + tags + "</div>" : "") +
+      (m.notes ? '<div class="notes"><b>Notes.</b> ' + m.notes + "</div>" : "") +
+      "</article>";
+  }
+
+  function matches(m) {
+    if (state.tier !== "all" && m.tier !== state.tier) return false;
+    if (state.caps.tools && !m.tools) return false;
+    if (state.caps.vision && !m.vision) return false;
+    if (state.q) {
+      var hay = (m.name + " " + m.org + " " + m.id + " " + (m.summary || "") + " " + (m.good_at || []).join(" ")).toLowerCase();
+      if (hay.indexOf(state.q) === -1) return false;
+    }
+    return true;
+  }
+
+  function render() {
+    var visible = MODELS.filter(matches);
+    var html = "";
+    TIERS.forEach(function (t) {
+      var group = visible.filter(function (m) { return m.tier === t.key; });
+      if (!group.length) return;
+      html += '<div class="group-h ' + t.key + '"><span class="dot"></span><span class="t">' + t.label +
+        ' &middot; ' + group.length + '</span><span class="d">' + t.desc + "</span></div>";
+      html += '<div class="grid">' + group.map(cardHTML).join("") + "</div>";
+    });
+    dex.innerHTML = html || '<div class="empty">No models match. Loosen the filters.</div>';
+    document.getElementById("count").textContent =
+      visible.length + " of " + MODELS.length + " models shown";
+  }
+
+  function renderStats() {
+    var n = MODELS.length;
+    var loc = MODELS.filter(function (m) { return m.tier === "local"; }).length;
+    var free = MODELS.filter(function (m) { return m.tier === "free-remote"; }).length;
+    var cloud = MODELS.filter(function (m) { return m.tier === "paid-cloud"; }).length;
+    var tools = MODELS.filter(function (m) { return m.tools; }).length;
+    document.getElementById("stats").innerHTML =
+      '<div class="stat"><div class="n">' + n + '</div><div class="l">models carded</div></div>' +
+      '<div class="stat local"><div class="n">' + loc + '</div><div class="l">sovereign / local</div></div>' +
+      '<div class="stat free"><div class="n">' + free + '</div><div class="l">free remote</div></div>' +
+      '<div class="stat cloud"><div class="n">' + cloud + '</div><div class="l">paid cloud</div></div>' +
+      '<div class="stat"><div class="n">' + tools + '</div><div class="l">tool-capable</div></div>';
+  }
+
+  function bindPills(containerId, onPick) {
+    var c = document.getElementById(containerId);
+    function act(el) { onPick(el); }
+    c.addEventListener("click", function (e) { var p = e.target.closest(".pill"); if (p) act(p); });
+    c.addEventListener("keydown", function (e) {
+      if (e.key === "Enter" || e.key === " ") { var p = e.target.closest(".pill"); if (p) { e.preventDefault(); act(p); } }
+    });
+  }
+
+  bindPills("tierPills", function (el) {
+    state.tier = el.dataset.tier;
+    document.querySelectorAll("#tierPills .pill").forEach(function (p) {
+      p.setAttribute("aria-pressed", p === el ? "true" : "false");
+    });
+    render();
+  });
+  bindPills("capPills", function (el) {
+    var cap = el.dataset.cap;
+    state.caps[cap] = !state.caps[cap];
+    el.setAttribute("aria-pressed", state.caps[cap] ? "true" : "false");
+    render();
+  });
+  document.getElementById("q").addEventListener("input", function (e) {
+    state.q = e.target.value.trim().toLowerCase(); render();
+  });
+
+  renderStats();
+  render();
+</script>

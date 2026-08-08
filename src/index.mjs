@@ -15,7 +15,7 @@ import { createProxyServer, handleRequest, buildConfig } from "./proxy/core.mjs"
 import { createRouter, routeAndSend } from "./proxy/router.mjs";
 import { buildModelCatalog, reconcileModeFromConfig, tagLocalModels, mergeDiscoveredCatalog, isModelAvailable } from "./proxy/advertise.mjs";
 import { loadAllowlist, saveAllowlist, applyAllowlist } from "./advertise.mjs";
-import { discoverCatalog, loadCache, saveCache, fetchNvidia, fetchOpenRouter, catalogStatus } from "./discovery.mjs";
+import { discoverCatalog, loadCache, saveCache, fetchNvidia, fetchOpenRouter, catalogStatus, loadCardOverrides, applyCardOverlays } from "./discovery.mjs";
 import { getPool, resetPool } from "./proxy/connection-pool.mjs";
 import { loadAgentRegistry, extractIdentity, ANONYMOUS_AGENT_ID } from "./identity/capauth.mjs";
 import { createAuthzClient } from "./policy/authz_decide.mjs";
@@ -969,11 +969,14 @@ export const server = http.createServer(async (req, res) => {
       return;
     }
     try {
-      const full = await getDiscoveredCatalog();          // Task 5 provides this
+      // Overlay our curated cards so static models (claude/ornith, which
+      // discovery never gives a card) show their real capabilities + dex
+      // fields here, not just the discovered ones (model-dex work).
+      const full = applyCardOverlays(await getDiscoveredCatalog(), loadCardOverrides());
       const allow = loadAllowlist();
-      // Card P2.4: each entry keeps its `card` (already carried through by
-      // getDiscoveredCatalog since card P2.1) and gains a `lifecycle`
-      // record alongside the existing `advertised` allowlist flag.
+      // Card P2.4: each entry keeps its `card` (from P2.1 + the overlay above)
+      // and gains a `lifecycle` record alongside the existing `advertised`
+      // allowlist flag.
       const data = buildAdminModelsView(full, allow);
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ object: "list", data }));
@@ -1121,7 +1124,9 @@ export const server = http.createServer(async (req, res) => {
       return;
     }
     try {
-      const full = await getDiscoveredCatalog();
+      // Overlay curated cards first so static models (claude/ornith) carry the
+      // capabilities the ranker needs (tools/ctx), not just discovered models.
+      const full = applyCardOverlays(await getDiscoveredCatalog(), loadCardOverrides());
       const catalog = buildRankCatalog(full);
       const allow = loadAllowlist();
       const chain = rankModels(catalog, requirements, {

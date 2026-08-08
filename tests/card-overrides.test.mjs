@@ -93,9 +93,22 @@ test('applyCardOverlay: no matching override entry leaves a heuristic card untou
   assert.equal(out.card.source, 'heuristic');
 });
 
-test('applyCardOverlay: no card at all is a no-op (never throws)', () => {
+test('applyCardOverlay: a card-LESS static model gets a card CREATED from the overlay', () => {
+  // claude/ornith are static config models discovery never gives a card, so the
+  // curated overlay is their only card. A matching override CREATES one (source
+  // 'manual') so they become rankable + show in the model dex.
   const model = { id: 'local-model', provider: 'local', free: true };
-  const out = applyCardOverlay(model, { 'local-model': { context_length: 1 } });
+  const out = applyCardOverlay(model, {
+    'local-model': { context_length: 262144, supported_parameters: ['tools'] },
+  });
+  assert.equal(out.card.context_length, 262144);
+  assert.deepEqual(out.card.supported_parameters, ['tools']);
+  assert.equal(out.card.source, 'manual');
+});
+
+test('applyCardOverlay: a card-less model with NO matching override stays card-less', () => {
+  const model = { id: 'unlisted-local', provider: 'local', free: true };
+  const out = applyCardOverlay(model, { 'other-model': { context_length: 1 } });
   assert.equal(out.card, undefined);
 });
 
