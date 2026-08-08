@@ -289,9 +289,16 @@ function _anthropicJsonToSSE(writer, resBody, chunkSize) {
   for (let blockIdx = 0; blockIdx < blocks.length; blockIdx++) {
     const block = blocks[blockIdx];
 
-    // content_block_start
+    // content_block_start — the shape depends on the block type. A text block
+    // opens empty ({type,text:""}) and fills via text_delta; a tool_use block
+    // MUST carry its id + name here (input opens empty, filled by
+    // input_json_delta). Emitting the text shape for a tool_use dropped the name,
+    // so Claude Code saw a nameless tool -> "No such tool available: undefined".
+    const startBlock = block.type === "tool_use"
+      ? { type: "tool_use", id: block.id, name: block.name, input: {} }
+      : { type: block.type, text: "" };
     writer.write(
-      JSON.stringify({ type: "content_block_start", index: blockIdx, content_block: { type: block.type, text: "" } }),
+      JSON.stringify({ type: "content_block_start", index: blockIdx, content_block: startBlock }),
       "content_block_start",
     );
 
