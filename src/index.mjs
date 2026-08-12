@@ -276,6 +276,28 @@ export function applyPickerBadges(data) {
 }
 
 /**
+ * Public-safe card projection for `/v1/models` (the funnel-exposed catalog +
+ * the model dex). Strips operator-internal card fields (currently `notes`,
+ * which carries ops commentary like "costs real money, keep the tier ladder
+ * tight") so they stay on the loopback `/admin/models` only. Everything a
+ * reader / picker / dex needs (display_name, summary, good_at, tier, ctx,
+ * tools, params, quant, speed, ...) is public-safe and kept. Pure; a card-less
+ * entry passes through untouched.
+ *
+ * @param {Array<object>} data
+ * @returns {Array<object>}
+ */
+const _INTERNAL_CARD_FIELDS = ["notes"];
+export function stripInternalCardFields(data) {
+  return data.map((m) => {
+    if (!m.card || typeof m.card !== "object") return m;
+    const card = { ...m.card };
+    for (const f of _INTERNAL_CARD_FIELDS) delete card[f];
+    return { ...m, card };
+  });
+}
+
+/**
  * Build the `/admin/models` payload (card P2.4): every discovered catalog
  * entry (carrying `card` already, when the provider adapter attached one -
  * card P2.1) plus the existing `advertised` allowlist flag and a NEW
@@ -967,14 +989,15 @@ export const server = http.createServer(async (req, res) => {
       // Composes with (does not replace) the allowlist filter above.
       // Picker badges (card P2.4): additive ctx_tokens/tools/vision derived
       // from each surviving entry's card, if it has one. Superset-only.
-      const data = applyPickerBadges(applyLifecycleView(allowed));
+      // Public-safe: strip internal card fields (notes) before the funnel.
+      const data = stripInternalCardFields(applyPickerBadges(applyLifecycleView(allowed)));
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ object: "list", data }));
     } catch (e) {
       console.warn("[skgateway] /v1/models discovery merge failed, falling back to static catalog:", e.message);
       let data = [];
       try {
-        data = applyPickerBadges(applyLifecycleView(buildModelCatalog(config.backends || {}, router, advertiseReconcileMode)));
+        data = stripInternalCardFields(applyPickerBadges(applyLifecycleView(buildModelCatalog(config.backends || {}, router, advertiseReconcileMode))));
       } catch (e2) {
         console.warn("[skgateway] /v1/models static catalog fallback also failed, serving empty list:", e2.message);
       }

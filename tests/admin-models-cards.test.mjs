@@ -191,6 +191,32 @@ describe("card P2.4: /admin/models cards+lifecycle, /v1/models picker badges", (
     assert.equal("vision" in out, false);
   });
 
+  // ── Pure helper: stripInternalCardFields (public-safe /v1/models) ──
+
+  test("stripInternalCardFields: drops internal card notes, keeps the public-safe fields", () => {
+    const entry = {
+      id: "claude-opus-4-8", object: "model", provider: "anthropic",
+      card: {
+        display_name: "Claude Opus 4.8", summary: "flagship", good_at: ["reasoning"],
+        tier: "paid-cloud", context_length: 500000, supported_parameters: ["tools"],
+        notes: "costs real money, keep the tier ladder tight",
+      },
+    };
+    const [out] = mod.stripInternalCardFields([entry]);
+    assert.equal("notes" in out.card, false, "notes is internal, must not reach /v1/models");
+    assert.equal(out.card.display_name, "Claude Opus 4.8");
+    assert.equal(out.card.summary, "flagship");
+    assert.deepEqual(out.card.good_at, ["reasoning"]);
+    assert.equal(out.card.tier, "paid-cloud");
+    assert.equal(out.id, "claude-opus-4-8");        // non-card fields untouched
+    assert.equal(entry.card.notes !== undefined, true, "does not mutate the input");
+  });
+
+  test("stripInternalCardFields: a card-less entry passes through untouched", () => {
+    const e = { id: "x", object: "model", owned_by: "local" };
+    assert.deepEqual(mod.stripInternalCardFields([e])[0], e);
+  });
+
   // ── Pure helper: buildAdminModelsView ──
 
   test("buildAdminModelsView: each entry gains a full lifecycle record, keeps card+advertised", () => {
