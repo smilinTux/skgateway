@@ -15,8 +15,21 @@ server:
 ##   reconcile: flag  (default) advertise all, annotate status available/unavailable
 ##              hide           omit models with no available serving backend
 ##              off            legacy behavior, advertise everything, no status
-# advertise:
-#   reconcile: flag
+## 2026-08-14: ENABLED as `hide`. It shipped commented out, so the effective
+## default was `flag` and the catalog advertised models whose only backend was
+## down. Live example: `ornith-1.0-35b` was still offered while chiap08:11436 is
+## connection-refused (ornith-aeon.service inactive).
+##
+## Measured after the flip: a freshly restarted gateway serves 26 models, and
+## the same gateway serves 16 once three real requests have failed. The signal
+## is REACTIVE (Backend.isAvailable() starts optimistic), so the catalog is at
+## its least accurate right after a restart. Card 767adc4e.
+##
+## SCOPE: this reconciles BACKEND health/quarantine only. A retired model on a
+## HEALTHY backend is still advertised, which is most of the current rot (11 of
+## 12 NVIDIA ids answer 410 Gone or 404 while the nvidia backend is fine).
+advertise:
+  reconcile: hide
 
 ## Connection Pooling — enforces per-backend concurrency limits
 ## NVIDIA NIM allows 20 concurrent requests max. We enforce this here
