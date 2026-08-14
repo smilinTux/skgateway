@@ -247,11 +247,29 @@ CREATE TABLE IF NOT EXISTS latency_log (
   total_ms      INTEGER
 );
 
+CREATE TABLE IF NOT EXISTS energy_log (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  req_id        TEXT NOT NULL,
+  agent_id      TEXT,
+  model         TEXT,
+  backend       TEXT,
+  card_id       TEXT,
+  ts            INTEGER NOT NULL,
+  day_bucket    TEXT NOT NULL,
+  joules        REAL,              -- NULL means "unknown", which is a real answer
+  basis         TEXT NOT NULL,     -- measured_gpu | imputed_local | imputed_cloud
+  node          TEXT,
+  concurrency_n INTEGER DEFAULT 1
+);
+
 CREATE INDEX IF NOT EXISTS idx_token_agent_day   ON token_usage (agent_id, day_bucket);
 CREATE INDEX IF NOT EXISTS idx_token_model_hour  ON token_usage (model, hour_bucket);
 CREATE INDEX IF NOT EXISTS idx_cost_day          ON cost_log (day_bucket);
 CREATE INDEX IF NOT EXISTS idx_latency_backend   ON latency_log (backend, ts);
 CREATE INDEX IF NOT EXISTS idx_request_agent     ON request_log (agent_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_energy_day        ON energy_log (day_bucket);
+CREATE INDEX IF NOT EXISTS idx_energy_card       ON energy_log (card_id);
+CREATE INDEX IF NOT EXISTS idx_energy_backend    ON energy_log (backend, ts);
 `;
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -420,6 +438,12 @@ export function createMetricsCollector(config) {
         INSERT INTO latency_log (req_id, model, backend, ts, first_byte_ms, total_ms)
         VALUES (@req_id, @model, @backend, @ts, @first_byte_ms, @total_ms)
       `),
+      insertEnergy: db.prepare(`
+        INSERT INTO energy_log
+          (req_id, agent_id, model, backend, card_id, ts, day_bucket, joules, basis, node, concurrency_n)
+        VALUES
+          (@req_id, @agent_id, @model, @backend, @card_id, @ts, @day_bucket, @joules, @basis, @node, @concurrency_n)
+      `),
     };
 
     // Wrap all inserts in a single transaction for performance
@@ -432,6 +456,8 @@ export function createMetricsCollector(config) {
           if (row._tokens) stmts.insertTokenUsage.run(row._tokens);
           if (row._cost)   stmts.insertCost.run(row._cost);
           stmts.insertLatency.run(row._latency);
+        } else if (row._type === 'energy') {
+          stmts.insertEnergy.run(row);
         }
       }
     });
@@ -772,8 +798,51 @@ export function createMetricsCollector(config) {
     }
 
     // Return the anomaly record (or null) so callers (e.g. the router) can emit
-    // a SIEM anomaly event. Purely additive — legacy callers ignore it.
+    // a SIEM anomaly event. Purely additive - legacy callers ignore it.
     return anomaly;
+  }
+
+  /**
+   * Record the energy cost of one upstream attempt.
+   *
+   * `joules: null` is a legitimate value meaning "we could not know", and the
+   * row is still written: a missing row is indistinguishable from a request
+   * that never happened.
+   *
+   * @param {object} meta
+   * @param {string} [meta.reqId]
+   * @param {string} [meta.agentId]
+   * @param {string} [meta.model]
+   * @param {string} [meta.backend]
+   * @param {string} [meta.cardId]
+   * @param {number|null} [meta.joules]
+   * @param {string} [meta.basis]        measured_gpu | imputed_local | imputed_cloud
+   * @param {string} [meta.node]
+   * @param {number} [meta.concurrencyN]
+   * @param {number} [meta.ts]           Unix ms, defaults to now
+   * @returns {void}
+   */
+  function recordEnergy({
+    reqId, agentId, model, backend, cardId,
+    joules, basis, node, concurrencyN, ts,
+  } = {}) {
+    if (!db) return;
+    const when = ts ?? Date.now();
+    writeBuffer.push({
+      _type: 'energy',
+      req_id: reqId ?? null,
+      agent_id: agentId ?? null,
+      model: model ?? null,
+      backend: backend ?? null,
+      card_id: cardId ?? null,
+      ts: when,
+      day_bucket: dayBucket(when),
+      joules: (joules === null || joules === undefined) ? null : Number(joules),
+      basis: basis ?? 'imputed_cloud',
+      node: node ?? null,
+      concurrency_n: concurrencyN ?? 1,
+    });
+    maybeFlush();
   }
 
   // ── query helpers ─────────────────────────────────────────────────────────
@@ -982,11 +1051,14 @@ export function createMetricsCollector(config) {
   return {
     recordRequest,
     recordResponse,
+    recordEnergy,
     getStats,
     getAnomalies,
     getTokenUsage,
     getCosts,
     close,
+    /** Force a synchronous flush of the write buffer. Mainly for tests. */
+    flush: () => maybeFlush(true),
     /** Direct db access for advanced queries (may be null if metrics disabled). */
     get db() { return db; },
   };
