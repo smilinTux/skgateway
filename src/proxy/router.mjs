@@ -1814,9 +1814,21 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // metering is disabled (default) meterUrl stays null and readMeter is
     // never called: no network call, no extra latency on the disabled path.
     const meterUrl = energyCfg?.enabled ? (energyCfg.meters?.[backendId] ?? null) : null;
+    const meterBeforeStart = meterUrl ? Date.now() : 0;
     const meterBefore = meterUrl
       ? await readMeter(meterUrl, energyCfg.read_timeout_ms ?? 250)
       : null;
+    // Wall-clock time this attempt's pre-read consumed. Subtracted out of
+    // latencyMs below so up to read_timeout_ms of meter round-trip never
+    // bleeds into backend.recordOutcome()/the dashboard's latencyP50: the
+    // instrument added to make energy telemetry trustworthy must not corrupt
+    // the latency telemetry sitting right next to it. Zero (no-op) whenever
+    // metering is disabled or this backend has no configured meter, so
+    // latencyMs stays exactly Date.now() - queueStart as before, byte for
+    // byte, on the disabled path. queueWaitMs (pool wait) is untouched, it
+    // was already snapshotted above before this read ran, and stays folded
+    // into latencyMs exactly as it always was.
+    const meterBeforeMs = meterUrl ? (Date.now() - meterBeforeStart) : 0;
 
     let res;
     try {
@@ -1856,7 +1868,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       }
     }
 
-    const latencyMs = Date.now() - queueStart;
+    const latencyMs = (Date.now() - queueStart) - meterBeforeMs;
 
     // Second meter read + energy accounting for this attempt, gated the same
     // way as the pre-read above: when energy metering is disabled the whole
