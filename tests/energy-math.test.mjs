@@ -1,0 +1,70 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import {
+  marginalJoules, imputeJoules, resolveBasis, coeffsForModel,
+} from '../src/metrics/energy.mjs';
+
+test('marginalJoules: delta of two counter reads', () => {
+  assert.equal(marginalJoules({ counter_j: 1000 }, { counter_j: 2713 }), 1713);
+});
+
+test('marginalJoules: null when either read is missing', () => {
+  assert.equal(marginalJoules(null, { counter_j: 100 }), null);
+  assert.equal(marginalJoules({ counter_j: 100 }, null), null);
+  assert.equal(marginalJoules(null, null), null);
+});
+
+test('marginalJoules: a counter that went backwards means a restart, not negative energy', () => {
+  // The meter restarted mid-request. We cannot know the energy, so say so
+  // rather than reporting a negative or a bogus huge number.
+  assert.equal(marginalJoules({ counter_j: 5000 }, { counter_j: 12 }), null);
+});
+
+test('marginalJoules: zero is a real answer, not a missing one', () => {
+  // The GPU genuinely did nothing, because a cloud backend served the request.
+  assert.equal(marginalJoules({ counter_j: 700 }, { counter_j: 700 }), 0);
+});
+
+test('imputeJoules: linear in tokens', () => {
+  const c = { j_per_input_token: 0.5, j_per_output_token: 2.85 };
+  assert.equal(imputeJoules({ input_tokens: 100, output_tokens: 600 }, c), 50 + 1710);
+});
+
+test('imputeJoules: null when no coefficients are known', () => {
+  // Better to record "unknown" than to invent a number and call it data.
+  assert.equal(imputeJoules({ input_tokens: 100, output_tokens: 600 }, null), null);
+});
+
+test('imputeJoules: missing token counts count as zero', () => {
+  const c = { j_per_input_token: 0.5, j_per_output_token: 2.85 };
+  assert.equal(imputeJoules({ output_tokens: 600 }, c), 1710);
+});
+
+test('resolveBasis: measured wins when the meter answered', () => {
+  assert.equal(resolveBasis({ metered: true, backendIsLocal: true }), 'measured_gpu');
+});
+
+test('resolveBasis: local without a meter is imputed_local', () => {
+  assert.equal(resolveBasis({ metered: false, backendIsLocal: true }), 'imputed_local');
+});
+
+test('resolveBasis: remote is always imputed_cloud', () => {
+  assert.equal(resolveBasis({ metered: false, backendIsLocal: false }), 'imputed_cloud');
+});
+
+test('coeffsForModel: exact match beats prefix', () => {
+  const table = {
+    'ornith-1.0-9b': { j_per_output_token: 2.85 },
+    'ornith': { j_per_output_token: 9.99 },
+  };
+  assert.equal(coeffsForModel('ornith-1.0-9b', table).j_per_output_token, 2.85);
+});
+
+test('coeffsForModel: prefix match when no exact entry', () => {
+  const table = { 'claude-': { j_per_output_token: 120 } };
+  assert.equal(coeffsForModel('claude-opus-4-8', table).j_per_output_token, 120);
+});
+
+test('coeffsForModel: null for an unknown model', () => {
+  assert.equal(coeffsForModel('some-new-model', { 'claude-': {} }), null);
+});
