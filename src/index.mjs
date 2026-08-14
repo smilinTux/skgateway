@@ -1341,6 +1341,23 @@ export const server = http.createServer(async (req, res) => {
       } catch { /* never let classification break a request */ }
     }
 
+    // Open the metrics record before dispatch so the collector can pair it with
+    // the response. The previous code called recordRequest once AFTER the
+    // response with snake_case keys the collector does not read, and never
+    // called recordResponse, so token_usage and cost_log stayed empty.
+    // agentId uses the same verified-identity expression as routeRequest below
+    // (falls back to X-Agent-Id / anonymous) rather than the raw header alone,
+    // so spend cannot be attributed to a spoofable header.
+    let metricsReqId = null;
+    if (metrics) {
+      metricsReqId = metrics.recordRequest({
+        agentId: identity.agent_id !== ANONYMOUS_AGENT_ID ? identity.agent_id : (req.headers["x-agent-id"] || undefined),
+        model: parsedModel || "unknown",
+        backend: undefined,           // not chosen yet; overridden on response
+        sessionId: req.headers["x-session-id"] || undefined,
+      });
+    }
+
     const routeRequest = {
       model:   parsedModel,
       messages: parsedMessages,
@@ -1408,14 +1425,24 @@ export const server = http.createServer(async (req, res) => {
     }
 
     // Record metrics
-    if (metrics) {
-      const duration = Date.now() - startTime;
-      metrics.recordRequest({
-        path: req.url,
-        method: req.method,
-        duration,
-        status: result?.status ?? res.statusCode,
-        agent_id: req.agent_id || req.headers["x-agent-id"] || "unknown",
+    if (metrics && metricsReqId) {
+      let parsedBody = null;
+      try {
+        parsedBody = result?.body ? JSON.parse(result.body.toString("utf8")) : null;
+      } catch {
+        parsedBody = null;           // SSE or non-JSON; usage extraction skipped
+      }
+      metrics.recordResponse({
+        reqId: metricsReqId,
+        statusCode: result?.status ?? res.statusCode,
+        totalMs: Date.now() - startTime,
+        responseHeaders: result?.headers ?? {},
+        responseBody: parsedBody,
+        // Same verified-identity expression as recordRequest above, restated
+        // here so a future refactor that reorders these two calls (or stops
+        // relying on the collector's pending-map carryover) cannot silently
+        // fall back to an unverified header.
+        agentId: identity.agent_id !== ANONYMOUS_AGENT_ID ? identity.agent_id : (req.headers["x-agent-id"] || undefined),
         model: parsedModel || "unknown",
         backend: result?.backendId,
       });
