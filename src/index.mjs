@@ -1384,7 +1384,7 @@ export const server = http.createServer(async (req, res) => {
     // failure here must not become a second, fabricated error stacked on top
     // of whatever the request path already did.
     let metricsClosed = false;
-    function closeMetrics({ statusCode, responseHeaders, responseBody, backend, errorMsg } = {}) {
+    function closeMetrics({ statusCode, responseHeaders, responseBody, backend, errorMsg, energy } = {}) {
       if (!metrics || !metricsReqId || metricsClosed) return;
       metricsClosed = true;
       try {
@@ -1402,6 +1402,27 @@ export const server = http.createServer(async (req, res) => {
       } catch (err) {
         console.error("[skgateway] metrics recordResponse failed:", err.message);
       }
+
+      // Energy row for this request's serving attempt (joule-economy P0).
+      // `energy` is only present when router.mjs actually took a meter/impute
+      // reading, which only happens when energy.enabled is true, so this is a
+      // no-op on the default shadow-mode (disabled) path.
+      if (energy) {
+        try {
+          metrics.recordEnergy({
+            reqId: metricsReqId,
+            agentId: metricsAgentId,
+            model: parsedModel || "unknown",
+            backend,
+            cardId: req.headers["x-sk-card-id"] || null,
+            joules: energy.joules,
+            basis: energy.basis,
+            node: energy.node,
+          });
+        } catch (err) {
+          console.error("[skgateway] metrics recordEnergy failed:", err.message);
+        }
+      }
     }
 
     const routeRequest = {
@@ -1415,6 +1436,10 @@ export const server = http.createServer(async (req, res) => {
       context: req.headers["x-sk-context"] || undefined,
       service: req.headers["x-sk-service"] || undefined,
       role:    req.headers["x-sk-role"]    || undefined,
+      // Internal card id for energy/cost attribution (joule-economy P0).
+      // Stripped before forwarding upstream in router.mjs; never leaves the
+      // gateway.
+      cardId:  req.headers["x-sk-card-id"] || undefined,
       // x-sk-require escape hatch (card P4.3): DEFAULT OFF via
       // matchRoutingEnabled (routing.match_enabled). With the flag off this
       // is always `undefined` (no field added, no parse run): byte-identical
@@ -1501,6 +1526,7 @@ export const server = http.createServer(async (req, res) => {
           responseBody: null,
           backend: result?.backendId,
           errorMsg: dispatchError.message,
+          energy: result?.energy,
         });
       } else {
         let parsedBody = null;
@@ -1514,6 +1540,7 @@ export const server = http.createServer(async (req, res) => {
           responseHeaders: result?.headers ?? {},
           responseBody: parsedBody,
           backend: result?.backendId,
+          energy: result?.energy,
         });
       }
     }

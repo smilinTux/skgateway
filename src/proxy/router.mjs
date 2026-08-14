@@ -26,6 +26,8 @@ import { isAnthropicBackend, toAnthropicRequest, toOpenAIResponse } from "./anth
 import { getPool } from "./connection-pool.mjs";
 import { isRegistryRouted, resolve as resolveRegistry, getAutoConfig, getConfigEpoch, loadRegistry } from "./registry.mjs";
 import { getFailoverConfig, isLocalUrl, probeLocalHealth, recordLocalOutcome } from "./local-failover.mjs";
+import { readMeter } from "./meter-client.mjs";
+import { marginalJoules, imputeJoules, resolveBasis, coeffsForModel } from "../metrics/energy.mjs";
 import { recordModelOutcome, getLifecycle } from "../discovery/model_catalog_store.mjs";
 import { isRoutable } from "../discovery/lifecycle.mjs";
 import { applyReasoningFloor } from "./core.mjs";
@@ -1452,6 +1454,19 @@ function eolGatedResponse(err) {
 export async function routeAndSend(router, request, upstreamPath, method, clientHeaders, body, usePool = true, siem = null) {
   const pool = usePool ? getPool() : null;
 
+  // Read fresh off getConfig() every request (not cached at module scope) so
+  // a SIGHUP config reload picks up a flipped energy.enabled or an updated
+  // meters/coefficients map without a restart, mirroring getPricing(). Fail
+  // soft to undefined when loadConfig() has never run (most router.mjs unit
+  // tests construct routeAndSend directly), matching isMatchRoutingEnabled()
+  // above: this must never throw into the request path.
+  let energyCfg;
+  try {
+    energyCfg = getConfig()?.energy;
+  } catch {
+    energyCfg = undefined;
+  }
+
   // ── SIEM: per-request audit correlation ──
   // Every lifecycle event emitted for this request shares one request_id so a
   // SIEM/SOC can stitch auth → request → (failover) → response|error together.
@@ -1754,6 +1769,9 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // a gzip'd upstream reply reaches the client as undecodable bytes ("HTTP 400:
     // <garbage>"). Force identity so backends return uncompressed bodies.
     delete forwardHeaders["accept-encoding"];
+    // Internal card id (energy/cost attribution) must never reach a
+    // third-party provider (NVIDIA, OpenRouter, etc).
+    delete forwardHeaders["x-sk-card-id"];
 
     const targetUrl = new URL(backendUrl);
     const queueStart = Date.now();
@@ -1789,6 +1807,16 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     }
 
     const queueWaitMs = Date.now() - queueStart;
+
+    // Meter read is per attempt, not per request: a failover attempt must be
+    // attributed to the backend that actually served it. Fail-open, so a slow
+    // or dead meter costs a null reading and nothing else. When energy
+    // metering is disabled (default) meterUrl stays null and readMeter is
+    // never called: no network call, no extra latency on the disabled path.
+    const meterUrl = energyCfg?.enabled ? (energyCfg.meters?.[backendId] ?? null) : null;
+    const meterBefore = meterUrl
+      ? await readMeter(meterUrl, energyCfg.read_timeout_ms ?? 250)
+      : null;
 
     let res;
     try {
@@ -1829,6 +1857,31 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     }
 
     const latencyMs = Date.now() - queueStart;
+
+    // Second meter read + energy accounting for this attempt, gated the same
+    // way as the pre-read above: when energy metering is disabled the whole
+    // block is skipped (attemptEnergy stays null), so lastResult.energy below
+    // is never set and index.mjs never calls recordEnergy. Zero behavior
+    // change on the disabled path.
+    let attemptEnergy = null;
+    if (energyCfg?.enabled) {
+      const meterAfter = meterUrl
+        ? await readMeter(meterUrl, energyCfg.read_timeout_ms ?? 250)
+        : null;
+
+      const measured = marginalJoules(meterBefore, meterAfter);
+      let joules = measured;
+      const basis = resolveBasis({ metered: measured !== null, backendIsLocal: isLocalUrl(backendUrl) });
+      if (measured === null) {
+        const usage = extractUsage(res.body);
+        joules = imputeJoules(
+          { input_tokens: usage.tokens_in, output_tokens: usage.tokens_out },
+          coeffsForModel(request.model ?? "", energyCfg?.coefficients ?? {}),
+        );
+      }
+      attemptEnergy = { joules, basis, node: meterAfter?.node ?? null };
+    }
+
     const success = res.status < 500;
     const qTransition = backend.recordOutcome(success, latencyMs);
 
@@ -1874,6 +1927,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     }
 
     lastResult = { ...res, backendId, failover: didFailover, queueWaitMs };
+    if (attemptEnergy) lastResult.energy = attemptEnergy;
 
     if (success) {
       console.log(

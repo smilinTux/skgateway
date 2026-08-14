@@ -281,6 +281,26 @@ const DEFAULTS = {
       openrouter: { enabled: true, free_only: true, chat_only: true },
     },
   },
+
+  // Joule-economy P0 metering (energy_log). Reads a skmeter counter around
+  // each upstream attempt and records measured or imputed joules.
+  //   enabled          - MASTER GATE. OFF by default: shadow mode ships dark,
+  //                      no meter reads, no behavior change, until a node's
+  //                      meter config has been validated.
+  //   read_timeout_ms  - hard ceiling per meter read; the meter is never worth
+  //                      waiting on, so this must stay well under any
+  //                      upstream timeout.
+  //   meters           - backend id (or URL host) -> meter endpoint.
+  //   coefficients     - model (exact or prefix) -> joules per token, used to
+  //                      impute energy for backends that cannot be metered.
+  energy: {
+    enabled: false,             // shadow mode ships OFF; flip per node after validation
+    read_timeout_ms: 250,
+    // backend id (or URL host) -> meter endpoint
+    meters: {},                 // e.g. { local: 'http://192.168.0.100:9420/energy' }
+    // model (exact or prefix) -> joules per token, for unmeterable backends
+    coefficients: {},
+  },
 };
 
 // ─── deep merge ───────────────────────────────────────────────────────────────
@@ -683,6 +703,19 @@ function validate(cfg) {
   // dashboard
   if (typeof cfg.dashboard.refresh_ms !== 'number' || cfg.dashboard.refresh_ms < 100)
     errs.push('dashboard.refresh_ms must be >= 100');
+
+  // energy (joule-economy P0 metering)
+  if (cfg.energy) {
+    if (typeof cfg.energy.enabled !== 'boolean') {
+      errs.push('energy.enabled must be a boolean');
+    }
+    if (cfg.energy.meters && typeof cfg.energy.meters !== 'object') {
+      errs.push('energy.meters must be an object mapping backend id to meter URL');
+    }
+    if (cfg.energy.coefficients && typeof cfg.energy.coefficients !== 'object') {
+      errs.push('energy.coefficients must be an object mapping model to joules-per-token');
+    }
+  }
 
   // Provider-route consistency (card 7ec1d18a): assert routes map to known
   // backends / resolvable aliases at boot AND reload, so a mis-wired route fails
