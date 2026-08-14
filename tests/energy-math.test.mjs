@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   marginalJoules, imputeJoules, resolveBasis, coeffsForModel,
+  usageFromSSE, attributeShare,
 } from '../src/metrics/energy.mjs';
 
 test('marginalJoules: delta of two counter reads', () => {
@@ -67,4 +68,47 @@ test('coeffsForModel: prefix match when no exact entry', () => {
 
 test('coeffsForModel: null for an unknown model', () => {
   assert.equal(coeffsForModel('some-new-model', { 'claude-': {} }), null);
+});
+
+test('usageFromSSE: pulls usage out of the final data chunk', () => {
+  const body = [
+    'data: {"choices":[{"delta":{"content":"hi"}}]}',
+    'data: {"choices":[{"delta":{"content":" there"}}]}',
+    'data: {"choices":[],"usage":{"prompt_tokens":51,"completion_tokens":600}}',
+    'data: [DONE]',
+    '',
+  ].join('\n\n');
+  const u = usageFromSSE(body);
+  assert.equal(u.input_tokens, 51);
+  assert.equal(u.output_tokens, 600);
+});
+
+test('usageFromSSE: tolerates a Buffer', () => {
+  const body = Buffer.from('data: {"usage":{"prompt_tokens":1,"completion_tokens":2}}\n\n');
+  assert.deepEqual(usageFromSSE(body), { input_tokens: 1, output_tokens: 2 });
+});
+
+test('usageFromSSE: null when no chunk carries usage', () => {
+  // Do not fabricate a zero: zero tokens and unknown tokens are different facts.
+  const body = 'data: {"choices":[{"delta":{"content":"hi"}}]}\n\ndata: [DONE]\n\n';
+  assert.equal(usageFromSSE(body), null);
+});
+
+test('usageFromSSE: null for non-SSE input', () => {
+  assert.equal(usageFromSSE('{"usage":{"prompt_tokens":1}}'), null);
+  assert.equal(usageFromSSE(''), null);
+  assert.equal(usageFromSSE(null), null);
+});
+
+test('attributeShare: sole tenant gets all the energy', () => {
+  assert.equal(attributeShare(1713, 600, 600), 1713);
+});
+
+test('attributeShare: two tenants split by output tokens', () => {
+  assert.equal(attributeShare(1000, 250, 1000), 250);
+});
+
+test('attributeShare: unknown totals fall back to the whole amount', () => {
+  // Over-attributing to one request is safer than silently losing the energy.
+  assert.equal(attributeShare(1000, 0, 0), 1000);
 });

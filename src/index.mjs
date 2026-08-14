@@ -1418,6 +1418,7 @@ export const server = http.createServer(async (req, res) => {
             joules: energy.joules,
             basis: energy.basis,
             node: energy.node,
+            concurrencyN: energy.concurrencyN ?? 1,
           });
         } catch (err) {
           console.error("[skgateway] metrics recordEnergy failed:", err.message);

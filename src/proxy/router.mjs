@@ -27,7 +27,7 @@ import { getPool } from "./connection-pool.mjs";
 import { isRegistryRouted, resolve as resolveRegistry, getAutoConfig, getConfigEpoch, loadRegistry } from "./registry.mjs";
 import { getFailoverConfig, isLocalUrl, probeLocalHealth, recordLocalOutcome } from "./local-failover.mjs";
 import { readMeter } from "./meter-client.mjs";
-import { marginalJoules, imputeJoules, resolveBasis, coeffsForModel } from "../metrics/energy.mjs";
+import { marginalJoules, imputeJoules, resolveBasis, coeffsForModel, usageFromSSE } from "../metrics/energy.mjs";
 import { recordModelOutcome, getLifecycle } from "../discovery/model_catalog_store.mjs";
 import { isRoutable } from "../discovery/lifecycle.mjs";
 import { applyReasoningFloor } from "./core.mjs";
@@ -293,6 +293,17 @@ function extractUsage(body) {
     // not JSON / streamed / no usage — nothing to report
   }
   return {};
+}
+
+// How many attempts are currently in flight against each meter, so energy
+// rows can record whether a measurement was single-tenant. Spec 4.6.
+const _inFlight = new Map();
+function inFlightOnMeter(url) { return _inFlight.get(url) ?? 1; }
+function enterMeter(url) { if (url) _inFlight.set(url, (_inFlight.get(url) ?? 0) + 1); }
+function exitMeter(url) {
+  if (!url) return;
+  const n = (_inFlight.get(url) ?? 1) - 1;
+  if (n <= 0) _inFlight.delete(url); else _inFlight.set(url, n);
 }
 
 // ---------------------------------------------------------------------------
@@ -1831,6 +1842,11 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     const meterBeforeMs = meterUrl ? (Date.now() - meterBeforeStart) : 0;
 
     let res;
+    // Track in-flight attempts against this meter so the energy row can
+    // record whether the measurement window was single-tenant (spec 4.6).
+    // No-op when meterUrl is null (energy metering disabled or no meter
+    // configured for this backend): the disabled path stays byte-identical.
+    enterMeter(meterUrl);
     try {
       if (isAnthropicBackend(backend)) {
         // Translate OpenAI chat-completions → Anthropic Messages API.
@@ -1866,6 +1882,9 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       if (pool && slot) {
         pool.release(backendId);
       }
+      // Pair every enterMeter with an exit here, even on a thrown upstream,
+      // so the in-flight count can never leak and drift upward.
+      exitMeter(meterUrl);
     }
 
     const latencyMs = (Date.now() - queueStart) - meterBeforeMs;
@@ -1885,13 +1904,22 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       let joules = measured;
       const basis = resolveBasis({ metered: measured !== null, backendIsLocal: isLocalUrl(backendUrl) });
       if (measured === null) {
+        // extractUsage() JSON.parses the body and returns {} for a streamed
+        // (SSE) body, so tokens_out is always absent there. Fall back to the
+        // SSE scanner in that case rather than imputing on undefined tokens.
         const usage = extractUsage(res.body);
+        const sse = (usage.tokens_out === undefined) ? usageFromSSE(res.body) : null;
         joules = imputeJoules(
-          { input_tokens: usage.tokens_in, output_tokens: usage.tokens_out },
+          sse ?? { input_tokens: usage.tokens_in, output_tokens: usage.tokens_out },
           coeffsForModel(request.model ?? "", energyCfg?.coefficients ?? {}),
         );
       }
-      attemptEnergy = { joules, basis, node: meterAfter?.node ?? null };
+      attemptEnergy = {
+        joules,
+        basis,
+        node: meterAfter?.node ?? null,
+        concurrencyN: meterUrl ? inFlightOnMeter(meterUrl) : 1,
+      };
     }
 
     const success = res.status < 500;
