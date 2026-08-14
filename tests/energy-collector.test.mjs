@@ -66,3 +66,35 @@ test('recordEnergy never throws when metrics are disabled', () => {
   const c = createMetricsCollector({ enabled: false });
   assert.doesNotThrow(() => c.recordEnergy({ reqId: 'x', joules: 1, basis: 'measured_gpu' }));
 });
+
+test('recordEnergy with no reqId does not throw', () => {
+  withCollector((c) => {
+    assert.doesNotThrow(() => c.recordEnergy({ joules: 5, basis: 'measured_gpu' }));
+  });
+});
+
+test('recordEnergy with no reqId writes no row', () => {
+  withCollector((c, dbPath) => {
+    c.recordEnergy({ joules: 5, basis: 'measured_gpu' });
+    c.flush?.();
+    const db = new Database(dbPath, { readonly: true });
+    const { n } = db.prepare('SELECT COUNT(*) AS n FROM energy_log').get();
+    db.close();
+    assert.equal(n, 0);
+  });
+});
+
+test('a valid recordRequest row survives a bad recordEnergy call in the same flush window', () => {
+  // This is the important one: energy_log.req_id is NOT NULL and flushBatch
+  // runs as a single transaction, so a bad energy row must never be allowed
+  // to roll back unrelated, valid rows buffered in the same window.
+  withCollector((c, dbPath) => {
+    const reqId = c.recordRequest({ agentId: 'lumina', model: 'ornith-1.0-9b', backend: 'local' });
+    c.recordEnergy({ joules: 5, basis: 'measured_gpu' }); // no reqId, must be dropped
+    c.flush?.();
+    const db = new Database(dbPath, { readonly: true });
+    const row = db.prepare('SELECT * FROM request_log WHERE id = ?').get(reqId);
+    db.close();
+    assert.ok(row, 'the valid request_log row should survive the bad energy call');
+  });
+});

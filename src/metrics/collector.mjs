@@ -827,6 +827,11 @@ export function createMetricsCollector(config) {
     joules, basis, node, concurrencyN, ts,
   } = {}) {
     if (!db) return;
+    // req_id is NOT NULL on energy_log, and flushBatch runs as one transaction,
+    // so a single bad row here would roll back every unrelated row buffered in
+    // the same window. A row that cannot be joined to a request is not worth
+    // that risk, and we do not fabricate a synthetic reqId to route around it.
+    if (!reqId) return;
     const when = ts ?? Date.now();
     writeBuffer.push({
       _type: 'energy',
