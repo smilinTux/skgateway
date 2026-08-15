@@ -11,9 +11,13 @@
  * most `budget` (default ~20) per sweep, through the caller's connection
  * pool so a sweep can never exceed the NVIDIA 20-concurrent limit alongside
  * live traffic. Every outcome feeds `lifecycle.applyProbeOutcome` so a 410
- * flips the model `eol` and a successful probe records `last_verified_at`
- * and promotes toward `active`, exactly like every other lifecycle signal in
- * this codebase.
+ * flips the model `eol`, a 400 flips it `not_chat` (card f9e8002b / C14: the
+ * probe sends a minimal well-formed chat completion, so a 400 is evidence
+ * about the model, not the request), a 429 leaves it untouched (alive and
+ * throttled, card 9e28de88), and a successful probe records
+ * `last_verified_at` and promotes toward `active` regardless of which of
+ * those dispositions it was in before, exactly like every other lifecycle
+ * signal in this codebase.
  *
  * Pure-ish and fully injectable for testing: `runProbe` (the actual
  * completion call) and `pool` (concurrency gate) are both passed in, so
@@ -59,6 +63,10 @@ export const DEFAULT_PROBE_SECONDS = 24 * 60 * 60;
  *   (`lifecycle.applyCatalogPresence`), not by a probe; spending sweep
  *   budget re-probing a 30-day-confirmed-dead id would starve the actual
  *   long tail of its share of the budget for no operational benefit.
+ *   `not_chat` (card f9e8002b / C14) is deliberately NOT excluded here the
+ *   way `dead` is: unlike a tombstone, it is only ever cleared by another
+ *   probe (`lifecycle.applyProbeOutcome`'s `ok` branch), so a not_chat id
+ *   must stay eligible for reselection or it could never recover.
  * - Optionally scoped to one `provider` (the production sweep is NVIDIA-only
  *   per design 5.2, since it must go through the NVIDIA connection pool;
  *   left generic here so tests, and any future multi-provider sweep, are not

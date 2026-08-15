@@ -196,6 +196,12 @@ export function getLifecycle(modelId, path = STORE_PATH) {
  * the router is about to return. This does NOT touch backend health or the
  * router's failover decision; it is purely a bookkeeping side effect.
  *
+ * Card f9e8002b / C14: this is USER traffic, of a shape we do not control,
+ * so it can never produce `not_chat`. `applyCompletionOutcome` only reacts
+ * to 2xx/404/410 and leaves every other status (400 and 500 included)
+ * untouched; `not_chat` is set exclusively by `applyProbeOutcome`, reached
+ * only from the probe sweep (src/discovery/probe.mjs), never from here.
+ *
  * @param {string} modelId
  * @param {{status: number, now?: number}} outcome
  * @param {string} [path]

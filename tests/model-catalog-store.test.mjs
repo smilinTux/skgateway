@@ -112,6 +112,22 @@ describe("recordModelOutcome, round trip", () => {
     assert.doesNotThrow(() => recordModelOutcome(undefined, { status: 410, now: 1 }, path));
     assert.doesNotThrow(() => recordModelOutcome("", { status: 410, now: 1 }, path));
   });
+
+  test("MANDATORY (card f9e8002b / C14): a USER-traffic 400 produces no lifecycle change, and never not_chat", () => {
+    // recordModelOutcome is the completion path (router.mjs on every real
+    // request). not_chat may ONLY come from the probe sweep
+    // (src/discovery/probe.mjs), never from here, no matter how many 400s a
+    // caller sends against a healthy model.
+    const path = freshPath();
+    for (let i = 0; i < 5; i++) {
+      recordModelOutcome("nvidia/nemotron-parse", { status: 400, now: 1000 + i }, path);
+    }
+    const lc = getLifecycle("nvidia/nemotron-parse", path);
+    assert.equal(lc.state, "active", "a completion-path 400 must never move the model out of active");
+    assert.notEqual(lc.state, "not_chat");
+    assert.equal(lc.consecutive_permanent_errors, 0);
+    assert.equal(lc.last_verified_at, null, "a 400 is not a success either: it must not fake a verification");
+  });
 });
 
 describe("recordModelOutcome, fail-soft writes", () => {

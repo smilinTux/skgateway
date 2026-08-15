@@ -123,6 +123,61 @@ describe('probeModels (fake completion runner + fake pool + fake clock)', () => 
     assert.equal(next.warm.last_verified_at, NOW);
   });
 
+  test('card f9e8002b / C14: a 400 probe flips the model to not_chat (nvidia/nemotron-parse shape)', async () => {
+    const store = { 'nvidia/nemotron-parse': lc({ last_verified_at: null }) };
+    const next = await probeModels(store, {
+      now: () => NOW,
+      runProbe: async () => ({ ok: false, status: 400 }),
+    });
+    assert.equal(next['nvidia/nemotron-parse'].state, 'not_chat');
+    assert.equal(next['nvidia/nemotron-parse'].eol_reason, 'not_chat');
+  });
+
+  test('card f9e8002b / C14: a not_chat model is excluded (falls out of routing/catalog) via the store', async () => {
+    const store = {
+      'nvidia/nemotron-parse': lc({ state: 'not_chat', eol_reason: 'not_chat', eol_at: NOW - 1000 }),
+    };
+    // Untouched by a sweep that never selects it (out of window check is not
+    // the point here; the point is that a not_chat record is not silently
+    // upgraded by anything except a fresh probe outcome).
+    const next = await probeModels(store, {
+      now: () => NOW,
+      runProbe: async () => ({ ok: false, status: 400 }),
+    });
+    assert.equal(next['nvidia/nemotron-parse'].state, 'not_chat');
+  });
+
+  test('card f9e8002b / C14: a later successful probe recovers a not_chat model to active', async () => {
+    const store = {
+      'nvidia/nemotron-parse': lc({ state: 'not_chat', eol_reason: 'not_chat', eol_at: NOW - 1000 }),
+    };
+    const next = await probeModels(store, {
+      now: () => NOW,
+      runProbe: async () => ({ ok: true, status: 200 }),
+    });
+    assert.equal(next['nvidia/nemotron-parse'].state, 'active');
+    assert.equal(next['nvidia/nemotron-parse'].eol_reason, null);
+  });
+
+  test('card 9e28de88: a 429 probe produces no disposition change at all, not not_chat and not eol', async () => {
+    const store = { 'nvidia/free-tier': lc({ state: 'active', last_verified_at: null }) };
+    const next = await probeModels(store, {
+      now: () => NOW,
+      runProbe: async () => ({ ok: false, status: 429 }),
+    });
+    assert.deepEqual(next['nvidia/free-tier'], store['nvidia/free-tier'], 'must be a byte-for-byte no-op');
+  });
+
+  test('card f9e8002b / C14: a 500 probe does NOT produce not_chat (thinkingmachines/inkling shape)', async () => {
+    const store = { 'thinkingmachines/inkling': lc({ state: 'active', last_verified_at: null }) };
+    const next = await probeModels(store, {
+      now: () => NOW,
+      runProbe: async () => ({ ok: false, status: 500 }),
+    });
+    assert.notEqual(next['thinkingmachines/inkling'].state, 'not_chat');
+    assert.equal(next['thinkingmachines/inkling'].state, 'suspect', 'a 500 is an availability problem, not a not_chat verdict');
+  });
+
   test('a non-410 failure (timeout) only demotes active -> suspect, no escalation', async () => {
     const store = { flaky: lc({ state: 'active', last_verified_at: null }) };
     const next = await probeModels(store, {

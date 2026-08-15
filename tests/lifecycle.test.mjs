@@ -43,6 +43,7 @@ test('LIFECYCLE_STATES enum', () => {
     SUSPECT: 'suspect',
     EOL: 'eol',
     DEAD: 'dead',
+    NOT_CHAT: 'not_chat',
   });
 });
 
@@ -349,11 +350,111 @@ test('ageDeadModels is a no-op for non-eol states', () => {
   );
 });
 
-test('isRoutable: true for active/suspect, false for eol/dead', () => {
+test('isRoutable: true for active/suspect, false for eol/dead/not_chat', () => {
   assert.equal(isRoutable({ state: 'active' }), true);
   assert.equal(isRoutable({ state: 'suspect' }), true);
   assert.equal(isRoutable({ state: 'eol' }), false);
   assert.equal(isRoutable({ state: 'dead' }), false);
+  assert.equal(isRoutable({ state: 'not_chat' }), false);
+});
+
+// ─── C14 (f9e8002b): not_chat, a third disposition, probe-driven only ────────
+
+test('a probe 400 flips an active model to not_chat (nvidia/nemotron-parse shape)', () => {
+  let lc = defaultLifecycle();
+  lc = applyProbeOutcome(lc, { ok: false, status: 400, now: T0 });
+  assert.equal(lc.state, 'not_chat');
+  assert.equal(lc.eol_reason, 'not_chat');
+  assert.equal(lc.eol_at, T0);
+});
+
+test('MANDATORY: a USER-traffic 400 (applyCompletionOutcome) produces NO lifecycle change at all', () => {
+  // The trap the card calls out by name: conflating a request-shape 400 from
+  // arbitrary user traffic with the probe's controlled 400 would let one
+  // malformed caller condemn a healthy model. applyCompletionOutcome must
+  // leave the record byte-for-byte untouched.
+  let lc = defaultLifecycle();
+  const before = { ...lc };
+  lc = applyCompletionOutcome(lc, { status: 400, now: T0, provider: 'nvidia' });
+  assert.deepEqual(lc, before, 'a completion-path 400 must be a complete no-op');
+  assert.notEqual(lc.state, 'not_chat', 'user traffic must never be able to set not_chat');
+
+  // Same record, hit with a 400 from user traffic 10 times in a row: still
+  // nothing. Unlike 404/410, there is no threshold that ever gets there,
+  // because the completion path does not look at 400 at all.
+  for (let i = 0; i < 10; i++) {
+    lc = applyCompletionOutcome(lc, { status: 400, now: T0 + i, provider: 'nvidia' });
+  }
+  assert.deepEqual(lc, before);
+});
+
+test('MANDATORY: a probe 429 produces NO disposition change at all, not not_chat and not eol', () => {
+  // Card 9e28de88 landed making 429 a failover condition; a probe hitting a
+  // free-tier rate limit means alive and throttled, nothing else.
+  let lc = defaultLifecycle();
+  const before = { ...lc };
+  lc = applyProbeOutcome(lc, { ok: false, status: 429, now: T0 });
+  assert.deepEqual(lc, before, 'a probe 429 must be a complete no-op, unlike a probe 410/400/timeout');
+
+  // Also true starting from a non-active state: a 429 must not even soften
+  // an eol record toward suspect the way a bare timeout/5xx would from active.
+  let lc2 = { ...defaultLifecycle(), state: 'eol', eol_reason: 'provider_410', eol_at: T0 - 1 };
+  const before2 = { ...lc2 };
+  lc2 = applyProbeOutcome(lc2, { ok: false, status: 429, now: T0 });
+  assert.deepEqual(lc2, before2);
+});
+
+test('MANDATORY: a probe 500 does NOT produce not_chat (thinkingmachines/inkling shape)', () => {
+  // inkling IS a listed chat model (models.dev text->text); its 500 is an
+  // availability problem, not evidence it is the wrong kind of model. A probe
+  // 500 must fall to the same weak-evidence path as a timeout: demote an
+  // active record to suspect, never to not_chat.
+  let lc = defaultLifecycle();
+  lc = applyProbeOutcome(lc, { ok: false, status: 500, now: T0 });
+  assert.notEqual(lc.state, 'not_chat');
+  assert.equal(lc.state, 'suspect', 'a probe 500 is weak evidence, same as a timeout: active -> suspect only');
+
+  // And it must never ESCALATE a record that already needs investigation,
+  // same rule as every other non-410/400/429 probe failure.
+  let lc2 = { ...defaultLifecycle(), state: 'suspect' };
+  lc2 = applyProbeOutcome(lc2, { ok: false, status: 500, now: T0 });
+  assert.equal(lc2.state, 'suspect');
+  assert.notEqual(lc2.state, 'not_chat');
+});
+
+test('MANDATORY: a not_chat model is excluded from routing (isRoutable false)', () => {
+  const lc = { ...defaultLifecycle(), state: 'not_chat', eol_reason: 'not_chat', eol_at: T0 };
+  assert.equal(isRoutable(lc), false);
+});
+
+test('MANDATORY: a later successful probe recovers a not_chat model to active', () => {
+  let lc = defaultLifecycle();
+  lc = applyProbeOutcome(lc, { ok: false, status: 400, now: T0 });
+  assert.equal(lc.state, 'not_chat');
+
+  // A provider adding chat support to an existing endpoint: the next probe
+  // succeeds. Recovery is unconditional and immediate, same as eol -> active.
+  lc = applyProbeOutcome(lc, { ok: true, status: 200, now: T0 + 1000 });
+  assert.equal(lc.state, 'active');
+  assert.equal(lc.eol_reason, null);
+  assert.equal(lc.eol_at, null);
+  assert.equal(lc.last_verified_at, T0 + 1000);
+});
+
+test('not_chat does not age into dead (ageDeadModels only acts on eol)', () => {
+  const lc = { ...defaultLifecycle(), state: 'not_chat', eol_reason: 'not_chat', eol_at: T0 };
+  const aged = ageDeadModels(lc, { now: T0 + 1000 * DAY_MS, deadAfterMs: THRESHOLDS.deadAfterMs });
+  assert.equal(aged.state, 'not_chat', 'not_chat is not a tombstone; it must not follow the eol->dead clock');
+});
+
+test('a probe 400 unconditionally overrides a prior suspect/eol disposition, same as 410 does', () => {
+  // Consistent with the existing unconditional-promotion design (an ok probe
+  // already overrides any prior state): a controlled probe request is
+  // stronger evidence than whatever put the record in its current state.
+  let lc = { ...defaultLifecycle(), state: 'eol', eol_reason: 'provider_410', eol_at: T0 - 1 };
+  lc = applyProbeOutcome(lc, { ok: false, status: 400, now: T0 });
+  assert.equal(lc.state, 'not_chat');
+  assert.equal(lc.eol_reason, 'not_chat');
 });
 
 test('thresholds are injected, not read from env or a module-level clock', () => {
