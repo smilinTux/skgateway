@@ -160,14 +160,32 @@ describe('hard filters: require block', () => {
   // key so an operator can see what happened, not silently admit it to a
   // free remote model the config asserts it cannot reach.
   test('an unimplemented require key excludes the candidate (fails closed, not silently)', () => {
+    // NOTE: this originally used `sensitivity` as its example of an
+    // unimplemented key. Card N1 has since implemented it, so the example moved
+    // to a key that is genuinely unhandled. The property under test is
+    // unchanged and is the point of card C5: a requirement this ranker does not
+    // implement must EXCLUDE, never silently admit.
     const results = rankModels(
       [entry('would-be-admitted', { capabilities: caps({ tool_use: { score: 1, basis: 'card' } }) })],
-      { require: { sensitivity: 'secret' } },
+      { require: { data_residency: 'eu-only' } },
     );
     const r = findResult(results, 'would-be-admitted');
-    assert.equal(r.excluded_reason, 'require:unknown:sensitivity');
+    assert.equal(r.excluded_reason, 'require:unknown:data_residency');
     assert.equal(r.score, null);
     assert.equal(r.rank, null);
+  });
+
+  test('sensitivity is now a REAL key, and still excludes rather than admits', () => {
+    // The other half of the same guarantee. C5 made unknown keys fail closed so
+    // that N1 could land a sensitivity gate that actually gates. If this ever
+    // returns null (pass), the sovereignty control has become a placebo again.
+    const results = rankModels(
+      [entry('free-remote', { capabilities: caps({ trust_zone: 2 }) })],
+      { require: { sensitivity: 'secret' } },
+    );
+    const r = findResult(results, 'free-remote');
+    assert.match(r.excluded_reason, /^require:sensitivity:/);
+    assert.equal(r.score, null);
   });
 
   test('a known require key alongside an unknown one still fails closed on the unknown key', () => {

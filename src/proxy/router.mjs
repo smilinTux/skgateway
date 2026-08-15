@@ -43,6 +43,12 @@ import { rankModels } from "../ranking/rank.mjs";
 import { buildCapabilityCatalog } from "../ranking/catalog.mjs";
 import { loadAllowlist } from "../advertise.mjs";
 import { isModelAvailable } from "./advertise.mjs";
+import {
+  resolveZoneCeiling,
+  isZoneAllowed,
+  policyFromRegistry,
+  TRUST_ZONES,
+} from "../policy/sensitivity.mjs";
 
 // sk-auto routing decision cache (TTL+LRU); keyed by request fingerprint + config epoch.
 const _autoDecisionCache = createDecisionCache({ ttlMs: 60_000, maxEntries: 500 });
@@ -1774,6 +1780,74 @@ function eolGatedResponse(err) {
  *   queueWaitMs?: number,
  * }>}
  */
+
+/**
+ * Is trust-zone enforcement armed? Card 45d7a30b / N1.
+ *
+ * Defaults OFF. The gate ships in SHADOW mode so a soak can show exactly what
+ * it would have blocked before it starts blocking, because the failure mode of
+ * turning it on blind is a 503 for real traffic, and the failure mode of
+ * leaving it off is a silent sovereignty crossing. Both are bad; only one is
+ * reversible in a hurry.
+ */
+function isSensitivityEnforced() {
+  try {
+    return !!getConfig()?.routing?.sensitivity_enforced;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The trust zone a BACKEND runs in, for failover-time gating.
+ *
+ * ranking/capabilities.mjs derives a per-MODEL zone from provider posture, but
+ * failover decisions happen at the backend level and before any ranking, so
+ * this resolves the same question from what a candidate actually has: its
+ * backend id and url. Deliberately conservative, an unrecognized backend is
+ * treated as the LEAST trusted rather than skipped, so "we could not tell"
+ * never satisfies a sovereignty requirement.
+ *
+ * @param {{backendId?:string, backendUrl?:string, backend?:object}} candidate
+ * @returns {number}
+ */
+export function backendTrustZone(candidate) {
+  const url = candidate?.backendUrl || candidate?.backend?.url || "";
+  const id = String(candidate?.backendId || candidate?.backend?.id || "");
+  if (url && isLocalUrl(url)) return TRUST_ZONES.SOVEREIGN_LOCAL;
+  // Anthropic is the one provider whose terms prohibit training on our content
+  // (verified 2026-08-15, card N2's provider posture block). The local
+  // claude-code-api wrapper is loopback and already caught by isLocalUrl above.
+  if (/^anthropic/.test(id)) return TRUST_ZONES.PAID_CONTRACTUAL;
+  return TRUST_ZONES.FREE_REMOTE;
+}
+
+/**
+ * Resolve the trust-zone ceiling this request must respect, or null when the
+ * caller stated no sensitivity at all.
+ *
+ * Null means UNCONSTRAINED, which is correct: a caller that says nothing about
+ * sensitivity gets today's behavior. This gate raises the floor for callers who
+ * opt in; it does not retroactively classify traffic that never declared
+ * itself. Making silence mean "secret" would fail-close the entire fleet on the
+ * day it shipped.
+ *
+ * @param {object} request
+ * @returns {{ceiling:number, sensitivity:string}|null}
+ */
+export function requestZoneCeiling(request) {
+  const sensitivity = request?.requirements?.require?.sensitivity;
+  if (sensitivity === undefined) return null;
+  let policy;
+  try {
+    policy = policyFromRegistry(loadRegistry());
+  } catch {
+    policy = undefined;
+  }
+  const { ceiling } = resolveZoneCeiling(sensitivity, policy);
+  return { ceiling, sensitivity: String(sensitivity) };
+}
+
 export async function routeAndSend(router, request, upstreamPath, method, clientHeaders, body, usePool = true, siem = null) {
   const pool = usePool ? getPool() : null;
 
@@ -1988,8 +2062,71 @@ export async function routeAndSend(router, request, upstreamPath, method, client
             isCloudFallback: true,
             model: fc.fallbackModel, // tag: model-granular throttle cooldown keying (card 9e28de88)
           };
+          // ── Card 45d7a30b / N1: sovereignty gate on the cloud fallback ──
+          //
+          // THIS is the crossing the card exists to stop. A sovereign local
+          // route (zone 0) transparently failing over to a free cloud model
+          // (zone 2) is exactly what happened when sk-default's backend went
+          // unreachable: the fleet kept answering, looked healthy, and had
+          // quietly started sending work to a provider that trains on it.
+          //
+          // A caller that declared a sensitivity gets that honored here, not
+          // just at rank time, because failover happens BELOW ranking and would
+          // otherwise be a hole straight through the gate.
+          const zc = requestZoneCeiling(request);
+          const fbZone = backendTrustZone(fallbackCandidate);
+          const fallbackAllowed = !zc || isZoneAllowed(fbZone, zc.ceiling);
+          if (zc && !fallbackAllowed) {
+            const msg =
+              `[router] sensitivity=${zc.sensitivity} (ceiling zone ${zc.ceiling}) ` +
+              `${isSensitivityEnforced() ? "BLOCKS" : "would block (shadow)"} ` +
+              `cloud failover to ${fb.id} (zone ${fbZone})`;
+            console.warn(msg);
+            emitSiem("sensitivity_gate", {
+              enforced: isSensitivityEnforced(),
+              sensitivity: zc.sensitivity,
+              ceiling: zc.ceiling,
+              candidate_zone: fbZone,
+              action: isSensitivityEnforced() ? "blocked" : "shadow",
+            }, { backend: fb.id });
+          }
+          // Shadow mode logs and does nothing else, so a soak can show what
+          // enforcement would change before it changes anything.
+          const useFallback = fallbackAllowed || !isSensitivityEnforced();
+
           const healthy = await probeLocalHealth(reg.url, fc);
-          if (healthy) {
+          if (!useFallback && !healthy) {
+            // Local is down and the only alternative would cross a zone the
+            // caller forbade. FAIL CLOSED. A 503 is the correct answer: the
+            // request cannot be served within its own sovereignty constraint,
+            // and answering it from a disallowed provider would be a silent
+            // policy violation dressed up as availability.
+            console.warn(
+              `[router] FAIL CLOSED: local backend ${reg.backend} unhealthy and cloud ` +
+                `failover forbidden by sensitivity=${zc.sensitivity}`,
+            );
+            return {
+              status: 503,
+              headers: { "content-type": "application/json" },
+              body: Buffer.from(JSON.stringify({
+                error: {
+                  message:
+                    `No model satisfies sensitivity=${zc.sensitivity} (max trust zone ${zc.ceiling}). ` +
+                    `The sovereign backend is unavailable and failover would cross into zone ${fbZone}.`,
+                  code: 503,
+                  type: "sensitivity_no_eligible_candidate",
+                  sensitivity: zc.sensitivity,
+                  ceiling: zc.ceiling,
+                  rejected_zone: fbZone,
+                },
+              }), "utf-8"),
+            };
+          }
+          if (!useFallback) {
+            // Local is healthy and cloud is forbidden: serve locally with no
+            // safety net rather than a net that violates the constraint.
+            candidates = [localCandidate];
+          } else if (healthy) {
             // Local looks alive: try it first, cloud as a bounded safety net for
             // a mid-request hang.
             candidates = [localCandidate, fallbackCandidate];

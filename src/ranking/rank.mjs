@@ -49,6 +49,7 @@
  */
 
 import { LIFECYCLE_STATES } from '../discovery/lifecycle.mjs';
+import { resolveZoneCeiling, isZoneAllowed } from '../policy/sensitivity.mjs';
 
 /**
  * Basis weights (design 6.2): empirical signal outweighs priors by
@@ -94,7 +95,21 @@ function excludedCandidate(id, reason) {
  * enforced and enforced nothing. See `requireFailureReason()` below for how
  * an unknown key is handled instead.
  */
-const KNOWN_REQUIRE_KEYS = new Set(['tool_use', 'min_ctx', 'vision', 'max_latency_p50_ms']);
+const KNOWN_REQUIRE_KEYS = new Set([
+  'tool_use',
+  'min_ctx',
+  'vision',
+  'max_latency_p50_ms',
+  // Card 45d7a30b / N1. `sensitivity` states what the JOB is, and the ranker
+  // turns that into a trust-zone ceiling. It is listed here because card C5
+  // made unrecognized keys fail closed, so a key that is genuinely implemented
+  // has to be declared or it would exclude every candidate. That ordering was
+  // deliberate: the gate had to fail closed BEFORE anything relied on it.
+  'sensitivity',
+  // Escape hatch for a caller that wants to name the ceiling directly rather
+  // than go through a sensitivity label.
+  'max_trust_zone',
+]);
 
 /**
  * Evaluate the `require` block against one catalog entry's capabilities.
@@ -127,7 +142,7 @@ const KNOWN_REQUIRE_KEYS = new Set(['tool_use', 'min_ctx', 'vision', 'max_latenc
  * @param {object} require requirements.require block
  * @returns {string|null}
  */
-function requireFailureReason(entry, require = {}) {
+function requireFailureReason(entry, require = {}, sensitivityPolicy = undefined) {
   const caps = entry.capabilities || {};
 
   for (const key of Object.keys(require)) {
@@ -153,6 +168,35 @@ function requireFailureReason(entry, require = {}) {
     if (typeof caps.latency_p50_ms === 'number' && caps.latency_p50_ms > require.max_latency_p50_ms) {
       return 'require:max_latency_p50_ms';
     }
+  }
+
+  // Card N1: sovereignty. Resolve a ceiling from whichever form the caller
+  // used, then hold the candidate's trust zone to it.
+  //
+  // Note the asymmetry with `max_latency_p50_ms` directly above, which gives an
+  // unmeasured model the benefit of the doubt. This one does the opposite: an
+  // UNKNOWN trust zone is treated as the least trusted and excluded. Latency is
+  // a performance guess where being wrong costs a slow response; a trust zone
+  // is a confidentiality claim where being wrong costs the content. N2 measured
+  // that a large share of the fleet has incomplete provider metadata, so
+  // "unknown" is the common case here, not an edge one.
+  let ceiling = null;
+  if (require.sensitivity !== undefined) {
+    const resolved = resolveZoneCeiling(require.sensitivity, sensitivityPolicy);
+    if (!resolved.recognized) return `require:sensitivity:unrecognized:${require.sensitivity}`;
+    ceiling = resolved.ceiling;
+  }
+  if (typeof require.max_trust_zone === 'number') {
+    // Both given: take the stricter. A caller cannot widen a sensitivity
+    // ceiling by also naming a laxer zone.
+    ceiling = ceiling === null ? require.max_trust_zone : Math.min(ceiling, require.max_trust_zone);
+  } else if (require.max_trust_zone !== undefined) {
+    return 'require:max_trust_zone:not_a_number';
+  }
+
+  if (ceiling !== null && !isZoneAllowed(caps.trust_zone, ceiling)) {
+    const z = typeof caps.trust_zone === 'number' ? caps.trust_zone : 'unknown';
+    return `require:sensitivity:trust_zone_${z}_exceeds_${ceiling}`;
   }
 
   return null;
@@ -283,7 +327,7 @@ export function rankModels(catalog, requirements = {}, opts = {}) {
       continue;
     }
 
-    const requireFail = requireFailureReason(entry, require);
+    const requireFail = requireFailureReason(entry, require, opts.sensitivityPolicy);
     if (requireFail) {
       excluded.push(excludedCandidate(entry.id, requireFail));
       continue;
