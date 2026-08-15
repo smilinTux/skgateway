@@ -12,15 +12,14 @@
 // why: importing them from here would make discovery.mjs and the adapters it
 // imports circularly dependent).
 
-const NON_CHAT = [
-  /embed/i, /\bbge\b/i, /rerank/i, /content-safety/i, /guard/i,
-  /\bfuyu\b/i, /\bocr\b/i, /vision-embed/i, /moderation/i,
-];
+// Card C13: the single source of truth is discovery/classify.mjs. This export
+// is kept because tests/discovery.test.mjs asserts its exact id-only behavior,
+// and because parseNvidia/parseOpenRouterFree below are the pre-adapter
+// functions whose output shape those tests pin.
+import { isChatModelId } from './discovery/classify.mjs';
 
-export function isChatModel(id) {
-  if (!id || typeof id !== 'string') return false;
-  return !NON_CHAT.some((re) => re.test(id));
-}
+/** Kept as a named export: tests/discovery.test.mjs pins this exact behavior. */
+export const isChatModel = isChatModelId;
 
 export function parseNvidia(json) {
   const data = (json && json.data) || [];
