@@ -728,9 +728,14 @@ export function parseRequireSpec(spec) {
  * through to normal resolution (role/context/service headers, or the
  * registry default) instead of a broken requirements object corrupting
  * routing. A present-but-nonsense header never throws (parseRequireSpec()'s
- * own fail-soft grammar handles that): an unrecognized require key just
- * degrades to a no-op downstream (rank.mjs's requireFailureReason() only
- * inspects the keys it knows), never a 500.
+ * own fail-soft grammar handles that): a malformed token is ignored at parse
+ * time, never a 500. A well-formed but unrecognized require key (a real
+ * word, just not one this ranker implements) is a different case and is NOT
+ * a no-op: since card C5, rank.mjs's requireFailureReason() fails closed on
+ * it (excludes the candidate with excluded_reason `require:unknown:<key>`)
+ * rather than silently admitting every candidate, so a sovereignty
+ * requirement like `sensitivity=secret` cannot look enforced while doing
+ * nothing.
  *
  * @param {string|string[]|undefined} headerValue raw req.headers["x-sk-require"]
  * @returns {{require:object, prefer?:string[], tier?:string[]}|null}
