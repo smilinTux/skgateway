@@ -32,6 +32,28 @@ if (!process.env.SKGATEWAY_MODEL_CATALOG_STORE_PATH) {
   process.env.SKGATEWAY_MODEL_CATALOG_STORE_PATH = join(dir, 'model_catalog_store.json');
 }
 
+// Same class of bug, second variable. src/proxy/registry.mjs binds
+// REGISTRY_PATH at module load from $SKMODELS_REGISTRY, defaulting to the REAL
+// per-node file ~/.skcapstone/models/registry.yaml. Twelve test files remember
+// to point that at a fixture or a nonexistent path; the rest inherit whatever
+// the developer's box happens to hold. tests/siem-live-hook.test.mjs did not
+// remember, so on a node with a populated registry the router registry-routed
+// its fake "m" model to the LIVE ornith backend at 192.168.0.100:8082 and the
+// assertion `backend === "fake"` failed with "reg:ornith" after an 8.7s round
+// trip to the LAN. On a bare CI runner the file is absent, so it passed there:
+// green CI, red developer box, which is the worst possible split.
+//
+// Default it to a path that cannot exist. loadRegistry() already treats an
+// unreadable registry as empty, so this is the "no registry configured" case,
+// which is the correct baseline for a unit test. A suite that needs a registry
+// still assigns SKMODELS_REGISTRY itself at module scope before importing
+// registry.mjs, and that assignment still wins.
+if (!process.env.SKMODELS_REGISTRY) {
+  process.env.SKMODELS_REGISTRY = join(
+    tmpdir(), 'skgw-test-no-registry', 'nonexistent-registry.yaml',
+  );
+}
+
 // Belt and braces: also mark this as a test run explicitly, so the guard trips
 // even on a runner that does not set NODE_TEST_CONTEXT.
 process.env.NODE_ENV = process.env.NODE_ENV || 'test';
