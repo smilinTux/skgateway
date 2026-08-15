@@ -298,3 +298,29 @@ test('the anchor constants match the documented measurement', () => {
   // 2.85 J/token measured on a 9B, so 0.317 J per token per billion.
   assert.ok(Math.abs(MEASURED_J_PER_TOKEN_PER_B - 2.85 / 9) < 0.002);
 });
+
+import { backendIsLocal } from '../src/metrics/energy.mjs';
+
+test('backendIsLocal: a loopback WRAPPER must not launder cloud work as local', () => {
+  // The anthropic backend is a proxy on 127.0.0.1:18782. A URL test calls it
+  // local, so every Anthropic request was filed imputed_local when the work
+  // really happens in Anthropic's datacenter. Config must win.
+  const urlIsLocal = (u) => u.includes('127.0.0.1');
+  const locality = { anthropic: 'remote' };
+  assert.equal(backendIsLocal('anthropic', 'http://127.0.0.1:18782/v1', locality, urlIsLocal), false);
+});
+
+test('backendIsLocal: falls back to the URL heuristic when undeclared', () => {
+  const urlIsLocal = (u) => u.includes('192.168.');
+  assert.equal(backendIsLocal('local', 'http://192.168.0.100:8082/v1', {}, urlIsLocal), true);
+  assert.equal(backendIsLocal('nvidia', 'https://integrate.api.nvidia.com/v1', {}, urlIsLocal), false);
+});
+
+test('backendIsLocal: an explicit local declaration also wins', () => {
+  assert.equal(backendIsLocal('odd', 'https://example.com/v1', { odd: 'local' }, () => false), true);
+});
+
+test('backendIsLocal: a throwing heuristic degrades to remote, never crashes', () => {
+  const boom = () => { throw new Error('bad url'); };
+  assert.equal(backendIsLocal('x', 'not-a-url', {}, boom), false);
+});

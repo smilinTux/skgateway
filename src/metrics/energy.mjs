@@ -50,6 +50,37 @@ export function imputeJoules(tokens, coeffs) {
 /**
  * Which of the three bases produced a number. Always recorded alongside it.
  */
+/**
+ * Is this backend physically local, for energy-basis purposes?
+ *
+ * A URL heuristic alone gets this WRONG for proxy backends. The `anthropic`
+ * backend is a loopback wrapper on 127.0.0.1:18782, so a URL test calls it
+ * local and every Anthropic request gets filed as `imputed_local` when the
+ * work actually happens in Anthropic's datacenter. The basis field exists to
+ * say WHERE energy was spent, so a wrapper must not be able to launder cloud
+ * work into the local column.
+ *
+ * Config wins over the heuristic:
+ *   energy:
+ *     locality:
+ *       anthropic: remote     # loopback wrapper, real work is off-box
+ *
+ * @param {string} backendId
+ * @param {string} backendUrl
+ * @param {object} locality   map of backendId -> "local" | "remote"
+ * @param {(u:string)=>boolean} urlIsLocal  fallback heuristic
+ */
+export function backendIsLocal(backendId, backendUrl, locality, urlIsLocal) {
+  const declared = locality && backendId ? locality[backendId] : undefined;
+  if (declared === 'remote') return false;
+  if (declared === 'local') return true;
+  try {
+    return Boolean(urlIsLocal && urlIsLocal(backendUrl));
+  } catch {
+    return false;
+  }
+}
+
 export function resolveBasis({ metered, backendIsLocal }) {
   if (metered) return 'measured_gpu';
   return backendIsLocal ? 'imputed_local' : 'imputed_cloud';
