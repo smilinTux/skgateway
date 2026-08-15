@@ -16,6 +16,13 @@
  *      counted as dead). Any other 4xx/5xx, a timeout, or a network error is
  *      reported with its own distinct reason - they mean different things
  *      (a 404/410 is a retired model; a timeout can be a slow cold start).
+ *      A 2xx with EMPTY `content` but non-empty `reasoning_content` is
+ *      alive-but-reasoning-only, a fourth distinct outcome alongside plain
+ *      alive/throttled/dead (card 8ae6b962/C17): several models in this
+ *      fleet (ornith-1.0-9b, qwen3.6-27b-abliterated, qwen3.8-27b, and more
+ *      arriving) spend their max_tokens budget on reasoning_content before
+ *      producing a visible answer, which is a capability fact about that
+ *      probe, never a liveness failure and never dead.
  *
  *   2. REPRESENTATION - the check that would have caught the real outage.
  *      GET /admin/models/status reports each discovery provider's last-fetch
@@ -67,6 +74,40 @@
  * are exactly where this class of drift lives. Intended cadence is DAILY, not
  * more - see the scheduler registration this ships with.
  *
+ * TOKEN FLOOR (card 8ae6b962/C17). DEFAULT_MAX_TOKENS used to be a flat 24,
+ * independent of src/discovery/capability-assessment.mjs's
+ * MIN_OUTPUT_TOKEN_LADDER ([64, 256, 1024, 2048]), which exists precisely
+ * because several models here emit `reasoning_content` with EMPTY `content`
+ * below that ceiling. Measured 2026-08-15 through this gateway:
+ * ornith-1.0-9b, qwen3.6-27b-abliterated and qwen3.8-27b all returned
+ * HTTP 200 with empty `content` and populated `reasoning_content` at
+ * max_tokens=24 (finish_reason "length" - they spent the whole budget
+ * thinking). ornith-1.0-9b needed 256 before content ever appeared in this
+ * run, but reasoning length varies call to call, and the assessment module
+ * already documents Ornith needing the full 2048 rung in other runs. Rather
+ * than pick a new round number, DEFAULT_MAX_TOKENS now reuses that module's
+ * ladder ceiling directly (imported, not copied), so the two floors agree by
+ * construction: raise the ladder there and this job's floor rises with it.
+ *
+ * COST OF THE RAISE. This does not change how many requests the sweep makes
+ * (still one liveness probe per advertised id, minus --skip-provider, plus
+ * the failover list) so any RPM/RPD-shaped free-tier limit is unaffected.
+ * It raises the per-request max_tokens CEILING from 24 to 2048 (85x), but a
+ * model that isn't reasoning-heavy stops itself at finish_reason "stop" well
+ * under the old 24-token cap regardless (measured: qwen3.8-27b-ud-q5_k_xl
+ * answered in 15 completion tokens even offered room), so the raise costs
+ * those models nothing. For the reasoning-heavy models this card exists for,
+ * measured actual completion_tokens once they produced content ranged 64 to
+ * 408 on this fleet's self-hosted ornith/qwen backends (compute time on our
+ * own hardware, not third-party quota) - nowhere near the 2048 ceiling in
+ * practice, though a model that never converges could still hit it. The
+ * free-tier providers (nvidia/openrouter/opencode, 57 of the 63 non-skipped
+ * ids as of 2026-08-15) have not individually been characterized as
+ * reasoning-heavy or not; if this raise starts producing FreeUsageLimitError
+ * on the daily cadence, that is the signal to drop cadence or cap
+ * max_tokens per-provider, not a reason to preemptively halve a cadence that
+ * has not yet been shown to cost anything extra for most of the catalog.
+ *
  * Usage:
  *   node scripts/verify-catalog.mjs [options]
  *
@@ -76,7 +117,9 @@
  *                            or ~/.skcapstone/models/registry.yaml)
  *       --skip-provider NAME provider to exclude from the liveness sweep,
  *                            repeatable (default: anthropic)
- *       --max-tokens N       max_tokens per probe completion (default 24)
+ *       --max-tokens N       max_tokens per probe completion (default: the
+ *                            capability-assessment ladder ceiling, see the
+ *                            TOKEN FLOOR section above)
  *       --timeout MS         per-completion timeout (default 45000)
  *       --delay MS           pacing delay between completions (default 500)
  *       --alert              fire sk-alert on a genuine failure
@@ -98,11 +141,16 @@
 import { fileURLToPath } from "node:url";
 import { resolveFailoverCandidates, REGISTRY_PATH } from "../src/proxy/registry.mjs";
 import { fireSkAlert } from "./lib/sk-alert.mjs";
+import { MIN_OUTPUT_TOKEN_LADDER } from "../src/discovery/capability-assessment.mjs";
 
 export const DEFAULT_ENDPOINT = process.env.SKGATEWAY_VERIFY_ENDPOINT || "http://localhost:18780";
 export const DEFAULT_REGISTRY_PATH = process.env.SKMODELS_REGISTRY || REGISTRY_PATH;
 export const DEFAULT_SKIP_PROVIDERS = ["anthropic"];
-export const DEFAULT_MAX_TOKENS = 24;
+// Reuses capability-assessment.mjs's own ladder ceiling rather than a
+// hand-picked number, so the two modules agree BY CONSTRUCTION (card
+// 8ae6b962/C17). See the TOKEN FLOOR section of this module's doc comment
+// for what was measured.
+export const DEFAULT_MAX_TOKENS = Math.max(...MIN_OUTPUT_TOKEN_LADDER);
 export const DEFAULT_TIMEOUT_MS = 45000;
 export const DEFAULT_DELAY_MS = 500;
 export const DEFAULT_ALERT_TTL_SECONDS = 43200; // 12h: re-pages once per calendar day on a daily cadence, not once per run
@@ -140,10 +188,22 @@ function groupIdsByProvider(items, providerOf, idOf) {
  * failure). Anything else is dead, with a distinct `reason` so 4xx/5xx/timeout
  * are never lumped into one generic "failed" bucket.
  *
- * @param {{status?:number, timedOut?:boolean, networkError?:string}} outcome
- * @returns {{alive:boolean, throttled:boolean, reason:string}}
+ * A 2xx whose body carries empty `content` alongside non-empty
+ * `reasoning_content` is a fourth outcome, alive-but-reasoning-only (card
+ * 8ae6b962/C17): the model answered the request, in the sense that it used
+ * the whole probe budget thinking about it, which is a capability fact about
+ * that max_tokens value, not evidence the model is unreachable or broken.
+ * Classifying it as plain dead is exactly the false-DEAD class this card
+ * exists to close off; classifying it as plain alive would hide a real (if
+ * benign) signal that this probe's token budget was too tight for this
+ * model. `content`/`reasoningContent` are optional so callers that never
+ * parsed a body (e.g. tests stubbing `{status}` only) fall through to the
+ * existing plain alive/dead behavior unchanged.
+ *
+ * @param {{status?:number, timedOut?:boolean, networkError?:string, content?:string|null, reasoningContent?:string|null}} outcome
+ * @returns {{alive:boolean, throttled:boolean, reasoningOnly?:boolean, reason:string}}
  */
-export function classifyProbe({ status, timedOut = false, networkError = null } = {}) {
+export function classifyProbe({ status, timedOut = false, networkError = null, content = null, reasoningContent = null } = {}) {
   // A connection-level failure talking to OUR OWN gateway says nothing about
   // the model. It says the gateway was not there.
   //
@@ -165,7 +225,14 @@ export function classifyProbe({ status, timedOut = false, networkError = null } 
   if (timedOut) return { alive: false, throttled: false, reason: "timeout" };
   if (typeof status !== "number") return { alive: false, throttled: false, reason: "no_response" };
   if (status === 429) return { alive: true, throttled: true, reason: "http_429" };
-  if (status >= 200 && status < 300) return { alive: true, throttled: false, reason: `http_${status}` };
+  if (status >= 200 && status < 300) {
+    const hasContent = typeof content === "string" && content.trim().length > 0;
+    const hasReasoning = typeof reasoningContent === "string" && reasoningContent.trim().length > 0;
+    if (!hasContent && hasReasoning) {
+      return { alive: true, throttled: false, reasoningOnly: true, reason: "reasoning_only_empty_content" };
+    }
+    return { alive: true, throttled: false, reason: `http_${status}` };
+  }
   return { alive: false, throttled: false, reason: `http_${status}` };
 }
 
@@ -214,7 +281,23 @@ export async function probeModel({ endpoint, id, maxTokens = DEFAULT_MAX_TOKENS,
       }),
     });
     const ms = Date.now() - start;
-    const cls = classifyProbe({ status: resp.status });
+    // Only a 2xx body is worth parsing: it is the only case classifyProbe
+    // does anything with content/reasoningContent for. A body that fails to
+    // parse (or a stub in a test that returns no .json()) must never crash
+    // the probe - it just means we have no content evidence either way, and
+    // classifyProbe falls back to its plain status-only behavior.
+    let content = null, reasoningContent = null;
+    if (resp.status >= 200 && resp.status < 300) {
+      try {
+        const parsed = await resp.json();
+        const message = parsed?.choices?.[0]?.message || {};
+        if (typeof message.content === "string") content = message.content;
+        if (typeof message.reasoning_content === "string") reasoningContent = message.reasoning_content;
+      } catch {
+        // no body evidence, see above
+      }
+    }
+    const cls = classifyProbe({ status: resp.status, content, reasoningContent });
     return { id, status: resp.status, ms, ...cls };
   } catch (e) {
     const ms = Date.now() - start;
@@ -302,22 +385,24 @@ export async function waitForGateway({ endpoint, fetchImpl = fetch, sleepImpl = 
  * provider map taken from the live /v1/models catalog.
  *
  * @param {object} args
- * @param {Array<{id:string, status:number|null, alive:boolean, throttled:boolean, reason:string}>} args.results
+ * @param {Array<{id:string, status:number|null, alive:boolean, throttled:boolean, reasoningOnly?:boolean, reason:string}>} args.results
  * @param {Map<string,string>} args.providerById
- * @returns {{perProvider: object, deadIds: Array<object>, aliveCount:number, throttledCount:number, deadCount:number}}
+ * @returns {{perProvider: object, deadIds: Array<object>, reasoningOnlyIds: Array<object>, aliveCount:number, throttledCount:number, reasoningOnlyCount:number, deadCount:number}}
  */
 export function summarizeLiveness({ results, providerById }) {
   const perProvider = {};
   const deadIds = [];
   const unreachableIds = [];
+  const reasoningOnlyIds = [];
   let aliveCount = 0;
   let throttledCount = 0;
+  let reasoningOnlyCount = 0;
   let deadCount = 0;
   let unreachableCount = 0;
   for (const r of results) {
     const provider = providerById.get(r.id) || "unknown";
     if (!perProvider[provider]) {
-      perProvider[provider] = { total: 0, alive: 0, throttled: 0, dead: 0, unreachable: 0, dead_ids: [] };
+      perProvider[provider] = { total: 0, alive: 0, throttled: 0, reasoning_only: 0, dead: 0, unreachable: 0, dead_ids: [], reasoning_only_ids: [] };
     }
     const p = perProvider[provider];
     p.total += 1;
@@ -325,6 +410,17 @@ export function summarizeLiveness({ results, providerById }) {
       aliveCount += 1;
       p.alive += 1;
       if (r.throttled) { throttledCount += 1; p.throttled += 1; }
+      // Reasoning-only is a sub-fact about an ALIVE result (card 8ae6b962/C17):
+      // the model answered the probe, it just spent the whole budget getting
+      // there. Counted alongside throttled, never subtracted from aliveCount,
+      // and never landing in deadIds - that is what pages.
+      if (r.reasoningOnly) {
+        reasoningOnlyCount += 1;
+        p.reasoning_only += 1;
+        const entry = { id: r.id, provider, ms: r.ms };
+        p.reasoning_only_ids.push(entry);
+        reasoningOnlyIds.push(entry);
+      }
     } else if (r.unreachable) {
       // The gateway was not reachable for this probe, so we learned NOTHING
       // about the model. Counted and reported separately, never as dead, and
@@ -340,7 +436,7 @@ export function summarizeLiveness({ results, providerById }) {
       deadIds.push(entry);
     }
   }
-  return { perProvider, deadIds, unreachableIds, aliveCount, throttledCount, deadCount, unreachableCount };
+  return { perProvider, deadIds, unreachableIds, reasoningOnlyIds, aliveCount, throttledCount, reasoningOnlyCount, deadCount, unreachableCount };
 }
 
 // ── check 2: representation ─────────────────────────────────────────────────
@@ -585,12 +681,16 @@ export function formatReport(result, endpoint) {
   }
   const { liveness, representation, countDivergence, failover } = result;
 
-  L.push(`  1. LIVENESS: ${liveness.aliveCount} alive (${liveness.throttledCount} throttled), ${liveness.deadCount} dead` +
+  L.push(`  1. LIVENESS: ${liveness.aliveCount} alive (${liveness.throttledCount} throttled, ${liveness.reasoningOnlyCount} reasoning-only), ${liveness.deadCount} dead` +
     (liveness.unreachableCount ? `, ${liveness.unreachableCount} UNREACHABLE (gateway was down, not model evidence)` : "") +
     (liveness.skipped.length ? `, ${liveness.skipped.length} skipped (${liveness.skipped.join(", ")})` : ""));
   for (const [provider, p] of Object.entries(liveness.perProvider)) {
-    L.push(`     ${provider}: ${p.alive}/${p.total} alive (${p.throttled} throttled), ${p.dead} dead`);
+    L.push(`     ${provider}: ${p.alive}/${p.total} alive (${p.throttled} throttled, ${p.reasoning_only} reasoning-only), ${p.dead} dead`);
     for (const d of p.dead_ids) L.push(`       DEAD ${d.id} - ${d.reason}`);
+    // Reasoning-only is a capability fact, not a failure - reported for
+    // diagnosability alongside dead_ids, but with no ALARM/DEAD label and
+    // never counted against liveness.deadCount (card 8ae6b962/C17).
+    for (const ro of p.reasoning_only_ids) L.push(`       reasoning-only ${ro.id} - answered, spent the probe budget thinking`);
   }
 
   L.push(`  2. REPRESENTATION: ${representation.gaps.length} gap(s)`);

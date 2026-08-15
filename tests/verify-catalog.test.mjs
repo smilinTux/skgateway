@@ -34,8 +34,10 @@ import {
   EXIT_OK,
   EXIT_DRIFT,
   EXIT_ERROR,
+  DEFAULT_MAX_TOKENS,
 } from "../scripts/verify-catalog.mjs";
 import { resolveFailoverCandidates } from "../src/proxy/registry.mjs";
+import { MIN_OUTPUT_TOKEN_LADDER } from "../src/discovery/capability-assessment.mjs";
 
 const noSleep = async () => {};
 
@@ -75,12 +77,53 @@ describe("classifyProbe", () => {
     assert.equal(r.alive, false);
     assert.match(r.reason, /ECONNREFUSED/);
   });
+
+  // Card 8ae6b962/C17: empty content with non-empty reasoning_content is a
+  // fourth, distinct outcome. It is alive - the model answered the request,
+  // it just spent the whole probe budget thinking about it first - and that
+  // is a capability fact, never a liveness failure.
+  test("2xx with empty content and non-empty reasoning_content is alive-but-reasoning-only, not dead", () => {
+    const r = classifyProbe({ status: 200, content: "", reasoningContent: "Thinking Process:\n1. ..." });
+    assert.equal(r.alive, true);
+    assert.equal(r.reasoningOnly, true);
+    assert.equal(r.reason, "reasoning_only_empty_content");
+  });
+
+  test("2xx with real content is plain alive even if reasoning_content is also present", () => {
+    const r = classifyProbe({ status: 200, content: "ok", reasoningContent: "some reasoning" });
+    assert.equal(r.alive, true);
+    assert.ok(!r.reasoningOnly);
+    assert.equal(r.reason, "http_200");
+  });
+
+  test("2xx with no content evidence at all (content/reasoningContent both null) is plain alive, unchanged from before this card", () => {
+    assert.deepEqual(classifyProbe({ status: 200 }), { alive: true, throttled: false, reason: "http_200" });
+  });
+
+  test("2xx with empty content and empty/whitespace-only reasoning_content is plain alive, not reasoning-only", () => {
+    const r = classifyProbe({ status: 200, content: "", reasoningContent: "   " });
+    assert.equal(r.alive, true);
+    assert.ok(!r.reasoningOnly);
+  });
+
+  test("429 is throttled even if a reasoning-shaped body were somehow attached - throttle takes priority", () => {
+    const r = classifyProbe({ status: 429, content: "", reasoningContent: "thinking" });
+    assert.equal(r.throttled, true);
+    assert.ok(!r.reasoningOnly);
+  });
+
+  test("a dead status (404) is dead regardless of any content fields", () => {
+    const r = classifyProbe({ status: 404, content: "", reasoningContent: "thinking" });
+    assert.equal(r.alive, false);
+    assert.ok(!r.reasoningOnly);
+    assert.equal(r.reason, "http_404");
+  });
 });
 
 // ── probeModel / probeAll ────────────────────────────────────────────────────
 
 describe("probeModel", () => {
-  test("posts to /v1/chat/completions with the model id and a small max_tokens, classifies the status", async () => {
+  test("posts to /v1/chat/completions with the model id and the default max_tokens, classifies the status", async () => {
     let seenUrl, seenBody;
     const fetchImpl = async (url, opts) => {
       seenUrl = url;
@@ -90,8 +133,44 @@ describe("probeModel", () => {
     const r = await probeModel({ endpoint: "http://x:1/", id: "some/model", fetchImpl });
     assert.equal(seenUrl, "http://x:1/v1/chat/completions");
     assert.equal(seenBody.model, "some/model");
-    assert.ok(seenBody.max_tokens > 0 && seenBody.max_tokens < 100, "max_tokens should be small");
+    // DEFAULT_MAX_TOKENS is no longer a hand-picked small number (card
+    // 8ae6b962/C17: 24 was below the floor a reasoning model needs to
+    // produce visible content at all). It must clear the ladder ceiling
+    // capability-assessment.mjs already proved is necessary, by construction
+    // rather than by two modules independently agreeing to the same literal.
+    assert.equal(seenBody.max_tokens, DEFAULT_MAX_TOKENS);
+    assert.equal(DEFAULT_MAX_TOKENS, Math.max(...MIN_OUTPUT_TOKEN_LADDER), "must reuse the assessment module's ladder ceiling, not a separately hand-picked value");
     assert.equal(r.alive, true);
+  });
+
+  test("a 2xx with non-empty content is plain alive, not reasoning-only", async () => {
+    const fetchImpl = async () => ({ status: 200, json: async () => ({ choices: [{ message: { content: "ok" } }] }) });
+    const r = await probeModel({ endpoint: "http://x:1", id: "m", fetchImpl });
+    assert.equal(r.alive, true);
+    assert.ok(!r.reasoningOnly);
+    assert.equal(r.reason, "http_200");
+  });
+
+  test("REPRO 2026-08-15: a 2xx with empty content and populated reasoning_content is alive-but-reasoning-only, never dead", async () => {
+    // Measured live through the gateway against ornith-1.0-9b at max_tokens=24:
+    // HTTP 200, finish_reason "length", content "", reasoning_content populated.
+    const fetchImpl = async () => ({
+      status: 200,
+      json: async () => ({
+        choices: [{ finish_reason: "length", message: { content: "", reasoning_content: "Thinking Process:\n1. Analyze the input..." } }],
+      }),
+    });
+    const r = await probeModel({ endpoint: "http://x:1", id: "ornith-1.0-9b", fetchImpl });
+    assert.equal(r.alive, true, "a model that answered by spending its budget thinking is not dead");
+    assert.equal(r.reasoningOnly, true);
+    assert.equal(r.reason, "reasoning_only_empty_content");
+  });
+
+  test("a 2xx body that fails to parse (or has no .json()) falls back to plain status-based classification", async () => {
+    const fetchImpl = async () => ({ status: 200 });
+    const r = await probeModel({ endpoint: "http://x:1", id: "m", fetchImpl });
+    assert.equal(r.alive, true);
+    assert.ok(!r.reasoningOnly);
   });
 
   test("an AbortError from the fetch is classified as a timeout, not a network error", async () => {
@@ -140,6 +219,27 @@ describe("summarizeLiveness", () => {
     assert.equal(cDead.reason, "http_404");
     const dDead = s.deadIds.find((d) => d.id === "d");
     assert.equal(dDead.reason, "timeout");
+  });
+
+  // Card 8ae6b962/C17: reasoning-only is counted alongside throttled, as a
+  // sub-fact of ALIVE, and must never land in deadIds - deadIds is what
+  // alerts, and a model that answered by thinking through its whole budget
+  // is not the "advertised model that doesn't work" this job pages about.
+  test("reasoning-only results count as alive, never dead, and are reported separately from throttled", () => {
+    const results = [
+      { id: "a", status: 200, alive: true, throttled: false, reason: "http_200" },
+      { id: "b", status: 200, alive: true, throttled: false, reasoningOnly: true, reason: "reasoning_only_empty_content" },
+      { id: "c", status: 429, alive: true, throttled: true, reason: "http_429" },
+    ];
+    const providerById = new Map([["a", "nvidia"], ["b", "nvidia"], ["c", "nvidia"]]);
+    const s = summarizeLiveness({ results, providerById });
+    assert.equal(s.aliveCount, 3, "reasoning-only is alive, not a separate non-alive bucket");
+    assert.equal(s.reasoningOnlyCount, 1);
+    assert.equal(s.deadCount, 0, "reasoning-only must never be counted as dead");
+    assert.equal(s.deadIds.length, 0);
+    assert.deepEqual(s.reasoningOnlyIds.map((r) => r.id), ["b"]);
+    assert.equal(s.perProvider.nvidia.reasoning_only, 1);
+    assert.equal(s.perProvider.nvidia.alive, 3);
   });
 });
 
