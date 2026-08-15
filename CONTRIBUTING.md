@@ -31,9 +31,12 @@ tests are part of "done".
 The green bar blocks merge. Run before opening a PR:
 
 ```bash
-npm install
-npm test          # node --test tests/*.test.mjs - all suites must pass
+npm ci            # plain, NOT --ignore-scripts: better-sqlite3 needs its install script
+npm test          # node --test --import ./tests/_setup.mjs tests/*.test.mjs
 ```
+
+`.github/workflows/ci.yml` runs exactly this on every push and pull request, on Node 20
+and 22. It swallows nothing, so a red suite fails the PR.
 
 - Any bug fix adds a regression test that fails before the fix and passes after
   (see `tests/metrics-collector.test.mjs` as the reference pattern).

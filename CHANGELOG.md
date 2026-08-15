@@ -103,10 +103,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **SOP: documented the Anthropic-compatible `POST /v1/messages` front end**
   (`src/index.mjs:1347`), matched by **pathname** so Claude Code's `?beta=true` still
   hits it, and the default logical role `sk-default`.
-- **SOP §4: added an explicit "CI cannot fail" gap.** There is no `ci.yml`. The only test
-  invocation is `npm test 2>/dev/null || true` inside a tags-only `publish.yml`, with
-  `continue-on-error: true` on the job and `if: always()` on the publisher. A green check
-  here certifies that a tag was pushed and nothing else. Owned by card `62a5256d`.
+- ~~**SOP §4: added an explicit "CI cannot fail" gap.**~~ Superseded within this same
+  Unreleased block: the gap is closed under "Added" and "Fixed" below. The finding was
+  that no `ci.yml` existed and the only test invocation was `npm test 2>/dev/null || true`
+  inside a tags-only `publish.yml`, with `continue-on-error: true` on the job and
+  `if: always()` on the publisher, so a green check certified only that a tag was pushed.
+  Owned by card `62a5256d`. §4 now documents the working gate and keeps the history.
 - **SOP §5/§6: documented the EFFECTIVE `ExecStart`.** The `config-path.conf` drop-in
   clears `ExecStart=` and re-declares it without `--config`, so the service loads the
   Syncthing-synced `~/.skcapstone/gateway/skgateway.yaml`, not the in-repo config. Also
@@ -123,15 +125,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `docs-evidence` block at the end of `SOP.md`: 8 hermetic, repo-local checks pinning the
+- **`.github/workflows/ci.yml`: the repo's first real test gate (card `62a5256d`).**
+  Runs `npm ci` then `npm test` on every push and pull request to `main`/`master`,
+  across a Node 20 and 22 matrix. No shell success-guard, no output redirection, no
+  job-level failure tolerance: a red suite fails the run.
+- `docs-evidence` block at the end of `SOP.md`: 11 hermetic, repo-local checks pinning the
   documented ports and `0.0.0.0` bind default, the pathname match for `/v1/messages`, the
-  MIT licence (this repo is private and is NOT relicensed to GPL), the documented CI gap,
-  the health/self-description routes, the config precedence chain, `sk-default`, and the
+  MIT licence (this repo is private and is NOT relicensed to GPL), the four CI facts
+  (ci.yml swallows nothing, publish is gated on a failable test job, neither test job
+  installs with `--ignore-scripts`, the test bootstrap pins `SKMODELS_REGISTRY`), the
+  health/self-description routes, the config precedence chain, `sk-default`, and the
   stale `/status` version. Every check was negative-tested.
-- `.github/workflows/docs-check.yml` running tiers 1 and 2 on push and pull_request.
+- `.github/workflows/docs-check.yml`, now running tiers 1, 2 and 3 on push and
+  pull_request, so the evidence block is executed rather than merely present.
 
 ### Fixed
 
+- **`publish.yml` could publish to npm from a fully red suite (card `62a5256d`).**
+  Removed `2>/dev/null || true` and `continue-on-error: true` from the `test` job, and
+  removed `if: always()` from `publish-npm`, so `needs: test` is now a real edge.
+- **`publish.yml`'s test job installed with `--ignore-scripts`**, which skips
+  better-sqlite3's native binding install. That alone fails 19 metrics, energy and SIEM
+  tests with `Could not locate the bindings file`, so even the swallowed test run was
+  testing a broken install. Both test jobs now use plain `npm ci`.
+- **`tests/siem-live-hook.test.mjs` reached a live LAN backend.** `src/proxy/registry.mjs`
+  binds `REGISTRY_PATH` at module load from `$SKMODELS_REGISTRY`, defaulting to the real
+  per-node `~/.skcapstone/models/registry.yaml`. Twelve test files override it; this one
+  did not, so on a node with a populated registry the router registry-routed the test's
+  fake model `m` to ornith at `http://192.168.0.100:8082/v1` and the assertion
+  `backend === "fake"` failed with `reg:ornith` after an 8.7 second LAN round trip. It
+  passed on a bare CI runner (no registry file), which is the worst kind of split.
+  `tests/_setup.mjs` now defaults `SKMODELS_REGISTRY` to a nonexistent path for every
+  test process, the same belt-and-braces pattern already used for
+  `SKGATEWAY_MODEL_CATALOG_STORE_PATH`. A suite that needs a registry still assigns the
+  variable itself before importing `registry.mjs`. Suite goes from 1147 pass / 1 fail to
+  **1148 pass / 0 fail**, and total runtime from 27s to 16s.
 - Metrics collector double config dereference (card `7e739811`). `index.mjs`
   initialises the collector with `createMetricsCollector(config.metrics || {})`
   (the already-extracted metrics slice), but the factory dereferenced

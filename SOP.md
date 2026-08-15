@@ -167,29 +167,52 @@ contract (card `7e739811`) so metrics can never silently disable again.
 node --test tests/metrics-collector.test.mjs   # must pass
 ```
 
-### ⚠️ KNOWN GAP: CI cannot fail. Do not cite it as evidence of anything.
+### The CI gate
 
-**There is no `ci.yml` in this repo.** `.github/workflows/` contains exactly
-`publish.yml` and `secret-scan.yml`. The only test invocation anywhere in CI is inside
-`publish.yml`, and it is neutralised three times over:
+`.github/workflows/ci.yml` runs `npm ci` then `npm test` on every **push** and
+**pull request** to `main`/`master`, on a Node matrix of 20 and 22, with no `|| true`,
+no `2>/dev/null` and no `continue-on-error`. A red suite fails the run.
+`.github/workflows/publish.yml` repeats the same `test` job on a `v*` tag and gates
+`publish-npm` on a plain `needs: test`, so a red suite blocks the npm publish.
 
-| Layer | What it does |
-|---|---|
-| `on: push: tags: ["v*"]` | The workflow **never runs on a push or a pull request.** A PR that deletes every test is green, because nothing ran. |
-| `run: npm test 2>/dev/null \|\| true` | Even on a tag, a red suite is swallowed. `2>/dev/null` also hides the failure output. |
-| `continue-on-error: true` on the `test` job | Belt and braces on the same job. |
-| `publish-npm` has `needs: test` **plus** `if: always()` | The `needs:` edge is decorative. A total test failure still publishes to npm. |
+Note both install with plain `npm ci`, **not** `npm ci --ignore-scripts`.
+`better-sqlite3` resolves its native binding through an install script; skipping it
+makes 19 metrics, energy and SIEM tests fail with `Could not locate the bindings file`
+instead of on their own merits.
 
-So: **a green checkmark on this repo certifies that a tag was pushed, and nothing more.**
-No test result is behind it. Never quote skgateway CI as proof that a change is safe,
-and never write a `docs-evidence` check that greps a workflow here as though it were a
-gate. Run `npm test` locally and read the output.
+> **This was not always true, and the history matters.** Until card `62a5256d` there
+> was no `ci.yml` at all. The only test invocation in CI lived in `publish.yml` and was
+> neutralised four times over: the workflow was `on: push: tags: ["v*"]` so it never ran
+> on a push or a PR; the step was `npm test 2>/dev/null || true`; the job also carried
+> `continue-on-error: true`; and `publish-npm` had `needs: test` **plus** `if: always()`,
+> so a total test failure still published to npm. A green checkmark certified only that
+> a tag had been pushed. If any of those four patterns reappears in a diff, it is a
+> regression, and the `docs-evidence` block below will go red.
 
-Fixing this is owned by coordination card `62a5256d` ("ci(skskills,skgateway): test jobs
-that can never fail, and publish anyway"). The fix is a real `ci.yml` on `push` +
-`pull_request` running `npm test` with no `|| true`, no `2>/dev/null`, and no
-`continue-on-error`. Until that lands, this section is the honest statement of the gate:
-there isn't one in CI.
+`.github/workflows/` now holds four workflows: `ci.yml`, `publish.yml`,
+`docs-check.yml` (the shared sk-standards gate at `tiers: "1,2,3"`, so the evidence
+block at the end of this file is executed on every push) and `secret-scan.yml`
+(pinned gitleaks binary, `--exit-code 1`).
+
+#### Tests must not read live per-node state
+
+`tests/_setup.mjs` is preloaded via `node --test --import` and pins two environment
+variables **before any module is imported**, because both are bound at module load:
+
+| Variable | Pinned to | Why |
+|---|---|---|
+| `SKGATEWAY_MODEL_CATALOG_STORE_PATH` | a fresh temp dir | otherwise the suite mutates the real per-node lifecycle store |
+| `SKMODELS_REGISTRY` | a nonexistent path | otherwise `src/proxy/registry.mjs` defaults to the real `~/.skcapstone/models/registry.yaml`, and a populated registry registry-routes a test's fake model to a **live LAN backend** |
+
+The second one was added under card `62a5256d`. `tests/siem-live-hook.test.mjs`
+asserted `backend === "fake"` and got `reg:ornith` after an 8.7 second round trip to
+`http://192.168.0.100:8082/v1`, because the developer box had a real registry and a bare
+CI runner does not. That split (green on CI, red on the box that ships it) is the worst
+possible failure mode for a gate, so the default is now "no registry configured" for
+every test process. A suite that needs a registry still assigns `SKMODELS_REGISTRY`
+itself at module scope before importing `registry.mjs`, and that assignment still wins.
+
+**Verified 2026-08-15, this worktree, Node 22.23.2: 1148 tests, 1148 pass, 0 fail.**
 
 ## 5. Release / Deploy
 
@@ -315,10 +338,10 @@ canonical check that metrics are recording (non-null object once enabled).
 | Requests 403 unexpectedly | A policy rule denied. Inspect `logs/audit.jsonl` and the dashboard Security Events panel; check `config/policies.yaml` rule order (first deny wins). |
 | Requests 429 | Rate limit hit. Check `rate_limits` for the agent/model in `config/policies.yaml`. |
 | Backend 4xx/5xx / model not found | `GET /v1/models` for the aggregated catalog; check backend `priority` and `models` globs and that the backend's `api_key_env` var is set in the environment. |
-| `better-sqlite3` fails to load | Native addon not built for this Node version. Re-run `npm install` (needs a `node-gyp` toolchain). |
+| `better-sqlite3` fails to load (`Could not locate the bindings file`) | The native addon was not built. Most often the install ran with `--ignore-scripts`, which skips it and fails 19 metrics/energy/SIEM tests. Re-run plain `npm ci` or `npm install` (needs a `node-gyp` toolchain). |
 | Config edits not taking effect | Two causes, check both. (a) Config is read once at startup and only re-read on `SIGHUP`: `systemctl --user kill -s HUP skgateway`. (b) **You probably edited the wrong file.** The effective command passes no `--config`, so the service loads `~/.skcapstone/gateway/skgateway.yaml`, not the in-repo `config/skgateway.yaml`. Confirm with `systemctl --user show skgateway -p ExecStart` (§5, §6). |
 | Behaviour changed and nothing was committed / a fix "disappeared" after a pull | `ExecStart` runs the source directly out of the **shared working checkout** `~/clawd/skcapstone-repos/skgateway`, with no build and no deployed artifact. An uncommitted edit there is live behaviour, and any later `git pull`/`checkout`/`reset` by another session silently erases it. `git -C ~/clawd/skcapstone-repos/skgateway status` before you conclude anything. Never edit that checkout: use a worktree, commit, then pull. |
-| A green CI checkmark on a PR | It certifies nothing about tests. There is no `ci.yml`; the only test invocation lives in a tag-triggered `publish.yml` behind `\|\| true` + `continue-on-error`. Run `npm test` locally (§4, card `62a5256d`). |
+| A green CI checkmark on a PR | Since card `62a5256d` it does certify `npm test` on Node 20 and 22. Confirm the `test` job actually ran: if a diff put a shell success-guard back on the step, or reverted the install to `--ignore-scripts`, green means nothing again (§4). |
 | `/status` reports a version that does not match what is installed | Expected, not a bug. The string is hardcoded at `src/index.mjs:962` and is not touched by the publish flow. Use `git describe --tags --match 'v[0-9]*'` or the published npm version (§9). |
 | Claude Code / `claude` CLI gets an untranslated or garbled response from `/v1/messages` | The Anthropic frontend matches by **pathname**. If someone changed `req.url.split("?")[0] === "/v1/messages"` to an exact `req.url ===` comparison, `?beta=true` requests fall through to the raw OpenAI proxy untranslated (`src/index.mjs:1347`). |
 | Alerts not reaching Telegram / SKCapstone | Integrated mode needs `~/.skcapstone/` present and `SK_STANDALONE` unset. Confirm `~/.skcapstone/pubsub/topics/skgateway.<severity>/` is being written (`src/integration.mjs`). |
@@ -349,8 +372,10 @@ canonical check that metrics are recording (non-null object once enabled).
   or `npm view skgateway version`. Making `/status` report the real version is a genuine
   code fix and out of scope for a docs pass; it is noted here so nobody trusts the
   number in the meantime.
-- **Test posture: no CI gate exists.** See the §4 gap and card `62a5256d`. Any "verified
-  by CI" claim about this repo is false today.
+- **Test posture: a real CI gate exists as of card `62a5256d`.** `ci.yml` runs
+  `npm test` on push and pull_request across Node 20 and 22, and the same job gates the
+  npm publish. Before that card there was no `ci.yml` at all, so any "verified by CI"
+  claim about this repo dated earlier than 2026-08-15 is false. See §4.
 - Secret posture: API keys sourced by env-var reference (§6), never inlined; `.env`
   gitignored. Transport security for cloud backends is provided by the backend URL
   (HTTPS); local backends stay on the LAN.
@@ -369,8 +394,14 @@ checks:
     run: grep -qF 'req.url.split("?")[0] === "/v1/messages"' src/index.mjs && ! grep -qF 'req.url === "/v1/messages"' src/index.mjs
   - name: licence is MIT and this private repo was not relicensed to GPL
     run: grep -qxF '  "license": "MIT"' package.json && head -1 LICENSE | grep -qxF 'MIT License' && ! grep -qi 'GNU GENERAL PUBLIC LICENSE' LICENSE
-  - name: the documented CI gap still holds (no ci.yml; publish.yml is tags-only and swallows npm test)
-    run: test ! -f .github/workflows/ci.yml && grep -qxF '      - run: npm test 2>/dev/null || true' .github/workflows/publish.yml && grep -qxF '    tags:' .github/workflows/publish.yml && ! grep -qE '^\s*(pull_request|branches):' .github/workflows/publish.yml
+  - name: ci.yml exists, runs npm test on push and pull_request, and swallows nothing
+    run: test -f .github/workflows/ci.yml && grep -qxF '      - run: npm test' .github/workflows/ci.yml && grep -qE '^\s+pull_request:' .github/workflows/ci.yml && ! grep -qE '\|\| true|2>/dev/null|continue-on-error' .github/workflows/ci.yml
+  - name: the npm publish is gated on a test job that can actually fail
+    run: grep -qxF '      - run: npm test' .github/workflows/publish.yml && grep -qxF '    needs: test' .github/workflows/publish.yml && ! grep -qF 'if: always()' .github/workflows/publish.yml && ! grep -qF 'continue-on-error' .github/workflows/publish.yml && ! grep -qF 'npm test 2>/dev/null' .github/workflows/publish.yml
+  - name: both test jobs install with plain npm ci, not --ignore-scripts (breaks the better-sqlite3 binding)
+    run: grep -qxF '      - run: npm ci' .github/workflows/ci.yml && grep -qxF '      - run: npm ci' .github/workflows/publish.yml && ! grep -q 'ignore-scripts' .github/workflows/ci.yml
+  - name: the test bootstrap pins SKMODELS_REGISTRY away from the live per-node registry
+    run: grep -qF "if (!process.env.SKMODELS_REGISTRY)" tests/_setup.mjs && grep -qF "process.env.SKMODELS_REGISTRY = join(" tests/_setup.mjs
   - name: documented health and self-description routes still exist
     run: grep -qF 'req.url === "/health" || req.url === "/healthz"' src/index.mjs && grep -qF 'req.url === "/.well-known/skworld-module.json"' src/index.mjs && grep -qF 'req.url === "/status"' src/index.mjs && grep -qF 'req.url === "/queue"' src/index.mjs
   - name: config precedence (explicit then SKGATEWAY_CONFIG then the synced path) is unchanged
