@@ -236,3 +236,43 @@ routing:
 dashboard:
   enabled: true
   refresh_ms: 5000
+
+## Dynamic provider model discovery (SKGateway dynamic-provider-model-discovery,
+## design doc 2026-07-25). Periodically queries each declared backend's
+## model-list endpoint and folds newly seen models into the effective model
+## set, instead of relying solely on the static `models` arrays under backends.
+discovery:
+  enabled: true
+  refresh_seconds: 3600            # how often to re-poll each provider (1h)
+  providers:
+    nvidia:     { enabled: true, free_only: true, chat_only: true }
+    openrouter: { enabled: true, free_only: true, chat_only: true }
+
+  ## EOL probe sweep (card P2.3, design doc 2026-08-08 §5.2). A budgeted,
+  ## off-request-path warm probe against candidate models (chosen from the
+  ## model lifecycle store, model_catalog_store.mjs) so a model that stopped
+  ## appearing in a provider's catalog listing, or whose last_verified_at is
+  ## null and can never be promoted by catalog-presence alone, still gets an
+  ## affirmative live/dead answer instead of drifting on absence-accounting
+  ## alone. Piggybacks on the discovery refresh cadence above, not a separate
+  ## timer: each refresh cycle checks whether a full probe_seconds has elapsed
+  ## since the last sweep (tracked in the discovery cache) and only then
+  ## spends its budget.
+  #
+  # probe_seconds:    0        # cadence: run the sweep at most once every N
+  #                             # seconds. 0 (the default) disables the sweep
+  #                             # entirely; nothing below has any effect while
+  #                             # this is 0. 86400 (daily) matches probe.mjs's
+  #                             # DEFAULT_PROBE_SECONDS.
+  # probe_budget:      20      # max models probed in a single sweep (matches
+  #                             # probe.mjs's DEFAULT_PROBE_BUDGET). Each probe
+  #                             # is a real upstream completion call, so this
+  #                             # is a real-cost ceiling per sweep, not a
+  #                             # display limit: raise it deliberately.
+  # probe_timeout_ms:  15000   # hard per-model abort timeout for a probe call
+  #                             # (matches probe.mjs's DEFAULT_PROBE_TIMEOUT_MS).
+  #
+  ## Before setting probe_seconds > 0 anywhere it matters: confirm the cadence
+  ## gate and budget behave as expected on a low-stakes node first. A live
+  ## sweep makes real calls against every candidate model it selects, up to
+  ## probe_budget, once the cadence window is due.

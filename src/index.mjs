@@ -324,16 +324,45 @@ export function buildAdminModelsView(full, allow, getLifecycleFn = getLifecycle)
   }));
 }
 
-async function refreshCatalog(cfg) {
+/**
+ * Card C3: refreshCatalog() is the only production call site of
+ * discoverCatalog(), and until this fix it never passed the EOL probe knobs
+ * (card P2.3, src/discovery/probe.mjs) through from cfg.discovery. Since
+ * discoverCatalog() defaults probeSeconds to 0 and its whole probe block is
+ * gated on `probeSeconds > 0`, no config key existed that could ever turn the
+ * sweep on: `discovery.probe_seconds` in the yaml did nothing.
+ *
+ * probe_seconds / probe_budget / probe_timeout_ms read here, snake_case in
+ * yaml matching every other key in this config block (see providers.*.enabled
+ * above). probePool is deliberately NOT sourced from cfg.discovery: it is not
+ * a serializable config value, it is the live proxy/connection-pool.mjs
+ * singleton, and discoverCatalog's own default (`probePool || getPool()`,
+ * discovery.mjs) already resolves it lazily and correctly once this function
+ * actually reaches the probe step (well after the module-level `pool`
+ * singleton further down is constructed). Capturing that module-scope `pool`
+ * const here eagerly would hit its temporal-dead-zone on the very first
+ * startup call, since this function is invoked eagerly (fire-and-forget, on
+ * module load) before `const pool = getPool(poolConfig)` runs.
+ *
+ * `discoverCatalogFn` is injected (default: the real discoverCatalog) purely
+ * for the regression test (tests/refresh-catalog-probe-wiring.test.mjs): it
+ * asserts on the opts object a spy receives, instead of on probe.mjs's
+ * internals, because a probe.mjs-only test is exactly what let this wiring
+ * gap ship silently (see card C3 / 1f65cf45).
+ */
+export async function refreshCatalog(cfg, discoverCatalogFn = discoverCatalog) {
   const d = cfg.discovery || {};
   const nvEnabled = d.providers?.nvidia?.enabled !== false;
   const orEnabled = d.providers?.openrouter?.enabled !== false;
   const nvidiaKey = process.env[cfg.backends?.nvidia?.api_key_env || "NVIDIA_API_KEY"];
-  const { models } = await discoverCatalog({
+  const { models } = await discoverCatalogFn({
     localModels: localModels(cfg),
     nvidiaFetch: nvEnabled ? () => fetchNvidia(nvidiaKey) : async () => ({ data: [] }),
     openrouterFetch: orEnabled ? () => fetchOpenRouter() : async () => ({ data: [] }),
     cache: _discoveryCache,
+    probeSeconds: d.probe_seconds || 0,
+    probeBudget: d.probe_budget,
+    probeTimeoutMs: d.probe_timeout_ms,
   });
   _catalog = models;
   registerDiscoveredRoutes(cfg, models);
