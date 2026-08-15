@@ -20,18 +20,16 @@
  * @module discovery/providers/openrouter
  */
 
-// Same non-chat filter as discovery.mjs's isChatModel/NON_CHAT (kept in sync
-// deliberately, not imported, to avoid a circular import between this module
-// and discovery.mjs while discovery.mjs itself now imports this module).
-const NON_CHAT = [
-  /embed/i, /\bbge\b/i, /rerank/i, /content-safety/i, /guard/i,
-  /\bfuyu\b/i, /\bocr\b/i, /vision-embed/i, /moderation/i,
-];
-
-function isChatModel(id) {
-  if (!id || typeof id !== 'string') return false;
-  return !NON_CHAT.some((re) => re.test(id));
-}
+// Card C13: the non-chat test lives in discovery/classify.mjs now. It used to
+// be a copy of discovery.mjs's list, kept in sync by hand with a comment asking
+// humans to remember. classify.mjs is a leaf module with no imports, so using
+// it here creates none of the circular dependency that motivated the copy.
+//
+// The upgrade that matters for THIS provider: OpenRouter publishes
+// architecture.output_modalities, so google/lyria-3-* (music models reporting
+// ["text","audio"]) are now excluded on capability evidence rather than slipping
+// through because their ids contain no known keyword.
+import { isChatCapable } from '../classify.mjs';
 
 function isFree(m) {
   if (String(m.id || '').endsWith(':free')) return true;
@@ -71,7 +69,7 @@ export function normalize(json, opts = {}) {
   return data
     .filter((m) => m && typeof m.id === 'string')
     .filter(isFree)
-    .filter((m) => isChatModel(m.id))
+    .filter(isChatCapable)
     .map((m) => ({
       id: m.id,
       provider: 'openrouter',

@@ -21,18 +21,13 @@
  * @module discovery/providers/nvidia
  */
 
-// Same non-chat filter as discovery.mjs's isChatModel/NON_CHAT (kept in sync
-// deliberately, not imported, to avoid a circular import between this module
-// and discovery.mjs while discovery.mjs itself now imports this module).
-const NON_CHAT = [
-  /embed/i, /\bbge\b/i, /rerank/i, /content-safety/i, /guard/i,
-  /\bfuyu\b/i, /\bocr\b/i, /vision-embed/i, /moderation/i,
-];
-
-function isChatModel(id) {
-  if (!id || typeof id !== 'string') return false;
-  return !NON_CHAT.some((re) => re.test(id));
-}
+// Card C13: the non-chat test lives in discovery/classify.mjs now (this was
+// the third hand-synced copy of the same regex list). NVIDIA publishes NO
+// capability data at all, its /v1/models entries carry only
+// {id, object, created, owned_by}, so for this provider classify.mjs can only
+// fall back to the id patterns. That limitation is the point: it is recorded in
+// classify.mjs rather than rediscovered here.
+import { isChatCapable } from '../classify.mjs';
 
 // Variant tokens the heuristic looks for in the bare id, in priority order.
 // 'code' folds into 'coder' (either spelling is reported as 'coder').
@@ -133,7 +128,7 @@ export function normalize(json, opts = {}) {
 
   return data
     .filter((m) => m && typeof m.id === 'string')
-    .filter((m) => isChatModel(m.id))
+    .filter(isChatCapable)
     .map((m) => {
       const h = parseHeuristicId(m.id);
       const descriptionParts = [h.org, h.family, h.size]
