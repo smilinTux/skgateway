@@ -27,7 +27,7 @@ import { getPool } from "./connection-pool.mjs";
 import { isRegistryRouted, resolve as resolveRegistry, getAutoConfig, getConfigEpoch, loadRegistry } from "./registry.mjs";
 import { getFailoverConfig, isLocalUrl, probeLocalHealth, recordLocalOutcome } from "./local-failover.mjs";
 import { readMeter } from "./meter-client.mjs";
-import { marginalJoules, imputeJoules, resolveBasis, coeffsForModel, usageFromSSE } from "../metrics/energy.mjs";
+import { marginalJoules, imputeJoules, resolveBasis, coeffsForModel, usageFromSSE, resolveMeterUrl } from "../metrics/energy.mjs";
 import { recordModelOutcome, getLifecycle } from "../discovery/model_catalog_store.mjs";
 import { isRoutable } from "../discovery/lifecycle.mjs";
 import { applyReasoningFloor } from "./core.mjs";
@@ -1734,6 +1734,12 @@ export async function routeAndSend(router, request, upstreamPath, method, client
 
   let lastResult = null;
   let didFailover = false;
+  // Every attempt that produced an energy observation, in attempt order.
+  // Reads are per attempt (spec 4.5), so writes must be too: a local metered
+  // attempt that burned real joules and then failed over to cloud gets its own
+  // row rather than being overwritten by the attempt that happened to win.
+  // Stays empty on the disabled path, where it is never attached to a result.
+  const energyAttempts = [];
 
   for (let i = 0; i < candidates.length; i++) {
     const { backendId, backendUrl, authHeaders, backend } = candidates[i];
@@ -1824,7 +1830,14 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // or dead meter costs a null reading and nothing else. When energy
     // metering is disabled (default) meterUrl stays null and readMeter is
     // never called: no network call, no extra latency on the disabled path.
-    const meterUrl = energyCfg?.enabled ? (energyCfg.meters?.[backendId] ?? null) : null;
+    // resolveMeterUrl, not a bare meters[backendId] lookup: registry routing
+    // (the main path, sk-default included) hands out synthetic "reg:*" ids,
+    // and spec 4.5 promises a URL-host fallback for backends that carry no
+    // node identity of their own. An exact-id-only lookup silently imputes
+    // the exact traffic this component was built to measure.
+    const meterUrl = energyCfg?.enabled
+      ? resolveMeterUrl(energyCfg.meters, backendId, backendUrl)
+      : null;
     const meterBeforeStart = meterUrl ? Date.now() : 0;
     const meterBefore = meterUrl
       ? await readMeter(meterUrl, energyCfg.read_timeout_ms ?? 250)
@@ -1931,7 +1944,12 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         basis,
         node: meterAfter?.node ?? null,
         concurrencyN: attemptConcurrency ?? 1,
+        // Which backend burned it. lastResult.backendId only ever names the
+        // final attempt, so without this an earlier attempt's row would be
+        // filed under the backend that served the retry.
+        backendId,
       };
+      energyAttempts.push(attemptEnergy);
     }
 
     const success = res.status < 500;
@@ -1980,6 +1998,9 @@ export async function routeAndSend(router, request, upstreamPath, method, client
 
     lastResult = { ...res, backendId, failover: didFailover, queueWaitMs };
     if (attemptEnergy) lastResult.energy = attemptEnergy;
+    // Only attached when something was actually observed, so the disabled
+    // path returns a result whose shape is unchanged, field for field.
+    if (energyAttempts.length > 0) lastResult.energyAttempts = energyAttempts;
 
     if (success) {
       console.log(

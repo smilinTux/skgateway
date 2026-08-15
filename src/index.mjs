@@ -31,6 +31,7 @@ import { isRoutable, LIFECYCLE_STATES } from "./discovery/lifecycle.mjs";
 import { rankModels } from "./ranking/rank.mjs";
 import { deriveCapabilities } from "./ranking/capabilities.mjs";
 import { REGISTRY_PATH } from "./proxy/registry.mjs";
+import { energyRowsFrom, energyHeaders } from "./metrics/energy.mjs";
 import { readFileSync } from "node:fs";
 import { load as yamlLoad } from "js-yaml";
 
@@ -1384,7 +1385,7 @@ export const server = http.createServer(async (req, res) => {
     // failure here must not become a second, fabricated error stacked on top
     // of whatever the request path already did.
     let metricsClosed = false;
-    function closeMetrics({ statusCode, responseHeaders, responseBody, backend, errorMsg, energy } = {}) {
+    function closeMetrics({ statusCode, responseHeaders, responseBody, backend, errorMsg, energy, energyAttempts } = {}) {
       if (!metrics || !metricsReqId || metricsClosed) return;
       metricsClosed = true;
       try {
@@ -1403,24 +1404,32 @@ export const server = http.createServer(async (req, res) => {
         console.error("[skgateway] metrics recordResponse failed:", err.message);
       }
 
-      // Energy row for this request's serving attempt (joule-economy P0).
-      // `energy` is only present when router.mjs actually took a meter/impute
-      // reading, which only happens when energy.enabled is true, so this is a
-      // no-op on the default shadow-mode (disabled) path.
-      if (energy) {
+      // Energy rows for this request (joule-economy P0). ONE ROW PER ATTEMPT
+      // that produced an observation, not one per request: an attempt that
+      // burned joules locally and then failed over to cloud paid for that
+      // energy, and a ledger that drops it is showing a number where a cost
+      // actually happened. energy_log permits multiple rows per req_id by
+      // design. energyRowsFrom() collapses to the single `energy` field when
+      // there is no per-attempt list, so the ordinary one-attempt request is
+      // unchanged, and returns [] when neither is set, so the default
+      // shadow-mode (disabled) path still writes nothing.
+      for (const row of energyRowsFrom({ energy, energyAttempts })) {
         try {
           metrics.recordEnergy({
             reqId: metricsReqId,
             agentId: metricsAgentId,
             model: parsedModel || "unknown",
-            backend,
+            // The attempt's own backend, falling back to the request's
+            // serving backend for the single-row shape that carries none.
+            backend: row.backendId ?? backend,
             cardId: req.headers["x-sk-card-id"] || null,
-            joules: energy.joules,
-            basis: energy.basis,
-            node: energy.node,
-            concurrencyN: energy.concurrencyN ?? 1,
+            joules: row.joules,
+            basis: row.basis,
+            node: row.node,
+            concurrencyN: row.concurrencyN ?? 1,
           });
         } catch (err) {
+          // Per row, so one unwritable row cannot swallow the others.
           console.error("[skgateway] metrics recordEnergy failed:", err.message);
         }
       }
@@ -1464,6 +1473,25 @@ export const server = http.createServer(async (req, res) => {
         router, routeRequest, routePath, req.method, req.headers, routeBody, true, siemHook,
       );
 
+      // Return energy to the caller (spec 4.5): x-sk-energy-joules /
+      // -basis / -node. Cost was being recorded and never returned, so no
+      // client could react to what it spends, which is the gap the spec
+      // names. Derived only from what was actually observed on the serving
+      // attempt: `{}` when energy metering is off (result.energy unset), and
+      // individually absent, never empty, for any field we do not know. That
+      // empty object spreads to nothing, so the disabled path emits exactly
+      // the headers it emitted before.
+      //
+      // The SERVING attempt only, deliberately, not a sum over
+      // result.energyAttempts. A failover's attempts can carry different
+      // bases (measured_gpu locally, imputed_cloud on the retry) and spec 4.2
+      // forbids presenting a mix of bases as one blended number. One joules
+      // value has to mean one basis and one node, so it means the attempt
+      // that produced the response the client is holding. The full
+      // per-attempt cost is in energy_log, where each row carries its own
+      // basis and can be aggregated honestly.
+      const eHeaders = energyHeaders(result?.energy);
+
       if (!result) {
         if (!res.headersSent) {
           res.writeHead(502, { "content-type": "application/json" });
@@ -1474,9 +1502,9 @@ export const server = http.createServer(async (req, res) => {
         let oai = null;
         try { oai = JSON.parse((result.body || "").toString("utf-8")); } catch {}
         if (result.status >= 300 || !oai) {
-          // Upstream error / unparseable — pass it through so the Anthropic client
+          // Upstream error / unparseable: pass it through so the Anthropic client
           // sees the real status rather than a fabricated success.
-          const headers = { ...result.headers };
+          const headers = { ...result.headers, ...eHeaders };
           delete headers["content-length"];
           delete headers["transfer-encoding"];
           delete headers["content-encoding"];
@@ -1488,17 +1516,21 @@ export const server = http.createServer(async (req, res) => {
             // Serialise the complete Anthropic message as the streaming event
             // sequence (message_start -> content_block_* -> message_delta ->
             // message_stop -> [DONE]); jsonToSSE auto-detects the Anthropic shape.
-            const writer = new SSEWriter(res, { keepAliveMs: 0 });
+            const writer = new SSEWriter(res, { keepAliveMs: 0, extraHeaders: eHeaders });
             writer.start();
             jsonToSSE(writer, amsg);
           } else {
             const outBuf = Buffer.from(JSON.stringify(amsg), "utf-8");
-            res.writeHead(200, { "content-type": "application/json", "content-length": outBuf.length });
+            res.writeHead(200, {
+              "content-type": "application/json",
+              "content-length": outBuf.length,
+              ...eHeaders,
+            });
             res.end(outBuf);
           }
         }
       } else {
-        const headers = { ...result.headers };
+        const headers = { ...result.headers, ...eHeaders };
         delete headers["content-length"];
         delete headers["transfer-encoding"];
         delete headers["content-encoding"];
@@ -1528,6 +1560,7 @@ export const server = http.createServer(async (req, res) => {
           backend: result?.backendId,
           errorMsg: dispatchError.message,
           energy: result?.energy,
+          energyAttempts: result?.energyAttempts,
         });
       } else {
         let parsedBody = null;
@@ -1542,6 +1575,7 @@ export const server = http.createServer(async (req, res) => {
           responseBody: parsedBody,
           backend: result?.backendId,
           energy: result?.energy,
+          energyAttempts: result?.energyAttempts,
         });
       }
     }

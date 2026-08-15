@@ -47,7 +47,14 @@ export function resolveBasis({ metered, backendIsLocal }) {
 }
 
 /**
- * Exact-then-prefix lookup, mirroring getPricing() in src/config.mjs.
+ * Exact match first, then LONGEST matching prefix.
+ *
+ * Deliberately NOT the same rule as getPricing() in src/config.mjs, which is
+ * first-match-wins over key order. Longest-prefix is the correct rule for a
+ * coefficient table: with both "ornith" and "ornith-1.0-9b" configured, the
+ * specific coefficient must win over the family one no matter which order the
+ * YAML happened to list them in, because key order in a config file is not a
+ * statement of intent. Do not "fix" this to match getPricing().
  */
 export function coeffsForModel(model, table) {
   if (!table || !model) return null;
@@ -61,6 +68,103 @@ export function coeffsForModel(model, table) {
     }
   }
   return best;
+}
+
+/**
+ * Find the meter endpoint for a backend.
+ *
+ * Backends carry no node identity (spec 4.5): BackendConfig has no hostname
+ * and no node concept, and registry routing invents synthetic ids of the form
+ * "reg:<backend>" that no operator would ever type into a config file. A
+ * lookup on the exact backend id alone therefore misses the main routing path,
+ * which is the exact traffic (sk-default) the spec's motivating incident is
+ * about, and misses it SILENTLY: the request just falls through to imputation
+ * while the config looks wired.
+ *
+ * Resolution order, first hit wins:
+ *   1. the exact backend id            ("local", "reg:ornith")
+ *   2. the other synthetic-id form     ("local" <-> "reg:local")
+ *   3. the backend URL's host:port     ("192.168.0.100:8082")
+ *   4. the backend URL's hostname      ("192.168.0.100")
+ *
+ * host:port before bare host, because two backends on one box (llama-server on
+ * :8082, something else on :8083) may well be different devices, and the more
+ * specific configured key is the one the operator meant.
+ *
+ * Never throws: a malformed URL costs the host-based fallbacks, nothing else.
+ *
+ * @param {Record<string,string>|null|undefined} meters
+ * @param {string|null|undefined} backendId
+ * @param {string|null|undefined} backendUrl
+ * @returns {string|null}
+ */
+export function resolveMeterUrl(meters, backendId, backendUrl) {
+  if (!meters || typeof meters !== "object") return null;
+  const has = (k) => (k && Object.prototype.hasOwnProperty.call(meters, k) ? meters[k] : null);
+
+  const exact = has(backendId);
+  if (exact) return exact;
+
+  if (backendId) {
+    const alt = backendId.startsWith("reg:") ? backendId.slice(4) : `reg:${backendId}`;
+    const synthetic = has(alt);
+    if (synthetic) return synthetic;
+  }
+
+  if (backendUrl) {
+    let u = null;
+    try {
+      u = new URL(backendUrl);
+    } catch {
+      return null;
+    }
+    return has(u.host) ?? has(u.hostname) ?? null;
+  }
+  return null;
+}
+
+/**
+ * The energy rows to write for one completed request.
+ *
+ * Meter reads are per attempt, so writes are too. A local metered attempt that
+ * burned real joules and then failed over to cloud must still get its own row:
+ * dropping it means the ledger shows the failover's cost and not the cost that
+ * was actually paid, which is a gap that looks like a number. energy_log
+ * already permits multiple rows per req_id.
+ *
+ * Falls back to the single `energy` field when no per-attempt list is present,
+ * so the ordinary one-attempt request keeps writing exactly one row and the
+ * disabled path (neither field set) still writes none.
+ *
+ * @param {{energy?:object, energyAttempts?:object[]}|null|undefined} result
+ * @returns {object[]}
+ */
+export function energyRowsFrom(result) {
+  const attempts = result?.energyAttempts;
+  if (Array.isArray(attempts) && attempts.length > 0) return attempts;
+  return result?.energy ? [result.energy] : [];
+}
+
+/**
+ * Response headers that hand a caller the energy its request cost (spec 4.5).
+ *
+ * Only what was actually computed. A header is ABSENT rather than empty when
+ * the value is unknown, because "x-sk-energy-joules: " reads as a measurement
+ * of nothing and an absent header reads as what it is: we do not know. The
+ * basis header still ships when joules is null, since "we tried to meter this
+ * and could not" is itself the fact a client needs to interpret the gap.
+ *
+ * @param {{joules?:number|null, basis?:string|null, node?:string|null}|null|undefined} energy
+ * @returns {Record<string,string>}
+ */
+export function energyHeaders(energy) {
+  if (!energy) return {};
+  const out = {};
+  const j = energy.joules;
+  if (typeof j === "number" && Number.isFinite(j)) out["x-sk-energy-joules"] = String(j);
+  if (typeof energy.basis === "string" && energy.basis) out["x-sk-energy-basis"] = energy.basis;
+  if (typeof energy.node === "string" && energy.node) out["x-sk-energy-node"] = energy.node;
+  return out;
 }
 
 /**

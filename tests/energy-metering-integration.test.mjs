@@ -17,6 +17,13 @@
  *      backend latency recorded by backend.recordOutcome() / getHealth()
  *      .latencyP50 (the queueStart..latencyMs window bug fixed alongside
  *      these tests).
+ *   5. Concurrency attribution: two genuinely overlapping attempts against
+ *      one meter record concurrencyN 2, not a false-clean 1.
+ *   6. One energy row PER METERED ATTEMPT: a failover whose first attempt
+ *      burned real joules writes two rows, each filed under the backend that
+ *      actually burned them.
+ *   7. Energy is returned to the caller as x-sk-energy-* response headers,
+ *      and the disabled path emits none.
  *
  * Run with:  node --test tests/energy-metering-integration.test.mjs
  */
@@ -24,12 +31,15 @@
 import { test, describe, before, after } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import Database from "better-sqlite3";
 
 import { createRouter, routeAndSend } from "../src/proxy/router.mjs";
 import { loadConfig } from "../src/config.mjs";
+import { createMetricsCollector } from "../src/metrics/collector.mjs";
+import { energyRowsFrom, energyHeaders } from "../src/metrics/energy.mjs";
 
 // ─── fake upstream helpers (same shape as siem-live-hook.test.mjs) ───────────
 
@@ -396,5 +406,170 @@ describe("energy metering - concurrency attribution", () => {
       "the fast attempt's sendUpstream resolved while the slow attempt was still in flight " +
       "against the same meter; concurrencyN must show the real overlap, not a false-clean 1",
     );
+  });
+});
+
+// ─── 6. one energy row per metered attempt (Finding C3) ─────────────────────
+
+describe("energy metering - every metered attempt gets its own row", () => {
+  let bad, good, meterPrimary, meterFallback;
+  before(async () => {
+    bad = await startUpstream(err500);
+    good = await startUpstream(ok200);
+    meterPrimary = await startMeter(counterMeter("primary-node", 1000, 900));
+    meterFallback = await startMeter(counterMeter("fallback-node", 5000, 40));
+    const cfgFile = writeEnergyConfig({
+      enabled: true,
+      meters: { primary: meterPrimary.url, fallback: meterFallback.url },
+    });
+    await loadConfig({ configPath: cfgFile, silent: true });
+  });
+  after(async () => {
+    await bad.close();
+    await good.close();
+    await meterPrimary.close();
+    await meterFallback.close();
+  });
+
+  test("a failover where the first attempt was metered writes TWO rows, attributed to the right backends", () => {
+    // The defect: lastResult.energy was overwritten per attempt and recorded
+    // once, so a local attempt that burned real joules and then failed over
+    // produced NO row for the energy it actually spent. The ledger showed the
+    // failover's cost and nothing else, which is a gap that looks like a
+    // number.
+    const dir = mkdtempSync(join(tmpdir(), "skgw-energy-attempts-"));
+    const dbPath = join(dir, "metrics.db");
+    const metrics = createMetricsCollector({ enabled: true, db_path: dbPath, cost_tracking: true });
+
+    return (async () => {
+      try {
+        const router = createRouter({
+          backends: {
+            primary:  { url: bad.url,  auth_type: "none", models: ["*"], priority: 1 },
+            fallback: { url: good.url, auth_type: "none", models: ["*"], priority: 2 },
+          },
+          failover: true,
+          siem_log: false,
+        });
+        const result = await routeAndSend(
+          router,
+          { model: "m" },
+          "/v1/chat/completions", "POST",
+          { "content-type": "application/json" },
+          Buffer.from(JSON.stringify({ model: "m" })),
+          false,
+          null,
+        );
+
+        assert.equal(result.status, 200);
+        assert.equal(result.backendId, "fallback");
+        assert.equal(result.energyAttempts?.length, 2, "both attempts observed energy");
+
+        // Replay index.mjs's fan-out through the REAL helper it calls, into a
+        // real collector, so this asserts rows in energy_log rather than a
+        // shape in memory.
+        const reqId = metrics.recordRequest({ agentId: "lumina", model: "m" });
+        for (const row of energyRowsFrom(result)) {
+          metrics.recordEnergy({
+            reqId,
+            agentId: "lumina",
+            model: "m",
+            backend: row.backendId ?? result.backendId,
+            joules: row.joules,
+            basis: row.basis,
+            node: row.node,
+            concurrencyN: row.concurrencyN ?? 1,
+          });
+        }
+        metrics.flush?.();
+
+        const db = new Database(dbPath, { readonly: true });
+        const rows = db.prepare(
+          "SELECT backend, node, joules FROM energy_log WHERE req_id = ? ORDER BY rowid"
+        ).all(reqId);
+        db.close();
+
+        assert.equal(rows.length, 2, "one row per metered attempt, not one per request");
+        assert.deepEqual(
+          rows.map((r) => r.backend), ["primary", "fallback"],
+          "the failed local attempt's joules must be filed under the backend that burned them, " +
+          "not under the backend that served the retry",
+        );
+        assert.deepEqual(rows.map((r) => r.node), ["primary-node", "fallback-node"]);
+        // The primary meter advanced 900 J per read, so its attempt really did
+        // register energy: this test is not passing on two empty rows.
+        assert.ok(rows[0].joules > 0, "the primary attempt recorded the joules it actually spent");
+      } finally {
+        metrics.close?.();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    })();
+  });
+});
+
+// ─── 7. energy is returned to the caller (Finding C5, spec 4.5) ────────────
+
+describe("energy metering - response headers", () => {
+  let up, meter;
+  before(async () => {
+    up = await startUpstream(ok200);
+    meter = await startMeter(counterMeter("dot100"));
+    const cfgFile = writeEnergyConfig({ enabled: true, meters: { fake: meter.url } });
+    await loadConfig({ configPath: cfgFile, silent: true });
+  });
+  after(async () => { await up.close(); await meter.close(); });
+
+  test("the serving result carries energy that becomes x-sk-energy-* response headers", async () => {
+    // Spec 4.5 requires the gateway to hand energy back so a client can react
+    // to what it spends. index.mjs derives these headers from result.energy
+    // via energyHeaders() and merges them into the relay's writeHead; this
+    // drives the same two steps against a real routed request.
+    const router = createRouter({
+      backends: { fake: { url: up.url, auth_type: "none", models: ["*"], priority: 1 } },
+      siem_log: false,
+    });
+    const result = await routeAndSend(
+      router,
+      { model: "m" },
+      "/v1/chat/completions", "POST",
+      { "content-type": "application/json" },
+      Buffer.from(JSON.stringify({ model: "m" })),
+      false,
+      null,
+    );
+
+    assert.equal(result.status, 200);
+    const h = energyHeaders(result.energy);
+    assert.equal(h["x-sk-energy-basis"], "measured_gpu");
+    assert.equal(h["x-sk-energy-node"], "dot100");
+    assert.equal(typeof h["x-sk-energy-joules"], "string");
+    assert.ok(Number.isFinite(Number(h["x-sk-energy-joules"])));
+
+    // Merged the same way the relay merges them: never clobbering the
+    // upstream headers that are already there.
+    const relayed = { ...result.headers, ...h };
+    assert.equal(relayed["content-type"], "application/json");
+    assert.equal(relayed["x-sk-energy-basis"], "measured_gpu");
+  });
+
+  test("the disabled path emits no energy headers at all", async () => {
+    const cfgFile = writeEnergyConfig({ enabled: false, meters: { fake: meter.url } });
+    await loadConfig({ configPath: cfgFile, silent: true });
+    const router = createRouter({
+      backends: { fake: { url: up.url, auth_type: "none", models: ["*"], priority: 1 } },
+      siem_log: false,
+    });
+    const result = await routeAndSend(
+      router,
+      { model: "m" },
+      "/v1/chat/completions", "POST",
+      { "content-type": "application/json" },
+      Buffer.from(JSON.stringify({ model: "m" })),
+      false,
+      null,
+    );
+    assert.equal(result.energy, undefined);
+    assert.equal(result.energyAttempts, undefined, "no attempt list on the disabled path either");
+    assert.deepEqual(energyHeaders(result.energy), {}, "spreading {} adds nothing to the relay");
   });
 });
