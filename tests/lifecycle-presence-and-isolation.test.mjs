@@ -291,3 +291,58 @@ describe('C2: catalog presence rescues a dropped-from-catalog eol record', () =>
     assert.equal(isRoutable({ state: LIFECYCLE_STATES.SUSPECT }), true);
   });
 });
+
+// ─── C12: presence must not override strong condemnation, verified or not ────
+
+describe('C12: catalog presence cannot promote a record a probe/completion condemned', () => {
+  const now = 1_800_000_000_000;
+
+  test('NEGATIVE CONTROL: a previously-verified provider_410/probe_failed record used to be rescued straight to active by presence alone', () => {
+    // Card fb747d52 / C12. The `dropped_from_catalog` gate a few lines above
+    // (affa0aac / C2) only guarded the branch that grants `suspect`. The
+    // branch that grants `active` outright checked ONLY `last_verified_at !=
+    // null`, with no `eol_reason` check at all, so it fired for provider_410
+    // and probe_failed records too, as long as they had EVER had one good
+    // completion before degrading. That is precisely the "weak evidence
+    // overturns strong evidence" hole item 4 of the card calls out: an id
+    // that worked once, then failed 3 completions in a row (provider_410) or
+    // failed an active probe (probe_failed), got resurrected to `active` the
+    // very next cycle just because the provider still lists it.
+    for (const reason of ['provider_410', 'probe_failed']) {
+      const condemned = {
+        ...defaultLifecycle(),
+        state: LIFECYCLE_STATES.EOL,
+        last_verified_at: now - 60_000, // it DID work once, before it broke
+        consecutive_permanent_errors: 3,
+        eol_reason: reason,
+        eol_at: now - 1000,
+      };
+      const next = applyCatalogPresence(condemned, { present: true, provider: 'nvidia', now });
+      assert.equal(
+        next.state,
+        LIFECYCLE_STATES.EOL,
+        `a prior verification must not let catalog presence move a ${reason} condemnation at all; ` +
+          'catalog presence is weak evidence and must not promote past strong evidence, ' +
+          'not even as far as suspect, verified or not',
+      );
+      assert.notEqual(next.state, LIFECYCLE_STATES.ACTIVE);
+    }
+  });
+
+  test('dropped_from_catalog + previously verified: presence DOES still promote straight to active', () => {
+    // The one case where full trust IS appropriate: the provider dropping and
+    // re-listing an id is a direct rebuttal of the ONLY reason it left, and
+    // the id was verified working before it vanished.
+    const lc = {
+      ...defaultLifecycle(),
+      state: LIFECYCLE_STATES.EOL,
+      last_verified_at: now - 60_000,
+      eol_reason: 'dropped_from_catalog',
+      eol_at: now - 1000,
+    };
+    const next = applyCatalogPresence(lc, { present: true, provider: 'nvidia', now });
+    assert.equal(next.state, LIFECYCLE_STATES.ACTIVE);
+    assert.equal(next.consecutive_permanent_errors, 0);
+    assert.equal(next.consecutive_successes, 0);
+  });
+});

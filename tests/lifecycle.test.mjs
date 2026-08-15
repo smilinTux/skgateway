@@ -30,6 +30,7 @@ test('defaultLifecycle() shape', () => {
     state: 'active',
     last_verified_at: null,
     consecutive_permanent_errors: 0,
+    consecutive_successes: 0,
     absent_cycles: 0,
     eol_reason: null,
     eol_at: null,
@@ -62,17 +63,158 @@ test('3 consecutive 410s: active -> eol with eol_reason provider_410', () => {
   assert.equal(lc.consecutive_permanent_errors, 3);
 });
 
-test('2 x 410 then a 200: counter resets, stays active', () => {
+test('2 x 410 then a single 200: stays active, but does NOT wipe the error streak', () => {
+  // Card fb747d52 / C12: this test used to assert a single 2xx zeroed
+  // consecutive_permanent_errors outright. That was the bug. A model
+  // succeeding one request in four never accumulates eolErrorThreshold (3)
+  // CONSECUTIVE failures under that rule, because every intermittent success
+  // erases the run, so it parks in `active` forever. The counter now needs
+  // the same promotionSuccessThreshold (2) consecutive successes to clear
+  // that eolErrorThreshold (3) needs consecutive failures to condemn.
   let lc = defaultLifecycle();
   lc = applyCompletionOutcome(lc, { status: 410, now: T0 });
   lc = applyCompletionOutcome(lc, { status: 410, now: T0 + 1000 });
   assert.equal(lc.consecutive_permanent_errors, 2);
 
   lc = applyCompletionOutcome(lc, { status: 200, now: T0 + 2000 });
+  assert.equal(lc.state, 'active', 'already active, and a first success does not need to wait');
+  assert.equal(
+    lc.consecutive_permanent_errors,
+    2,
+    'one success is not enough evidence to forgive two prior failures',
+  );
+  assert.equal(lc.consecutive_successes, 1);
+  assert.equal(lc.last_verified_at, T0 + 2000, 'the success itself is still recorded');
+  assert.equal(lc.eol_reason, null);
+
+  // A second CONSECUTIVE success clears it: the same threshold that promotes
+  // also forgives.
+  lc = applyCompletionOutcome(lc, { status: 200, now: T0 + 3000 });
   assert.equal(lc.state, 'active');
   assert.equal(lc.consecutive_permanent_errors, 0);
-  assert.equal(lc.last_verified_at, T0 + 2000);
+  assert.equal(lc.consecutive_successes, 2);
+});
+
+// ─── C12: promotion needs consecutive passes, not one lucky 2xx ──────────────
+
+test('a first-sighting id is not held cold: defaultLifecycle() starts active, one 2xx keeps it active', () => {
+  // Card fb747d52 acceptance criterion: a brand-new id must not be made to
+  // wait. Free tiers rotate ids roughly 74 percent between cycles; requiring
+  // 2 passes before a new id could serve traffic would leave those tiers
+  // permanently cold.
+  let lc = defaultLifecycle();
+  assert.equal(lc.state, 'active');
+  lc = applyCompletionOutcome(lc, { status: 200, now: T0 });
+  assert.equal(lc.state, 'active', 'a record that was never demoted does not need to earn promotion');
+});
+
+test('a non-active record needs promotionSuccessThreshold consecutive 2xx to reach active, and sits in suspect until then', () => {
+  let lc = { ...defaultLifecycle(), state: 'eol', eol_reason: 'provider_410', eol_at: T0 - 1 };
+
+  lc = applyCompletionOutcome(lc, { status: 200, now: T0 });
+  assert.equal(lc.state, 'suspect', 'one success is real evidence, so it is routable again, but not yet trusted');
+  assert.equal(lc.consecutive_successes, 1);
+
+  lc = applyCompletionOutcome(lc, { status: 200, now: T0 + 1000 });
+  assert.equal(lc.state, 'active', 'the second CONSECUTIVE success meets the default threshold of 2');
+  assert.equal(lc.consecutive_successes, 2);
+  assert.equal(lc.consecutive_permanent_errors, 0);
   assert.equal(lc.eol_reason, null);
+});
+
+test('a 404 in between breaks the success streak back to 0', () => {
+  let lc = { ...defaultLifecycle(), state: 'suspect' };
+  lc = applyCompletionOutcome(lc, { status: 200, now: T0 });
+  assert.equal(lc.consecutive_successes, 1);
+
+  lc = applyCompletionOutcome(lc, { status: 404, now: T0 + 1000 });
+  assert.equal(lc.consecutive_successes, 0, 'a failure interrupts an in-progress promotion run');
+
+  lc = applyCompletionOutcome(lc, { status: 200, now: T0 + 2000 });
+  assert.equal(lc.state, 'suspect', 'the streak restarted, so one success still is not enough');
+  assert.equal(lc.consecutive_successes, 1);
+});
+
+test('a 429 advances neither counter (card 9e28de88: rate limits are not pass or fail)', () => {
+  let lc = defaultLifecycle();
+  lc = applyCompletionOutcome(lc, { status: 404, now: T0 });
+  assert.equal(lc.consecutive_permanent_errors, 1);
+
+  lc = applyCompletionOutcome(lc, { status: 429, now: T0 + 1000 });
+  assert.equal(lc.consecutive_permanent_errors, 1, '429 must not add to the error streak');
+  assert.equal(lc.consecutive_successes, 0, '429 must not add to the success streak either');
+  assert.equal(lc.state, 'active');
+
+  // and it must not interrupt an in-progress success streak either
+  let lc2 = { ...defaultLifecycle(), state: 'suspect' };
+  lc2 = applyCompletionOutcome(lc2, { status: 200, now: T0 });
+  assert.equal(lc2.consecutive_successes, 1);
+  lc2 = applyCompletionOutcome(lc2, { status: 429, now: T0 + 1000 });
+  assert.equal(lc2.consecutive_successes, 1, '429 must not reset a success streak in progress');
+  lc2 = applyCompletionOutcome(lc2, { status: 200, now: T0 + 2000 });
+  assert.equal(lc2.state, 'active', 'the 429 in between did not cost the streak its second success');
+});
+
+test('promotionSuccessThreshold is a THRESHOLDS entry, tunable per provider like absentSuspectThreshold', () => {
+  const customThresholds = {
+    ...THRESHOLDS,
+    promotionSuccessThreshold: { default: 2, flaky_provider: 4 },
+  };
+  let lc = { ...defaultLifecycle(), state: 'eol', eol_reason: 'provider_410' };
+  lc = applyCompletionOutcome(lc, {
+    status: 200,
+    now: T0,
+    provider: 'flaky_provider',
+    thresholds: customThresholds,
+  });
+  lc = applyCompletionOutcome(lc, {
+    status: 200,
+    now: T0 + 1000,
+    provider: 'flaky_provider',
+    thresholds: customThresholds,
+  });
+  assert.equal(lc.state, 'suspect', '2 successes must not be enough when this provider needs 4');
+  assert.equal(lc.consecutive_successes, 2);
+});
+
+test('MANDATORY NEGATIVE CONTROL: a model alternating 2xx/404 forever does not stay active indefinitely', () => {
+  // This is the exact bug card fb747d52 describes: a model that succeeds one
+  // request in four never accumulates eolErrorThreshold (3) CONSECUTIVE
+  // failures, because every intermittent success used to reset the counter
+  // to 0, so it parked in `active` forever and kept being advertised. This
+  // scenario passes on the pre-fix code (a bare `applyCompletionOutcome`
+  // with no consecutive-success gate).
+  let lc = defaultLifecycle();
+  let sawEol = false;
+  let sawActiveAfterEol = false;
+
+  for (let i = 0; i < 60; i++) {
+    const status = i % 2 === 0 ? 200 : 404;
+    lc = applyCompletionOutcome(lc, { status, now: T0 + i * 1000 });
+    if (lc.state === 'eol') sawEol = true;
+    if (sawEol && lc.state === 'active') sawActiveAfterEol = true;
+  }
+
+  assert.ok(sawEol, 'the alternating pattern must eventually condemn the record at least once');
+  assert.notEqual(
+    lc.state,
+    'active',
+    'a model that never lands two CONSECUTIVE successes must not settle back into active',
+  );
+  assert.equal(
+    sawActiveAfterEol,
+    false,
+    'once condemned, a strictly-alternating pattern (never 2 successes in a row) must never regain active',
+  );
+});
+
+test('MANDATORY NEGATIVE CONTROL variant: pattern starting with a success, same result', () => {
+  let lc = defaultLifecycle();
+  for (let i = 0; i < 60; i++) {
+    const status = i % 2 === 0 ? 404 : 200;
+    lc = applyCompletionOutcome(lc, { status, now: T0 + i * 1000 });
+  }
+  assert.notEqual(lc.state, 'active');
 });
 
 test('absent 1 cycle, default provider: active -> suspect', () => {
