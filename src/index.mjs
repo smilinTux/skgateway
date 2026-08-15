@@ -31,6 +31,7 @@ import { isRoutable, LIFECYCLE_STATES } from "./discovery/lifecycle.mjs";
 import { rankModels } from "./ranking/rank.mjs";
 import { deriveCapabilities } from "./ranking/capabilities.mjs";
 import { REGISTRY_PATH } from "./proxy/registry.mjs";
+import { energyRowsFrom, energyHeaders } from "./metrics/energy.mjs";
 import { readFileSync } from "node:fs";
 import { load as yamlLoad } from "js-yaml";
 
@@ -1341,17 +1342,114 @@ export const server = http.createServer(async (req, res) => {
       } catch { /* never let classification break a request */ }
     }
 
+    // Open the metrics record before dispatch so the collector can pair it with
+    // the response. The previous code called recordRequest once AFTER the
+    // response with snake_case keys the collector does not read, and never
+    // called recordResponse, so token_usage and cost_log stayed empty.
+    // agentId uses the same verified-identity expression as routeRequest below
+    // (falls back to X-Agent-Id / anonymous) rather than the raw header alone,
+    // so spend cannot be attributed to a spoofable header. Computed once here
+    // and reused by recordRequest and closeMetrics below so both always agree.
+    const metricsAgentId = identity.agent_id !== ANONYMOUS_AGENT_ID
+      ? identity.agent_id
+      : (req.headers["x-agent-id"] || undefined);
+
+    // Metrics must never be able to fail a real inference. recordRequest runs
+    // synchronously, before dispatch, with nothing else guarding it, so a
+    // metrics-internal failure (e.g. a synchronous write error inside
+    // maybeFlush) would otherwise 502 a request that never even reached
+    // routeAndSend. On failure metricsReqId stays null, and every metrics call
+    // below is guarded on it, so the request proceeds exactly as if metrics
+    // were disabled.
+    let metricsReqId = null;
+    if (metrics) {
+      try {
+        metricsReqId = metrics.recordRequest({
+          agentId: metricsAgentId,
+          model: parsedModel || "unknown",
+          backend: undefined,           // not chosen yet; overridden on response
+          sessionId: req.headers["x-session-id"] || undefined,
+        });
+      } catch (err) {
+        console.error("[skgateway] metrics recordRequest failed:", err.message);
+        metricsReqId = null;
+      }
+    }
+
+    // Closes the metrics record exactly once, from whichever exit path gets
+    // there first: the normal response-writing branches below, or the finally
+    // block that also runs when routeAndSend (or a response-writing branch)
+    // throws. metricsClosed guards against a double-record if more than one
+    // call site ever runs (the normal path always sets it, so the finally's
+    // own check below is a no-op on success). Never throws itself: a metrics
+    // failure here must not become a second, fabricated error stacked on top
+    // of whatever the request path already did.
+    let metricsClosed = false;
+    function closeMetrics({ statusCode, responseHeaders, responseBody, backend, errorMsg, energy, energyAttempts } = {}) {
+      if (!metrics || !metricsReqId || metricsClosed) return;
+      metricsClosed = true;
+      try {
+        metrics.recordResponse({
+          reqId: metricsReqId,
+          statusCode,
+          totalMs: Date.now() - startTime,
+          responseHeaders: responseHeaders ?? {},
+          responseBody: responseBody ?? null,
+          agentId: metricsAgentId,
+          model: parsedModel || "unknown",
+          backend,
+          errorMsg,
+        });
+      } catch (err) {
+        console.error("[skgateway] metrics recordResponse failed:", err.message);
+      }
+
+      // Energy rows for this request (joule-economy P0). ONE ROW PER ATTEMPT
+      // that produced an observation, not one per request: an attempt that
+      // burned joules locally and then failed over to cloud paid for that
+      // energy, and a ledger that drops it is showing a number where a cost
+      // actually happened. energy_log permits multiple rows per req_id by
+      // design. energyRowsFrom() collapses to the single `energy` field when
+      // there is no per-attempt list, so the ordinary one-attempt request is
+      // unchanged, and returns [] when neither is set, so the default
+      // shadow-mode (disabled) path still writes nothing.
+      for (const row of energyRowsFrom({ energy, energyAttempts })) {
+        try {
+          metrics.recordEnergy({
+            reqId: metricsReqId,
+            agentId: metricsAgentId,
+            model: parsedModel || "unknown",
+            // The attempt's own backend, falling back to the request's
+            // serving backend for the single-row shape that carries none.
+            backend: row.backendId ?? backend,
+            cardId: req.headers["x-sk-card-id"] || null,
+            joules: row.joules,
+            basis: row.basis,
+            node: row.node,
+            concurrencyN: row.concurrencyN ?? 1,
+          });
+        } catch (err) {
+          // Per row, so one unwritable row cannot swallow the others.
+          console.error("[skgateway] metrics recordEnergy failed:", err.message);
+        }
+      }
+    }
+
     const routeRequest = {
       model:   parsedModel,
       messages: parsedMessages,
       // Verified CapAuth identity (falls back to X-Agent-Id / anonymous).
-      agentId: identity.agent_id !== ANONYMOUS_AGENT_ID ? identity.agent_id : (req.headers["x-agent-id"] || undefined),
+      agentId: metricsAgentId,
       // skmodels registry role/context routing (single source of truth).
       // Present => routeAndSend resolves via ~/.skcapstone/models/registry.yaml
       // (precedence context > service > role > default) before backend select.
       context: req.headers["x-sk-context"] || undefined,
       service: req.headers["x-sk-service"] || undefined,
       role:    req.headers["x-sk-role"]    || undefined,
+      // Internal card id for energy/cost attribution (joule-economy P0).
+      // Stripped before forwarding upstream in router.mjs; never leaves the
+      // gateway.
+      cardId:  req.headers["x-sk-card-id"] || undefined,
       // x-sk-require escape hatch (card P4.3): DEFAULT OFF via
       // matchRoutingEnabled (routing.match_enabled). With the flag off this
       // is always `undefined` (no field added, no parse run): byte-identical
@@ -1361,64 +1459,125 @@ export const server = http.createServer(async (req, res) => {
       requirements: resolveRequestRequirements(req.headers["x-sk-require"], matchRoutingEnabled),
     };
 
-    const result = await routeAndSend(
-      router, routeRequest, routePath, req.method, req.headers, routeBody, true, siemHook,
-    );
+    // Dispatch-through-response-writing runs in its own try/finally so that
+    // ANY throw here (routeAndSend re-throws everything that is not a
+    // ModelEolError, most routinely a backend timeout or DNS failure) still
+    // closes the metrics record before the exception continues propagating to
+    // the outer catch below. Without this, such a request opened a `pending`
+    // entry in the collector via recordRequest above and NEVER closed it,
+    // leaking one entry per failed request for the life of the process.
+    let result;
+    let dispatchError = null;
+    try {
+      result = await routeAndSend(
+        router, routeRequest, routePath, req.method, req.headers, routeBody, true, siemHook,
+      );
 
-    if (!result) {
-      if (!res.headersSent) {
-        res.writeHead(502, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: { message: "No backend produced a response", code: 502 } }));
-      }
-    } else if (anthropicWant) {
-      // Translate the buffered OpenAI result back to the Anthropic wire format.
-      let oai = null;
-      try { oai = JSON.parse((result.body || "").toString("utf-8")); } catch {}
-      if (result.status >= 300 || !oai) {
-        // Upstream error / unparseable — pass it through so the Anthropic client
-        // sees the real status rather than a fabricated success.
-        const headers = { ...result.headers };
+      // Return energy to the caller (spec 4.5): x-sk-energy-joules /
+      // -basis / -node. Cost was being recorded and never returned, so no
+      // client could react to what it spends, which is the gap the spec
+      // names. Derived only from what was actually observed on the serving
+      // attempt: `{}` when energy metering is off (result.energy unset), and
+      // individually absent, never empty, for any field we do not know. That
+      // empty object spreads to nothing, so the disabled path emits exactly
+      // the headers it emitted before.
+      //
+      // The SERVING attempt only, deliberately, not a sum over
+      // result.energyAttempts. A failover's attempts can carry different
+      // bases (measured_gpu locally, imputed_cloud on the retry) and spec 4.2
+      // forbids presenting a mix of bases as one blended number. One joules
+      // value has to mean one basis and one node, so it means the attempt
+      // that produced the response the client is holding. The full
+      // per-attempt cost is in energy_log, where each row carries its own
+      // basis and can be aggregated honestly.
+      const eHeaders = energyHeaders(result?.energy);
+
+      if (!result) {
+        if (!res.headersSent) {
+          res.writeHead(502, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: { message: "No backend produced a response", code: 502 } }));
+        }
+      } else if (anthropicWant) {
+        // Translate the buffered OpenAI result back to the Anthropic wire format.
+        let oai = null;
+        try { oai = JSON.parse((result.body || "").toString("utf-8")); } catch {}
+        if (result.status >= 300 || !oai) {
+          // Upstream error / unparseable: pass it through so the Anthropic client
+          // sees the real status rather than a fabricated success.
+          const headers = { ...result.headers, ...eHeaders };
+          delete headers["content-length"];
+          delete headers["transfer-encoding"];
+          delete headers["content-encoding"];
+          res.writeHead(result.status, headers);
+          res.end(result.body);
+        } else {
+          const amsg = toAnthropicMessage(oai, parsedModel);
+          if (anthropicStream) {
+            // Serialise the complete Anthropic message as the streaming event
+            // sequence (message_start -> content_block_* -> message_delta ->
+            // message_stop -> [DONE]); jsonToSSE auto-detects the Anthropic shape.
+            const writer = new SSEWriter(res, { keepAliveMs: 0, extraHeaders: eHeaders });
+            writer.start();
+            jsonToSSE(writer, amsg);
+          } else {
+            const outBuf = Buffer.from(JSON.stringify(amsg), "utf-8");
+            res.writeHead(200, {
+              "content-type": "application/json",
+              "content-length": outBuf.length,
+              ...eHeaders,
+            });
+            res.end(outBuf);
+          }
+        }
+      } else {
+        const headers = { ...result.headers, ...eHeaders };
         delete headers["content-length"];
         delete headers["transfer-encoding"];
         delete headers["content-encoding"];
         res.writeHead(result.status, headers);
         res.end(result.body);
-      } else {
-        const amsg = toAnthropicMessage(oai, parsedModel);
-        if (anthropicStream) {
-          // Serialise the complete Anthropic message as the streaming event
-          // sequence (message_start -> content_block_* -> message_delta ->
-          // message_stop -> [DONE]); jsonToSSE auto-detects the Anthropic shape.
-          const writer = new SSEWriter(res, { keepAliveMs: 0 });
-          writer.start();
-          jsonToSSE(writer, amsg);
-        } else {
-          const outBuf = Buffer.from(JSON.stringify(amsg), "utf-8");
-          res.writeHead(200, { "content-type": "application/json", "content-length": outBuf.length });
-          res.end(outBuf);
-        }
       }
-    } else {
-      const headers = { ...result.headers };
-      delete headers["content-length"];
-      delete headers["transfer-encoding"];
-      delete headers["content-encoding"];
-      res.writeHead(result.status, headers);
-      res.end(result.body);
-    }
-
-    // Record metrics
-    if (metrics) {
-      const duration = Date.now() - startTime;
-      metrics.recordRequest({
-        path: req.url,
-        method: req.method,
-        duration,
-        status: result?.status ?? res.statusCode,
-        agent_id: req.agent_id || req.headers["x-agent-id"] || "unknown",
-        model: parsedModel || "unknown",
-        backend: result?.backendId,
-      });
+    } catch (err) {
+      // Record which branch we're in for the finally block below, then
+      // rethrow unchanged: the outer catch still writes the 502 (or leaves an
+      // already-started response alone) exactly as it did before this round,
+      // so the client-visible behaviour on this path is unaffected.
+      dispatchError = err;
+      throw err;
+    } finally {
+      if (dispatchError) {
+        // routeAndSend or a response-writing branch threw. res.headersSent
+        // tells us whether the outer catch (which runs right after this
+        // finally) will still get to write the 502 itself, or whether a
+        // partial response already went out; either way, record a real
+        // non-2xx status and the error message so this shows up in
+        // request_log as a closed, failed request rather than a silently
+        // missing row.
+        closeMetrics({
+          statusCode: res.headersSent ? (res.statusCode || 502) : 502,
+          responseHeaders: {},
+          responseBody: null,
+          backend: result?.backendId,
+          errorMsg: dispatchError.message,
+          energy: result?.energy,
+          energyAttempts: result?.energyAttempts,
+        });
+      } else {
+        let parsedBody = null;
+        try {
+          parsedBody = result?.body ? JSON.parse(result.body.toString("utf8")) : null;
+        } catch {
+          parsedBody = null;           // SSE or non-JSON; usage extraction skipped
+        }
+        closeMetrics({
+          statusCode: result?.status ?? res.statusCode,
+          responseHeaders: result?.headers ?? {},
+          responseBody: parsedBody,
+          backend: result?.backendId,
+          energy: result?.energy,
+          energyAttempts: result?.energyAttempts,
+        });
+      }
     }
   } catch (err) {
     console.error("[skgateway] unhandled error:", err.message);

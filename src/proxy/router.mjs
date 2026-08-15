@@ -26,6 +26,8 @@ import { isAnthropicBackend, toAnthropicRequest, toOpenAIResponse } from "./anth
 import { getPool } from "./connection-pool.mjs";
 import { isRegistryRouted, resolve as resolveRegistry, getAutoConfig, getConfigEpoch, loadRegistry } from "./registry.mjs";
 import { getFailoverConfig, isLocalUrl, probeLocalHealth, recordLocalOutcome } from "./local-failover.mjs";
+import { readMeter } from "./meter-client.mjs";
+import { marginalJoules, imputeJoules, resolveBasis, coeffsForModel, usageFromSSE, resolveMeterUrl } from "../metrics/energy.mjs";
 import { recordModelOutcome, getLifecycle } from "../discovery/model_catalog_store.mjs";
 import { isRoutable } from "../discovery/lifecycle.mjs";
 import { applyReasoningFloor } from "./core.mjs";
@@ -291,6 +293,17 @@ function extractUsage(body) {
     // not JSON / streamed / no usage — nothing to report
   }
   return {};
+}
+
+// How many attempts are currently in flight against each meter, so energy
+// rows can record whether a measurement was single-tenant. Spec 4.6.
+const _inFlight = new Map();
+function inFlightOnMeter(url) { return _inFlight.get(url) ?? 1; }
+function enterMeter(url) { if (url) _inFlight.set(url, (_inFlight.get(url) ?? 0) + 1); }
+function exitMeter(url) {
+  if (!url) return;
+  const n = (_inFlight.get(url) ?? 1) - 1;
+  if (n <= 0) _inFlight.delete(url); else _inFlight.set(url, n);
 }
 
 // ---------------------------------------------------------------------------
@@ -1452,6 +1465,19 @@ function eolGatedResponse(err) {
 export async function routeAndSend(router, request, upstreamPath, method, clientHeaders, body, usePool = true, siem = null) {
   const pool = usePool ? getPool() : null;
 
+  // Read fresh off getConfig() every request (not cached at module scope) so
+  // a SIGHUP config reload picks up a flipped energy.enabled or an updated
+  // meters/coefficients map without a restart, mirroring getPricing(). Fail
+  // soft to undefined when loadConfig() has never run (most router.mjs unit
+  // tests construct routeAndSend directly), matching isMatchRoutingEnabled()
+  // above: this must never throw into the request path.
+  let energyCfg;
+  try {
+    energyCfg = getConfig()?.energy;
+  } catch {
+    energyCfg = undefined;
+  }
+
   // ── SIEM: per-request audit correlation ──
   // Every lifecycle event emitted for this request shares one request_id so a
   // SIEM/SOC can stitch auth → request → (failover) → response|error together.
@@ -1708,6 +1734,12 @@ export async function routeAndSend(router, request, upstreamPath, method, client
 
   let lastResult = null;
   let didFailover = false;
+  // Every attempt that produced an energy observation, in attempt order.
+  // Reads are per attempt (spec 4.5), so writes must be too: a local metered
+  // attempt that burned real joules and then failed over to cloud gets its own
+  // row rather than being overwritten by the attempt that happened to win.
+  // Stays empty on the disabled path, where it is never attached to a result.
+  const energyAttempts = [];
 
   for (let i = 0; i < candidates.length; i++) {
     const { backendId, backendUrl, authHeaders, backend } = candidates[i];
@@ -1754,6 +1786,9 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // a gzip'd upstream reply reaches the client as undecodable bytes ("HTTP 400:
     // <garbage>"). Force identity so backends return uncompressed bodies.
     delete forwardHeaders["accept-encoding"];
+    // Internal card id (energy/cost attribution) must never reach a
+    // third-party provider (NVIDIA, OpenRouter, etc).
+    delete forwardHeaders["x-sk-card-id"];
 
     const targetUrl = new URL(backendUrl);
     const queueStart = Date.now();
@@ -1790,7 +1825,49 @@ export async function routeAndSend(router, request, upstreamPath, method, client
 
     const queueWaitMs = Date.now() - queueStart;
 
+    // Meter read is per attempt, not per request: a failover attempt must be
+    // attributed to the backend that actually served it. Fail-open, so a slow
+    // or dead meter costs a null reading and nothing else. When energy
+    // metering is disabled (default) meterUrl stays null and readMeter is
+    // never called: no network call, no extra latency on the disabled path.
+    // resolveMeterUrl, not a bare meters[backendId] lookup: registry routing
+    // (the main path, sk-default included) hands out synthetic "reg:*" ids,
+    // and spec 4.5 promises a URL-host fallback for backends that carry no
+    // node identity of their own. An exact-id-only lookup silently imputes
+    // the exact traffic this component was built to measure.
+    const meterUrl = energyCfg?.enabled
+      ? resolveMeterUrl(energyCfg.meters, backendId, backendUrl)
+      : null;
+    const meterBeforeStart = meterUrl ? Date.now() : 0;
+    const meterBefore = meterUrl
+      ? await readMeter(meterUrl, energyCfg.read_timeout_ms ?? 250)
+      : null;
+    // Wall-clock time this attempt's pre-read consumed. Subtracted out of
+    // latencyMs below so up to read_timeout_ms of meter round-trip never
+    // bleeds into backend.recordOutcome()/the dashboard's latencyP50: the
+    // instrument added to make energy telemetry trustworthy must not corrupt
+    // the latency telemetry sitting right next to it. Zero (no-op) whenever
+    // metering is disabled or this backend has no configured meter, so
+    // latencyMs stays exactly Date.now() - queueStart as before, byte for
+    // byte, on the disabled path. queueWaitMs (pool wait) is untouched, it
+    // was already snapshotted above before this read ran, and stays folded
+    // into latencyMs exactly as it always was.
+    const meterBeforeMs = meterUrl ? (Date.now() - meterBeforeStart) : 0;
+
     let res;
+    // Captured inside try/catch, after sendUpstream resolves (or throws) and
+    // before finally runs exitMeter. Ruling R19: reading the in-flight count
+    // after exitMeter has already removed this attempt from the set means
+    // two genuinely overlapping attempts would both read back 1, which is
+    // worse than not recording the field at all (a false "clean" reading).
+    // Capturing it here, while this attempt is still counted, is what lets
+    // the field actually show 2+ when there is real overlap.
+    let attemptConcurrency = null;
+    // Track in-flight attempts against this meter so the energy row can
+    // record whether the measurement window was single-tenant (spec 4.6).
+    // No-op when meterUrl is null (energy metering disabled or no meter
+    // configured for this backend): the disabled path stays byte-identical.
+    enterMeter(meterUrl);
     try {
       if (isAnthropicBackend(backend)) {
         // Translate OpenAI chat-completions → Anthropic Messages API.
@@ -1814,6 +1891,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       } else {
         res = await sendUpstream(upstreamPath, method, forwardHeaders, attemptBody, targetUrl, backend.timeout_ms);
       }
+      attemptConcurrency = meterUrl ? inFlightOnMeter(meterUrl) : 1;
     } catch (err) {
       // sendUpstream resolves with 502 on network error, but be defensive
       res = {
@@ -1821,14 +1899,59 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         headers: {},
         body: Buffer.from(JSON.stringify({ error: { message: err.message } })),
       };
+      attemptConcurrency = meterUrl ? inFlightOnMeter(meterUrl) : 1;
     } finally {
       // Always release the slot, even on error
       if (pool && slot) {
         pool.release(backendId);
       }
+      // Pair every enterMeter with an exit here, even on a thrown upstream,
+      // so the in-flight count can never leak and drift upward. This runs
+      // after attemptConcurrency has already been captured above, so the
+      // leak-proofing and the read no longer share a moment in time.
+      exitMeter(meterUrl);
     }
 
-    const latencyMs = Date.now() - queueStart;
+    const latencyMs = (Date.now() - queueStart) - meterBeforeMs;
+
+    // Second meter read + energy accounting for this attempt, gated the same
+    // way as the pre-read above: when energy metering is disabled the whole
+    // block is skipped (attemptEnergy stays null), so lastResult.energy below
+    // is never set and index.mjs never calls recordEnergy. Zero behavior
+    // change on the disabled path.
+    let attemptEnergy = null;
+    if (energyCfg?.enabled) {
+      const meterAfter = meterUrl
+        ? await readMeter(meterUrl, energyCfg.read_timeout_ms ?? 250)
+        : null;
+
+      const measured = marginalJoules(meterBefore, meterAfter);
+      let joules = measured;
+      const basis = resolveBasis({ metered: measured !== null, backendIsLocal: isLocalUrl(backendUrl) });
+      if (measured === null) {
+        // extractUsage() JSON.parses the body and returns {} for a streamed
+        // (SSE) body, so tokens_out is always absent there. Fall back to the
+        // SSE scanner in that case rather than imputing on undefined tokens.
+        const usage = extractUsage(res.body);
+        const sse = (usage.tokens_out === undefined) ? usageFromSSE(res.body) : null;
+        joules = imputeJoules(
+          sse ?? { input_tokens: usage.tokens_in, output_tokens: usage.tokens_out },
+          coeffsForModel(request.model ?? "", energyCfg?.coefficients ?? {}),
+        );
+      }
+      attemptEnergy = {
+        joules,
+        basis,
+        node: meterAfter?.node ?? null,
+        concurrencyN: attemptConcurrency ?? 1,
+        // Which backend burned it. lastResult.backendId only ever names the
+        // final attempt, so without this an earlier attempt's row would be
+        // filed under the backend that served the retry.
+        backendId,
+      };
+      energyAttempts.push(attemptEnergy);
+    }
+
     const success = res.status < 500;
     const qTransition = backend.recordOutcome(success, latencyMs);
 
@@ -1874,6 +1997,10 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     }
 
     lastResult = { ...res, backendId, failover: didFailover, queueWaitMs };
+    if (attemptEnergy) lastResult.energy = attemptEnergy;
+    // Only attached when something was actually observed, so the disabled
+    // path returns a result whose shape is unchanged, field for field.
+    if (energyAttempts.length > 0) lastResult.energyAttempts = energyAttempts;
 
     if (success) {
       console.log(

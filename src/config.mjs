@@ -281,6 +281,42 @@ const DEFAULTS = {
       openrouter: { enabled: true, free_only: true, chat_only: true },
     },
   },
+
+  // Joule-economy P0 metering (energy_log). Reads a skmeter counter around
+  // each upstream attempt and records measured or imputed joules.
+  //   enabled          - MASTER GATE. OFF by default: shadow mode ships dark,
+  //                      no meter reads, no behavior change, until a node's
+  //                      meter config has been validated.
+  //   read_timeout_ms  - hard ceiling per meter read; the meter is never worth
+  //                      waiting on, so this must stay well under any
+  //                      upstream timeout.
+  //   meters           - backend id (exact, or the synthetic 'reg:<id>' form,
+  //                      or the backend URL's host:port, or its host) ->
+  //                      meter endpoint. See resolveMeterUrl() in
+  //                      src/metrics/energy.mjs for the resolution order.
+  //   coefficients     - model (exact or prefix) -> joules per token, used to
+  //                      impute energy for backends that cannot be metered.
+  //
+  // REACHABILITY, the thing that silently breaks this: the URL below is
+  // fetched BY THIS GATEWAY PROCESS, from the host the gateway runs on, which
+  // on this fleet is not the GPU node. skmeter binds 127.0.0.1 by default, so
+  // a meter left at its default bind answers nothing across the network and
+  // every request quietly falls back to imputation while this config looks
+  // wired. Widening skmeter's bind (SKMETER_BIND, see systemd/skmeter.service
+  // in skcapstone) publishes a node's power telemetry to whoever can reach the
+  // port, so it is a deliberate deployment decision, never a default. Validate
+  // with scripts/skmeter-validate.sh pointed at THIS url before flipping
+  // enabled, and read the recorded rows' basis afterwards: a table full of
+  // imputed_local where measured_gpu was expected is what an unreachable meter
+  // looks like from the outside.
+  energy: {
+    enabled: false,             // shadow mode ships OFF; flip per node after validation
+    read_timeout_ms: 250,
+    // backend id (or 'reg:<id>', or URL host:port, or URL host) -> meter endpoint
+    meters: {},                 // e.g. { local: 'http://192.168.0.100:9420/energy' }
+    // model (exact or prefix) -> joules per token, for unmeterable backends
+    coefficients: {},
+  },
 };
 
 // ─── deep merge ───────────────────────────────────────────────────────────────
@@ -683,6 +719,19 @@ function validate(cfg) {
   // dashboard
   if (typeof cfg.dashboard.refresh_ms !== 'number' || cfg.dashboard.refresh_ms < 100)
     errs.push('dashboard.refresh_ms must be >= 100');
+
+  // energy (joule-economy P0 metering)
+  if (cfg.energy) {
+    if (typeof cfg.energy.enabled !== 'boolean') {
+      errs.push('energy.enabled must be a boolean');
+    }
+    if (cfg.energy.meters && typeof cfg.energy.meters !== 'object') {
+      errs.push('energy.meters must be an object mapping backend id to meter URL');
+    }
+    if (cfg.energy.coefficients && typeof cfg.energy.coefficients !== 'object') {
+      errs.push('energy.coefficients must be an object mapping model to joules-per-token');
+    }
+  }
 
   // Provider-route consistency (card 7ec1d18a): assert routes map to known
   // backends / resolvable aliases at boot AND reload, so a mis-wired route fails
