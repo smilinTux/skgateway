@@ -117,6 +117,11 @@ backends:
   #   url: https://opencode.ai/zen/v1
   #   auth_type: api_key
   #   api_key_env: OPENCODE_API_KEY            # env var name only, NOT the key; optional bearer
+  #   auth_optional: true                      # card C15: this provider genuinely serves
+  #                                            # unauthenticated traffic (measured 2026-08-15).
+  #                                            # Declaring it here means the gateway is not left
+  #                                            # inferring intent from an absent env var, which is
+  #                                            # how a caller's own bearer used to end up upstream.
   #   discovery: free                          # free | all -- no static `models:` list, see above
   #   max_concurrent: 10
 

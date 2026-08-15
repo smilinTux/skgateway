@@ -57,6 +57,43 @@ import { adjustWithEmpirical, promptClassFromResult } from "../classifiers/empir
 // ---------------------------------------------------------------------------
 
 /** Window size for the sliding error-rate calculation (number of requests). */
+/**
+ * Client-supplied credential headers, stripped before ANY upstream call
+ * (card 6e61f798 / C15).
+ *
+ * These authenticate a caller TO THIS GATEWAY. None of them is ever a valid
+ * credential for an upstream provider, and relaying one is a credential
+ * disclosure to a third party. `authorization` is the one that was actually
+ * observed leaking to opencode.ai; the rest are here because they are the same
+ * category and there is no reason to wait for each to be demonstrated.
+ */
+export const CLIENT_CREDENTIAL_HEADERS = [
+  "authorization",
+  "proxy-authorization",
+  "cookie",
+  "x-api-key",
+  "api-key",
+  "x-goog-api-key",
+  "x-sk-capability",
+];
+
+/**
+ * Gateway-internal control headers the caller sends for OUR routing logic.
+ * Meaningless to an upstream provider, and several of them (agent id, session
+ * id, service name) describe our internal topology, so they are stripped from
+ * third-party calls for the same reason `x-sk-card-id` already was.
+ */
+export const INTERNAL_CONTROL_HEADERS = [
+  "x-sk-card-id",
+  "x-sk-context",
+  "x-sk-require",
+  "x-sk-role",
+  "x-sk-service",
+  "x-agent-id",
+  "x-session-id",
+  "x-model",
+];
+
 const HEALTH_WINDOW = 100;
 
 /** Mark backend degraded once error rate exceeds this threshold (10 %). */
@@ -560,6 +597,11 @@ export class Backend {
     this.id = config.id;
     this.url = config.url.replace(/\/$/, ""); // strip trailing slash
     this.auth_type = config.auth_type || "none";
+    // Card 6e61f798 / C15: an operator's explicit statement that this provider
+    // is meant to be used without a key, rather than the gateway inferring it
+    // from an env var that happens to be missing. See buildAuthHeaders().
+    this.auth_optional = config.auth_optional === true;
+    this.api_key_env = config.api_key_env || null;
     this.models = Array.isArray(config.models) ? config.models : [];
     // Marks a discovery-driven backend (e.g. openrouter, see config.mjs
     // backends.*.discovery). Its `models` array starts empty and is populated
@@ -830,7 +872,31 @@ export class Backend {
       case "bearer": {
         const key = this._resolveApiKey();
         if (!key) {
-          console.warn(`[router] backend=${this.id} auth_type=${this.auth_type} but no key found`);
+          // Card 6e61f798 / C15. A missing key used to degrade silently to an
+          // unauthenticated call, and because the caller's headers were copied
+          // first, whatever bearer the CLIENT sent went upstream in its place.
+          // The header leak is fixed above; this makes the remaining ambiguity
+          // explicit instead of inferring intent from an absent env var.
+          //
+          // `auth_optional: true` says the operator KNOWS this provider serves
+          // unauthenticated traffic and wants that. OpenCode Zen genuinely does
+          // (measured 2026-08-15: /v1/models and /v1/chat/completions both
+          // return 200 with no auth header at all), so this is a real mode, not
+          // a workaround.
+          //
+          // Without that flag a missing key is a misconfiguration. We still do
+          // not hard-fail the request, because that would convert a recoverable
+          // credential problem into an outage for every model on the backend,
+          // but the warning is deliberately loud and names the env var so the
+          // operator can act. Deciding to fail closed here is a live behavior
+          // change and is left to a separate, explicit call.
+          if (this.auth_optional !== true) {
+            console.warn(
+              `[router] backend=${this.id} declares auth_type=${this.auth_type} but ` +
+                `${this.api_key_env || "its api key env"} is unset. Sending UNAUTHENTICATED. ` +
+                `Set the key, or declare auth_optional: true if this provider is meant to be used without one.`,
+            );
+          }
           return {};
         }
         return { authorization: `Bearer ${key}` };
@@ -2052,8 +2118,35 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       continue;
     }
 
-    // Merge auth headers into a sanitized copy of client headers
+    // Merge auth headers into a sanitized copy of client headers.
+    //
+    // CARD 6e61f798 / C15. The client's credential headers are stripped BEFORE
+    // the backend's own auth is merged in, not after, and not by relying on the
+    // merge to overwrite them.
+    //
+    // The old order was `{...clientHeaders}` then merge, which looks equivalent
+    // and is not: `buildAuthHeaders()` returns an EMPTY object whenever a
+    // backend declares `auth_type: api_key` but its `api_key_env` is unset (it
+    // logs a warning and gives up). With nothing to overwrite it, the caller's
+    // `authorization` header survived and was relayed verbatim to a third-party
+    // provider. Reproduced live against opencode.ai: a request carrying
+    // `authorization: Bearer test` came back 401 with OpenCode's own
+    // `AuthError: Invalid API key`, proving OUR gateway forwarded the caller's
+    // bearer. The identical request with no header returned 200.
+    //
+    // A caller's token authenticates them to US. It is never an upstream
+    // credential, and the failure was config-triggered (an absent env var)
+    // rather than request-triggered, so nothing in a request review would have
+    // caught it. As capauth moves richer per-request tokens onto this path
+    // (cards a150c9c0, 373a33ca), the blast radius only grows.
+    //
+    // Stripping first also makes the downstream Anthropic branch correct by
+    // construction: it reads `forwardHeaders.authorization` to authenticate the
+    // Messages API call, and that now resolves to the BACKEND's credential (the
+    // oauth token for anthropic-direct) or to nothing for the local
+    // claude-code-api wrapper, which is `auth_type: none` and needs none.
     const forwardHeaders = { ...clientHeaders };
+    for (const h of CLIENT_CREDENTIAL_HEADERS) delete forwardHeaders[h];
     for (const [k, v] of Object.entries(authHeaders)) {
       forwardHeaders[k] = v;
     }
@@ -2066,9 +2159,11 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // a gzip'd upstream reply reaches the client as undecodable bytes ("HTTP 400:
     // <garbage>"). Force identity so backends return uncompressed bodies.
     delete forwardHeaders["accept-encoding"];
-    // Internal card id (energy/cost attribution) must never reach a
-    // third-party provider (NVIDIA, OpenRouter, etc).
-    delete forwardHeaders["x-sk-card-id"];
+    // Internal control headers (energy/cost attribution, agent + session
+    // identity, routing hints) must never reach a third-party provider. The
+    // card id was already stripped here for exactly this reason; the rest of
+    // the family carries the same problem and now goes with it.
+    for (const h of INTERNAL_CONTROL_HEADERS) delete forwardHeaders[h];
 
     const targetUrl = new URL(backendUrl);
     const queueStart = Date.now();
