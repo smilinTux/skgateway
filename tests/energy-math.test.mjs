@@ -234,3 +234,67 @@ test("marginalJoules: a genuine measured zero from an ACTIVE meter stays zero", 
   const b = { counter_j: 700, samples_n: 530, metering: "active" };
   assert.equal(marginalJoules(a, b), 0);
 });
+
+import {
+  paramsFromModelId, derivedCoeffs,
+  MEASURED_J_PER_TOKEN_PER_B, CLOUD_J_PER_TOKEN_PER_B, INPUT_TOKEN_RATIO,
+} from '../src/metrics/energy.mjs';
+
+test('paramsFromModelId: plain dense sizes', () => {
+  assert.deepEqual(paramsFromModelId('ornith-1.0-9b'), { total_b: 9, active_b: 9 });
+  assert.deepEqual(paramsFromModelId('meta/llama-3.1-70b-instruct'), { total_b: 70, active_b: 70 });
+});
+
+test('paramsFromModelId: MoE uses ACTIVE params, because compute tracks active', () => {
+  // 550B total but only 55B active. Charging 550 would overstate it 10x.
+  assert.deepEqual(paramsFromModelId('nvidia/nemotron-3-ultra-550b-a55b'), { total_b: 550, active_b: 55 });
+  assert.deepEqual(paramsFromModelId('qwen/qwen3.5-397b-a17b'), { total_b: 397, active_b: 17 });
+});
+
+test('paramsFromModelId: a :free suffix does not hide the size', () => {
+  assert.deepEqual(paramsFromModelId('google/gemma-4-26b-a4b-it:free'), { total_b: 26, active_b: 4 });
+});
+
+test('paramsFromModelId: unparseable returns null, never a guess', () => {
+  // Frontier models do not publish parameter counts. Recording "unknown" beats
+  // inventing a number, which is the whole design rule of this module.
+  assert.equal(paramsFromModelId('claude-opus-4-8'), null);
+  assert.equal(paramsFromModelId('thinkingmachines/inkling'), null);
+  assert.equal(paramsFromModelId(''), null);
+  assert.equal(paramsFromModelId(null), null);
+});
+
+test('paramsFromModelId: active can never exceed total', () => {
+  const p = paramsFromModelId('weird-7b-a99b');
+  assert.ok(p.active_b <= p.total_b);
+});
+
+test('derivedCoeffs: scales with active params and discounts input tokens', () => {
+  const c = derivedCoeffs('meta/llama-3.1-70b-instruct');
+  assert.ok(Math.abs(c.j_per_output_token - 70 * CLOUD_J_PER_TOKEN_PER_B) < 1e-9);
+  assert.ok(Math.abs(c.j_per_input_token - c.j_per_output_token * INPUT_TOKEN_RATIO) < 1e-9);
+});
+
+test('derivedCoeffs: null for an unparseable id', () => {
+  assert.equal(derivedCoeffs('claude-opus-4-8'), null);
+});
+
+test('coeffsForModel: a curated entry BEATS derivation', () => {
+  // This is load bearing. Our own ornith runs on a consumer card and was
+  // MEASURED at 2.85 J/token; derivation would apply the datacenter discount
+  // and return ~0.95, understating local energy threefold and making local
+  // look artificially cheap against cloud.
+  const table = { ornith: { j_per_output_token: 2.85, j_per_input_token: 0.285 } };
+  assert.equal(coeffsForModel('ornith-1.0-9b', table).j_per_output_token, 2.85);
+});
+
+test('coeffsForModel: falls back to derivation when nothing is curated', () => {
+  const c = coeffsForModel('nvidia/nemotron-3-super-120b-a12b', {});
+  assert.ok(c && c.j_per_output_token > 0);
+  assert.ok(Math.abs(c.j_per_output_token - 12 * CLOUD_J_PER_TOKEN_PER_B) < 1e-9);
+});
+
+test('the anchor constants match the documented measurement', () => {
+  // 2.85 J/token measured on a 9B, so 0.317 J per token per billion.
+  assert.ok(Math.abs(MEASURED_J_PER_TOKEN_PER_B - 2.85 / 9) < 0.002);
+});

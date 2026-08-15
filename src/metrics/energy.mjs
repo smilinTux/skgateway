@@ -65,6 +65,93 @@ export function resolveBasis({ metered, backendIsLocal }) {
  * YAML happened to list them in, because key order in a config file is not a
  * statement of intent. Do not "fix" this to match getPricing().
  */
+/**
+ * ENERGY ANCHOR, and where every derived number comes from.
+ *
+ * Measured on 2026-08-15, node .100, NVIDIA RTX 5060 Ti, ornith-1.0-9b served
+ * by llama-server: 600 output tokens cost 1713 J marginal (idle baseline
+ * 8.96 W subtracted), which is 2.85 J per output token. Re-run it with
+ * scripts/skmeter-validate.sh in skcapstone; the gate reproduces the figure.
+ *
+ *   2.85 J/token / 9B params = 0.317 J per token per billion params
+ *
+ * That is a consumer card. Datacenter accelerators are meaningfully more
+ * efficient per token, so cloud is discounted by DATACENTER_EFFICIENCY. The
+ * discount is the single softest number here and it is a judgment call, not a
+ * measurement; it is isolated as one constant so it can be corrected in one
+ * place when better data arrives.
+ *
+ * Sanity check: the commonly cited "0.3 Wh per query" works out near 2 J per
+ * token for a typical response, which sits beside our measured 2.85. Model
+ * size and datacenter efficiency roughly cancel for mid-size models, so the
+ * anchor is not wildly off.
+ *
+ * KNOWN UNCERTAINTY, roughly 3x either way. Do not present these as precise:
+ *   - the anchor model is NVFP4 quantized; quantization changes energy a lot
+ *   - batching, which a busy provider does and we did not
+ *   - MoE routing overhead beyond raw active-parameter count
+ *   - prefill vs decode split (see INPUT_TOKEN_RATIO)
+ * Any aggregate mixing measured and imputed rows must report the mix, per
+ * spec 4.2. `energy_log.basis` is what makes that possible.
+ */
+export const MEASURED_J_PER_TOKEN_PER_B = 0.317;
+export const DATACENTER_EFFICIENCY = 3.0;
+export const CLOUD_J_PER_TOKEN_PER_B = MEASURED_J_PER_TOKEN_PER_B / DATACENTER_EFFICIENCY;
+
+/**
+ * Prefill is far cheaper per token than decode: it is parallel across the
+ * prompt, where decode is sequential and memory-bandwidth bound. A tenth is a
+ * documented estimate, not a measurement. Note our own anchor folded a short
+ * 51-token prompt into the output figure, so for long prompts this
+ * under-counts rather than over-counts.
+ */
+export const INPUT_TOKEN_RATIO = 0.1;
+
+/**
+ * Pull parameter counts out of a model id.
+ *
+ * Most ids in this fleet carry their own size: "-9b", "-70b", "-30b-a3b",
+ * "-550b-a55b", "122b-a10b". The "aNNb" suffix is the ACTIVE parameter count
+ * of a mixture-of-experts model, and compute (therefore energy) tracks active
+ * params, not total. A static coefficient table would go stale immediately
+ * here because discovery keeps adding free models, so deriving from the id is
+ * what keeps this honest without hand maintenance.
+ *
+ * @returns {{total_b:number, active_b:number}|null} null when unparseable,
+ *   which is deliberate: an unknown size yields no estimate rather than a
+ *   guessed one.
+ */
+export function paramsFromModelId(model) {
+  if (!model || typeof model !== 'string') return null;
+  const id = model.toLowerCase();
+  // active params first: "-a17b", "-a3b"
+  const active = id.match(/[-_]a(\d+(?:\.\d+)?)b(?![a-z0-9])/);
+  // total params: the LAST plain "<n>b" that is not the active marker
+  const totals = [...id.matchAll(/(?:^|[-_/])(\d+(?:\.\d+)?)b(?![a-z0-9])/g)];
+  if (!totals.length) return null;
+  const total_b = parseFloat(totals[totals.length - 1][1]);
+  if (!Number.isFinite(total_b) || total_b <= 0) return null;
+  const active_b = active ? parseFloat(active[1]) : total_b;
+  if (!Number.isFinite(active_b) || active_b <= 0) return null;
+  return { total_b, active_b: Math.min(active_b, total_b) };
+}
+
+/**
+ * Derive per-token coefficients for a model whose id encodes its size.
+ * Returns null when the size cannot be read, so the ledger records "unknown"
+ * rather than an invented number.
+ */
+export function derivedCoeffs(model, jPerTokenPerB = CLOUD_J_PER_TOKEN_PER_B) {
+  const p = paramsFromModelId(model);
+  if (!p) return null;
+  const out = p.active_b * jPerTokenPerB;
+  return {
+    j_per_output_token: out,
+    j_per_input_token: out * INPUT_TOKEN_RATIO,
+    basis_note: `derived from ${p.active_b}B active params`,
+  };
+}
+
 export function coeffsForModel(model, table) {
   if (!table || !model) return null;
   if (Object.prototype.hasOwnProperty.call(table, model)) return table[model];
@@ -76,7 +163,10 @@ export function coeffsForModel(model, table) {
       bestLen = key.length;
     }
   }
-  return best;
+  // A curated entry always wins. Only when none matches do we derive from the
+  // parameter count encoded in the id, which is what keeps a fleet that
+  // discovers new free models continuously from filling up with null rows.
+  return best ?? derivedCoeffs(model);
 }
 
 /**
