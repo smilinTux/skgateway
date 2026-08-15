@@ -451,6 +451,25 @@ export async function discoverCatalog(opts) {
     probeRunProbe,
     probeProvider = 'nvidia',
     nvidiaApiKey = process.env.NVIDIA_API_KEY,
+    // Card 2ba73bf9 / C9 (measurement half): the tier-2 capability battery
+    // rides this same probe sweep (see probe.mjs's probeModels doc comment).
+    // Threaded through here the same way probeSeconds/probeBudget/etc. were
+    // BEFORE card 1f65cf45/C3 wired index.mjs's refreshCatalog() to actually
+    // pass them: this function supports the knobs correctly, but nothing in
+    // this repo's index.mjs reads a `discovery.capability_*` config key yet,
+    // so production never reaches this path today. That is deliberate, not
+    // an oversight: C9's measurement half is out-of-scope for touching
+    // index.mjs or enabling anything in live config (both explicitly
+    // reserved). Whoever wires cfg.discovery through should follow the exact
+    // pattern C3 used for probeSeconds, and should NOT add a
+    // `discovery.capability_seconds`-shaped config doc comment until that
+    // wiring lands, for the same reason C3 itself exists: documenting a key
+    // nothing reads is worse than not documenting it.
+    capabilityBudget,
+    capabilityIntervalMs,
+    capabilityTimeoutMs,
+    chatComplete,
+    probeRunCapabilityAssessment,
   } = opts;
   const at = now();
   let stale = false;
@@ -568,6 +587,15 @@ export async function discoverCatalog(opts) {
           poolBackendId: DEFAULT_POOL_BACKEND_ID,
           now: () => at,
           runProbe,
+          // Card 2ba73bf9 / C9: undefined unless a caller explicitly opts in
+          // (no production default for chatComplete, mirroring runProbe's own
+          // no-silent-network-default discipline); probeModels() treats a
+          // missing chatComplete as tier 2 fully disabled, tier 1 unaffected.
+          chatComplete,
+          runCapabilityAssessment: probeRunCapabilityAssessment,
+          capabilityBudget,
+          capabilityIntervalMs,
+          capabilityTimeoutMs,
         });
         saveLifecycleStore(probed, lifecycleStorePath);
         cache.lastProbedAt = at;
