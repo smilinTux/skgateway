@@ -17,6 +17,20 @@
  * successes (card fb747d52 / C12). A brand-new id is exempt: it starts
  * `active` in `defaultLifecycle()` and has no history to distrust, so this
  * threshold only ever gates a record that has already lost trust.
+ *
+ * `not_chat` (card f9e8002b / C14) is a third, structurally different
+ * disposition alongside eol: the model exists and is healthy, it just does
+ * not serve chat completions (a document parser, a video classifier, an
+ * embedder that slipped past catalog filtering, ...). It is set ONLY by
+ * `applyProbeOutcome`, never by `applyCompletionOutcome`: a 400 from a
+ * well-formed probe request we authored ourselves is evidence about the
+ * model, but the same 400 from arbitrary user traffic is evidence about the
+ * request, and conflating the two would let one malformed call condemn a
+ * healthy model. It is excluded from routing like eol (`isRoutable()`
+ * returns false for both), but it is not eol: it is not a tombstone, it does
+ * not age into `dead` (`ageDeadModels` only acts on `eol`), and a later
+ * successful probe recovers it straight to `active` exactly like it would
+ * recover an `eol` record.
  */
 
 export const LIFECYCLE_STATES = {
@@ -24,6 +38,7 @@ export const LIFECYCLE_STATES = {
   SUSPECT: 'suspect',
   EOL: 'eol',
   DEAD: 'dead',
+  NOT_CHAT: 'not_chat',
 };
 
 export const THRESHOLDS = {
@@ -106,6 +121,19 @@ export function defaultLifecycle() {
  * constantly and a 429 says nothing about whether the model works; backend
  * failures are handled by the separate backend-health machine) is not a
  * lifecycle signal and leaves the record, and both counters, untouched.
+ *
+ * This is also, deliberately, where 400 and 500 stop: card f9e8002b / C14
+ * built a `not_chat` disposition for a request-shape 400 (see
+ * `applyProbeOutcome` below), and it is tempting to wire that same signal in
+ * here. Do not. A 400 on THIS path came from a real user request of unknown
+ * shape (missing a field, wrong type, an oversized payload), so it is
+ * evidence about the request, not the model, and a 500 here is the ordinary
+ * shape of an overloaded backend under load. Only a request we authored
+ * ourselves (the probe sweep) can tell "this model rejects a well-formed
+ * chat completion" apart from "this request was malformed" or "this backend
+ * is busy". Falling through to the final `return { ...lc }` for both is the
+ * fix, not new code: it is what already happens here, and it must keep
+ * happening.
  */
 export function applyCompletionOutcome(lc, { status, now, provider, thresholds = THRESHOLDS }) {
   const promotionThreshold =
@@ -284,12 +312,26 @@ export function applyCatalogPresence(lc, { present, provider, now, thresholds = 
 
 /**
  * Feed the outcome of an off-request-path probe sweep (5.2). A successful
- * probe is unconditional evidence the model is alive: promote to active.
- * A 410 is unconditional evidence it is gone: flip to eol immediately
- * (`probe_failed`, distinct from `provider_410`/`dropped_from_catalog` so the
- * source of the EOL call is visible in `/admin/models`). Any other failure
- * (timeout, 5xx) is weaker evidence and only demotes an active model to
- * suspect; it never escalates a model that already needs investigation.
+ * probe is unconditional evidence the model is alive: promote to active,
+ * clearing not_chat and eol alike (whatever the record's prior disposition,
+ * a real completion succeeding now outranks it). A 410 is unconditional
+ * evidence it is gone: flip to eol immediately (`probe_failed`, distinct
+ * from `provider_410`/`dropped_from_catalog` so the source of the EOL call
+ * is visible in `/admin/models`). A 400 is unconditional evidence it is
+ * healthy but not a chat model (card f9e8002b / C14): flip to `not_chat`
+ * (`eol_reason: 'not_chat'`, the same "why is this record not simply
+ * active" field router.mjs already surfaces on a gated request, so the
+ * existing eol-gate error/SIEM path stays informative with zero changes
+ * there). A 429 means alive and throttled (card 9e28de88: free tiers
+ * rate-limit constantly) and produces NO change at all, not even the
+ * active->suspect demotion below: it is not evidence of anything, unlike
+ * every other branch here. Any OTHER failure (timeout, 5xx, and anything
+ * else that is not 2xx/410/400/429) is weaker evidence and only demotes an
+ * active model to suspect; it never escalates a model that already needs
+ * investigation, and it never manufactures a not_chat verdict out of an
+ * availability problem (thinkingmachines/inkling's 500 belongs here, not in
+ * the 400 branch: it stays a suspect/active availability story, not a
+ * not_chat one).
  *
  * A probe is deliberately kept as an unconditional, single-shot promotion
  * (unlike `applyCompletionOutcome`'s 2xx, which now needs
@@ -299,6 +341,9 @@ export function applyCatalogPresence(lc, { present, provider, now, thresholds = 
  * in `applyCatalogPresence`), off the request path and not something a
  * flaky model's live traffic pattern can influence, so treating one ok as
  * sufficient does not reopen the "one lucky response" hole this card closes.
+ * The same reasoning is why a single probe 400 is enough to condemn to
+ * not_chat: it is a request we authored, not a data point contaminated by
+ * whatever a caller happened to send.
  */
 export function applyProbeOutcome(lc, { ok, status, now }) {
   if (ok) {
@@ -314,11 +359,32 @@ export function applyProbeOutcome(lc, { ok, status, now }) {
     };
   }
 
+  // Card 9e28de88: alive and throttled, not evidence of anything. Must stay
+  // ahead of every other branch below, including the active->suspect
+  // demotion at the bottom: a 429 must not even soften the record.
+  if (status === 429) {
+    return { ...lc };
+  }
+
   if (status === 410) {
     return {
       ...lc,
       state: LIFECYCLE_STATES.EOL,
       eol_reason: 'probe_failed',
+      eol_at: now,
+    };
+  }
+
+  // Card f9e8002b / C14: a well-formed probe request rejected with 400 is
+  // evidence about the MODEL (it exists, it answered, it is not a chat
+  // model), not about a request we do not control, which is exactly why
+  // this branch may only ever be reached from here and never from
+  // applyCompletionOutcome above.
+  if (status === 400) {
+    return {
+      ...lc,
+      state: LIFECYCLE_STATES.NOT_CHAT,
+      eol_reason: 'not_chat',
       eol_at: now,
     };
   }
@@ -343,7 +409,12 @@ export function ageDeadModels(lc, { now, deadAfterMs = THRESHOLDS.deadAfterMs })
   return { ...lc };
 }
 
-/** true for active|suspect (still eligible as a route candidate), false for eol|dead. */
+/**
+ * true for active|suspect (still eligible as a route candidate), false for
+ * eol|dead|not_chat. Card f9e8002b / C14: not_chat is excluded from routing
+ * for the same reason eol is (both fail isRoutable), even though it is not
+ * eol, is not a tombstone, and does not age into dead.
+ */
 export function isRoutable(lc) {
   return lc.state === LIFECYCLE_STATES.ACTIVE || lc.state === LIFECYCLE_STATES.SUSPECT;
 }

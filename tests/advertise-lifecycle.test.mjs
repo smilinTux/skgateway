@@ -85,6 +85,7 @@ function bootGateway({ port, dashPort, storePath, env }) {
       "      - p14-suspect-1",
       "      - p14-eol-1",
       "      - p14-dead-1",
+      "      - p14-notchat-1",
       "",
     ].join("\n"),
   );
@@ -161,6 +162,18 @@ describe("GET /v1/models + GET /admin/models/status - lifecycle-aware advertise 
           eol_reason: "dropped_from_catalog",
           eol_at: 1000,
         },
+        // Card f9e8002b / C14: a healthy, probe-classified non-chat model
+        // (e.g. nvidia/nemotron-parse). Must be excluded from /v1/models
+        // like eol, but must be DISTINGUISHABLE from eol on /admin/models.
+        "p14-notchat-1": {
+          state: "not_chat",
+          last_verified_at: null,
+          consecutive_permanent_errors: 0,
+          consecutive_successes: 0,
+          absent_cycles: 0,
+          eol_reason: "not_chat",
+          eol_at: 1000,
+        },
       }),
     );
     handle = await bootGateway({ port: PORT, dashPort: DASH, storePath, env: {} });
@@ -176,6 +189,32 @@ describe("GET /v1/models + GET /admin/models/status - lifecycle-aware advertise 
     const ids = body.data.map((m) => m.id);
     assert.equal(ids.includes("p14-eol-1"), false);
     assert.equal(ids.includes("p14-dead-1"), false);
+  });
+
+  test("card f9e8002b / C14: a not_chat id is also absent from /v1/models, same as eol", async () => {
+    const { status, body } = await getJson(PORT, "/v1/models");
+    assert.equal(status, 200);
+    const ids = body.data.map((m) => m.id);
+    assert.equal(ids.includes("p14-notchat-1"), false);
+  });
+
+  test("card f9e8002b / C14: GET /admin/models distinguishes not_chat from eol on the same entry", async () => {
+    const { status, body } = await getJson(PORT, "/admin/models");
+    assert.equal(status, 200);
+    const notChat = body.data.find((m) => m.id === "p14-notchat-1");
+    const eol = body.data.find((m) => m.id === "p14-eol-1");
+    // Deliberately NOT hidden here (buildAdminModelsView shows every known id,
+    // eol/dead/not_chat included, so the operator can see what is being pruned
+    // vs. what merely belongs to a different API surface).
+    assert.ok(notChat, "not_chat id must still be visible on the admin view");
+    assert.ok(eol, "eol id must still be visible on the admin view");
+    assert.equal(notChat.lifecycle.state, "not_chat");
+    assert.equal(eol.lifecycle.state, "eol");
+    assert.notEqual(
+      notChat.lifecycle.state,
+      eol.lifecycle.state,
+      "an operator must be able to tell 'remove from config' (eol) apart from 'wrong API surface' (not_chat)",
+    );
   });
 
   test("suspect id is present but flagged, active id is present and unflagged", async () => {
@@ -264,14 +303,15 @@ describe("registerDiscoveredRoutes - only active|suspect ids written to Backend.
     try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best effort */ }
   });
 
-  test("filterRoutableModelIds keeps active|suspect, drops eol|dead", () => {
+  test("filterRoutableModelIds keeps active|suspect, drops eol|dead|not_chat", () => {
     const states = {
       "a": { state: "active" },
       "s": { state: "suspect" },
       "e": { state: "eol" },
       "d": { state: "dead" },
+      "n": { state: "not_chat" },
     };
-    const out = mod.filterRoutableModelIds(["a", "s", "e", "d"], (id) => states[id]);
+    const out = mod.filterRoutableModelIds(["a", "s", "e", "d", "n"], (id) => states[id]);
     assert.deepEqual(out, ["a", "s"]);
   });
 
@@ -287,6 +327,9 @@ describe("registerDiscoveredRoutes - only active|suspect ids written to Backend.
       "nvidia/suspect-1": { state: "suspect" },
       "nvidia/eol-1": { state: "eol" },
       "nvidia/dead-1": { state: "dead" },
+      // Card f9e8002b / C14: nvidia/nemotron-parse's shape, a healthy id
+      // probe-classified as not serving chat completions.
+      "nvidia/notchat-1": { state: "not_chat" },
       "openrouter/active-2": { state: "active" },
       "openrouter/eol-2": { state: "eol" },
     };
@@ -302,6 +345,7 @@ describe("registerDiscoveredRoutes - only active|suspect ids written to Backend.
       { id: "nvidia/suspect-1", provider: "nvidia" },
       { id: "nvidia/eol-1", provider: "nvidia" },
       { id: "nvidia/dead-1", provider: "nvidia" },
+      { id: "nvidia/notchat-1", provider: "nvidia" },
       { id: "openrouter/active-2", provider: "openrouter" },
       { id: "openrouter/eol-2", provider: "openrouter" },
       { id: "irrelevant-local-1", provider: "local" }, // non nvidia/openrouter: ignored
@@ -315,6 +359,7 @@ describe("registerDiscoveredRoutes - only active|suspect ids written to Backend.
     );
     assert.equal(backends.nvidia.models.includes("nvidia/eol-1"), false);
     assert.equal(backends.nvidia.models.includes("nvidia/dead-1"), false);
+    assert.equal(backends.nvidia.models.includes("nvidia/notchat-1"), false);
     assert.deepEqual(backends.openrouter.models, ["openrouter/active-2"]);
   });
 
@@ -343,4 +388,39 @@ describe("registerDiscoveredRoutes - only active|suspect ids written to Backend.
     // flag an all-eol provider would silently start accepting every model id.
     assert.ok(backends.openrouter.discovery, "must be flagged so empty models means 'nothing', not 'everything'");
   });
+});
+
+// ── lifecycleCounts must not silently drop a disposition (card f9e8002b) ──
+//
+// The bucket list used to be a hand-written literal {active, suspect, eol,
+// dead}. Adding `not_chat` meant those models were counted by nobody: the
+// hasOwnProperty guard skipped them and the totals quietly stopped reconciling
+// against the catalog size. A summary that omits what it cannot describe is the
+// same failure this whole epic is about.
+test("lifecycleCounts covers every lifecycle state and always reconciles", async () => {
+  const { lifecycleCounts } = await import("../src/index.mjs");
+  const { LIFECYCLE_STATES } = await import("../src/discovery/lifecycle.mjs");
+
+  const catalog = [
+    { id: "a" }, { id: "b" }, { id: "c" }, { id: "d" }, { id: "e" }, { id: "f" },
+  ];
+  const states = {
+    a: LIFECYCLE_STATES.ACTIVE,
+    b: LIFECYCLE_STATES.SUSPECT,
+    c: LIFECYCLE_STATES.EOL,
+    d: LIFECYCLE_STATES.DEAD,
+    e: LIFECYCLE_STATES.NOT_CHAT,
+    f: "some-state-from-the-future",
+  };
+  const counts = lifecycleCounts(catalog, (id) => ({ state: states[id] }));
+
+  assert.equal(counts[LIFECYCLE_STATES.NOT_CHAT], 1, "not_chat must be counted, not skipped");
+  assert.equal(counts.unknown, 1, "an unrecognized state must be surfaced, not dropped");
+
+  const total = Object.values(counts).reduce((a, b) => a + b, 0);
+  assert.equal(total, catalog.length, "counts must reconcile against the catalog size");
+
+  for (const s of Object.values(LIFECYCLE_STATES)) {
+    assert.ok(s in counts, `every state in the enum needs a bucket: ${s}`);
+  }
 });
