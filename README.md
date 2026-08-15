@@ -180,6 +180,20 @@ server:
   bind: 0.0.0.0         # Bind address (127.0.0.1 for localhost-only)
 ```
 
+⚠️ **The `0.0.0.0` default is all interfaces, which includes the LAN.** On the SKWorld
+fleet both nodes run with this default, so the proxy and the SOC dashboard are reachable
+from the LAN as well as the tailnet. That is a known, stated deviation from
+`UNIFIED_INGRESS_STANDARD` (which asks for `127.0.0.1` or the tailnet address), not
+compliance with it. It is not internet-exposed: neither node has a public interface and
+Tailscale Funnel does not publish `:18780` or `:18781`. Set `bind` to the tailnet IP or
+`127.0.0.1`, or set `SKGATEWAY_BIND`, on any host that does not need LAN reach.
+Full analysis: [SOP.md](./SOP.md) §2 "Front-end / Exposure".
+
+Which file is loaded, first match wins: `--config` → `$SKGATEWAY_CONFIG` →
+`~/.skcapstone/gateway/skgateway.yaml` (Syncthing-synced) → the in-repo
+`config/skgateway.yaml`. The fleet units pass no `--config`, so they read the synced
+file, not the one in your checkout.
+
 ### Backends
 
 Backends are tried in priority order. Models are matched by exact name or glob.
