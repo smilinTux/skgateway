@@ -144,7 +144,24 @@ function groupIdsByProvider(items, providerOf, idOf) {
  * @returns {{alive:boolean, throttled:boolean, reason:string}}
  */
 export function classifyProbe({ status, timedOut = false, networkError = null } = {}) {
-  if (networkError) return { alive: false, throttled: false, reason: `network_error: ${networkError}` };
+  // A connection-level failure talking to OUR OWN gateway says nothing about
+  // the model. It says the gateway was not there.
+  //
+  // Measured 2026-08-15: a sweep reported 24 NVIDIA models DEAD with
+  // `network_error: fetch failed`, in one contiguous block. Every one of them
+  // returned 200 when probed individually seconds later, and the same run's
+  // failover check found a model ALIVE that its own liveness check had just
+  // called dead. The journal showed the gateway took a SIGTERM mid-sweep (it is
+  // restarted by skoperator, and by operators) and the failures were simply the
+  // restart window.
+  //
+  // Reporting those as dead models would page daily and be ignored inside a
+  // week, which costs more than the check is worth. `unreachable` is a distinct,
+  // non-fatal outcome: the caller re-checks gateway health and retries rather
+  // than condemning anything.
+  if (networkError) {
+    return { alive: false, throttled: false, unreachable: true, reason: `gateway_unreachable: ${networkError}` };
+  }
   if (timedOut) return { alive: false, throttled: false, reason: "timeout" };
   if (typeof status !== "number") return { alive: false, throttled: false, reason: "no_response" };
   if (status === 429) return { alive: true, throttled: true, reason: "http_429" };
@@ -227,10 +244,55 @@ export async function probeModel({ endpoint, id, maxTokens = DEFAULT_MAX_TOKENS,
 export async function probeAll({ ids, endpoint, maxTokens = DEFAULT_MAX_TOKENS, timeoutMs = DEFAULT_TIMEOUT_MS, delayMs = DEFAULT_DELAY_MS, fetchImpl = fetch, sleepImpl = defaultSleep }) {
   const out = [];
   for (let i = 0; i < ids.length; i++) {
-    out.push(await probeModel({ endpoint, id: ids[i], maxTokens, timeoutMs, fetchImpl }));
+    let r = await probeModel({ endpoint, id: ids[i], maxTokens, timeoutMs, fetchImpl });
+
+    // The gateway went away. Wait for it to come back and re-probe this id
+    // once before recording anything, so a restart window does not turn into a
+    // block of false DEADs (see classifyProbe's note). Bounded and best-effort:
+    // if it does not return, the id keeps its `unreachable` outcome, which the
+    // summary reports separately and never alerts on.
+    if (r.unreachable) {
+      const back = await waitForGateway({ endpoint, fetchImpl, sleepImpl });
+      if (back) r = await probeModel({ endpoint, id: ids[i], maxTokens, timeoutMs, fetchImpl });
+    }
+
+    out.push(r);
     if (delayMs > 0 && i < ids.length - 1) await sleepImpl(delayMs);
   }
   return out;
+}
+
+/**
+ * Poll the gateway's own health endpoint until it answers, or give up.
+ * Deliberately short and bounded: this exists to ride out a service restart
+ * (measured at roughly 6 to 10 seconds on this fleet), not to wait out an
+ * outage. Returns true when the gateway answered.
+ *
+ * @param {object} args
+ * @param {string} args.endpoint
+ * @param {typeof fetch} [args.fetchImpl]
+ * @param {(ms:number) => Promise<void>} [args.sleepImpl]
+ * @param {number} [args.attempts]
+ * @param {number} [args.intervalMs]
+ * @returns {Promise<boolean>}
+ */
+export async function waitForGateway({ endpoint, fetchImpl = fetch, sleepImpl = defaultSleep, attempts = 10, intervalMs = 3000 }) {
+  for (let i = 0; i < attempts; i++) {
+    await sleepImpl(intervalMs);
+    try {
+      const ac = new AbortController();
+      const t = setTimeout(() => ac.abort(), 5000);
+      try {
+        const resp = await fetchImpl(`${endpoint}/v1/models`, { signal: ac.signal, headers: { accept: "application/json" } });
+        if (resp && resp.ok) return true;
+      } finally {
+        clearTimeout(t);
+      }
+    } catch {
+      // still down, keep waiting
+    }
+  }
+  return false;
 }
 
 // ── check 1: liveness ────────────────────────────────────────────────────────
@@ -247,18 +309,29 @@ export async function probeAll({ ids, endpoint, maxTokens = DEFAULT_MAX_TOKENS, 
 export function summarizeLiveness({ results, providerById }) {
   const perProvider = {};
   const deadIds = [];
+  const unreachableIds = [];
   let aliveCount = 0;
   let throttledCount = 0;
   let deadCount = 0;
+  let unreachableCount = 0;
   for (const r of results) {
     const provider = providerById.get(r.id) || "unknown";
-    if (!perProvider[provider]) perProvider[provider] = { total: 0, alive: 0, throttled: 0, dead: 0, dead_ids: [] };
+    if (!perProvider[provider]) {
+      perProvider[provider] = { total: 0, alive: 0, throttled: 0, dead: 0, unreachable: 0, dead_ids: [] };
+    }
     const p = perProvider[provider];
     p.total += 1;
     if (r.alive) {
       aliveCount += 1;
       p.alive += 1;
       if (r.throttled) { throttledCount += 1; p.throttled += 1; }
+    } else if (r.unreachable) {
+      // The gateway was not reachable for this probe, so we learned NOTHING
+      // about the model. Counted and reported separately, never as dead, and
+      // never alerted on: this is our own availability, not catalog drift.
+      unreachableCount += 1;
+      p.unreachable += 1;
+      unreachableIds.push({ id: r.id, provider, reason: r.reason, status: r.status });
     } else {
       deadCount += 1;
       p.dead += 1;
@@ -267,7 +340,7 @@ export function summarizeLiveness({ results, providerById }) {
       deadIds.push(entry);
     }
   }
-  return { perProvider, deadIds, aliveCount, throttledCount, deadCount };
+  return { perProvider, deadIds, unreachableIds, aliveCount, throttledCount, deadCount, unreachableCount };
 }
 
 // ── check 2: representation ─────────────────────────────────────────────────
@@ -513,6 +586,7 @@ export function formatReport(result, endpoint) {
   const { liveness, representation, countDivergence, failover } = result;
 
   L.push(`  1. LIVENESS: ${liveness.aliveCount} alive (${liveness.throttledCount} throttled), ${liveness.deadCount} dead` +
+    (liveness.unreachableCount ? `, ${liveness.unreachableCount} UNREACHABLE (gateway was down, not model evidence)` : "") +
     (liveness.skipped.length ? `, ${liveness.skipped.length} skipped (${liveness.skipped.join(", ")})` : ""));
   for (const [provider, p] of Object.entries(liveness.perProvider)) {
     L.push(`     ${provider}: ${p.alive}/${p.total} alive (${p.throttled} throttled), ${p.dead} dead`);
