@@ -106,6 +106,13 @@ export function usageFromSSE(body) {
  * rather than hides. When totals are unknown, attribute the whole amount:
  * over-attributing to one request is safer than losing the energy entirely.
  *
+ * NOT YET WIRED IN. Nothing in router.mjs or index.mjs calls this. P0 only
+ * records concurrency_n on the energy row so calibration can filter for
+ * clean single-tenant measurements; it does not split energy across
+ * overlapping tenants. This function is the primitive spec 4.6 describes,
+ * kept here implemented and tested for whoever wires up that split later.
+ * Do not read its presence as concurrency attribution being live today.
+ *
  * @param {number} joules
  * @param {number} ownOutputTokens
  * @param {number} totalOutputTokens

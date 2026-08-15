@@ -327,3 +327,74 @@ describe("energy metering - latency isolation", () => {
     );
   });
 });
+
+// ─── 5. concurrency attribution (Ruling R19) ────────────────────────────────
+
+describe("energy metering - concurrency attribution", () => {
+  let up, meter;
+  before(async () => {
+    // The upstream delays the "slow" attempt (x-test-id: A) long enough that
+    // it is still in flight when the "fast" attempt (x-test-id: B) resolves,
+    // so the two attempts genuinely overlap against the same meter.
+    up = await startUpstream((req, res) => {
+      const respond = () => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          id: "cmpl-test",
+          choices: [{ message: { role: "assistant", content: "hi" } }],
+          usage: { prompt_tokens: 5, completion_tokens: 5, total_tokens: 10 },
+        }));
+      };
+      const delayMs = req.headers["x-test-id"] === "A" ? 250 : 20;
+      setTimeout(respond, delayMs);
+    });
+    meter = await startMeter(counterMeter("dot100"));
+    const cfgFile = writeEnergyConfig({ enabled: true, meters: { fake: meter.url } });
+    await loadConfig({ configPath: cfgFile, silent: true });
+  });
+  after(async () => { await up.close(); await meter.close(); });
+
+  test("two genuinely overlapping attempts against the same meter record concurrencyN 2, not 1 (Finding 1 fix)", async () => {
+    const router = createRouter({
+      backends: { fake: { url: up.url, auth_type: "none", models: ["*"], priority: 1 } },
+      siem_log: false,
+    });
+
+    const slowPromise = routeAndSend(
+      router,
+      { model: "m" },
+      "/v1/chat/completions", "POST",
+      { "content-type": "application/json", "x-test-id": "A" },
+      Buffer.from(JSON.stringify({ model: "m" })),
+      false,
+      null,
+    );
+    // Give the slow attempt a head start so its enterMeter() has definitely
+    // run, and its exitMeter() definitely has not, by the time the fast
+    // attempt's sendUpstream resolves and captures its own count.
+    await new Promise((r) => setTimeout(r, 30));
+    const fastPromise = routeAndSend(
+      router,
+      { model: "m" },
+      "/v1/chat/completions", "POST",
+      { "content-type": "application/json", "x-test-id": "B" },
+      Buffer.from(JSON.stringify({ model: "m" })),
+      false,
+      null,
+    );
+
+    const [slowResult, fastResult] = await Promise.all([slowPromise, fastPromise]);
+
+    assert.equal(slowResult.status, 200);
+    assert.equal(fastResult.status, 200);
+    // Sole regression this guards: reading the in-flight count after this
+    // attempt's own exitMeter (in the finally) would always read back 1,
+    // even though the slow attempt was still genuinely in flight the whole
+    // time the fast attempt's upstream call was running.
+    assert.equal(
+      fastResult.energy.concurrencyN, 2,
+      "the fast attempt's sendUpstream resolved while the slow attempt was still in flight " +
+      "against the same meter; concurrencyN must show the real overlap, not a false-clean 1",
+    );
+  });
+});

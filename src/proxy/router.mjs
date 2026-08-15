@@ -1842,6 +1842,14 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     const meterBeforeMs = meterUrl ? (Date.now() - meterBeforeStart) : 0;
 
     let res;
+    // Captured inside try/catch, after sendUpstream resolves (or throws) and
+    // before finally runs exitMeter. Ruling R19: reading the in-flight count
+    // after exitMeter has already removed this attempt from the set means
+    // two genuinely overlapping attempts would both read back 1, which is
+    // worse than not recording the field at all (a false "clean" reading).
+    // Capturing it here, while this attempt is still counted, is what lets
+    // the field actually show 2+ when there is real overlap.
+    let attemptConcurrency = null;
     // Track in-flight attempts against this meter so the energy row can
     // record whether the measurement window was single-tenant (spec 4.6).
     // No-op when meterUrl is null (energy metering disabled or no meter
@@ -1870,6 +1878,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       } else {
         res = await sendUpstream(upstreamPath, method, forwardHeaders, attemptBody, targetUrl, backend.timeout_ms);
       }
+      attemptConcurrency = meterUrl ? inFlightOnMeter(meterUrl) : 1;
     } catch (err) {
       // sendUpstream resolves with 502 on network error, but be defensive
       res = {
@@ -1877,13 +1886,16 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         headers: {},
         body: Buffer.from(JSON.stringify({ error: { message: err.message } })),
       };
+      attemptConcurrency = meterUrl ? inFlightOnMeter(meterUrl) : 1;
     } finally {
       // Always release the slot, even on error
       if (pool && slot) {
         pool.release(backendId);
       }
       // Pair every enterMeter with an exit here, even on a thrown upstream,
-      // so the in-flight count can never leak and drift upward.
+      // so the in-flight count can never leak and drift upward. This runs
+      // after attemptConcurrency has already been captured above, so the
+      // leak-proofing and the read no longer share a moment in time.
       exitMeter(meterUrl);
     }
 
@@ -1918,7 +1930,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         joules,
         basis,
         node: meterAfter?.node ?? null,
-        concurrencyN: meterUrl ? inFlightOnMeter(meterUrl) : 1,
+        concurrencyN: attemptConcurrency ?? 1,
       };
     }
 
