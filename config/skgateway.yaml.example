@@ -376,3 +376,36 @@ discovery:
 # routing:
 #   sensitivity_enforced: false
 
+## ── Bucket pools: address the WORK, not a model (card 2ba73bf9 / C9) ──
+##
+## A bucket id is an ordinary model string, so a harness sets ONE value and
+## nothing else changes:   model: "sk-l-internal"
+##
+##   sk-<model_class>-<sensitivity>
+##     model_class   S/M/L/XL, the capability FLOOR for the work. Taken from
+##                   the canonical grade vocabulary (docs/specs/joule-grade-
+##                   vocabulary.json), where the grader has already computed it
+##                   as CLASS[max(size_rank, risk_rank)]. Floor is HARD, never
+##                   route below it. Ceiling is SOFT, a bigger model is fine.
+##     sensitivity   public/internal/secret, DATA EXPOSURE. Resolves to a trust
+##                   zone ceiling via the N1 gate.
+##
+## NOTE two different things are named S/M/L/XL and they are NOT the same. The
+## bucket's model_class is about the WORK ("XL: architecture, changes contracts
+## others depend on"). A model card's `size_class` is PARAMETER COUNT (a 9B is
+## M, a 550B is XL). Parameter size is a useful PRIOR for meeting a capability
+## floor and is not the same claim, so a measured capability always wins over it.
+##
+## Why buckets: every rot problem this gateway has had came from something
+## naming a model id that later went stale (the static nvidia list, the
+## hardcoded failover model, roles pinned to one backend). A bucket cannot rot.
+## Only its membership changes, and membership is derived rather than written
+## down. The tradeoff is that you stop knowing which model answered, so the
+## system has to care instead: an empty pool FAILS CLOSED with 503 listing what
+## was excluded and why, and never substitutes across a class floor or a
+## sensitivity ceiling.
+##
+## Ships OFF. With it off a bucket id is not special and routes as it would
+## today. Turn it on only after reviewing what the pools actually resolve to.
+# routing:
+#   buckets_enabled: false

@@ -49,6 +49,7 @@ import {
   policyFromRegistry,
   TRUST_ZONES,
 } from "../policy/sensitivity.mjs";
+import { parseBucketId, resolveBucket, selectMember } from "../policy/buckets.mjs";
 
 // sk-auto routing decision cache (TTL+LRU); keyed by request fingerprint + config epoch.
 const _autoDecisionCache = createDecisionCache({ ttlMs: 60_000, maxEntries: 500 });
@@ -1848,6 +1849,119 @@ export function requestZoneCeiling(request) {
   return { ceiling, sensitivity: String(sensitivity) };
 }
 
+
+/** Is bucket-pool addressing armed? Card 2ba73bf9 / C9. Off by default. */
+function isBucketsEnabled() {
+  try {
+    return !!getConfig()?.routing?.buckets_enabled;
+  } catch {
+    return false;
+  }
+}
+
+/** Per-bucket rotation counters. Ranking decides eligibility, this decides who serves. */
+const _bucketCounters = new Map();
+
+/**
+ * Resolve a bucket address to router candidates, or to a fail-closed 503.
+ *
+ * Returns `{candidates}` on success, or `{failClosed}` carrying the response to
+ * return directly. An empty pool is NOT an error to paper over: it means no
+ * model in the fleet satisfies both the capability floor and the sovereignty
+ * ceiling this caller asked for, and serving it from something that misses
+ * either would be a silent policy violation dressed up as availability.
+ *
+ * @param {object} router
+ * @param {{bucket:string, model_class:string, sensitivity:string}} addr
+ * @param {object} request
+ * @param {Buffer} body raw request body, rewritten to the chosen concrete model
+ */
+function resolveBucketCandidates(router, addr, request, body) {
+  let catalog = [];
+  try {
+    catalog = buildMatchCatalog();
+  } catch {
+    catalog = [];
+  }
+
+  let policy;
+  try {
+    policy = policyFromRegistry(loadRegistry());
+  } catch {
+    policy = undefined;
+  }
+
+  const { members, rejected, ceiling } = resolveBucket({
+    bucket: addr,
+    catalog,
+    sensitivityPolicy: policy,
+    isRoutable: (e) => isRoutable(getLifecycle(e.id)),
+  });
+
+  emitSiem("bucket_resolve", {
+    bucket: addr.bucket,
+    model_class: addr.model_class,
+    sensitivity: addr.sensitivity,
+    ceiling,
+    eligible: members.length,
+    rejected: rejected.length,
+  }, {});
+
+  if (members.length === 0) {
+    console.warn(
+      `[router] bucket ${addr.bucket} FAIL CLOSED: no model meets class floor ` +
+        `${addr.model_class} within trust zone <= ${ceiling}. ${rejected.length} excluded.`,
+    );
+    return {
+      failClosed: {
+        status: 503,
+        headers: { "content-type": "application/json" },
+        body: Buffer.from(JSON.stringify({
+          error: {
+            message:
+              `No model satisfies bucket ${addr.bucket} (capability floor ${addr.model_class}, ` +
+              `max trust zone ${ceiling}).`,
+            code: 503,
+            type: "bucket_no_eligible_member",
+            bucket: addr.bucket,
+            model_class: addr.model_class,
+            sensitivity: addr.sensitivity,
+            ceiling,
+            // The rejects are the actionable part. An empty pool with no
+            // reasons is an outage report; with reasons it is a decision an
+            // operator can do something about.
+            excluded: rejected.slice(0, 20),
+          },
+        }), "utf-8"),
+      },
+    };
+  }
+
+  const n = (_bucketCounters.get(addr.bucket) || 0) + 1;
+  _bucketCounters.set(addr.bucket, n);
+  const picked = selectMember(members, n);
+
+  console.log(
+    `[router] bucket ${addr.bucket} -> ${picked.id} ` +
+      `(class ${picked.model_class || "?"} via ${picked.class_basis}, zone ${picked.trust_zone ?? "?"}, ` +
+      `${members.length} eligible)`,
+  );
+
+  // Resolve the chosen id through the router's own model matching, so
+  // failover, quarantine, pooling and the throttle cooldowns all apply
+  // unchanged. Every alternate door for that id is kept, which is what makes
+  // card 9e28de88's same-model-different-provider preference work inside a pool.
+  const results = router.route({ ...request, model: picked.id, agentId: request.agentId });
+  const list = Array.isArray(results) ? results : results ? [results] : [];
+  return {
+    candidates: list.map((r) => ({
+      ...r,
+      bodyOverride: rewriteBodyModel(body, picked.id),
+      model: picked.id,
+    })),
+  };
+}
+
 export async function routeAndSend(router, request, upstreamPath, method, clientHeaders, body, usePool = true, siem = null) {
   const pool = usePool ? getPool() : null;
 
@@ -1923,7 +2037,26 @@ export async function routeAndSend(router, request, upstreamPath, method, client
   // upstream to the resolved backend. Otherwise fall through to normal
   // model-name routing (full backward-compat).
   let candidates = null;
-  if (isRegistryRouted(request)) {
+
+  // ── Bucket pools (card 2ba73bf9 / C9) ──
+  // `sk-<class>-<sensitivity>` addresses a POOL, not a model. Checked BEFORE
+  // registry routing because a bucket id is deliberately shaped like the
+  // existing `sk-*` logical ids and would otherwise be swallowed by
+  // isRegistryRouted() as an unknown role.
+  //
+  // Gated behind routing.buckets_enabled, off by default, for the same reason
+  // the sensitivity gate is: a pool that resolves to nothing returns 503, and
+  // that is the correct answer but not one to discover in production on a
+  // Friday. With the flag off a bucket id simply is not special and falls
+  // through to today's behavior.
+  const bucketAddr = isBucketsEnabled() ? parseBucketId(request.model) : null;
+  if (bucketAddr) {
+    const resolved = resolveBucketCandidates(router, bucketAddr, request, body);
+    if (resolved.failClosed) return resolved.failClosed;
+    candidates = resolved.candidates;
+  }
+
+  if (!candidates && isRegistryRouted(request)) {
     let reg = resolveRegistry({
       model: request.model,
       context: request.context,
