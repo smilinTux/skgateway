@@ -227,10 +227,25 @@ describe('full shape', () => {
       },
     };
     const caps = deriveCapabilities(card, { metrics: { latency_p50_ms: 900, success_rate: 1 } });
+    // One identifier per line, deliberately. Packed several to a line, this
+    // list reads to gitleaks' generic-api-key heuristic as a quoted key sitting
+    // next to a high-entropy value, and it failed the secret scan on every push
+    // for hours. There is no secret here, only a sorted list of capability
+    // field names. Do not re-pack it, and do not quote an example of the
+    // offending shape in a comment either: the first attempt at this note did
+    // exactly that and tripped the scanner a second time.
     assert.deepEqual(Object.keys(caps).sort(), [
-      'coding', 'ctx_tokens', 'latency_p50_ms', 'reasoning', 'size_class',
-      'sovereignty', 'success_rate', 'throughput_tps', 'tool_use',
-      'trust_zone', 'vision',
+      'coding',
+      'ctx_tokens',
+      'latency_p50_ms',
+      'reasoning',
+      'size_class',
+      'sovereignty',
+      'success_rate',
+      'throughput_tps',
+      'tool_use',
+      'trust_zone',
+      'vision',
     ]);
     assert.equal(caps.tool_use.score, 1);
     assert.equal(caps.tool_use.basis, 'card');
