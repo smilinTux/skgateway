@@ -432,3 +432,69 @@ describe("main (CLI)", () => {
     assert.equal(code, EXIT_OK);
   });
 });
+
+// ── gateway outage must not be reported as dead models ──────────────────────
+//
+// Measured 2026-08-15: a sweep reported 24 NVIDIA models DEAD with
+// `network_error: fetch failed` in one contiguous block. All 24 returned 200
+// when probed individually seconds later, and the SAME run's failover check
+// found a model alive that its own liveness check had just called dead. The
+// journal showed the gateway took a SIGTERM mid-sweep. The models were fine;
+// our gateway had restarted underneath the job.
+//
+// A daily job that pages about 24 healthy models gets muted within a week,
+// which costs more than the check is worth.
+describe("gateway unreachability is not model evidence", () => {
+  test("a connection failure classifies as unreachable, never dead", () => {
+    const c = classifyProbe({ networkError: "fetch failed" });
+    assert.equal(c.unreachable, true);
+    assert.equal(c.alive, false);
+    assert.match(c.reason, /gateway_unreachable/);
+  });
+
+  test("a real HTTP error is still dead, not unreachable", () => {
+    const c = classifyProbe({ status: 404 });
+    assert.equal(c.alive, false);
+    assert.ok(!c.unreachable, "a 404 from a reachable gateway IS model evidence");
+    assert.equal(c.reason, "http_404");
+  });
+
+  test("a timeout is still dead, not unreachable", () => {
+    const c = classifyProbe({ timedOut: true });
+    assert.ok(!c.unreachable);
+    assert.equal(c.reason, "timeout");
+  });
+
+  test("summarizeLiveness counts unreachable separately from dead", () => {
+    const results = [
+      { id: "a", alive: true, throttled: false, reason: "http_200", status: 200 },
+      { id: "b", alive: false, unreachable: true, reason: "gateway_unreachable: fetch failed", status: null },
+      { id: "c", alive: false, throttled: false, reason: "http_404", status: 404 },
+    ];
+    const providerById = new Map([["a", "nvidia"], ["b", "nvidia"], ["c", "nvidia"]]);
+    const s = summarizeLiveness({ results, providerById });
+    assert.equal(s.deadCount, 1, "only the genuine 404 is dead");
+    assert.equal(s.unreachableCount, 1);
+    assert.equal(s.deadIds.length, 1, "an unreachable id must never land in deadIds, which is what alerts");
+    assert.equal(s.deadIds[0].id, "c");
+    assert.equal(s.perProvider.nvidia.unreachable, 1);
+  });
+
+  test("probeAll waits for the gateway and re-probes rather than condemning", async () => {
+    // First probe hits the restart window, the gateway then comes back and the
+    // re-probe succeeds. The model must end up alive.
+    let call = 0;
+    const fetchImpl = async (url) => {
+      if (url.endsWith("/v1/models")) return { ok: true, status: 200, json: async () => ({ data: [] }) };
+      call += 1;
+      if (call === 1) throw new Error("fetch failed");
+      return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "ok" } }] }) };
+    };
+    const out = await probeAll({
+      ids: ["m1"], endpoint: "http://gw", delayMs: 0,
+      fetchImpl, sleepImpl: async () => {},
+    });
+    assert.equal(out.length, 1);
+    assert.equal(out[0].alive, true, "a restart window must not condemn a healthy model");
+  });
+});
