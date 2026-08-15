@@ -119,8 +119,36 @@ function localModels(cfg) {
   return tagLocalModels(cfg.backends || {});
 }
 
-function providerBackend(provider) {
-  return provider === "nvidia" ? "nvidia" : provider === "openrouter" ? "openrouter" : null;
+/**
+ * Which router backend serves a discovery provider's models.
+ *
+ * This used to hardcode `nvidia` and `openrouter` and return null for anything
+ * else, which meant a THIRD discovery provider could be fully implemented,
+ * fetched, lifecycle-tracked and ADVERTISED on /v1/models while being
+ * completely unroutable. That is not hypothetical: enabling OpenCode Zen
+ * (card 6cc8aac3 / C8) put 7 models on /v1/models that every one of which
+ * answered 404, which is precisely the defect the whole 767adc4e epic exists
+ * to eliminate. Advertised is not the same as reachable, and the catalog is
+ * the thing that must never claim otherwise.
+ *
+ * A discovery provider now maps to the CONFIGURED BACKEND OF THE SAME NAME.
+ * That is already the convention the two original providers followed by hand,
+ * so this generalizes rather than changes them, and it means the next provider
+ * needs no edit here at all. Returning null when no such backend is configured
+ * is still correct: there is genuinely nowhere to route those ids, and
+ * registerDiscoveredRoutes skips them rather than inventing a destination.
+ *
+ * @param {string} provider discovery provider name
+ * @param {object} [cfg] gateway config, for the configured-backends lookup
+ * @returns {string|null} backend name, or null when nothing serves it
+ */
+function providerBackend(provider, cfg) {
+  if (!provider || typeof provider !== "string") return null;
+  if (cfg?.backends && Object.prototype.hasOwnProperty.call(cfg.backends, provider)) {
+    return provider;
+  }
+  // Preserved for callers that pass no cfg (tests predating this signature).
+  return provider === "nvidia" || provider === "openrouter" ? provider : null;
 }
 
 /**
@@ -169,7 +197,7 @@ export function registerDiscoveredRoutes(cfg, catalog, opts = {}) {
   const getLifecycleFn = opts.getLifecycleFn || getLifecycle;
   const byProvider = new Map();
   for (const m of catalog) {
-    const be = providerBackend(m.provider);
+    const be = providerBackend(m.provider, cfg);
     if (!be) continue;
     if (!byProvider.has(be)) byProvider.set(be, new Set());
     byProvider.get(be).add(m.id);
