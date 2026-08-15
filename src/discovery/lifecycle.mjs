@@ -113,6 +113,39 @@ export function applyCatalogPresence(lc, { present, provider, now, thresholds = 
         last_verified_at: now,
       };
     }
+
+    // An `eol` record with NO prior verification used to be unrecoverable
+    // (card affa0aac / C2). It fell straight to the `absent_cycles: 0` reset
+    // below, so a model could be re-confirmed present by the provider on every
+    // single hourly cycle and stay eol forever. Measured 2026-08-14: all 21
+    // openrouter records were in exactly this state, returned by every fetch,
+    // and ZERO were advertised. The only escape was a probe sweep that has
+    // never run (card 1f65cf45 / C3).
+    //
+    // Presence is genuinely weaker evidence than a verified completion, so it
+    // does NOT earn `active`. It earns `suspect`: routable again, and flagged
+    // as such on /v1/models, where real traffic or a probe can settle it.
+    //
+    // Gated on `dropped_from_catalog` on purpose. That reason means "the
+    // provider stopped listing it", and the provider now listing it again is a
+    // DIRECT contradiction of the evidence that retired it. A `provider_410` or
+    // `probe_failed` record was condemned by something stronger (an actual
+    // request that failed), and mere catalog membership must not overturn that.
+    // A provider catalog demonstrably lists ids it will not serve: NVIDIA's
+    // lists 102 and 47 of them answered 404 to a real completion.
+    if (
+      lc.state === LIFECYCLE_STATES.EOL &&
+      lc.eol_reason === 'dropped_from_catalog'
+    ) {
+      return {
+        ...lc,
+        state: LIFECYCLE_STATES.SUSPECT,
+        absent_cycles: 0,
+        eol_reason: null,
+        eol_at: null,
+      };
+    }
+
     return { ...lc, absent_cycles: 0 };
   }
 
