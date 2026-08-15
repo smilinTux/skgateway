@@ -930,7 +930,28 @@ export function createRouter(config = {}) {
 
     // Exact or glob match first
     const matched = available.filter((b) => b.supportsModel(model));
-    if (matched.length > 0) return matched;
+
+    // The gate has to be checked here too, not only in the fallback branch
+    // below. `Backend.models` is a snapshot written by
+    // registerDiscoveredRoutes() at startup and refreshed only once per
+    // `discovery.refresh_seconds` (live: 3600s) or on a manual
+    // POST /admin/models/refresh. There is no reactive re-sync, so a model
+    // that flips to eol|dead mid-hour is still listed in `Backend.models`
+    // and `supportsModel()` still matches it. Without this check the gate
+    // below is unreachable for any id a backend claims, and a dead model
+    // keeps routing for up to an hour (card C4). The store read is
+    // mtime/TTL cached (2s, model_catalog_store.mjs) so this adds no real
+    // per-request cost.
+    if (matched.length > 0) {
+      const lcMatched = getLifecycle(model);
+      if (!isRoutable(lcMatched)) {
+        const gated = [];
+        gated.eolGated = true;
+        gated.eolReason = lcMatched.eol_reason;
+        return gated;
+      }
+      return matched;
+    }
 
     // No backend explicitly claims this model. A KNOWN eol|dead id (per the
     // lifecycle store, card P1.6) is gated here instead of falling through:
