@@ -135,6 +135,195 @@ const DEFAULT_QUARANTINE_THRESHOLD = 5;
 const DEFAULT_QUARANTINE_COOLDOWN_MS = 30_000;
 
 // ---------------------------------------------------------------------------
+// Rate-limit failover (card 9e28de88): 429 (and, deliberately, 402) are
+// failover-worthy, MODEL-granular cooldowns, not the backend-granular
+// quarantine machine above.
+//
+// MEASURED: opencode.ai zen's free tier (deepseek-v4-flash-free) returns 429
+// FreeUsageLimitError once its budget is spent. The candidate loop used to
+// treat `res.status < 500` as success, so a throttled model was returned to
+// the caller verbatim instead of failing over, and the whole promise of a
+// multi-provider pool ("give me any door that fits") collapsed to "give me
+// the first door's error".
+//
+// WHY NOT THE QUARANTINE MACHINE ABOVE: quarantine is backend-granular (N
+// consecutive failures pull the WHOLE backend out of rotation for every
+// model it serves). A 429 says nothing about the backend, which is healthy;
+// it says one model on it is out of free-tier budget right now. Reusing
+// quarantine here would punish every other model on a perfectly healthy
+// backend for one model's rate limit, exactly the mistake the eol work
+// (card P1.2/P1.6) already made and un-made for lifecycle state: use the
+// instrument sized to the evidence.
+//
+// This cooldown is keyed by (backendId, model) so:
+//   - the SAME backend serving a DIFFERENT model is unaffected, and
+//   - a DIFFERENT backend (another door) serving the SAME model is
+//     unaffected, which is exactly what lets #5 below (prefer another door
+//     to the same model) actually pay off on the very next request.
+// ---------------------------------------------------------------------------
+
+/** @type {Map<string, {untilMs:number, status:number, retryAfterMs:?number, hits:number, lastAt:number}>} */
+const _throttleCooldowns = new Map();
+
+/** Default cooldown (ms) for a 429 with no `Retry-After` header. Free-tier
+ * 429s are almost always a seconds-scale window, so this stays short. */
+const DEFAULT_429_COOLDOWN_MS = 30_000;
+
+/**
+ * Default cooldown (ms) for a 402 with no `Retry-After` header. See the
+ * 402/403 decision comment on `isFailoverStatus()` below: a 402 on these
+ * providers means "quota exhausted for the billing period", which resets on
+ * an hours/day scale, not a seconds scale, so the default is much longer
+ * than the 429 default on purpose.
+ */
+const DEFAULT_402_COOLDOWN_MS = 6 * 60 * 60 * 1000; // 6h
+
+/** Ceiling on any single cooldown, including a Retry-After-derived one, so a
+ * provider that sends back an absurd value (or a full daily reset window in
+ * seconds) can never take a door out of rotation for longer than this from
+ * this process's point of view. */
+const MAX_THROTTLE_COOLDOWN_MS = 24 * 60 * 60 * 1000; // 24h
+
+function throttleKey(backendId, model) {
+  return `${backendId}::${model}`;
+}
+
+/**
+ * Parse a `Retry-After` header value (delta-seconds or an HTTP-date) into
+ * milliseconds. Returns null when absent/unparseable so the caller falls
+ * back to a status-specific default.
+ *
+ * @param {*} value
+ * @returns {?number}
+ */
+function parseRetryAfterMs(value) {
+  if (value === undefined || value === null || value === "") return null;
+  const secs = Number(value);
+  if (Number.isFinite(secs) && secs >= 0) return secs * 1000;
+  const dateMs = Date.parse(String(value));
+  if (!Number.isNaN(dateMs)) {
+    const delta = dateMs - Date.now();
+    return delta > 0 ? delta : 0;
+  }
+  return null;
+}
+
+/**
+ * Which upstream status codes should advance the candidate loop to the next
+ * door rather than being handed straight back to the caller (card 9e28de88
+ * fix #1). `isThrottleStatus()` is the subset of these that are also a
+ * MODEL-granular cooldown signal (#2) rather than a backend-health one.
+ *
+ *   >= 500  existing behavior, unchanged: backend/server error, retry
+ *           elsewhere.
+ *   429     rate limited. The model is alive and correct, just throttled on
+ *           THIS door right now. Retryable elsewhere immediately, and
+ *           retryable on the SAME door again after a short cooldown.
+ *   402     DELIBERATE DECISION: also failover-worthy. On these free-tier
+ *           providers a 402 means "quota exhausted for the billing period"
+ *           for this door/account, not "the model is broken" and not "slow
+ *           down for a second". A different door (another provider, or the
+ *           same provider's other free models) is not touched by one
+ *           model's period quota, so moving to the next candidate is
+ *           correct, same as 429, just with a much longer default cooldown
+ *           (period-scale, these providers rarely send Retry-After on a
+ *           402).
+ *   403     DELIBERATE DECISION: left OUT, still terminal (unchanged,
+ *           handled by the pre-existing `res.status < 500` path). On these
+ *           providers a 403 is overwhelmingly an authorization/policy
+ *           verdict (bad or missing API key, this key not entitled to this
+ *           model, a content-policy block), not a quota window. Those
+ *           reasons are either permanent for this exact request (failing
+ *           over would hide a real misconfiguration behind a slower
+ *           multi-hop retry instead of surfacing it) or would recur
+ *           identically on every other door sharing the same credential
+ *           (failing over buys nothing but loses attribution). If a
+ *           provider is later measured overloading 403 for quota the way
+ *           OpenRouter overloads 402 for it, that is its own follow-up
+ *           card with its own measurement, not a guess baked in here.
+ *
+ * @param {number} status
+ * @returns {boolean}
+ */
+function isFailoverStatus(status) {
+  return status >= 500 || status === 429 || status === 402;
+}
+
+/**
+ * Subset of `isFailoverStatus()` that is a rate/quota throttle rather than a
+ * hard backend error, i.e. the statuses that arm the model-granular cooldown
+ * and must NOT touch backend health (see `healthy` in the candidate loop,
+ * which stays `res.status < 500` unchanged).
+ *
+ * @param {number} status
+ * @returns {boolean}
+ */
+function isThrottleStatus(status) {
+  return status === 429 || status === 402;
+}
+
+/**
+ * Record a throttle (429/402) observation for a (backend, model) door and
+ * arm its cooldown. This doubles as fix #6 ("record observed throttle
+ * events per (model, provider)"): every call updates `hits`/`lastAt` on the
+ * SAME map the cooldown check reads, rather than a second parallel
+ * scoreboard. `_throttleStateForTests()` exposes it for assertions.
+ *
+ * NOT wired into src/ranking/rank.mjs's `dimValue()` by this card: that
+ * ranker scores catalog entries per MODEL id (design 4.1), not per
+ * (model, provider) door, so there is nowhere for a provider-granular
+ * throttle signal to land without first making the ranker provider-aware,
+ * which is its own card. This function is the recording half only; see the
+ * router.mjs module comment / PR description for what is deliberately left
+ * for that follow-up.
+ *
+ * @param {string} backendId
+ * @param {string} model
+ * @param {number} status  429 or 402
+ * @param {*} retryAfterHeader  raw `retry-after` header value, if present
+ * @returns {{untilMs:number, cooldownMs:number}}
+ */
+function recordThrottle(backendId, model, status, retryAfterHeader) {
+  const key = throttleKey(backendId, model);
+  const prior = _throttleCooldowns.get(key);
+  const headerMs = parseRetryAfterMs(retryAfterHeader);
+  const defaultMs = status === 402 ? DEFAULT_402_COOLDOWN_MS : DEFAULT_429_COOLDOWN_MS;
+  const cooldownMs = Math.min(headerMs ?? defaultMs, MAX_THROTTLE_COOLDOWN_MS);
+  const untilMs = Date.now() + cooldownMs;
+  const hits = (prior?.hits || 0) + 1;
+  _throttleCooldowns.set(key, { untilMs, status, retryAfterMs: headerMs, hits, lastAt: Date.now() });
+  return { untilMs, cooldownMs };
+}
+
+/**
+ * Is (backendId, model) currently cooling down from a prior throttle?
+ * @param {string} backendId
+ * @param {string} model
+ * @returns {boolean}
+ */
+function isThrottled(backendId, model) {
+  const entry = _throttleCooldowns.get(throttleKey(backendId, model));
+  return !!entry && Date.now() < entry.untilMs;
+}
+
+/** Test-only: clear every recorded throttle cooldown between test cases. */
+export function _resetThrottleCooldownsForTests() {
+  _throttleCooldowns.clear();
+}
+
+/**
+ * Test-only: introspect a (backendId, model) door's recorded throttle state
+ * (`{untilMs, status, retryAfterMs, hits, lastAt}`), or null if it has never
+ * throttled. Not used by production code.
+ * @param {string} backendId
+ * @param {string} model
+ */
+export function _throttleStateForTests(backendId, model) {
+  const entry = _throttleCooldowns.get(throttleKey(backendId, model));
+  return entry ? { ...entry } : null;
+}
+
+// ---------------------------------------------------------------------------
 // Type documentation (JSDoc only — no TypeScript)
 // ---------------------------------------------------------------------------
 
@@ -1369,13 +1558,27 @@ export function _buildMatchCatalogForTests() {
  * 7.2): rank the discovered catalog against the role's requirements (the
  * pure P3.2 ranker), cache the RANKED ID ORDER (not the resolved backends,
  * those must stay fresh: health/auth can change independent of ranking),
- * then resolve each ranked id to a real backend via the router's own
- * model-matching (`router.route()`), taking each id's primary candidate and
- * attaching the exact `bodyOverride` model-rewrite mechanism the
- * cloud-fallback candidate already uses (router.mjs's local-failover
- * branch). Because every entry lands in the same `{backendId, backendUrl,
- * authHeaders, backend, bodyOverride}` shape the existing candidate loop
- * already understands, failover/quarantine/pool/SIEM all apply unchanged.
+ * then resolve each ranked id to its FULL priority-ordered door chain via
+ * the router's own model-matching (`router.route()`) and attach the exact
+ * `bodyOverride` model-rewrite mechanism the cloud-fallback candidate
+ * already uses (router.mjs's local-failover branch). Because every entry
+ * lands in the same `{backendId, backendUrl, authHeaders, backend,
+ * bodyOverride, model}` shape the existing candidate loop already
+ * understands, failover/quarantine/pool/SIEM/throttle-cooldown all apply
+ * unchanged.
+ *
+ * Card 9e28de88 fix #5: every door `router.route()` returns for a ranked id
+ * is pushed, not just the top-priority one, before moving on to the NEXT
+ * ranked id. Measured: nine free-tier ids are currently served by two or
+ * more providers at once (nemotron-3-ultra-550b-a55b on nvidia, openrouter,
+ * AND opencode zen, among others). When the top door for a ranked id
+ * throttles, reaching the SAME model through its next-priority door
+ * preserves the caller's expectations exactly (same model, same behavior);
+ * substituting a different ranked model changes behavior and should only
+ * be reached once every door for the current one is exhausted. Since
+ * `router.route()` already orders each id's doors by backend priority, the
+ * happy path (the top door is healthy) is byte-identical to before this
+ * card; this only lengthens the chain actually walked on a throttle/error.
  *
  * @param {ReturnType<typeof createRouter>} router
  * @param {{match:true, role:string, requirements:?object}} reg
@@ -1417,7 +1620,14 @@ async function buildMatchCandidates(router, reg, request, body) {
       continue;
     }
     if (!results || results.length === 0) continue;
-    candidates.push({ ...results[0], bodyOverride: rewriteBodyModel(body, id) });
+    // Push EVERY door for this ranked id (see fix #5 in the doc comment
+    // above), tagged with the concrete `model` so the candidate loop's
+    // throttle cooldown (fix #2) keys on the right (backend, model) pair
+    // even though every door here shares one bodyOverride rewrite.
+    const rewritten = rewriteBodyModel(body, id);
+    for (const r of results) {
+      candidates.push({ ...r, bodyOverride: rewritten, model: id });
+    }
   }
 
   if (picks.length) {
@@ -1679,6 +1889,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           authHeaders: {},
           backend: b,
           localUrl: reg.url, // tag: record the health outcome of this attempt
+          model: reg.model, // tag: model-granular throttle cooldown keying (card 9e28de88)
         };
         candidates = [localCandidate];
 
@@ -1709,6 +1920,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
             // carries the local concrete model, which cloud would 400 on).
             bodyOverride: rewriteBodyModel(body, fc.fallbackModel),
             isCloudFallback: true,
+            model: fc.fallbackModel, // tag: model-granular throttle cooldown keying (card 9e28de88)
           };
           const healthy = await probeLocalHealth(reg.url, fc);
           if (healthy) {
@@ -1776,6 +1988,12 @@ export async function routeAndSend(router, request, upstreamPath, method, client
   // row rather than being overwritten by the attempt that happened to win.
   // Stays empty on the disabled path, where it is never attached to a result.
   const energyAttempts = [];
+  // Every candidate that ended in a throttle (429/402), whether an actual
+  // upstream response or a still-cooling-down door skipped without a
+  // network call (card 9e28de88 fix #3/#6). Drives the attributable-429
+  // synthesis at the bottom of the loop, and is the attribution payload
+  // itself: {backendId, model, status, cooldownMs, skipped?}.
+  const throttledAttempts = [];
 
   for (let i = 0; i < candidates.length; i++) {
     const { backendId, backendUrl, authHeaders, backend } = candidates[i];
@@ -1783,6 +2001,13 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // candidate rewrites the model to a cloud-served id). Default to the shared
     // body when no override is present.
     const attemptBody = candidates[i].bodyOverride || body;
+    // The model THIS door actually serves. Only differs from request.model
+    // for candidates that carry an explicit tag (the @match chain, card
+    // 9e28de88 fix #5, and the cloud-fallback/local-registry candidates);
+    // every other candidate serves the same model as every other candidate
+    // in the list (candidatesFor() only ever matches on model id), so
+    // request.model is the correct default.
+    const candidateModel = candidates[i].model || request.model;
 
     if (i > 0) {
       didFailover = true;
@@ -1806,6 +2031,25 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         to_backend: backendId,
         reason: `previous_status_${lastResult?.status ?? "error"}`,
       }, { backend: backendId });
+    }
+
+    // Model-granular throttle cooldown (card 9e28de88 fix #2): this exact
+    // door threw a 429/402 for this exact model recently enough that it is
+    // still cooling down. Skip it with NO network call rather than paying
+    // for a near-certain repeat 429, and record the skip as an attempt for
+    // the attributable-429 synthesis below.
+    if (isThrottled(backendId, candidateModel)) {
+      const state = _throttleCooldowns.get(throttleKey(backendId, candidateModel));
+      const remainingMs = Math.max(0, (state?.untilMs ?? 0) - Date.now());
+      console.warn(
+        `[router] SKIP backend=${backendId} model=${candidateModel} ` +
+        `still cooling down from ${state?.status} (${remainingMs}ms remaining)`
+      );
+      throttledAttempts.push({
+        backendId, model: candidateModel, status: state?.status ?? 429,
+        cooldownMs: remainingMs, skipped: true,
+      });
+      continue;
     }
 
     // Merge auth headers into a sanitized copy of client headers
@@ -1988,23 +2232,36 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       energyAttempts.push(attemptEnergy);
     }
 
-    const success = res.status < 500;
-    const qTransition = backend.recordOutcome(success, latencyMs);
+    // `healthy` drives every BACKEND-health side effect below (quarantine,
+    // local-health, the error-rate window inside recordOutcome itself) and
+    // is deliberately unchanged from the original `success = res.status <
+    // 500`: a 429/402 is not evidence the backend is broken (card 9e28de88
+    // fix #4). `retryElsewhere`/`throttled` (below, after these health
+    // writes) is the SEPARATE routing decision of whether to keep this
+    // response or try the next door; splitting the two is the whole point
+    // of this card, so a throttled model can fail over WITHOUT damaging
+    // backend health or lifecycle state.
+    const healthy = res.status < 500;
+    const qTransition = backend.recordOutcome(healthy, latencyMs);
 
     // Model-granular lifecycle bookkeeping (card P1.2, section 4.2 of the
     // model-ranking design doc): record this concrete model's completion
     // status as the passive signal for the EOL state machine (a 404/410
     // counts toward eol, a 2xx resets toward active). This is purely a
     // bookkeeping side effect on a fail-soft store, it does NOT change the
-    // `success` failover decision above (the shipped 410->backend_error
-    // stopgap already makes 410 fail over).
+    // `healthy` failover decision above (the shipped 410->backend_error
+    // stopgap already makes 410 fail over). applyCompletionOutcome()
+    // (src/discovery/lifecycle.mjs) already ignores any status that is not
+    // 2xx/404/410, so a 429 or 402 here is a verified no-op for eol
+    // bookkeeping (card C12 covers this; card 9e28de88 fix #4 re-verifies
+    // it rather than duplicating the gate here).
     recordModelOutcome(request.model, { status: res.status, now: Date.now() });
 
     // Feed the real completion outcome back into the local-health verdict so a
     // wedged local backend that got past the probe but then hung/errored is
     // marked unhealthy immediately (subsequent requests skip it), and a healthy
     // completion keeps it live — faster convergence than the probe TTL alone.
-    if (candidates[i].localUrl) recordLocalOutcome(candidates[i].localUrl, success);
+    if (candidates[i].localUrl) recordLocalOutcome(candidates[i].localUrl, healthy);
 
     // Dead-alias auto-quarantine transitions (card 2d1f3a2c). Mirror the
     // failover pattern: a stdout JSON line (always) plus a structured SIEM
@@ -2038,7 +2295,14 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // path returns a result whose shape is unchanged, field for field.
     if (energyAttempts.length > 0) lastResult.energyAttempts = energyAttempts;
 
-    if (success) {
+    // Card 9e28de88 fix #1: 429/402 join >=500 as failover-worthy, so a
+    // throttled door advances the loop instead of being handed back to the
+    // caller. `healthy` above already kept backend health/lifecycle out of
+    // this decision entirely.
+    const retryElsewhere = isFailoverStatus(res.status);
+    const throttled = isThrottleStatus(res.status);
+
+    if (!retryElsewhere) {
       console.log(
         `[router] ${res.status} OK backend=${backendId} latency=${latencyMs}ms` +
         (didFailover ? " (failover)" : "") +
@@ -2069,6 +2333,28 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       return lastResult;
     }
 
+    if (throttled) {
+      // Card 9e28de88 fix #2/#6: arm the model-granular cooldown (Retry-After
+      // when the upstream sent one, else a status-specific default) and
+      // record the observation for attribution/future ranking use, on the
+      // SAME map, not a parallel scoreboard.
+      const retryAfterHeader = res.headers?.["retry-after"] ?? res.headers?.["Retry-After"];
+      const { cooldownMs } = recordThrottle(backendId, candidateModel, res.status, retryAfterHeader);
+      throttledAttempts.push({ backendId, model: candidateModel, status: res.status, cooldownMs });
+      console.warn(
+        `[router] ${res.status} THROTTLED backend=${backendId} model=${candidateModel} ` +
+        `cooldown=${cooldownMs}ms` +
+        (i < candidates.length - 1 ? " (trying next door)" : " (no more candidates)")
+      );
+      emitSiem("anomaly", {
+        type: "rate_limited",
+        backend: backendId,
+        status_code: res.status,
+        cooldown_ms: cooldownMs,
+      }, { backend: backendId, severity: "info" });
+      continue;
+    }
+
     console.warn(
       `[router] ${res.status} ERROR backend=${backendId} latency=${latencyMs}ms` +
       (i < candidates.length - 1 ? " — trying next backend" : " — no more backends")
@@ -2082,7 +2368,45 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     }, { backend: backendId });
   }
 
-  // All backends failed — return the last response so the caller can relay the error
+  // Card 9e28de88 fix #3: every candidate ended in a throttle, whether a
+  // real upstream 429/402 or a still-cooling-down door skipped without a
+  // network call. Relaying `lastResult` here would either hand back one
+  // arbitrary door's raw, unattributed 429 body, or (if EVERY door was
+  // skipped via cooldown, so no upstream call ever happened) return null.
+  // Neither tells the caller or the SOC which models/providers were tried.
+  // Build one attributable 429 instead.
+  if (candidates.length > 0 && throttledAttempts.length === candidates.length) {
+    const waitsMs = throttledAttempts.map((t) => t.cooldownMs ?? DEFAULT_429_COOLDOWN_MS);
+    const retryAfterSec = Math.max(1, Math.ceil(Math.min(...waitsMs) / 1000));
+    const payload = JSON.stringify({
+      error: {
+        message: "All candidate models are currently rate limited",
+        code: 429,
+        type: "rate_limited_all_candidates",
+      },
+      attempted: throttledAttempts,
+    });
+    console.warn(
+      `[router] 429 ALL CANDIDATES THROTTLED model=${request.model} ` +
+      `tried=[${throttledAttempts.map((t) => `${t.backendId}/${t.model}`).join(", ")}]`
+    );
+    emitSiem("response", {
+      status: 429,
+      failover: didFailover,
+      all_backends_failed: true,
+      all_throttled: true,
+    }, { backend: lastResult?.backendId ?? null });
+    return {
+      status: 429,
+      headers: { "content-type": "application/json", "retry-after": String(retryAfterSec) },
+      body: Buffer.from(payload, "utf-8"),
+      backendId: lastResult?.backendId ?? null,
+      failover: didFailover,
+    };
+  }
+
+  // All backends failed for some other (non-throttle) reason: return the
+  // last response so the caller can relay the error.
   emitSiem("response", {
     status: lastResult?.status ?? 502,
     failover: didFailover,
