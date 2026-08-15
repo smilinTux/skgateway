@@ -165,7 +165,14 @@ describe('probeModels (fake completion runner + fake pool + fake clock)', () => 
       now: () => NOW,
       runProbe: async () => ({ ok: false, status: 429 }),
     });
-    assert.deepEqual(next['nvidia/free-tier'], store['nvidia/free-tier'], 'must be a byte-for-byte no-op');
+    // Card 2ba73bf9 / C9: the lifecycle disposition itself is still a
+    // byte-for-byte no-op (every original field, unchanged); a 429 now ALSO
+    // records a measured 'unmeasured' liveness fact (never 'incapable', see
+    // card 2ba73bf9's explicit rule), which is new information being added,
+    // not the lifecycle machine's state being disturbed.
+    const { measured_capabilities, ...lifecycleOnly } = next['nvidia/free-tier'];
+    assert.deepEqual(lifecycleOnly, store['nvidia/free-tier'], 'lifecycle disposition must be a byte-for-byte no-op');
+    assert.equal(measured_capabilities.liveness.status, 'unmeasured');
   });
 
   test('card f9e8002b / C14: a 500 probe does NOT produce not_chat (thinkingmachines/inkling shape)', async () => {
@@ -275,6 +282,123 @@ describe('probeModels (fake completion runner + fake pool + fake clock)', () => 
         },
       }),
     );
+  });
+});
+
+describe('probeModels: tier-2 capability battery (card 2ba73bf9 / C9)', () => {
+  test('with no chatComplete supplied, tier 2 never runs and measured_capabilities only gets liveness', async () => {
+    const store = { a: lc({ last_verified_at: null }) };
+    const next = await probeModels(store, {
+      now: () => NOW,
+      runProbe: async () => ({ ok: true, status: 200 }),
+    });
+    assert.equal(next.a.measured_capabilities.liveness.status, 'pass');
+    assert.equal(next.a.measured_capabilities.tool_call, null);
+    assert.equal(next.a.measured_capabilities.last_full_assessment_at, null);
+  });
+
+  test('with no runCapabilityAssessment override, probeModels uses the real capability-assessment.mjs battery and it actually calls chatComplete', async () => {
+    let chatCalls = 0;
+    const store = { a: lc({ last_verified_at: null }) };
+    const next = await probeModels(store, {
+      now: () => NOW,
+      runProbe: async () => ({ ok: true, status: 200 }),
+      chatComplete: async () => {
+        chatCalls++;
+        return { ok: true, status: 200, message: { content: 'x' } };
+      },
+    });
+    assert.ok(chatCalls > 0, 'the real battery must issue real chatComplete calls when not overridden');
+    assert.equal(next.a.measured_capabilities.liveness.status, 'pass');
+    assert.equal(next.a.measured_capabilities.last_full_assessment_at, NOW);
+  });
+
+  test('a first-sighting model that passes liveness gets a full tier-2 battery', async () => {
+    const store = { fresh: lc({ last_verified_at: null }) };
+    let batteryCalledWith = null;
+    const next = await probeModels(store, {
+      now: () => NOW,
+      runProbe: async () => ({ ok: true, status: 200 }),
+      chatComplete: async () => ({ ok: true, status: 200, message: { content: 'x' } }),
+      runCapabilityAssessment: async (id) => {
+        batteryCalledWith = id;
+        return {
+          tool_call: { capability: 'measured', status: 'pass', assertion: 'x', measured_at: NOW, evidence: null },
+        };
+      },
+    });
+    assert.equal(batteryCalledWith, 'fresh');
+    assert.equal(next.fresh.measured_capabilities.tool_call.status, 'pass');
+    assert.equal(next.fresh.measured_capabilities.last_full_assessment_at, NOW);
+  });
+
+  test('tier 2 is skipped for a model whose liveness probe failed this sweep (no point battering a dead model)', async () => {
+    const store = { deadish: lc({ last_verified_at: null }) };
+    let batteryCalls = 0;
+    await probeModels(store, {
+      now: () => NOW,
+      runProbe: async () => ({ ok: false, status: 410 }),
+      chatComplete: async () => ({ ok: true, status: 200, message: { content: 'x' } }),
+      runCapabilityAssessment: async () => {
+        batteryCalls++;
+        return {};
+      },
+    });
+    assert.equal(batteryCalls, 0);
+  });
+
+  test('an already-assessed model within capabilityIntervalMs is not re-battered, only re-pinged for liveness', async () => {
+    const store = {
+      seasoned: lc({
+        last_verified_at: null,
+        measured_capabilities: { last_full_assessment_at: NOW - 1000, tool_call: { capability: 'measured', status: 'pass', assertion: 'x', measured_at: NOW - 1000, evidence: null } },
+      }),
+    };
+    let batteryCalls = 0;
+    const next = await probeModels(store, {
+      now: () => NOW,
+      runProbe: async () => ({ ok: true, status: 200 }),
+      chatComplete: async () => ({ ok: true, status: 200, message: { content: 'x' } }),
+      capabilityIntervalMs: 1_000_000,
+      runCapabilityAssessment: async () => {
+        batteryCalls++;
+        return {};
+      },
+    });
+    assert.equal(batteryCalls, 0);
+    assert.equal(next.seasoned.measured_capabilities.tool_call.status, 'pass', 'the prior measured fact survives untouched');
+  });
+
+  test('capabilityBudget caps how many models get the full battery in one sweep, independent of the liveness budget', async () => {
+    const store = {};
+    for (let i = 0; i < 10; i++) store[`m${i}`] = lc({ last_verified_at: null });
+    let batteryCalls = 0;
+    await probeModels(store, {
+      now: () => NOW,
+      budget: 10,
+      capabilityBudget: 2,
+      runProbe: async () => ({ ok: true, status: 200 }),
+      chatComplete: async () => ({ ok: true, status: 200, message: { content: 'x' } }),
+      runCapabilityAssessment: async () => {
+        batteryCalls++;
+        return {};
+      },
+    });
+    assert.equal(batteryCalls, 2);
+  });
+
+  test('a battery-level throw is fail-soft and does not break the sweep or corrupt the record', async () => {
+    const store = { a: lc({ last_verified_at: null }) };
+    const next = await probeModels(store, {
+      now: () => NOW,
+      runProbe: async () => ({ ok: true, status: 200 }),
+      chatComplete: async () => ({ ok: true, status: 200, message: { content: 'x' } }),
+      runCapabilityAssessment: async () => {
+        throw new Error('boom');
+      },
+    });
+    assert.equal(next.a.measured_capabilities.liveness.status, 'pass');
+    assert.equal(next.a.measured_capabilities.last_full_assessment_at, null, 'a failed battery must not count as a completed assessment');
   });
 });
 
@@ -391,5 +515,50 @@ describe('discoverCatalog wires the probe sweep into the existing refresh cadenc
     });
     assert.ok(Array.isArray(models));
     assert.equal(models.length, 1);
+  });
+
+  test('card 2ba73bf9 / C9: chatComplete/capability opts thread through discoverCatalog into the same sweep, no second scheduler', async () => {
+    const path = freshPath();
+    const cache = {};
+    let batteryCalledWith = null;
+    await discoverCatalog({
+      localModels: [],
+      nvidiaFetch: async () => ({ data: [{ id: 'nvidia/newmodel' }] }),
+      openrouterFetch: noopFetch(),
+      cache,
+      now: () => 0,
+      lifecycleStorePath: path,
+      probeSeconds: 1,
+      probeRunProbe: async () => ({ ok: true, status: 200 }),
+      chatComplete: async () => ({ ok: true, status: 200, message: { content: 'x' } }),
+      probeRunCapabilityAssessment: async (id) => {
+        batteryCalledWith = id;
+        return {};
+      },
+    });
+    assert.equal(batteryCalledWith, 'nvidia/newmodel');
+    _resetCacheForTests();
+    const record = getLifecycle('nvidia/newmodel', path);
+    assert.equal(record.measured_capabilities.liveness.status, 'pass');
+  });
+
+  test('with no chatComplete opt supplied (today\'s production shape), the sweep runs liveness only, tier 2 stays inert', async () => {
+    const path = freshPath();
+    const cache = {};
+    const { models } = await discoverCatalog({
+      localModels: [],
+      nvidiaFetch: async () => ({ data: [{ id: 'nvidia/z' }] }),
+      openrouterFetch: noopFetch(),
+      cache,
+      now: () => 0,
+      lifecycleStorePath: path,
+      probeSeconds: 1,
+      probeRunProbe: async () => ({ ok: true, status: 200 }),
+    });
+    assert.ok(Array.isArray(models));
+    _resetCacheForTests();
+    const record = getLifecycle('nvidia/z', path);
+    assert.equal(record.measured_capabilities.liveness.status, 'pass');
+    assert.equal(record.measured_capabilities.tool_call, null);
   });
 });

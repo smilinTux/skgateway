@@ -29,6 +29,15 @@
  */
 
 import { defaultLifecycle, applyProbeOutcome, LIFECYCLE_STATES } from './lifecycle.mjs';
+import {
+  livenessFromProbeOutcome,
+  applyCapabilityMeasurement,
+  runCapabilityAssessment,
+  selectCapabilityCandidates,
+  DEFAULT_CAPABILITY_BUDGET,
+  DEFAULT_CAPABILITY_INTERVAL_MS,
+  DEFAULT_CAPABILITY_TIMEOUT_MS,
+} from './capability-assessment.mjs';
 
 /** Default cap on probes per sweep (design 5.2: "max ~20/cycle"). */
 export const DEFAULT_PROBE_BUDGET = 20;
@@ -132,6 +141,42 @@ export function selectProbeCandidates(
  * model to `suspect` and never escalates a model that already needs
  * investigation.
  *
+ * MEASUREMENT (card 2ba73bf9 / C9, "MEMBERSHIP IS MEASURED, NOT DECLARED"):
+ * this sweep is also where the capability battery rides, exactly as the card
+ * requires ("ride the existing probe sweep, do not build a second
+ * scheduler"). Two tiers, both bolted onto the SAME per-candidate loop below
+ * rather than a separate pass, so a capability battery never draws an extra
+ * pool slot beyond what the liveness probe already acquired for that id:
+ *
+ *   Tier 1 (cheap, every eligible candidate, unchanged cost): the existing
+ *   one-word liveness probe above. Its outcome is now ALSO folded into
+ *   `measured_capabilities.liveness` on the same lifecycle record
+ *   (livenessFromProbeOutcome), at zero extra network cost.
+ *
+ *   Tier 2 (expensive, rare): a full tool-calling / structured-output /
+ *   instruction-following / min-output-tokens battery
+ *   (capability-assessment.mjs's runCapabilityAssessment), gated three ways
+ *   so it can never dominate the shared budget real traffic also draws from:
+ *     - only offered `runCapabilityAssessment` is supplied (undefined by
+ *       default, same opt-in discipline as `runProbe`);
+ *     - only for ids selected by `selectCapabilityCandidates` out of this
+ *       sweep's OWN tier-1 candidate list (never a superset): first sighting
+ *       (no `measured_capabilities` at all) is always eligible, an
+ *       already-assessed id is only due again after `capabilityIntervalMs`
+ *       (default 30 days, rare), and both are capped by `capabilityBudget`
+ *       (default 3, small on purpose: up to 7 sequential calls per model
+ *       versus the liveness probe's 1);
+ *     - only when this sweep's liveness probe for that id actually
+ *       succeeded: there is no reason to spend a multi-call battery probing
+ *       capability detail on a model tier 1 just found dead or throttled.
+ *   A 429 anywhere inside the battery aborts the REST of the battery for
+ *   that model immediately (see runCapabilityAssessment's doc comment):
+ *   free-tier throttling is shared across a model's endpoints, so continuing
+ *   to probe would almost certainly just collect more 429s while spending
+ *   real budget, exactly the "measuring costs the same scarce resource as
+ *   using" failure the card calls out (two of seven free models hit
+ *   FreeUsageLimitError from capability probing alone on 2026-08-14).
+ *
  * @param {Record<string, object>} store
  * @param {object} opts
  * @param {number} [opts.budget]
@@ -143,9 +188,22 @@ export function selectProbeCandidates(
  * @param {string} [opts.poolBackendId]
  * @param {number|(() => number)} [opts.now]
  * @param {(id: string, o: {timeoutMs: number, maxTokens: number}) => Promise<{ok: boolean, status?: number}>} [opts.runProbe]
+ * @param {(id: string, o: {chatComplete: Function, timeoutMs: number, now: number|(() => number)}) => Promise<object>} [opts.runCapabilityAssessment]
+ *   Tier-2 battery runner (capability-assessment.mjs's `runCapabilityAssessment`
+ *   by default when `chatComplete` is supplied; pass a different function to
+ *   fully stub tier 2 in tests). Undefined/no `chatComplete` disables tier 2
+ *   entirely: tier 1 (liveness) is unaffected either way.
+ * @param {(id: string, req: object, o: {timeoutMs?: number}) => Promise<object>} [opts.chatComplete]
+ *   The actual network call tier 2's assertions issue. Required to run tier 2
+ *   at all; production has no default (mirrors `runProbe`/`nvidiaFetch`
+ *   elsewhere in this codebase: every real call site must supply one, no
+ *   silent network default for something this budget-sensitive).
+ * @param {number} [opts.capabilityBudget]
+ * @param {number} [opts.capabilityIntervalMs]
+ * @param {number} [opts.capabilityTimeoutMs]
  * @returns {Promise<Record<string, object>>} a NEW store map; entries not
  *   selected this sweep are carried over unchanged, selected entries carry
- *   their post-probe lifecycle record.
+ *   their post-probe lifecycle record plus an updated `measured_capabilities`.
  */
 export async function probeModels(store, opts = {}) {
   const {
@@ -158,6 +216,11 @@ export async function probeModels(store, opts = {}) {
     poolBackendId = DEFAULT_POOL_BACKEND_ID,
     now = Date.now,
     runProbe,
+    chatComplete,
+    runCapabilityAssessment: runCapabilityAssessmentOpt,
+    capabilityBudget = DEFAULT_CAPABILITY_BUDGET,
+    capabilityIntervalMs = DEFAULT_CAPABILITY_INTERVAL_MS,
+    capabilityTimeoutMs = DEFAULT_CAPABILITY_TIMEOUT_MS,
   } = opts;
 
   const safeStore = store || {};
@@ -171,6 +234,13 @@ export async function probeModels(store, opts = {}) {
   if (candidates.length === 0) {
     return { ...safeStore };
   }
+
+  const assessBattery = typeof chatComplete === 'function'
+    ? (runCapabilityAssessmentOpt || runCapabilityAssessment)
+    : null;
+  const capabilityIds = assessBattery
+    ? new Set(selectCapabilityCandidates(safeStore, candidates, { budget: capabilityBudget, now: nowMs, intervalMs: capabilityIntervalMs }))
+    : new Set();
 
   const next = { ...safeStore };
   const canPool = pool && typeof pool.acquire === 'function' && typeof pool.release === 'function';
@@ -194,11 +264,34 @@ export async function probeModels(store, opts = {}) {
           outcome = { ok: false };
         }
         const lc = safeStore[id] || defaultLifecycle();
-        next[id] = applyProbeOutcome(lc, {
+        const probedLc = applyProbeOutcome(lc, {
           ok: Boolean(outcome && outcome.ok),
           status: outcome && outcome.status,
           now: nowMs,
         });
+
+        let capRecord = applyCapabilityMeasurement(
+          lc.measured_capabilities,
+          { liveness: livenessFromProbeOutcome(outcome, nowMs) },
+          { now: nowMs },
+        );
+
+        if (assessBattery && capabilityIds.has(id) && outcome && outcome.ok) {
+          try {
+            const battery = await assessBattery(id, { chatComplete, timeoutMs: capabilityTimeoutMs, now: nowMs });
+            capRecord = applyCapabilityMeasurement(capRecord, battery, { now: nowMs, full: true });
+          } catch {
+            // A battery-level throw (a bug in the injected chatComplete, an
+            // uncaught rejection): fail-soft, same discipline as runProbe's
+            // own rejection handling above. Deliberately does NOT advance
+            // last_full_assessment_at: nothing was actually measured, so this
+            // id must stay eligible for tier 2 next sweep rather than being
+            // treated as freshly assessed and going quiet for
+            // capabilityIntervalMs.
+          }
+        }
+
+        next[id] = { ...probedLc, measured_capabilities: capRecord };
       } finally {
         if (canPool) pool.release(poolBackendId);
       }
