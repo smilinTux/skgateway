@@ -97,6 +97,45 @@ test('normalize() never claims declared tool support or a context length it does
   }
 });
 
+test('normalize() adds numeric params_b/active_params_b and a heuristic size_class (card N2)', () => {
+  const cards = normalize(NVIDIA_FIXTURE, { now: () => 5000 });
+  const qwen = cards.find((c) => c.id === 'qwen/qwen3.5-122b-a10b');
+  assert.equal(qwen.card.params_b, 122);
+  assert.equal(qwen.card.active_params_b, 10);
+  assert.equal(qwen.card.size_class, 'XL');
+
+  const llama = cards.find((c) => c.id === 'meta/llama-3.3-70b-instruct');
+  assert.equal(llama.card.params_b, 70);
+  assert.equal(llama.card.active_params_b, null);
+  assert.equal(llama.card.size_class, 'L');
+});
+
+test('normalize() leaves params_b/active_params_b/size_class null when the id carries no size token', () => {
+  const cards = normalize(NVIDIA_FIXTURE, { now: () => 5000 });
+  const r1 = cards.find((c) => c.id === 'deepseek-ai/deepseek-r1-thinking');
+  assert.equal(r1.card.params_b, null);
+  assert.equal(r1.card.active_params_b, null);
+  assert.equal(r1.card.size_class, null);
+});
+
+test('normalize() distinguishes an XL MoE model (550B total) from a small dense one (9B), the concrete fleet test', () => {
+  const fixture = {
+    data: [
+      { id: 'nvidia/nemotron-3-ultra-550b-a55b', object: 'model', owned_by: 'nvidia' },
+      { id: 'nvidia/nvidia-nemotron-nano-9b-v2', object: 'model', owned_by: 'nvidia' },
+    ],
+  };
+  const cards = normalize(fixture, { now: () => 5000 });
+  const ultra = cards.find((c) => c.id === 'nvidia/nemotron-3-ultra-550b-a55b');
+  const nano = cards.find((c) => c.id === 'nvidia/nvidia-nemotron-nano-9b-v2');
+  assert.equal(ultra.card.params_b, 550);
+  assert.equal(ultra.card.active_params_b, 55);
+  assert.equal(ultra.card.size_class, 'XL');
+  assert.equal(nano.card.params_b, 9);
+  assert.equal(nano.card.size_class, 'M');
+  assert.notEqual(ultra.card.size_class, nano.card.size_class);
+});
+
 test('normalize() is fail-soft on a malformed/empty payload (never throws)', () => {
   assert.deepEqual(normalize({}), []);
   assert.deepEqual(normalize(null), []);

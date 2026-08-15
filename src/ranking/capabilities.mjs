@@ -29,6 +29,19 @@
  * empirical signal from `ratings.jsonl` via `modelStats()`) or `'prior'`
  * (an id-family guess, used only when there is no rated signal yet).
  *
+ * Card N2 (coordination id f942d93b) adds `size_class`, `trust_zone`, and
+ * `throughput_tps` (design 2026-08-14-model-metadata-risk-job-matching-arch.md
+ * section 4.1's "DERIVED AT READ TIME, never stored" list). All three are
+ * pure arithmetic over the arguments given, same as everything else in this
+ * module: `size_class` is surfaced straight off the card (the card itself
+ * carries the provenance, either a provider adapter's heuristic guess or the
+ * manual overlay that wins over it), `trust_zone` folds `sovereignty` with
+ * an injected provider-posture map (`opts.providers`, the overlay's
+ * `providers:` block; this module does not read config files itself), and
+ * `throughput_tps` is an injected metrics field like `latency_p50_ms` /
+ * `success_rate` (null until the joule epic's `recordResponse` fix lands,
+ * design section 2's "Ground truth", never fabricated in the meantime).
+ *
  * @module ranking/capabilities
  */
 
@@ -185,6 +198,76 @@ function deriveSovereignty(modelCard) {
   return paid ? 'paid-cloud' : 'free-remote';
 }
 
+const _VALID_SIZE_CLASSES = new Set(['S', 'M', 'L', 'XL']);
+
+/**
+ * `size_class`: surfaced straight off the card, never recomputed here (design
+ * 4.1: "derived: surfaced from the card"). The card itself may carry a
+ * provider adapter's heuristic guess (`nvidia.mjs`/`openrouter.mjs`,
+ * card N2) or a curated value from `config/model-cards.overrides.yaml`
+ * (which already wins over the heuristic via `applyCardOverlay`'s
+ * precedence, before this function ever sees the card). An invalid or
+ * missing value is `null`, never guessed here a second time.
+ *
+ * @param {object} card modelCard.card
+ * @returns {'S'|'M'|'L'|'XL'|null}
+ */
+function deriveSizeClass(card) {
+  return _VALID_SIZE_CLASSES.has(card.size_class) ? card.size_class : null;
+}
+
+/**
+ * Resolve a model's provider-posture entry (`data_retention`, `verified`,
+ * `ref`) out of the injected `providers` map (the overlay's `providers:`
+ * block, design 4.3). A per-model override (`card.data_retention`) wins,
+ * same precedence philosophy as everywhere else in the overlay (design 4.3:
+ * "allowed for the exceptional case ... wins over the provider default").
+ * Local backends are matched by name fragment since they are registered
+ * under several backend keys (`local`, `chiap08-ornith`, `chiap08-qwen38`,
+ * ...) that all mean the same "our own hardware" posture, per the design's
+ * own `providers.local` comment ("any isLocalUrl() backend"). Returns `null`
+ * when nothing in the map matches: card N1 (trust zones), which consumes
+ * this, treats an unmatched provider as the least-trusted case, never a
+ * silent pass.
+ *
+ * @param {object} modelCard
+ * @param {object|null|undefined} providers the overlay's `providers:` block
+ * @returns {{data_retention?: string, verified?: string, ref?: string}|null}
+ */
+function resolveProviderPosture(modelCard, providers) {
+  const card = (modelCard && modelCard.card) || {};
+  if (typeof card.data_retention === 'string') return { data_retention: card.data_retention };
+  if (!providers || typeof providers !== 'object') return null;
+  const name = modelCard && modelCard.provider;
+  if (typeof name === 'string' && providers[name]) return providers[name];
+  if (typeof name === 'string') {
+    if (name === 'anthropic-direct' && providers.anthropic) return providers.anthropic;
+    if (/ornith|qwen38|^local$|^ollama$/i.test(name) && providers.local) return providers.local;
+  }
+  return null;
+}
+
+/**
+ * `trust_zone`: derived at read time (design 5.2), never stored. Three
+ * values: sovereign compute is always zone 0 regardless of what the
+ * providers map says (sovereignty already answers the question); a paid
+ * backend with a verified `contractual-zero` retention posture is zone 1;
+ * everything else, including an unmatched/unknown posture, is zone 2 (fail
+ * to the LEAST trusted zone on missing signal, never the most). This is
+ * card N2's plumbing for card N1 (trust-zone gating), not yet an
+ * enforcement point itself: nothing in this module blocks a request, it
+ * only reports the number.
+ *
+ * @param {'local'|'free-remote'|'paid-cloud'} sovereignty
+ * @param {{data_retention?: string}|null} posture
+ * @returns {0|1|2}
+ */
+function deriveTrustZone(sovereignty, posture) {
+  if (sovereignty === 'local') return 0;
+  if (sovereignty === 'paid-cloud' && posture && posture.data_retention === 'contractual-zero') return 1;
+  return 2;
+}
+
 /**
  * Derive the full capability vector for one model (design 4.1 `capabilities`
  * block). Pure aside from the two delegated reads (`modelStats()`'s own
@@ -196,12 +279,17 @@ function deriveSovereignty(modelCard) {
  *   url?, card}` (design 4.1's ModelCard record; `card` is the raw-ish
  *   provider metadata block from the P2.1 adapters / registry / overlay).
  * @param {object} [opts]
- * @param {{latency_p50_ms?:number, success_rate?:number}} [opts.metrics]
+ * @param {{latency_p50_ms?:number, success_rate?:number, throughput_tps?:number}} [opts.metrics]
  *   Pre-resolved metrics.db snapshot for THIS model (14-day window, design
- *   6.1). Injected, never read live from here.
+ *   6.1). Injected, never read live from here. `throughput_tps` (card N2)
+ *   follows the same injection discipline; null when the caller has nothing
+ *   to give it (design section 2: blocked on the live `recordResponse` fix).
  * @param {{path?:string, window?:number}} [opts.ratings]
  *   Forwarded verbatim to `modelStats()` as its `opts` (e.g. a fixture
  *   `path` in tests). Omit to use empirical.mjs's real ratings.jsonl.
+ * @param {object|null} [opts.providers] (card N2) the overlay's `providers:`
+ *   block (design 4.3), used only to resolve `trust_zone`. Omit to always
+ *   get zone 2 for anything non-local (fail to least-trusted on no signal).
  * @param {() => number} [opts.now] Reserved for future recency-weighting
  *   (unused today; accepted for interface stability with the rest of this
  *   codebase's mtime/TTL clock convention).
@@ -214,12 +302,17 @@ function deriveSovereignty(modelCard) {
  *   reasoning: {score:number, basis:'ratings'|'prior'},
  *   coding: {score:number, basis:'ratings'|'prior'},
  *   sovereignty: 'local'|'free-remote'|'paid-cloud',
+ *   size_class: 'S'|'M'|'L'|'XL'|null,
+ *   trust_zone: 0|1|2,
+ *   throughput_tps: number|null,
  * }}
  */
 export function deriveCapabilities(modelCard, opts = {}) {
   const card = (modelCard && modelCard.card) || {};
   const metrics = opts.metrics || {};
   const ratingsOpts = opts.ratings || {};
+  const sovereignty = deriveSovereignty(modelCard);
+  const posture = resolveProviderPosture(modelCard, opts.providers);
 
   return {
     tool_use: deriveToolUse(card),
@@ -229,7 +322,10 @@ export function deriveCapabilities(modelCard, opts = {}) {
     success_rate: typeof metrics.success_rate === 'number' ? metrics.success_rate : null,
     reasoning: deriveQualityDim(modelCard, 'reasoning', ['thinking', 'reasoning'], ratingsOpts),
     coding: deriveQualityDim(modelCard, 'code', ['coder'], ratingsOpts),
-    sovereignty: deriveSovereignty(modelCard),
+    sovereignty,
+    size_class: deriveSizeClass(card),
+    trust_zone: deriveTrustZone(sovereignty, posture),
+    throughput_tps: typeof metrics.throughput_tps === 'number' ? metrics.throughput_tps : null,
   };
 }
 

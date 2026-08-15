@@ -91,6 +91,73 @@ test('normalize() retains the full card instead of discarding fields', () => {
   assert.equal(gemma.card.fetched_at, 5000);
 });
 
+test('normalize() surfaces reasoning/structured_outputs booleans from supported_parameters (card N2)', () => {
+  const cards = normalize(OPENROUTER_FIXTURE, { now: () => 5000 });
+  const gemma = cards.find((c) => c.id === 'google/gemma-4-31b-it:free');
+  const vl = cards.find((c) => c.id === 'qwen/qwen3.5-vl-72b:free');
+  assert.equal(gemma.card.reasoning, true);
+  assert.equal(gemma.card.structured_outputs, true);
+  assert.equal(vl.card.reasoning, false);
+  assert.equal(vl.card.structured_outputs, true);
+});
+
+test('normalize() distinguishes an XL free MoE model (550B total) from a small free model (9B), the concrete fleet test', () => {
+  const fixture = {
+    data: [
+      {
+        id: 'nvidia/nemotron-3-ultra-550b-a55b:free',
+        context_length: 1000000,
+        architecture: { modality: 'text->text' },
+        pricing: { prompt: '0', completion: '0' },
+        top_provider: { max_completion_tokens: 65536 },
+        supported_parameters: ['tools', 'reasoning'],
+      },
+      {
+        id: 'nvidia/nemotron-nano-9b-v2:free',
+        context_length: 128000,
+        architecture: { modality: 'text->text' },
+        pricing: { prompt: '0', completion: '0' },
+        top_provider: { max_completion_tokens: null },
+        supported_parameters: ['tools', 'reasoning', 'structured_outputs'],
+      },
+    ],
+  };
+  const cards = normalize(fixture, { now: () => 5000 });
+  const ultra = cards.find((c) => c.id === 'nvidia/nemotron-3-ultra-550b-a55b:free');
+  const nano = cards.find((c) => c.id === 'nvidia/nemotron-nano-9b-v2:free');
+  assert.equal(ultra.card.params_b, 550);
+  assert.equal(ultra.card.active_params_b, 55);
+  assert.equal(ultra.card.size_class, 'XL');
+  assert.equal(ultra.card.params_basis, 'id-pattern');
+  assert.equal(nano.card.params_b, 9);
+  assert.equal(nano.card.active_params_b, null);
+  assert.equal(nano.card.size_class, 'M');
+  assert.notEqual(ultra.card.size_class, nano.card.size_class);
+});
+
+test('normalize() falls back to description prose for params when the id carries no size token (real live case)', () => {
+  // Measured 2026-08-15: the live OpenRouter id is
+  // "nvidia/nemotron-3.5-lightning:free" (no size token at all), unlike the
+  // sibling NVIDIA raw catalog id "nemotron-3.5-lightning-30b-a3b". Its own
+  // description states the split in prose.
+  const fixture = {
+    data: [{
+      id: 'nvidia/nemotron-3.5-lightning:free',
+      description: 'NVIDIA Nemotron 3.5 Lightning is an open mixture-of-experts model from NVIDIA, with 3B active parameters out of 30B total. It is suited for high-throughput agentic workloads.',
+      context_length: 1000000,
+      architecture: { modality: 'text->text' },
+      pricing: { prompt: '0', completion: '0' },
+      top_provider: { max_completion_tokens: 65536 },
+      supported_parameters: ['tools', 'reasoning'],
+    }],
+  };
+  const [card] = normalize(fixture, { now: () => 5000 });
+  assert.equal(card.card.params_b, 30);
+  assert.equal(card.card.active_params_b, 3);
+  assert.equal(card.card.size_class, 'L');
+  assert.equal(card.card.params_basis, 'description');
+});
+
 test('normalize() surfaces vision modality for a multimodal card', () => {
   const cards = normalize(OPENROUTER_FIXTURE, { now: () => 5000 });
   const vl = cards.find((c) => c.id === 'qwen/qwen3.5-vl-72b:free');
@@ -121,6 +188,12 @@ test('normalize() defaults missing optional card fields to null instead of throw
   assert.equal(card.card.modality, null);
   assert.deepEqual(card.card.supported_parameters, []);
   assert.equal(card.card.description, null);
+  assert.equal(card.card.reasoning, false);
+  assert.equal(card.card.structured_outputs, false);
+  assert.equal(card.card.params_b, null);
+  assert.equal(card.card.active_params_b, null);
+  assert.equal(card.card.size_class, null);
+  assert.equal(card.card.params_basis, null);
 });
 
 test('fetch() GETs the OpenRouter models endpoint and returns parsed JSON', async () => {

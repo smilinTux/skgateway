@@ -10,6 +10,11 @@
  * active-param counts) and tags the result `source:'heuristic'` so every
  * downstream consumer (capabilities.mjs, the ranker, `/admin/models`) can see
  * this is a guess, not a provider-declared fact (design 6.1 basis honesty).
+ * Card N2 (coordination id f942d93b) adds `params_b`/`active_params_b`
+ * (numeric normalization of the `size`/`active_params` strings) and a
+ * heuristic `size_class` (S/M/L/XL, the Joule Economy enum verbatim, see
+ * `discovery/model-size.mjs`), all still `source: 'heuristic'` and all
+ * overridable by the manual overlay.
  * It never claims `tool_use` support or a `context_length`/
  * `max_output_tokens` it doesn't actually have; `config/model-cards.
  * overrides.yaml` (card P2.2) is where committed, validated knowledge for
@@ -28,6 +33,7 @@
 // fall back to the id patterns. That limitation is the point: it is recorded in
 // classify.mjs rather than rediscovered here.
 import { isChatCapable } from '../classify.mjs';
+import { deriveSizeClassFromParams } from '../model-size.mjs';
 
 // Variant tokens the heuristic looks for in the bare id, in priority order.
 // 'code' folds into 'coder' (either spelling is reported as 'coder').
@@ -137,6 +143,19 @@ export function normalize(json, opts = {}) {
       if (h.active_params) description += ` (active ${h.active_params})`;
       if (h.variants.length) description += ` [${h.variants.join(', ')}]`;
 
+      // params_b/active_params_b (card N2): numeric normalization of the
+      // "397b"/"a17b"-style strings above, so downstream consumers (the
+      // overlay's size_class derivation, capabilities.mjs) get a number, not
+      // a string to re-parse. size_class is a heuristic guess from TOTAL
+      // params (never active, design Q4); the manual overlay in
+      // config/model-cards.overrides.yaml wins over this guess via
+      // applyCardOverlay's precedence, unchanged here. Both stay
+      // `source: 'heuristic'` on the card, same honesty tag as everything
+      // else this adapter guesses.
+      const params_b = h.size ? Number.parseFloat(h.size) : null;
+      const active_params_b = h.active_params ? Number.parseFloat(h.active_params) : null;
+      const size_class = deriveSizeClassFromParams(params_b);
+
       return {
         id: m.id,
         provider: 'nvidia',
@@ -161,6 +180,9 @@ export function normalize(json, opts = {}) {
           active_params: h.active_params,
           variant: h.variant,
           variants: h.variants,
+          params_b,
+          active_params_b,
+          size_class,
         },
       };
     });

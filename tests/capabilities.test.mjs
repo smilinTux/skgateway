@@ -228,8 +228,9 @@ describe('full shape', () => {
     };
     const caps = deriveCapabilities(card, { metrics: { latency_p50_ms: 900, success_rate: 1 } });
     assert.deepEqual(Object.keys(caps).sort(), [
-      'coding', 'ctx_tokens', 'latency_p50_ms', 'reasoning', 'sovereignty',
-      'success_rate', 'tool_use', 'vision',
+      'coding', 'ctx_tokens', 'latency_p50_ms', 'reasoning', 'size_class',
+      'sovereignty', 'success_rate', 'throughput_tps', 'tool_use',
+      'trust_zone', 'vision',
     ]);
     assert.equal(caps.tool_use.score, 1);
     assert.equal(caps.tool_use.basis, 'card');
@@ -240,5 +241,89 @@ describe('full shape', () => {
     assert.equal(caps.sovereignty, 'free-remote');
     assert.ok(['ratings', 'prior'].includes(caps.reasoning.basis));
     assert.ok(['ratings', 'prior'].includes(caps.coding.basis));
+    assert.equal(caps.size_class, null);
+    assert.equal(caps.trust_zone, 2);
+    assert.equal(caps.throughput_tps, null);
+  });
+});
+
+describe('size_class (card N2)', () => {
+  test('surfaced straight off the card when it is a valid S/M/L/XL value', () => {
+    const card = { id: 'x', card: { size_class: 'XL' } };
+    assert.equal(deriveCapabilities(card, {}).size_class, 'XL');
+  });
+
+  test('null when the card carries no size_class', () => {
+    const card = { id: 'x', card: {} };
+    assert.equal(deriveCapabilities(card, {}).size_class, null);
+  });
+
+  test('null when the card carries an invalid value (never passed through)', () => {
+    const card = { id: 'x', card: { size_class: 'bogus' } };
+    assert.equal(deriveCapabilities(card, {}).size_class, null);
+  });
+
+  test('distinguishes an XL free MoE model from a small free model, the concrete fleet test', () => {
+    const ultra = { id: 'nvidia/nemotron-3-ultra-550b-a55b', provider: 'nvidia', free: true, card: { size_class: 'XL', params_b: 550, active_params_b: 55 } };
+    const nano = { id: 'nvidia/nvidia-nemotron-nano-9b-v2', provider: 'nvidia', free: true, card: { size_class: 'M', params_b: 9 } };
+    const ultraCaps = deriveCapabilities(ultra, {});
+    const nanoCaps = deriveCapabilities(nano, {});
+    assert.equal(ultraCaps.size_class, 'XL');
+    assert.equal(nanoCaps.size_class, 'M');
+    assert.notEqual(ultraCaps.size_class, nanoCaps.size_class);
+  });
+});
+
+describe('trust_zone (card N2)', () => {
+  test('zone 0: sovereignty local, regardless of any providers map', () => {
+    const card = { id: 'ornith-1.0-9b', provider: 'local', free: true, card: { tier: 'local' } };
+    assert.equal(deriveCapabilities(card, {}).trust_zone, 0);
+  });
+
+  test('zone 1: paid-cloud with a verified contractual-zero posture', () => {
+    const card = { id: 'claude-opus-4-8', provider: 'anthropic', free: false, card: { tier: 'paid-cloud' } };
+    const providers = { anthropic: { data_retention: 'contractual-zero', verified: '2026-08-15' } };
+    assert.equal(deriveCapabilities(card, { providers }).trust_zone, 1);
+  });
+
+  test('zone 2: free-remote, any posture', () => {
+    const card = { id: 'nvidia/x', provider: 'nvidia', free: true, card: { tier: 'free-remote' } };
+    const providers = { nvidia: { data_retention: 'trains', verified: '2026-08-15' } };
+    assert.equal(deriveCapabilities(card, { providers }).trust_zone, 2);
+  });
+
+  test('zone 2: paid-cloud but the posture is not contractual-zero (fail to least-trusted)', () => {
+    const card = { id: 'x', provider: 'somepaid', free: false, card: { tier: 'paid-cloud' } };
+    const providers = { somepaid: { data_retention: 'retains', verified: '2026-08-15' } };
+    assert.equal(deriveCapabilities(card, { providers }).trust_zone, 2);
+  });
+
+  test('zone 2: paid-cloud with no providers map at all (missing signal fails to least-trusted)', () => {
+    const card = { id: 'x', provider: 'somepaid', free: false, card: { tier: 'paid-cloud' } };
+    assert.equal(deriveCapabilities(card, {}).trust_zone, 2);
+  });
+
+  test('a per-model card.data_retention override wins over the providers map', () => {
+    const card = { id: 'x', provider: 'openrouter', free: false, card: { tier: 'paid-cloud', data_retention: 'contractual-zero' } };
+    const providers = { openrouter: { data_retention: 'trains' } };
+    assert.equal(deriveCapabilities(card, { providers }).trust_zone, 1);
+  });
+
+  test('anthropic-direct backend name resolves to the anthropic provider posture', () => {
+    const card = { id: 'claude-opus-4-8', provider: 'anthropic-direct', free: false, card: { tier: 'paid-cloud' } };
+    const providers = { anthropic: { data_retention: 'contractual-zero' } };
+    assert.equal(deriveCapabilities(card, { providers }).trust_zone, 1);
+  });
+});
+
+describe('throughput_tps (card N2, injected, measured)', () => {
+  test('sourced straight from injected metrics', () => {
+    const card = { id: 'x', card: {} };
+    assert.equal(deriveCapabilities(card, { metrics: { throughput_tps: 42.5 } }).throughput_tps, 42.5);
+  });
+
+  test('null (never fabricated) when metrics are absent', () => {
+    const card = { id: 'x', card: {} };
+    assert.equal(deriveCapabilities(card, {}).throughput_tps, null);
   });
 });
