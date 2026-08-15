@@ -341,3 +341,38 @@ discovery:
   ## gate and budget behave as expected on a low-stakes node first. A live
   ## sweep makes real calls against every candidate model it selects, up to
   ## probe_budget, once the cadence window is due.
+
+## ── Sovereignty: job sensitivity to model trust zone (card 45d7a30b / N1) ──
+##
+## Two axes, deliberately not conflated:
+##   job sensitivity   public / internal / secret. How bad is it if this
+##                     content leaves our hardware. NOT the Joule size x risk
+##                     grade, which measures blast radius if the work goes
+##                     wrong. A one-line prompt holding a private key is tiny
+##                     blast radius and maximum sensitivity.
+##   model trust zone  0 sovereign local, 1 paid-contractual cloud,
+##                     2 free-remote. Derived from the provider's verified
+##                     data-retention posture (see config/model-cards.overrides
+##                     .yaml `providers:`), not asserted here.
+##
+## This DELIBERATELY INVERTS the cost tier ladder. That ladder prefers
+## free-remote because free is cheaper; it measures COST. On TRUST, free-remote
+## is the worst option we have: verified 2026-08-15, nvidia, openrouter and
+## opencode all train on submitted content, while Anthropic's commercial terms
+## prohibit it. Free is not a discount, it is a different payment method and
+## the payment is the data. Both ladders are right about different questions.
+##
+## Enforcement ships OFF. With it off the gate SHADOW LOGS every decision it
+## would have changed (grep for `sensitivity_gate` / "would block (shadow)"),
+## so a soak shows the blast radius before anything starts returning 503.
+## Turning it on blind risks 503s for real traffic; leaving it off risks a
+## silent sovereignty crossing. Only one of those is reversible in a hurry,
+## which is why the soak comes first.
+##
+## When enforcement is on and no candidate satisfies the ceiling, the request
+## FAILS CLOSED with 503. It never falls back across a zone. A fallback that
+## quietly downgrades sovereignty looks healthy, which is exactly how
+## sk-default ended up serving from cloud after its local backend died.
+# routing:
+#   sensitivity_enforced: false
+
