@@ -22,16 +22,32 @@ import {
   resolveBucket,
   selectMember,
   gradeVocabulary,
+  measuredClassCeiling,
+  effectiveClass,
 } from '../src/policy/buckets.mjs';
 import { TRUST_ZONES } from '../src/policy/sensitivity.mjs';
 
-const entry = (id, { zone, measured, declared } = {}) => ({
+// `declared` is the parameter-size PRIOR (card f942d93b). `failed` names a
+// capability the assessment measured as failing, which CAPS the class. There is
+// deliberately no way to express "measured class = XL": measurement is evidence
+// against a class, never for one. See measuredClassCeiling().
+const entry = (id, { zone, declared, failed } = {}) => ({
   id,
   capabilities: {
     ...(zone !== undefined ? { trust_zone: zone } : {}),
-    ...(measured ? { measured_class: measured } : {}),
     ...(declared ? { size_class: declared } : {}),
   },
+  ...(failed
+    ? {
+        lifecycle: {
+          measured_capabilities: {
+            tool_call: { status: failed === 'tool_call' ? 'fail' : 'pass' },
+            structured_output: { status: failed === 'structured_output' ? 'fail' : 'pass' },
+            instruction_following: { status: 'pass' },
+          },
+        },
+      }
+    : {}),
 });
 
 describe('C9: bucket addressing', () => {
@@ -69,10 +85,10 @@ describe('C9: bucket addressing', () => {
 });
 
 describe('C9: the capability floor is HARD', () => {
-  test('a measured class satisfies its own floor and below', () => {
-    assert.equal(meetsClassFloor(entry('a', { measured: 'XL' }), 'L').ok, true);
-    assert.equal(meetsClassFloor(entry('a', { measured: 'L' }), 'L').ok, true);
-    assert.equal(meetsClassFloor(entry('a', { measured: 'M' }), 'L').ok, false);
+  test('the declared prior satisfies its own floor and below', () => {
+    assert.equal(meetsClassFloor(entry('a', { declared: 'XL' }), 'L').ok, true);
+    assert.equal(meetsClassFloor(entry('a', { declared: 'L' }), 'L').ok, true);
+    assert.equal(meetsClassFloor(entry('a', { declared: 'M' }), 'L').ok, false);
   });
 
   test('a declared parameter size is a PRIOR, and labelled as one', () => {
@@ -82,10 +98,11 @@ describe('C9: the capability floor is HARD', () => {
   });
 
   test('MEASURED beats DECLARED, never the other way round', () => {
-    // A 550B model that measurably cannot do the work must not ride its size.
-    const r = meetsClassFloor(entry('big-but-weak', { declared: 'XL', measured: 'S' }), 'L');
+    // A 550B model that measurably cannot hold a tool call must not ride its
+    // size into an L bucket.
+    const r = meetsClassFloor(entry('big-but-weak', { declared: 'XL', failed: 'tool_call' }), 'L');
     assert.equal(r.ok, false);
-    assert.equal(r.basis, 'measured');
+    assert.match(r.basis, /measured-ceiling/);
   });
 
   test('UNKNOWN capability clears only the S floor', () => {
@@ -102,11 +119,11 @@ describe('C9: the capability floor is HARD', () => {
 
 describe('C9: eligibility composes the floor with the sovereignty ceiling', () => {
   const catalog = [
-    entry('ornith-35b', { zone: TRUST_ZONES.SOVEREIGN_LOCAL, measured: 'L' }),
-    entry('claude-opus', { zone: TRUST_ZONES.PAID_CONTRACTUAL, measured: 'XL' }),
-    entry('big-pickle', { zone: TRUST_ZONES.FREE_REMOTE, measured: 'L' }),
-    entry('tiny-free', { zone: TRUST_ZONES.FREE_REMOTE, measured: 'S' }),
-    entry('mystery', { measured: 'XL' }), // no zone at all
+    entry('ornith-35b', { zone: TRUST_ZONES.SOVEREIGN_LOCAL, declared: 'L' }),
+    entry('claude-opus', { zone: TRUST_ZONES.PAID_CONTRACTUAL, declared: 'XL' }),
+    entry('big-pickle', { zone: TRUST_ZONES.FREE_REMOTE, declared: 'L' }),
+    entry('tiny-free', { zone: TRUST_ZONES.FREE_REMOTE, declared: 'S' }),
+    entry('mystery', { declared: 'XL' }), // no zone at all
   ];
 
   test('a secret bucket admits only sovereign, however capable the rest are', () => {
@@ -172,5 +189,73 @@ describe('C9: rotation spreads load rather than hammering the favourite', () => 
     for (const c of [-1, -7, 1e9, 0.5]) {
       assert.ok(members.includes(selectMember(members, c)));
     }
+  });
+});
+
+// ── the seam between the two halves of C9 ───────────────────────────────────
+//
+// The bucket layer needs a class; the assessment half produces capabilities
+// (tool_call, structured_output, ...). Nothing derived one from the other until
+// this bridge, so without it every model fell back to the declared parameter
+// size and "measured, not declared" would have been aspirational.
+describe('C9: measurement can only LOWER a class, never raise it', () => {
+  const m = (over) => ({
+    tool_call: { status: 'pass' },
+    structured_output: { status: 'pass' },
+    instruction_following: { status: 'pass' },
+    ...over,
+  });
+
+  test('a model that cannot hold a tool call is capped at S regardless of size', () => {
+    // The whole reason declared size is only a prior. A 550B that fails a tool
+    // call is not an XL-capable model, it is a large model that cannot do the
+    // work the bucket promises.
+    const { cap } = measuredClassCeiling(m({ tool_call: { status: 'fail' } }));
+    assert.equal(cap, 'S');
+    assert.equal(effectiveClass('XL', m({ tool_call: { status: 'fail' } })).cls, 'S');
+  });
+
+  test('failing schema or instruction following caps at M', () => {
+    assert.equal(measuredClassCeiling(m({ structured_output: { status: 'fail' } })).cap, 'M');
+    assert.equal(measuredClassCeiling(m({ instruction_following: { status: 'fail' } })).cap, 'M');
+  });
+
+  test('PASSING everything does NOT promote above the declared prior', () => {
+    // Passing a tool-call assertion proves a model can emit a tool call. It
+    // proves nothing about architecture-level reasoning, which is what an XL
+    // floor claims. Measurement is evidence AGAINST, not evidence FOR.
+    const r = effectiveClass('M', m());
+    assert.equal(r.cls, 'M', 'a passing battery must not turn an M model into an XL one');
+    assert.equal(r.basis, 'declared-size-prior');
+  });
+
+  test('UNMEASURED caps nothing, so a throttled model is not demoted', () => {
+    // A 429 during assessment means we learned nothing. Demoting for it would
+    // evict a good model for being popular, undoing the distinction the
+    // assessment half draws between unmeasured and incapable.
+    for (const status of ['unmeasured', undefined]) {
+      const { cap } = measuredClassCeiling(m({ tool_call: { status } }));
+      assert.equal(cap, null, `status=${status} must not cap`);
+    }
+    assert.equal(effectiveClass('XL', m({ tool_call: { status: 'unmeasured' } })).cls, 'XL');
+  });
+
+  test('no measurement at all leaves the prior untouched', () => {
+    assert.equal(effectiveClass('L', null).cls, 'L');
+    assert.equal(effectiveClass(null, null).cls, null);
+  });
+
+  test('end to end: a measured failure removes a model from an L bucket', () => {
+    const big = {
+      id: 'big-but-weak',
+      capabilities: { size_class: 'XL', trust_zone: 0 },
+      lifecycle: { measured_capabilities: m({ tool_call: { status: 'fail' } }) },
+    };
+    const { members, rejected } = resolveBucket({
+      bucket: { model_class: 'L', sensitivity: 'secret' },
+      catalog: [big],
+    });
+    assert.equal(members.length, 0, 'declared XL must not carry a model that failed the measurement');
+    assert.match(rejected[0].reason, /measured-ceiling/);
   });
 });

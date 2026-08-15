@@ -126,6 +126,70 @@ export function allBuckets(vocab = gradeVocabulary()) {
   return out;
 }
 
+
+/**
+ * What the MEASURED capabilities cap a model's class at.
+ *
+ * Card 2ba73bf9 (C9) says membership must rest on what a model demonstrably
+ * does. Card C9's assessment half produces `measured_capabilities` on the
+ * lifecycle record: tool_call, structured_output, instruction_following,
+ * min_output_tokens, each `pass` / `fail` / `unmeasured`.
+ *
+ * MEASUREMENT CAN ONLY LOWER A CLASS, NEVER RAISE IT. This is the honest
+ * constraint and it is easy to get wrong. Passing a tool-call assertion proves
+ * a model can emit a well-formed tool_call; it proves nothing about whether it
+ * can do architecture-level reasoning, which is what an XL floor claims. So a
+ * measured PASS is not evidence for a high class, it is only the absence of
+ * evidence against one. A measured FAIL is strong evidence against, because a
+ * model that cannot hold a tool call cannot do agentic work at any size.
+ *
+ * `unmeasured` caps nothing. A model throttled during assessment (429) or one
+ * we simply have not got to yet must not be demoted for being popular or new.
+ * That is the same distinction the assessment half draws between "unmeasured"
+ * and "incapable", and losing it here would undo it.
+ *
+ * @param {object} measured `measured_capabilities` from the lifecycle record
+ * @returns {{cap: string|null, reason: string|null}} cap is a class letter
+ */
+export function measuredClassCeiling(measured) {
+  if (!measured || typeof measured !== 'object') return { cap: null, reason: null };
+  const status = (k) => measured?.[k]?.status || null;
+
+  // Cannot hold a tool call: no amount of parameters makes this agent-capable.
+  if (status('tool_call') === 'fail') {
+    return { cap: 'S', reason: 'measured tool_call fail' };
+  }
+  // Cannot honor a schema or follow an exact instruction: usable for prose,
+  // not for work that another system has to consume.
+  if (status('structured_output') === 'fail' || status('instruction_following') === 'fail') {
+    return { cap: 'M', reason: 'measured structured_output/instruction_following fail' };
+  }
+  return { cap: null, reason: null };
+}
+
+/**
+ * Fold the declared prior with the measured ceiling into one effective class.
+ *
+ * @param {string|null} declared parameter-size class (card f942d93b), a PRIOR
+ * @param {object} measured measured_capabilities
+ * @returns {{cls: string|null, basis: string}}
+ */
+export function effectiveClass(declared, measured) {
+  const { cap, reason } = measuredClassCeiling(measured);
+  if (!declared) {
+    // No prior. A measured cap still tells us the model is at most `cap`, but
+    // with nothing to fold it into we only know an upper bound, not a value.
+    return cap ? { cls: cap, basis: `measured-ceiling (${reason})` } : { cls: null, basis: 'unknown' };
+  }
+  if (!cap) return { cls: declared, basis: 'declared-size-prior' };
+  const dRank = classRank(declared);
+  const cRank = classRank(cap);
+  if (dRank === null || cRank === null) return { cls: declared, basis: 'declared-size-prior' };
+  return cRank < dRank
+    ? { cls: cap, basis: `measured-ceiling (${reason}) below declared ${declared}` }
+    : { cls: declared, basis: 'declared-size-prior' };
+}
+
 /**
  * Does this model meet the bucket's capability FLOOR?
  *
@@ -150,24 +214,21 @@ export function meetsClassFloor(entry, floorClass) {
   if (need === null) return { ok: false, basis: 'unknown-floor', modelClass: null };
 
   const caps = entry?.capabilities || {};
-  const measured = caps.measured_class || caps.capability_class || null;
-  if (measured) {
-    const have = classRank(measured);
-    return { ok: have !== null && have >= need, basis: 'measured', modelClass: measured };
-  }
 
-  // PRIOR, not proof. size_class here is PARAMETER SIZE (card N2), a different
-  // axis from the work-difficulty class this floor is expressed in. It
-  // correlates well enough to be useful and is explicitly labelled as a prior
+  // PRIOR, not proof. size_class here is PARAMETER SIZE (card f942d93b), a
+  // different axis from the work-difficulty class this floor is expressed in.
+  // It correlates well enough to be useful and is explicitly labelled a prior
   // so nobody later mistakes it for an assessment.
   const declared = caps.size_class || entry?.card?.size_class || null;
-  if (declared) {
-    const have = classRank(declared);
-    return { ok: have !== null && have >= need, basis: 'declared-size-prior', modelClass: declared };
-  }
+  const measured = entry?.lifecycle?.measured_capabilities || entry?.measured_capabilities || null;
 
-  // S is the floor everything clears; anything higher needs actual evidence.
-  return { ok: need === 0, basis: 'unknown', modelClass: null };
+  const { cls, basis } = effectiveClass(declared, measured);
+  if (!cls) {
+    // S is the floor everything clears; anything higher needs actual evidence.
+    return { ok: need === 0, basis: 'unknown', modelClass: null };
+  }
+  const have = classRank(cls);
+  return { ok: have !== null && have >= need, basis, modelClass: cls };
 }
 
 /**
