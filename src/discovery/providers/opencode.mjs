@@ -163,6 +163,23 @@ function buildCard(entry, fetched_at) {
     ...(entry.reasoning ? ['reasoning'] : []),
     ...(entry.structured_output ? ['structured_outputs'] : []),
   ];
+  // reasoning/structured_outputs (card N2): models.dev declares these
+  // directly (`entry.reasoning`, `entry.structured_output`), real
+  // provider-declared facts, not a guess. Surfaced as booleans on the card
+  // (not just folded into supported_parameters) so callers don't have to
+  // re-scan an array for them, matching openrouter.mjs's card N2 shape.
+  const reasoning = entry.reasoning === true;
+  const structured_outputs = entry.structured_output === true;
+  // params_b/active_params_b (card N2): models.dev's `opencode` registry
+  // carries no parameter-count field at all (verified 2026-08-15 against
+  // big-pickle/nemotron-3-ultra-free/nemotron-3.5-lightning-free: no `size`,
+  // `params`, or similar key), and Zen's ids (e.g. "big-pickle",
+  // "nemotron-3-ultra-free") carry no size token either, unlike NVIDIA's own
+  // raw ids. So there is no source to derive from here; left null rather
+  // than cross-referencing a sibling NVIDIA id by name similarity inside
+  // this adapter (that cross-reference, where it is safe to make, lives as
+  // a dated, explicit manual overlay entry in
+  // config/model-cards.overrides.yaml instead, not a silent guess in code).
   const inputMod = Array.isArray(modalities.input) && modalities.input.length
     ? modalities.input.join('+')
     : 'text';
@@ -175,6 +192,11 @@ function buildCard(entry, fetched_at) {
     max_output_tokens: typeof limit.output === 'number' ? limit.output : null,
     modality: outputMod ? `${inputMod}->${outputMod}` : null,
     supported_parameters,
+    reasoning,
+    structured_outputs,
+    params_b: null,
+    active_params_b: null,
+    size_class: null,
     description: typeof entry.description === 'string'
       ? entry.description
       : (typeof entry.name === 'string' ? entry.name : null),

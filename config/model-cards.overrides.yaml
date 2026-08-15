@@ -20,6 +20,59 @@
 # EOL is NOT tracked here: the lifecycle state machine (card P1.1) owns that.
 # Do not resurrect a pruned id. Keep the numbers honest; if you are not sure of
 # a value, leave it out rather than guessing (a null field beats a wrong one).
+#
+# Card N2 (coordination id f942d93b, design doc
+# 2026-08-14-model-metadata-risk-job-matching-arch.md): six more machine
+# fields, same "leave it out rather than guess" rule.
+#   params_b / active_params_b   total / MoE-active parameters in billions.
+#                                 For NVIDIA and OpenRouter ids with a size
+#                                 token, discovery/providers/{nvidia,
+#                                 openrouter}.mjs already derive these
+#                                 heuristically at fetch time (see
+#                                 discovery/model-size.mjs); an override here
+#                                 wins over that guess (applyCardOverlay
+#                                 precedence, discovery.mjs:268). For a static
+#                                 model (Claude, Ornith, the local vision
+#                                 model) there is no heuristic to enrich, so
+#                                 the value below IS the whole fact.
+#   size_class                   S/M/L/XL, the Joule Economy enum VERBATIM
+#                                 (skcapstone docs/superpowers/specs/
+#                                 2026-08-14-joule-economy-design.md 3.1/3.3).
+#                                 Same precedence: overlay wins over the
+#                                 heuristic params_b-based guess.
+#   latency_class                interactive|batch. Overlay-only today (no
+#                                 metrics.db p50 signal is wired into this
+#                                 file; that measured path is card P5.4/A3,
+#                                 not this one). Flag a model batch only on
+#                                 an observed slow measurement, noted inline.
+#   reasoning / structured_outputs   booleans. For a live provider card
+#                                 (OpenRouter, models.dev/OpenCode Zen) these
+#                                 are now read directly off
+#                                 supported_parameters/models.dev's own
+#                                 declaration in the adapter itself (card
+#                                 building, not this file) and this file
+#                                 CANNOT override them: both `source:
+#                                 'openrouter'` and `source: 'models.dev'`
+#                                 are in discovery.mjs's
+#                                 `_FRESH_PROVIDER_SOURCES`, so
+#                                 applyCardOverlay skips those ids entirely
+#                                 (discovery.mjs:266-273). For a static model
+#                                 they are declared below directly.
+#   min_output_tokens            lifted from the registry backend blocks
+#                                 (~/.skcapstone/models/registry.yaml
+#                                 `min_output_tokens:`) that already floor
+#                                 this for reasoning models whose <think>
+#                                 block can otherwise starve content
+#                                 entirely. registry.yaml stays the
+#                                 enforcement point for registry-routed
+#                                 traffic; this is the same fact made
+#                                 readable to the ranker/matcher for
+#                                 `@match`-routed traffic (design 6c).
+#
+# A `providers:` top-level block (sibling of `overrides:`, see the bottom of
+# this file) carries per-PROVIDER data_retention posture, each with a dated
+# verification. Per-model `data_retention` overrides belong on the model's
+# own override entry (design 4.3) and win over the provider default.
 
 overrides:
 
@@ -40,6 +93,15 @@ overrides:
     quant: "n/a (hosted)"
     speed: "medium; premium quality"
     license: proprietary
+    # Card N2: size_class curated (params unknown and irrelevant for a
+    # hosted static, same call the design's own worked example makes for
+    # this exact model, section 4.2). reasoning/structured_outputs already
+    # true in supported_parameters above; declared here too as plain
+    # booleans so a caller doesn't have to re-scan that array.
+    size_class: XL
+    latency_class: interactive
+    reasoning: true
+    structured_outputs: true
     notes: "Pinned to role sk-heavy and the sk-auto hard tier. Costs real money, use the tier ladder to keep it off cheap jobs."
 
   claude-opus-4-7:
@@ -52,6 +114,10 @@ overrides:
     supported_parameters: [tools, tool_choice, structured_outputs, reasoning]
     modality: "text+image->text"
     tier: paid-cloud
+    size_class: XL
+    latency_class: interactive
+    reasoning: true
+    structured_outputs: true
 
   claude-sonnet-4-6:
     display_name: "Claude Sonnet 4.6"
@@ -64,6 +130,15 @@ overrides:
     modality: "text+image->text"
     tier: paid-cloud
     speed: "fast"
+    # Card N2: curated below XL, not because Sonnet is weak, but because
+    # Opus already holds the sk-heavy XL slot and a job matcher choosing
+    # between the two on `min_class` alone should prefer Opus for a
+    # class-XL requirement. A judgment call, not a params-derived number
+    # (Claude discloses no parameter count).
+    size_class: L
+    latency_class: interactive
+    reasoning: true
+    structured_outputs: true
 
   claude-haiku-4-5:
     display_name: "Claude Haiku 4.5"
@@ -76,6 +151,13 @@ overrides:
     modality: "text+image->text"
     tier: paid-cloud
     speed: "very fast"
+    # Card N2: fastest/cheapest Claude, curated M (not the XL/L Opus/Sonnet
+    # get): Haiku's own supported_parameters above never declared
+    # `reasoning`, so that boolean stays false/omitted here too, honest with
+    # the card's own declaration rather than assumed from the family name.
+    size_class: M
+    latency_class: interactive
+    structured_outputs: true
 
   # ──────────────────────── OUR ORNITH FLEET (local, sovereign) ───────────────
   # DeepReinforce Ornith 1.0, self-hosted on our own GPUs. Cloud-free, private.
@@ -96,6 +178,17 @@ overrides:
     tier: local
     speed: "medium (~1-3s warm); NVFP4 aeon variant is the current default"
     license: open-weights
+    # Card N2: size_class L / min_output_tokens 8192 match the spec's own
+    # worked overlay example (design doc 4.2) for this exact model.
+    # min_output_tokens lifted from registry.yaml backends.ornith-big /
+    # backends.ornith (both 8192): the reasoning model spends completion
+    # tokens on <think> before content, so a small client max_tokens returns
+    # empty content with finish_reason=stop (measured, same note as below).
+    params_b: 35
+    size_class: L
+    latency_class: interactive
+    reasoning: true
+    min_output_tokens: 8192
     notes: "Registry role sk-default -> ornith-big -> ornith-1.0-35b-aeon-nvfp4 on chiap08 :11436. Reasoning model: needs max_tokens >= 2048 (8192 floor) or content starves under <think>."
 
   ornith-big:
@@ -108,6 +201,11 @@ overrides:
     supported_parameters: [tools, tool_choice, reasoning]
     modality: "text->text"
     tier: local
+    params_b: 35
+    size_class: L
+    latency_class: interactive
+    reasoning: true
+    min_output_tokens: 8192
 
   ornith-1.0-9b:
     display_name: "Ornith 1.0 9B (ornith-tiny)"
@@ -122,7 +220,60 @@ overrides:
     quant: "NVFP4 + MTP"
     tier: local
     speed: "fast"
+    # Card N2: size_class M / min_output_tokens 8192, again matching the
+    # spec's own worked example (4.2) verbatim for this model.
+    params_b: 9
+    size_class: M
+    latency_class: interactive
+    reasoning: true
+    min_output_tokens: 8192
     notes: "Registry role ornith-tiny. Default reply model for lumina/opus agent contexts."
+
+  # qwen38 = Qwen3.8 27B UD-Q5_K_XL on chiap08 :11439 (registry backend
+  # `qwen38`). No overlay entry existed for this id before card N2 even
+  # though it made sk-default 2026-08-14 and is a reasoning model with the
+  # exact same <think>-starvation trait as the two Ornith models above
+  # (registry.yaml backends.qwen38.min_output_tokens: 8192, measured: 121
+  # completion tokens to answer "say alive"; max_tokens 16 -> empty string).
+  # Two ids because the llama-server serves it name-agnostically and the
+  # registry advertises both (skgateway.yaml backends.chiap08-qwen38.models).
+  qwen3.8-27b-ud-q5_k_xl:
+    display_name: "Qwen3.8 27B UD-Q5_K_XL (chiap08, sk-default)"
+    org: "Qwen (self-hosted)"
+    summary: "Sovereign reasoning + tool-use + vision model on chiap08, the current sk-default target."
+    good_at: [reasoning, coding, tool use, vision, sovereign/private work]
+    context_length: 262144
+    max_output_tokens: 16384
+    supported_parameters: [tools, tool_choice, reasoning]
+    modality: "text+image->text"
+    vision: true
+    params: "27B"
+    quant: "UD-Q5_K_XL"
+    tier: local
+    speed: "medium"
+    params_b: 27
+    size_class: L
+    latency_class: interactive
+    reasoning: true
+    min_output_tokens: 8192
+    notes: "Registry backend qwen38, unit llama-qwen38.service. mmproj-F16.gguf loaded (vision-capable)."
+
+  qwen3.8-27b:
+    display_name: "Qwen3.8 27B (short alias)"
+    org: "Qwen (self-hosted)"
+    summary: "Registry alias for qwen3.8-27b-ud-q5_k_xl, same backend."
+    good_at: [reasoning, coding, tool use, vision, sovereign/private work]
+    context_length: 262144
+    max_output_tokens: 16384
+    supported_parameters: [tools, tool_choice, reasoning]
+    modality: "text+image->text"
+    vision: true
+    tier: local
+    params_b: 27
+    size_class: L
+    latency_class: interactive
+    reasoning: true
+    min_output_tokens: 8192
 
   # ───────────────────────── OUR VISION MODEL (local) ─────────────────────────
   qwen3.6-27b-abliterated:
@@ -136,11 +287,24 @@ overrides:
     params: "27B"
     quant: "Q4_K_M"
     tier: local
+    params_b: 27
+    size_class: L
+    latency_class: interactive
     notes: "Registry roles sk-vision + sk-creative. Abliterated: minimal refusals, used as a text personality brain too."
 
   # ──────────────────── KEY FREE REMOTE MODELS (enriched) ─────────────────────
   # NVIDIA NIM free tier. supported_parameters here is best-effort curation
   # (NIM's /v1/models does not declare it), tag it only where verified.
+  #
+  # Card N2: params_b/active_params_b/size_class are NOT hand-added below for
+  # every entry in this section. discovery/providers/nvidia.mjs already
+  # heuristically parses these off the id string at fetch time (e.g.
+  # "qwen3.5-397b-a17b" -> params_b:397, active_params_b:17, size_class:XL),
+  # source:'heuristic', and that survives the overlay merge unless overridden
+  # here (applyCardOverlay spreads the heuristic card first, discovery.mjs:
+  # 268-281). An explicit override below is only added where it locks in a
+  # value against a future NVIDIA id rename, or flags latency_class for a
+  # model with no id-derivable slowness signal.
   openai/gpt-oss-20b:
     display_name: "GPT-OSS 20B"
     org: OpenAI (open weights, NVIDIA NIM)
@@ -181,11 +345,107 @@ overrides:
   mistralai/mistral-large-3-675b-instruct-2512:
     context_length: 262144
     tier: free-remote
+    # Card N2: locked explicitly (matches the design doc's own 4.2 worked
+    # example verbatim for this exact model), even though the heuristic
+    # already derives the same 675/XL from the id today.
+    params_b: 675
+    size_class: XL
+    latency_class: batch
   deepseek-ai/deepseek-v4-pro:
     context_length: 1048576
     tier: free-remote
+    # Card N2: latency_class locked batch on the measured ~46s note above;
+    # no metrics.db p50 is wired into this file yet (that's card P5.4).
+    latency_class: batch
     notes: "slow (~46s), batch/cron use"
   minimaxai/minimax-m2.7:
     context_length: 204800
     tier: free-remote
+    latency_class: batch
     notes: "slow (~40s), batch/cron use"
+
+# ─────────────────────────────────────────────────────────────────────────
+# providers: per-PROVIDER trust posture (card N2, design doc section 4.3).
+# Sibling of `overrides:` above, not nested under it: this describes WHO
+# serves a model, not any one model's card. Consumed by
+# src/ranking/capabilities.mjs's `deriveTrustZone()` (opts.providers) to
+# fold sovereignty + retention posture into `capabilities.trust_zone`
+# (0 sovereign / 1 contractual paid-cloud / 2 exposed free-remote, design
+# 5.2). This is card N2's plumbing only: nothing here enforces a zone
+# ceiling yet, that hard-filter gate is card N1's job.
+#
+# Every claim below carries `verified:` (the date someone actually read the
+# cited source, not the date this file was committed) and `ref:`. An
+# undated retention claim is worthless in six months, per this card's own
+# acceptance criteria. When a provider's posture could not be verified this
+# session, the honest value is `unknown` with today's date, never a guess.
+#
+# Per-model override: a model's own `override` entry may carry its own
+# `data_retention` key (e.g. a specific paid OpenRouter route with a
+# no-log flag) and that wins over the provider default here
+# (capabilities.mjs's `resolveProviderPosture()` checks the model first).
+# ─────────────────────────────────────────────────────────────────────────
+providers:
+  # Self-hosted: sovereignty is architectural (data never leaves hardware we
+  # own), not a claim against a third party's ToS, so there is nothing to
+  # date-verify. Matched by capabilities.mjs's resolveProviderPosture() for
+  # any backend name containing "ornith"/"qwen38", or named exactly "local"
+  # or "ollama" (all our self-hosted backend keys).
+  local:
+    data_retention: local-only
+
+  # Verified 2026-08-15 against Anthropic's commercial terms
+  # (https://www.anthropic.com/legal/commercial-terms), Section B: "Anthropic
+  # may not train models on Customer Content from Services." Reached via the
+  # :18782 claude-code-api wrapper (first-party subscription usage, backend
+  # key "anthropic") and the api.anthropic.com direct fallback (same
+  # account, backend key "anthropic-direct"; capabilities.mjs resolves that
+  # key onto this same entry). The commercial-terms page does not itself state a
+  # retention WINDOW (it points to a separate DPA for that); the training
+  # prohibition is what N1's zone-1 test actually needs, so that is what is
+  # asserted here.
+  anthropic:
+    data_retention: contractual-zero
+    verified: "2026-08-15"
+    ref: "https://www.anthropic.com/legal/commercial-terms, Section B"
+
+  # Verified 2026-08-15 via https://opencode.ai/docs/zen, which quotes
+  # NVIDIA's own free-tier trial banner verbatim: "Trial use only - do not
+  # submit personal or confidential data. Your use is logged for security
+  # purposes and to improve NVIDIA products and services." That is a
+  # training claim from NVIDIA's own UI text, not this session's inference.
+  # Applies to the NVIDIA NIM free tier (backend key "nvidia") and to the
+  # NVIDIA-origin free models routed through OpenCode Zen (nemotron-*-free),
+  # which carry the identical restriction per the same page.
+  nvidia:
+    data_retention: trains
+    verified: "2026-08-15"
+    ref: "https://opencode.ai/docs/zen (quoting NVIDIA's NIM free-tier trial banner)"
+
+  # Checked 2026-08-15: OpenRouter's own privacy/logging docs
+  # (https://openrouter.ai/docs/features/privacy-and-logging) explicitly
+  # decline to state OpenRouter's own retention/training policy for prompts
+  # ("This setting has no bearing on OpenRouter's own policies and what we
+  # do with your prompts.") and instead point at each ROUTED provider's own
+  # policy, which varies per model and changes as OpenRouter adds/drops
+  # upstream providers. Recorded `trains` as the fail-safe assumption for
+  # the free tier specifically (unauthenticated, zero-cost inference is the
+  # least-verifiable arrangement available), not because every routed
+  # provider was individually confirmed to train.
+  openrouter:
+    data_retention: trains
+    verified: "2026-08-15"
+    ref: "https://openrouter.ai/docs/features/privacy-and-logging (policy varies per routed provider; free tier assumed worst-case)"
+
+  # Verified 2026-08-15 via https://opencode.ai/docs/zen: for the free-tier
+  # models during their trial period (Big Pickle, DeepSeek V4 Flash Free,
+  # MiMo-V2.5 Free, Hy3 Free, Laguna S 2.1 Free), "collected data may be
+  # used to improve the model," and the NVIDIA-origin free models on the
+  # same page carry NVIDIA's own logging/training language too (see the
+  # `nvidia` entry above). Zen's paid models are zero-retention per the same
+  # page; this entry is scoped to what card N2 actually routes today
+  # (`discovery: free` in skgateway.yaml, opencode backend), the free tier.
+  opencode:
+    data_retention: trains
+    verified: "2026-08-15"
+    ref: "https://opencode.ai/docs/zen (free-tier models: 'collected data may be used to improve the model')"
