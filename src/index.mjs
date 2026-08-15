@@ -15,7 +15,7 @@ import { createProxyServer, handleRequest, buildConfig } from "./proxy/core.mjs"
 import { createRouter, routeAndSend } from "./proxy/router.mjs";
 import { buildModelCatalog, reconcileModeFromConfig, tagLocalModels, mergeDiscoveredCatalog, isModelAvailable } from "./proxy/advertise.mjs";
 import { loadAllowlist, saveAllowlist, applyAllowlist } from "./advertise.mjs";
-import { discoverCatalog, loadCache, saveCache, fetchNvidia, fetchOpenRouter, catalogStatus, loadCardOverrides, applyCardOverlays } from "./discovery.mjs";
+import { discoverCatalog, loadCache, saveCache, fetchNvidia, fetchOpenRouter, fetchOpencode, catalogStatus, loadCardOverrides, applyCardOverlays } from "./discovery.mjs";
 import { getPool, resetPool } from "./proxy/connection-pool.mjs";
 import { loadAgentRegistry, extractIdentity, ANONYMOUS_AGENT_ID } from "./identity/capauth.mjs";
 import { createAuthzClient } from "./policy/authz_decide.mjs";
@@ -355,11 +355,30 @@ export async function refreshCatalog(cfg, discoverCatalogFn = discoverCatalog) {
   const d = cfg.discovery || {};
   const nvEnabled = d.providers?.nvidia?.enabled !== false;
   const orEnabled = d.providers?.openrouter?.enabled !== false;
+  // OpenCode Zen (card C8) is the one provider that defaults OFF rather than
+  // ON: nvidia and openrouter use `!== false` because they are long-standing
+  // and an operator who never mentions them still expects them. A brand-new
+  // provider must not start making network calls to a third party the moment
+  // this code lands, so it needs `=== true`.
+  //
+  // But OFF must mean DISABLED, never UNREACHABLE. The knob is read here, at
+  // the only production call site, so setting
+  // `discovery.providers.opencode.enabled: true` genuinely turns it on. Card
+  // C3 was exactly this bug in the other direction: probe.mjs was fully built
+  // and `discoverCatalog` supported it, but refreshCatalog never passed the
+  // option through, so `discovery.probe_seconds` was config that did nothing
+  // and an operator reading the file would reasonably believe otherwise.
+  // Built-but-unreachable is the failure mode this fleet keeps rediscovering,
+  // so the wiring lands with the feature even when the feature ships off.
+  const ocEnabled = d.providers?.opencode?.enabled === true;
   const nvidiaKey = process.env[cfg.backends?.nvidia?.api_key_env || "NVIDIA_API_KEY"];
   const { models } = await discoverCatalogFn({
     localModels: localModels(cfg),
     nvidiaFetch: nvEnabled ? () => fetchNvidia(nvidiaKey) : async () => ({ data: [] }),
     openrouterFetch: orEnabled ? () => fetchOpenRouter() : async () => ({ data: [] }),
+    opencodeFetch: ocEnabled
+      ? () => fetchOpencode(process.env[cfg.backends?.opencode?.api_key_env || "OPENCODE_API_KEY"])
+      : async () => ({ zen: { data: [] }, modelsDev: null }),
     cache: _discoveryCache,
     probeSeconds: d.probe_seconds || 0,
     probeBudget: d.probe_budget,

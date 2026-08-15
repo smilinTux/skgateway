@@ -121,6 +121,72 @@ describe("card C3: refreshCatalog wires discovery.probe_* into discoverCatalog",
     assert.equal(captured.probeTimeoutMs, 12000, "discovery.probe_timeout_ms must reach discoverCatalog as probeTimeoutMs");
   });
 
+  // ── Card C8: the same class of bug, caught before it could ship ──
+  //
+  // OpenCode Zen shipped with a complete adapter and full discoverCatalog
+  // support, but refreshCatalog did not forward `opencodeFetch`, so
+  // `discovery.providers.opencode.enabled: true` would have been config that
+  // did nothing. That is precisely the C3 failure above, and the reason these
+  // assertions live in the same file: the bug is the WIRING, not the feature.
+  //
+  // Note the asymmetry with nvidia/openrouter, which is deliberate. Those are
+  // opt-OUT (`!== false`) because they predate this and an operator who never
+  // mentions them still expects them. A brand-new third-party provider is
+  // opt-IN (`=== true`) so landing the code makes no network calls on its own.
+  // Off by default, but REACHABLE.
+
+  test("discovery.providers.opencode.enabled true makes a real opencode fetch reach discoverCatalog", async () => {
+    let captured = null;
+    const spy = async (opts) => { captured = opts; return { models: [] }; };
+    const cfg = {
+      backends: { opencode: { api_key_env: "OPENCODE_API_KEY" } },
+      discovery: { enabled: true, providers: { opencode: { enabled: true } } },
+    };
+    await mod.refreshCatalog(cfg, spy);
+    assert.ok(captured, "discoverCatalogFn must have been called");
+    assert.equal(typeof captured.opencodeFetch, "function", "opencodeFetch must be forwarded");
+    // Prove it is the REAL fetch path, not the empty stub: the stub resolves
+    // immediately to an empty shape, whereas the enabled path calls out. We
+    // assert on identity of behavior rather than making a network call by
+    // checking that the disabled case below produces a different result.
+  });
+
+  test("opencode stays OFF when the config does not opt in, and OFF means an empty stub not a live call", async () => {
+    for (const discovery of [
+      { enabled: true, providers: {} },
+      { enabled: true, providers: { opencode: {} } },
+      { enabled: true, providers: { opencode: { enabled: false } } },
+    ]) {
+      let captured = null;
+      const spy = async (opts) => { captured = opts; return { models: [] }; };
+      await mod.refreshCatalog({ backends: {}, discovery }, spy);
+      assert.equal(typeof captured.opencodeFetch, "function");
+      const res = await captured.opencodeFetch();
+      assert.deepEqual(
+        res,
+        { zen: { data: [] }, modelsDev: null },
+        "a disabled provider must resolve to the empty stub, never touch the network",
+      );
+    }
+  });
+
+  test("NEGATIVE CONTROL: an enabled opencode does NOT resolve to the empty stub", async () => {
+    // If someone reverts the wiring, refreshCatalog will either omit
+    // opencodeFetch entirely or hand back the stub, and this fails.
+    let captured = null;
+    const spy = async (opts) => { captured = opts; return { models: [] }; };
+    await mod.refreshCatalog(
+      { backends: {}, discovery: { enabled: true, providers: { opencode: { enabled: true } } } },
+      spy,
+    );
+    assert.equal(typeof captured.opencodeFetch, "function", "wiring reverted: opencodeFetch missing");
+    assert.notEqual(
+      captured.opencodeFetch.toString(),
+      (async () => ({ zen: { data: [] }, modelsDev: null })).toString(),
+      "wiring reverted: enabled opencode still resolves to the disabled stub",
+    );
+  });
+
   test("a config with no discovery.probe_seconds key still resolves to probeSeconds 0 (sweep stays off by default)", async () => {
     let captured = null;
     const spy = async (opts) => {
