@@ -308,11 +308,13 @@ export async function fetchOpenRouter() {
   return openrouterAdapter.fetch();
 }
 
-// Card C8: kept as a named export for the same reason as fetchNvidia/
-// fetchOpenRouter above, for whenever src/index.mjs's refreshCatalog() is
-// wired to pass an opencodeFetch opt through (deliberately NOT done in this
-// card: see discoverCatalog()'s opencodeFetch default below and the doc
-// comment on that opt for why).
+// Card C8: named export like fetchNvidia/fetchOpenRouter above.
+// refreshCatalog() in src/index.mjs DOES pass this through, gated on
+// `discovery.providers.opencode.enabled === true` (opt-in, unlike the two
+// long-standing providers which are opt-out). Off by default, but reachable:
+// setting that config key genuinely enables the provider. Card C3 was the
+// cautionary case, where a fully-built feature was unreachable because the
+// only production call site never forwarded its option.
 export async function fetchOpencode(apiKey) {
   return opencodeAdapter.fetch(apiKey);
 }
