@@ -14,6 +14,15 @@
  */
 export function marginalJoules(before, after) {
   if (!before || !after) return null;
+  // A meter that has never observed a sample has no power source on that node.
+  // It reports metering "unavailable" and omits counter_j precisely so this
+  // cannot be read as a measured zero. Treat it as unknowable, not as free.
+  // Found by deploying skmeter to a node with no GPU: the old payload sent
+  // counter_j 0.0, the delta came out 0, and real work was recorded as
+  // joules 0 with basis measured_gpu.
+  if (before.metering === "unavailable" || after.metering === "unavailable") {
+    return null;
+  }
   const a = Number(before.counter_j);
   const b = Number(after.counter_j);
   if (!Number.isFinite(a) || !Number.isFinite(b)) return null;

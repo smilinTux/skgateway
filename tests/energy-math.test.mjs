@@ -212,3 +212,25 @@ test('energyHeaders: unknown joules omits the header rather than sending an empt
   assert.equal('x-sk-energy-node' in h, false);
   assert.equal(h['x-sk-energy-basis'], 'imputed_local', 'the basis still explains the gap');
 });
+
+// Regression: found by deploying skmeter to a node with no GPU. The payload
+// carried counter_j 0.0, the gateway computed a delta of 0, and real work was
+// recorded as joules 0 with basis measured_gpu.
+test("marginalJoules: a meter with no power source is unknowable, not zero", () => {
+  const dead = { samples_n: 0, metering: "unavailable", node: "n1" };
+  assert.equal(marginalJoules(dead, dead), null);
+});
+
+test("marginalJoules: an omitted counter_j is null even without the flag", () => {
+  // Defence in depth for an older meter build that omits counter_j silently.
+  const dead = { samples_n: 0, node: "n1" };
+  assert.equal(marginalJoules(dead, dead), null);
+});
+
+test("marginalJoules: a genuine measured zero from an ACTIVE meter stays zero", () => {
+  // The GPU was sampled and truly did nothing because a cloud backend served
+  // the request. That is a real measurement and must not collapse to null.
+  const a = { counter_j: 700, samples_n: 512, metering: "active" };
+  const b = { counter_j: 700, samples_n: 530, metering: "active" };
+  assert.equal(marginalJoules(a, b), 0);
+});
