@@ -27,7 +27,7 @@ import { getPool } from "./connection-pool.mjs";
 import { isRegistryRouted, resolve as resolveRegistry, getAutoConfig, getConfigEpoch, loadRegistry } from "./registry.mjs";
 import { getFailoverConfig, isLocalUrl, probeLocalHealth, recordLocalOutcome } from "./local-failover.mjs";
 import { readMeter } from "./meter-client.mjs";
-import { marginalJoules, imputeJoules, resolveBasis, coeffsForModel, usageFromSSE, resolveMeterUrl } from "../metrics/energy.mjs";
+import { marginalJoules, imputeJoules, resolveBasis, coeffsForModel, backendIsLocal, usageFromSSE, resolveMeterUrl } from "../metrics/energy.mjs";
 import { recordModelOutcome, getLifecycle } from "../discovery/model_catalog_store.mjs";
 import { isRoutable } from "../discovery/lifecycle.mjs";
 import { applyReasoningFloor } from "./core.mjs";
@@ -2302,7 +2302,10 @@ export async function routeAndSend(router, request, upstreamPath, method, client
 
       const measured = marginalJoules(meterBefore, meterAfter);
       let joules = measured;
-      const basis = resolveBasis({ metered: measured !== null, backendIsLocal: isLocalUrl(backendUrl) });
+      const basis = resolveBasis({
+        metered: measured !== null,
+        backendIsLocal: backendIsLocal(backendId, backendUrl, energyCfg?.locality, isLocalUrl),
+      });
       if (measured === null) {
         // extractUsage() JSON.parses the body and returns {} for a streamed
         // (SSE) body, so tokens_out is always absent there. Fall back to the
