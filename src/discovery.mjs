@@ -56,6 +56,7 @@ import {
 } from './discovery/model_catalog_store.mjs';
 import * as nvidiaAdapter from './discovery/providers/nvidia.mjs';
 import * as openrouterAdapter from './discovery/providers/openrouter.mjs';
+import * as opencodeAdapter from './discovery/providers/opencode.mjs';
 import {
   probeModels,
   DEFAULT_PROBE_BUDGET,
@@ -255,7 +256,14 @@ export function loadCardOverrides(path = CARD_OVERRIDES_PATH) {
  * @param {Record<string, object>} overrides id -> override fields
  * @returns {object} `model`, overlaid when applicable
  */
-const _FRESH_PROVIDER_SOURCES = new Set(["openrouter"]);
+// Card C8: 'models.dev' added alongside 'openrouter'. opencode.mjs's card is
+// a live provider-declared card (models.dev's opencode registry), not a
+// heuristic guess, so it deserves the same protection from the manual
+// overlay that openrouter's card gets. The null-card fallback path (a
+// models.dev outage, see opencode.mjs's normalize()) sets `card: null`, so
+// `src` below is undefined for that entry and it stays eligible for overlay
+// enrichment, same as NVIDIA's heuristic cards.
+const _FRESH_PROVIDER_SOURCES = new Set(["openrouter", "models.dev"]);
 
 export function applyCardOverlay(model, overrides) {
   const override = overrides && overrides[model.id];
@@ -278,9 +286,9 @@ export function applyCardOverlays(models, overrides) {
   return models.map((m) => applyCardOverlay(m, overrides));
 }
 
-export function mergeCatalog(local, nvidia, openrouter) {
+export function mergeCatalog(local, nvidia, openrouter, opencode) {
   const seen = new Map();
-  for (const group of [local || [], nvidia || [], openrouter || []]) {
+  for (const group of [local || [], nvidia || [], openrouter || [], opencode || []]) {
     for (const m of group) {
       if (!seen.has(m.id)) seen.set(m.id, m);
     }
@@ -298,6 +306,17 @@ export async function fetchNvidia(apiKey) {
 
 export async function fetchOpenRouter() {
   return openrouterAdapter.fetch();
+}
+
+// Card C8: named export like fetchNvidia/fetchOpenRouter above.
+// refreshCatalog() in src/index.mjs DOES pass this through, gated on
+// `discovery.providers.opencode.enabled === true` (opt-in, unlike the two
+// long-standing providers which are opt-out). Off by default, but reachable:
+// setting that config key genuinely enables the provider. Card C3 was the
+// cautionary case, where a fully-built feature was unreachable because the
+// only production call site never forwarded its option.
+export async function fetchOpencode(apiKey) {
+  return opencodeAdapter.fetch(apiKey);
 }
 
 /**
@@ -369,6 +388,24 @@ export async function discoverCatalog(opts) {
     localModels = [],
     nvidiaFetch,
     openrouterFetch,
+    // Card C8: unlike nvidiaFetch/openrouterFetch above (no default; every
+    // production call site is required to supply a real one, and every test
+    // is required to supply a mock), opencodeFetch DOES default, to a stub
+    // that resolves successfully with zero models. Two reasons:
+    //   1. src/index.mjs's refreshCatalog() is NOT wired to pass an
+    //      opencodeFetch opt yet (deliberate: this card's scope is the
+    //      adapter + this module + config/skgateway.yaml.example, not the
+    //      production call site, and the live config must NOT enable this
+    //      provider yet per the card - see acceptance criteria). Production
+    //      therefore always hits this default today, and it must behave as
+    //      "not configured" (an empty, successful cycle), not as "outage"
+    //      (which would set `stale: true` on every single discovery cycle
+    //      the moment this branch ships, for a provider nobody turned on).
+    //   2. Every existing test in this suite that calls discoverCatalog()
+    //      predates this provider and does not pass opencodeFetch. Making it
+    //      required like nvidiaFetch/openrouterFetch would flip `stale` to
+    //      true on all of them.
+    opencodeFetch = async () => ({ zen: { data: [] }, modelsDev: null }),
     cache = {},
     now = Date.now,
     // Card P1.3: where the shared model lifecycle store (model_catalog_store.mjs)
@@ -419,8 +456,10 @@ export async function discoverCatalog(opts) {
   let stale = false;
   let nvidia = [];
   let openrouter = [];
+  let opencode = [];
   let nvidiaOk = false;
   let openrouterOk = false;
+  let opencodeOk = false;
   try {
     // Card P2.1: normalize() (not the legacy parseNvidia()) so the merged
     // catalog carries the full ModelCard, not just the id.
@@ -443,6 +482,20 @@ export async function discoverCatalog(opts) {
     stale = true;
     openrouter = (cache.models || []).filter((m) => m.provider === 'openrouter');
     recordProvider(cache, 'openrouter', { ok: false, count: openrouter.length, at, error: String(e?.message || e) });
+  }
+  try {
+    // Card C8: opencodeAdapter.fetch() throws only on a Zen failure (a real
+    // provider outage); a models.dev-only failure is swallowed inside the
+    // adapter and surfaces here as a successful fetch with `modelsDev: null`,
+    // which normalize() turns into null-card entries rather than an empty
+    // list (see opencode.mjs's doc comments for both fetch() and normalize()).
+    opencode = opencodeAdapter.normalize(await opencodeFetch(), { now: () => at });
+    opencodeOk = true;
+    recordProvider(cache, 'opencode', { ok: true, count: opencode.length, at });
+  } catch (e) {
+    stale = true;
+    opencode = (cache.models || []).filter((m) => m.provider === 'opencode');
+    recordProvider(cache, 'opencode', { ok: false, count: opencode.length, at, error: String(e?.message || e) });
   }
 
   // Catalog-absence tracking (card P1.3): only a REAL live fetch is evidence
@@ -475,7 +528,17 @@ export async function discoverCatalog(opts) {
         );
         updated = { ...updated, ...reconciled };
       }
-      if (nvidiaOk || openrouterOk) saveLifecycleStore(updated, lifecycleStorePath);
+      if (opencodeOk) {
+        const reconciled = reconcilePresence(
+          sliceByProvider(fullStore, 'opencode', declaredModels?.opencode ?? declaredModelsFor('opencode')),
+          opencode.map((m) => m.id),
+          'opencode',
+          at,
+          thresholds,
+        );
+        updated = { ...updated, ...reconciled };
+      }
+      if (nvidiaOk || openrouterOk || opencodeOk) saveLifecycleStore(updated, lifecycleStorePath);
     } catch {
       // fail-soft, see doc comment above.
     }
@@ -515,7 +578,7 @@ export async function discoverCatalog(opts) {
   }
 
   const overrides = cardOverrides || loadCardOverrides(cardOverridesPath);
-  const models = applyCardOverlays(mergeCatalog(localModels, nvidia, openrouter), overrides).map((m) => ({ ...m, stale }));
+  const models = applyCardOverlays(mergeCatalog(localModels, nvidia, openrouter, opencode), overrides).map((m) => ({ ...m, stale }));
   cache.models = models;
   // Freshness observability: record when this discovery cycle completed. The
   // cycle is fail-soft (a throwing provider falls back to cache above and only

@@ -67,6 +67,59 @@ backends:
       # Prune to models your NVIDIA account can actually serve.
     priority: 1
 
+  ## OpenCode Zen (hosted, card C8 / 6cc8aac3). Serves both paid frontier
+  ## models AND a rotating free tier (big-pickle, the *-free ids). Follows the
+  ## openrouter pattern below, NOT the nvidia one above: `discovery: "free"`
+  ## with NO static `models:` list here. A static list is exactly what rotted
+  ## on nvidia and produced dead advertised ids (parent card 767adc4e):
+  ## models.dev's opencode registry shows 27 zero-cost models and only 7 of
+  ## them are actually live on Zen right now (measured 2026-08-15), a 74
+  ## percent turnover that would stale a hand-maintained list within days.
+  ##
+  ## Two upstream sources feed the discovered catalog for this backend, not
+  ## one: Zen's own /v1/models says WHICH ids are being served right now, but
+  ## carries no pricing or capability data ({id, object, created, owned_by}
+  ## only). models.dev's `opencode` registry key supplies the model card
+  ## (cost, context/output limits, tool_call, reasoning) and is the ONLY
+  ## source used to decide "free": `cost.input == 0 && cost.output == 0`,
+  ## never an id suffix. big-pickle is free with no `-free` suffix; it is the
+  ## reason this backend exists. Six of the other seven currently-live free
+  ## ids do end in `-free`, which is exactly why a suffix rule would have
+  ## looked right in testing and then silently dropped big-pickle in
+  ## production. See src/discovery/providers/opencode.mjs for the join.
+  ##
+  ## auth_type api_key is OPTIONAL here in practice: measured 2026-08-15, both
+  ## GET /v1/models and POST /v1/chat/completions return 200 with zero auth
+  ## headers. OPENCODE_API_KEY (documented by the provider) is still wired as
+  ## an optional bearer, because unauthenticated access is exactly the kind of
+  ## thing that gets rate limited without notice; a live 429
+  ## (FreeUsageLimitError) was in fact observed against the free tier during
+  ## the measurement session for this card. A 401/429 degrades cleanly
+  ## (treated as a normal fetch/attempt failure) and never poisons the model
+  ## lifecycle store.
+  ##
+  ## TRUST ZONE (card N1): tagged zone 2 / free-remote on every discovered
+  ## card (see opencode.mjs's buildCard()). Unauthenticated free inference to
+  ## a third party is the least private option this gateway has: the data
+  ## itself is the payment, and we are not even identified to the provider.
+  ## Never route `require: {sensitivity: secret}` traffic here.
+  ##
+  ## GATED, DO NOT ENABLE YET. This backend is not wired into production
+  ## discovery in this change (src/index.mjs's refreshCatalog does not yet
+  ## pass an opencodeFetch opt through), and per card C8's acceptance
+  ## criteria it must not be enabled at all until cards C1 (7330bb05), C2
+  ## (affa0aac) and C3 (1f65cf45) are confirmed landed AND OpenRouter's free
+  ## tier is confirmed recovered on THIS host (openrouter's advertised count
+  ## > 0, not stuck at the all-eol state those cards fixed). That is a
+  ## deliberate, separate operational decision, not a code gap to work
+  ## around here.
+  # opencode:
+  #   url: https://opencode.ai/zen/v1
+  #   auth_type: api_key
+  #   api_key_env: OPENCODE_API_KEY            # env var name only, NOT the key; optional bearer
+  #   discovery: free                          # free | all -- no static `models:` list, see above
+  #   max_concurrent: 10
+
   ## Claude models via the LOCAL claude-code-api wrapper (claude --print on
   ## 127.0.0.1:18782). auth_type none: the wrapper IS Claude Code and bills as
   ## first-party subscription. Do NOT point this at api.anthropic.com.
@@ -247,6 +300,13 @@ discovery:
   providers:
     nvidia:     { enabled: true, free_only: true, chat_only: true }
     openrouter: { enabled: true, free_only: true, chat_only: true }
+    ## opencode: { enabled: true, free_only: true, chat_only: true }
+    ## Commented out on purpose (card C8 / 6cc8aac3). NOT wired into
+    ## production discovery yet in this change (refreshCatalog in
+    ## src/index.mjs doesn't pass an opencodeFetch opt through), and must not
+    ## be enabled at all until C1/C2/C3 have landed AND OpenRouter's free
+    ## tier is confirmed recovered on this host. See the `backends.opencode`
+    ## comment block above for the full reasoning.
 
   ## EOL probe sweep (card P2.3, design doc 2026-08-08 §5.2). A budgeted,
   ## off-request-path warm probe against candidate models (chosen from the

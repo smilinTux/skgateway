@@ -31,7 +31,22 @@ export const THRESHOLDS = {
   eolErrorThreshold: 3,
   // consecutive absent-from-catalog cycles before active -> suspect, per
   // provider (openrouter's free tier churns daily, so it gets more slack).
-  absentSuspectThreshold: { default: 1, openrouter: 2 },
+  // Card C8: opencode gets the same slack as openrouter, not more. Measured
+  // 2026-08-15, 20 of 27 zero-cost models in models.dev's opencode registry
+  // have already rotated out of Zen's live /v1/models (74 percent), which
+  // sounds like it argues for a HIGHER threshold than openrouter's 2. It does
+  // not: that 74 percent is registry-level attrition observed over an
+  // unknown, possibly weeks-long window, not a measurement of how often a
+  // given hourly discovery cycle sees a currently-live id blip out and back.
+  // No such cycle-to-cycle flakiness was observed or claimed. Overriding on
+  // an unmeasured guess would be the same mistake this epic exists to fix
+  // (a hand-tuned number nobody re-derives). `default: 1` is right for a
+  // stable catalog; opencode is not stable, so it inherits openrouter's
+  // already-justified "churny free tier" value instead of the 1-cycle
+  // default. If real operation shows single-cycle disappear/reappear
+  // flapping specific to opencode, raise this with a measured number, the
+  // same way openrouter's 2 was arrived at.
+  absentSuspectThreshold: { default: 1, openrouter: 2, opencode: 2 },
   // consecutive absent-from-catalog cycles (total, not reset on the
   // active->suspect flip) before suspect -> eol.
   absentEolThreshold: 3,
