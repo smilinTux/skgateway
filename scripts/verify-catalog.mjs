@@ -174,7 +174,22 @@ export async function probeModel({ endpoint, id, maxTokens = DEFAULT_MAX_TOKENS,
     const resp = await fetchImpl(`${base}/v1/chat/completions`, {
       method: "POST",
       signal: ac.signal,
-      headers: { "content-type": "application/json", authorization: "Bearer sk-local" },
+      // NO authorization header, deliberately.
+      //
+      // The gateway merges a backend's own auth ON TOP of a copy of the
+      // client's headers (router.mjs:2056), and buildAuthHeaders() returns an
+      // empty object when a backend declares api_key auth but has no resolvable
+      // key. So a client bearer SURVIVES that merge and is relayed upstream.
+      // Sending a placeholder here made all 7 OpenCode Zen models report
+      // http_401: opencode.ai rejected our dummy token and this job reported
+      // seven healthy models as dead. A verification job that cries wolf is
+      // worse than no verification job.
+      //
+      // This probe is loopback-to-loopback against our own gateway, which does
+      // not require caller auth on /v1/chat/completions, so no header is
+      // needed. If that ever changes, send a REAL token, never a placeholder.
+      // The underlying header-relay issue is tracked as card 6e61f798 (C15).
+      headers: { "content-type": "application/json" },
       body: JSON.stringify({
         model: id,
         messages: [{ role: "user", content: PROBE_PROMPT }],
