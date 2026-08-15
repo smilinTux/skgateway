@@ -7,6 +7,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-15
+
+### Fixed
+
+- **The advertised catalog was INVERTED, not merely stale** (card `767adc4e`). 83 models
+  live in a provider's catalog were marked `eol` and hidden, while 7 the provider had
+  retired were marked `active` and advertised; 6 of 16 advertised ids returned 410 Gone.
+  OpenRouter was a total blackout: 21 of 21 records `eol` with zero advertised, while the
+  provider healthily returned 16 models every hour. Two independent causes.
+- **`sliceByProvider` was blind to config-declared models.** Presence reconciliation was
+  scoped to store entries already carrying a `provider` tag, and completion-path records
+  never get one. A model declared in `backends.<provider>.models` but absent from every
+  live fetch could not accumulate `absent_cycles`, so it was structurally immune to the
+  mechanism built to retire it. Its only death path was three consecutive real-caller
+  410s, which bills a user a failed request per increment.
+- **The test suite wrote to the production lifecycle store.** Records were found stamped
+  with injected test clocks (`eol_at` 1000/4000/10000) and synthetic fixture ids. One
+  model's `absent_cycles` moved 24 to 36 to 60 in a single session purely because the
+  suite ran. Fixed in two layers: `tests/_setup.mjs` preloaded via `node --test --import`
+  redirects the path before any module loads, and a guard throws if anything still
+  reaches the live path.
+- **An `eol` record with no prior verification could never recover.** Catalog presence
+  now promotes such a record to `suspect` (routable and flagged), gated on
+  `eol_reason: dropped_from_catalog`, since the provider listing it again contradicts why
+  it was retired. A `probe_failed` record is not overturned by mere membership.
+- **The eol gate gave a dead model up to an hour of live routing**, because it was only
+  consulted when no backend claimed the id and `Backend.models` is an hourly snapshot.
+- **Unrecognized `require` keys failed OPEN**, silently admitting every candidate. A
+  `require: {sensitivity: secret}` would have been a placebo.
+- **The probe sweep was unreachable, not merely disabled.** `refreshCatalog` never
+  forwarded its options, so setting `discovery.probe_seconds` did nothing.
+- **Promotion needed only one lucky 2xx** while demotion needed three consecutive
+  failures, so a model succeeding one request in four parked permanently in `active`.
+- **The non-chat filter was an id-regex denylist that failed open**, in three hand-synced
+  copies. A document parser, a video detector and two music models were advertised as
+  chat models.
+- **A caller's `authorization` header was forwarded to third-party providers** whenever a
+  backend's `api_key_env` was unset. Reproduced live: a request with a bearer came back
+  with OpenCode's own `AuthError`, proving the relay. Client credential headers are now
+  stripped before backend auth is merged, and internal control headers no longer leak our
+  topology upstream.
+- **A 429 counted as success**, so the router never failed over from a throttled free
+  model. 429 and 402 are now failover-worthy with model-granular cooldowns; 403 stays
+  terminal.
+- **A discovery provider could be advertised but unroutable.** `providerBackend` hardcoded
+  two names, so enabling a third provider put 7 models on `/v1/models` that all 404'd.
+
+### Added
+
+- **OpenCode Zen as a free-model provider**, including `big-pickle` and a 1M-context
+  `nemotron-3-ultra-free`. Liveness comes from Zen, the model card from models.dev, and
+  free is decided by cost rather than an id suffix (big-pickle is free and has no `-free`
+  suffix).
+- **Bucket pools** (`sk-<model_class>-<sensitivity>`): address the work, not a model. A
+  bucket cannot rot; only its membership changes. Fails closed with a 503 listing what was
+  excluded and why, and rotates across members rather than hammering the favourite.
+- **Trust-zone sovereignty gating.** Job sensitivity (public/internal/secret) maps to a
+  model trust-zone ceiling (0 sovereign, 1 paid-contractual, 2 free-remote), enforced in
+  the ranker AND in the failover path. Deliberately inverts the cost ladder: verified from
+  provider terms, nvidia, openrouter and opencode all train on submitted content. Ships
+  OFF behind `routing.sensitivity_enforced`, shadow-logging first.
+- **Capability assessment**: measure tool calling, structured output, instruction
+  following and the minimum `max_tokens` at which a reasoning model returns content.
+  Measurement can only LOWER a class, never raise it.
+- **`not_chat` as a third lifecycle disposition**, set only by the probe sweep. 400 and
+  500 remain excluded from the eol path.
+- **Model metadata**: `params_b`/`active_params_b` (MoE-aware), `size_class`,
+  `latency_class`, `min_output_tokens`, plus dated per-provider data-retention postures.
+- **Host namespacing** (`chiap08::qwen3.8-27b`), additive, with the single-slash form
+  resolved by lookup rather than by syntax.
+- **A daily catalog verification job** with per-provider liveness, provider representation
+  (the check that would have caught the OpenRouter blackout), count divergence, and
+  failover redundancy alarming below 2 live entries.
+- **A reproducible lifecycle-store repair script.**
+
+### Notes
+
+- `discovery.probe_seconds` remains unset, so the probe sweep is wired but not running.
+  Enabling it is a deliberate operator decision: the first sweep makes real calls against
+  roughly 100 models and that quota is shared with live traffic.
+- Bucket pools, trust-zone enforcement and capability assessment all ship OFF.
+
+
 ### Documentation
 
 - **SOP: the `0.0.0.0` bind is now stated as a DEVIATION, not as compliance.** §2's
