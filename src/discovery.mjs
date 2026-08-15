@@ -12,15 +12,14 @@
 // why: importing them from here would make discovery.mjs and the adapters it
 // imports circularly dependent).
 
-const NON_CHAT = [
-  /embed/i, /\bbge\b/i, /rerank/i, /content-safety/i, /guard/i,
-  /\bfuyu\b/i, /\bocr\b/i, /vision-embed/i, /moderation/i,
-];
+// Card C13: the single source of truth is discovery/classify.mjs. This export
+// is kept because tests/discovery.test.mjs asserts its exact id-only behavior,
+// and because parseNvidia/parseOpenRouterFree below are the pre-adapter
+// functions whose output shape those tests pin.
+import { isChatModelId } from './discovery/classify.mjs';
 
-export function isChatModel(id) {
-  if (!id || typeof id !== 'string') return false;
-  return !NON_CHAT.some((re) => re.test(id));
-}
+/** Kept as a named export: tests/discovery.test.mjs pins this exact behavior. */
+export const isChatModel = isChatModelId;
 
 export function parseNvidia(json) {
   const data = (json && json.data) || [];
@@ -51,7 +50,10 @@ import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { load as yamlLoad } from 'js-yaml';
 import { defaultLifecycle, applyCatalogPresence, THRESHOLDS as LIFECYCLE_THRESHOLDS } from './discovery/lifecycle.mjs';
-import { STORE_PATH as LIFECYCLE_STORE_PATH } from './discovery/model_catalog_store.mjs';
+import {
+  STORE_PATH as LIFECYCLE_STORE_PATH,
+  assertNotProductionStoreInTest,
+} from './discovery/model_catalog_store.mjs';
 import * as nvidiaAdapter from './discovery/providers/nvidia.mjs';
 import * as openrouterAdapter from './discovery/providers/openrouter.mjs';
 import {
@@ -62,6 +64,7 @@ import {
   DEFAULT_POOL_BACKEND_ID,
 } from './discovery/probe.mjs';
 import { getPool } from './proxy/connection-pool.mjs';
+import { getConfig } from './config.mjs';
 
 const CACHE_PATH = join(homedir(), '.config', 'skgateway', 'model_catalog_cache.json');
 
@@ -105,11 +108,76 @@ export function reconcilePresence(store, fetchedIds, provider, now, thresholds =
   return next;
 }
 
-/** The subset of `fullStore` this module previously tagged as belonging to `provider`. */
-function sliceByProvider(fullStore, provider) {
+/**
+ * The ids this provider is DECLARED to serve in the gateway config
+ * (`backends.<provider>.models`), as a Set. Wildcard patterns are skipped:
+ * they are not concrete ids and cannot be reconciled against a catalog.
+ *
+ * Fail-soft: getConfig() throws when no config has been loaded (every unit
+ * test that never boots the gateway), and a missing declaration list simply
+ * means we fall back to the previous behavior for that provider.
+ *
+ * @param {string} provider
+ * @returns {Set<string>}
+ */
+function declaredModelsFor(provider) {
+  try {
+    const models = getConfig()?.backends?.[provider]?.models;
+    if (!Array.isArray(models)) return new Set();
+    return new Set(models.filter((m) => typeof m === 'string' && !m.includes('*')));
+  } catch {
+    return new Set();
+  }
+}
+
+/**
+ * The subset of `fullStore` that belongs to `provider` for presence
+ * reconciliation, plus the ids `provider` is declared to serve.
+ *
+ * CARD 7330bb05 / C1, the root cause of the 2026-08-14 catalog inversion.
+ * This used to return ONLY entries already carrying `lc.provider === provider`.
+ * Lifecycle records born on the completion path never carry that tag:
+ * `recordModelOutcome()` writes `applyCompletionOutcome()` output, and none of
+ * lifecycle.mjs's completion transitions set `provider` (only
+ * `reconcilePresence` does). So a model declared in `backends.<provider>.models`
+ * that the live fetch never returns could never enter presence reconciliation:
+ * it could not accumulate `absent_cycles`, could not reach `absentEolThreshold`,
+ * and was structurally immune to the very mechanism built to retire it.
+ *
+ * Measured consequence: 7 ids gone from NVIDIA's catalog sat at
+ * `absent_cycles: 0, provider: null` while being advertised, and 6 of them
+ * answered 410 to a real completion. Their only remaining death path was three
+ * consecutive permanent errors from REAL traffic, which bills a caller a failed
+ * request per increment.
+ *
+ * The declaration is the missing third input alongside the store and the fetch.
+ * Two deliberate constraints:
+ *
+ *   - A declared id is only adopted when the record has NO provider tag. We
+ *     never steal an id already attributed to a different provider, because
+ *     reconciling it against the wrong catalog would retire a live model.
+ *   - A declared id with no store record at all is seeded with
+ *     `defaultLifecycle()` so it enters the sweep on the very first cycle.
+ *     Declared-but-never-seen is exactly the "config bug" case this must catch,
+ *     and it has no record precisely because nothing has ever routed to it.
+ *
+ * This does NOT guess a provider for untagged completion-path records. A model
+ * id alone does not identify its backend; only the config declaration does.
+ *
+ * @param {Record<string, object>} fullStore
+ * @param {string} provider
+ * @param {Set<string>} [declaredIds]
+ * @returns {Record<string, object>}
+ */
+function sliceByProvider(fullStore, provider, declaredIds = new Set()) {
   const slice = {};
   for (const [id, lc] of Object.entries(fullStore || {})) {
-    if (lc && lc.provider === provider) slice[id] = lc;
+    if (!lc) continue;
+    if (lc.provider === provider) slice[id] = lc;
+    else if (!lc.provider && declaredIds.has(id)) slice[id] = lc;
+  }
+  for (const id of declaredIds) {
+    if (!(id in slice)) slice[id] = defaultLifecycle();
   }
   return slice;
 }
@@ -135,6 +203,10 @@ function loadLifecycleStoreFresh(path) {
 
 /** Persist the lifecycle store to `path`. Fail-soft: a write error never breaks a discovery cycle. */
 function saveLifecycleStore(store, path) {
+  // Card affa0aac / C2: this module writes the store directly, so it needs the
+  // same test guard as model_catalog_store.mjs's own writer. It sits outside
+  // the try because everything inside is swallowed by design.
+  assertNotProductionStoreInTest(path);
   try {
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, JSON.stringify(store, null, 2));
@@ -307,6 +379,11 @@ export async function discoverCatalog(opts) {
     // tests/router-model-outcome.test.mjs) or by passing this opt directly.
     lifecycleStorePath = LIFECYCLE_STORE_PATH,
     thresholds = LIFECYCLE_THRESHOLDS,
+    // Card C1: the ids each provider is DECLARED to serve
+    // (backends.<provider>.models). Injectable so tests can exercise the
+    // declared-but-absent path without booting a config; production resolves
+    // it per cycle from the live config via declaredModelsFor().
+    declaredModels,
     // Card P2.2: manual card overlay. `cardOverrides`, when provided
     // (tests), is used as-is; otherwise it is loaded fresh from
     // `cardOverridesPath` every cycle (hourly cadence, cheap to re-read, and
@@ -380,7 +457,7 @@ export async function discoverCatalog(opts) {
       let updated = { ...fullStore };
       if (nvidiaOk) {
         const reconciled = reconcilePresence(
-          sliceByProvider(fullStore, 'nvidia'),
+          sliceByProvider(fullStore, 'nvidia', declaredModels?.nvidia ?? declaredModelsFor('nvidia')),
           nvidia.map((m) => m.id),
           'nvidia',
           at,
@@ -390,7 +467,7 @@ export async function discoverCatalog(opts) {
       }
       if (openrouterOk) {
         const reconciled = reconcilePresence(
-          sliceByProvider(fullStore, 'openrouter'),
+          sliceByProvider(fullStore, 'openrouter', declaredModels?.openrouter ?? declaredModelsFor('openrouter')),
           openrouter.map((m) => m.id),
           'openrouter',
           at,

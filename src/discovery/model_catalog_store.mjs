@@ -24,13 +24,67 @@
 
 import { readFileSync, writeFileSync, mkdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, dirname } from "node:path";
+import { join, dirname, resolve } from "node:path";
 import { defaultLifecycle, applyCompletionOutcome } from "./lifecycle.mjs";
 
 /** Absolute path to the lifecycle store JSON (env override honoured). */
 export const STORE_PATH =
   process.env.SKGATEWAY_MODEL_CATALOG_STORE_PATH ||
   join(homedir(), ".config", "skgateway", "model_catalog_store.json");
+
+/**
+ * The real, per-node production store path, ignoring any env override.
+ * Kept separate from STORE_PATH so the test guard below still knows which file
+ * is the live one even when a suite has pointed STORE_PATH somewhere safe.
+ */
+export const PRODUCTION_STORE_PATH = join(
+  homedir(),
+  ".config",
+  "skgateway",
+  "model_catalog_store.json",
+);
+
+/**
+ * True when this process is running under a test runner.
+ *
+ * `node --test` sets NODE_TEST_CONTEXT in every test child process, which is
+ * the signal that works regardless of how the suite is invoked. NODE_ENV is
+ * checked too so a differently-wired runner still trips the guard. Deliberately
+ * NOT a config flag: a guard you can forget to switch on is not a guard.
+ */
+function isTestRun() {
+  return Boolean(process.env.NODE_TEST_CONTEXT) || process.env.NODE_ENV === "test";
+}
+
+/**
+ * Refuse to let a test run write the live lifecycle store (card affa0aac / C2).
+ *
+ * On 2026-08-14 the production store was found holding records stamped with
+ * injected test clocks (eol_at 1000 / 4000 / 10000) and synthetic fixture ids
+ * (`x`, `qwen/a`, `g/c:free`). Running `npm test` in this repo was a fleet
+ * mutation event: one model's absent_cycles was observed going 24 -> 36 -> 60
+ * across a single session while it was present in the provider catalog the
+ * whole time. That corruption hid 83 live models and advertised 6 dead ones.
+ *
+ * Most suites already redirect SKGATEWAY_MODEL_CATALOG_STORE_PATH to a temp
+ * dir. This makes the ones that forget FAIL LOUDLY instead of silently
+ * corrupting a real node, which is the difference between a test bug and an
+ * outage. It throws rather than no-ops on purpose: a silent refusal is the same
+ * shape of problem as the silent write it replaces.
+ *
+ * @param {string} path the path a writer is about to open
+ * @throws {Error} when a test run targets the live store
+ */
+export function assertNotProductionStoreInTest(path) {
+  if (!isTestRun()) return;
+  if (resolve(path) !== resolve(PRODUCTION_STORE_PATH)) return;
+  throw new Error(
+    `refusing to write the production lifecycle store from a test run: ${PRODUCTION_STORE_PATH}. ` +
+      "Set SKGATEWAY_MODEL_CATALOG_STORE_PATH to a temp path before importing any module " +
+      "that captures it (see tests/router-model-outcome.test.mjs, which sets it above its imports " +
+      "because discovery.mjs binds LIFECYCLE_STORE_PATH at module load).",
+  );
+}
 
 /**
  * How long a `loadCatalogStore()` call may serve the in-memory copy before
@@ -87,8 +141,17 @@ export function loadCatalogStore(path = STORE_PATH, opts = {}) {
   return _cache;
 }
 
-/** Persist `store` to `path` and warm the cache with it. Fail-soft: never throws. */
+/**
+ * Persist `store` to `path` and warm the cache with it. Fail-soft: never throws
+ * on an I/O problem.
+ *
+ * The test guard runs OUTSIDE the try on purpose. Everything inside is
+ * swallowed by design (a store hiccup must never reach a request path), and a
+ * swallowed guard would be no guard at all: the write would simply not happen
+ * and nobody would learn why.
+ */
 function saveCatalogStore(store, path) {
+  assertNotProductionStoreInTest(path);
   try {
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, JSON.stringify(store, null, 2));
@@ -140,6 +203,10 @@ export function getLifecycle(modelId, path = STORE_PATH) {
  */
 export function recordModelOutcome(modelId, { status, now = Date.now() } = {}, path = STORE_PATH) {
   if (!modelId) return;
+  // Guard before the fail-soft try: this function's catch swallows everything,
+  // so a guard inside it would silently do nothing. See
+  // assertNotProductionStoreInTest.
+  assertNotProductionStoreInTest(path);
   try {
     const store = loadCatalogStore(path);
     const prev = store[modelId] || defaultLifecycle();

@@ -30,6 +30,7 @@ import { getLifecycle } from "./discovery/model_catalog_store.mjs";
 import { isRoutable, LIFECYCLE_STATES } from "./discovery/lifecycle.mjs";
 import { rankModels } from "./ranking/rank.mjs";
 import { deriveCapabilities } from "./ranking/capabilities.mjs";
+import { buildCapabilityCatalog } from "./ranking/catalog.mjs";
 import { REGISTRY_PATH } from "./proxy/registry.mjs";
 import { energyRowsFrom, energyHeaders } from "./metrics/energy.mjs";
 import { readFileSync } from "node:fs";
@@ -324,16 +325,45 @@ export function buildAdminModelsView(full, allow, getLifecycleFn = getLifecycle)
   }));
 }
 
-async function refreshCatalog(cfg) {
+/**
+ * Card C3: refreshCatalog() is the only production call site of
+ * discoverCatalog(), and until this fix it never passed the EOL probe knobs
+ * (card P2.3, src/discovery/probe.mjs) through from cfg.discovery. Since
+ * discoverCatalog() defaults probeSeconds to 0 and its whole probe block is
+ * gated on `probeSeconds > 0`, no config key existed that could ever turn the
+ * sweep on: `discovery.probe_seconds` in the yaml did nothing.
+ *
+ * probe_seconds / probe_budget / probe_timeout_ms read here, snake_case in
+ * yaml matching every other key in this config block (see providers.*.enabled
+ * above). probePool is deliberately NOT sourced from cfg.discovery: it is not
+ * a serializable config value, it is the live proxy/connection-pool.mjs
+ * singleton, and discoverCatalog's own default (`probePool || getPool()`,
+ * discovery.mjs) already resolves it lazily and correctly once this function
+ * actually reaches the probe step (well after the module-level `pool`
+ * singleton further down is constructed). Capturing that module-scope `pool`
+ * const here eagerly would hit its temporal-dead-zone on the very first
+ * startup call, since this function is invoked eagerly (fire-and-forget, on
+ * module load) before `const pool = getPool(poolConfig)` runs.
+ *
+ * `discoverCatalogFn` is injected (default: the real discoverCatalog) purely
+ * for the regression test (tests/refresh-catalog-probe-wiring.test.mjs): it
+ * asserts on the opts object a spy receives, instead of on probe.mjs's
+ * internals, because a probe.mjs-only test is exactly what let this wiring
+ * gap ship silently (see card C3 / 1f65cf45).
+ */
+export async function refreshCatalog(cfg, discoverCatalogFn = discoverCatalog) {
   const d = cfg.discovery || {};
   const nvEnabled = d.providers?.nvidia?.enabled !== false;
   const orEnabled = d.providers?.openrouter?.enabled !== false;
   const nvidiaKey = process.env[cfg.backends?.nvidia?.api_key_env || "NVIDIA_API_KEY"];
-  const { models } = await discoverCatalog({
+  const { models } = await discoverCatalogFn({
     localModels: localModels(cfg),
     nvidiaFetch: nvEnabled ? () => fetchNvidia(nvidiaKey) : async () => ({ data: [] }),
     openrouterFetch: orEnabled ? () => fetchOpenRouter() : async () => ({ data: [] }),
     cache: _discoveryCache,
+    probeSeconds: d.probe_seconds || 0,
+    probeBudget: d.probe_budget,
+    probeTimeoutMs: d.probe_timeout_ms,
   });
   _catalog = models;
   registerDiscoveredRoutes(cfg, models);
@@ -699,9 +729,14 @@ export function parseRequireSpec(spec) {
  * through to normal resolution (role/context/service headers, or the
  * registry default) instead of a broken requirements object corrupting
  * routing. A present-but-nonsense header never throws (parseRequireSpec()'s
- * own fail-soft grammar handles that): an unrecognized require key just
- * degrades to a no-op downstream (rank.mjs's requireFailureReason() only
- * inspects the keys it knows), never a 500.
+ * own fail-soft grammar handles that): a malformed token is ignored at parse
+ * time, never a 500. A well-formed but unrecognized require key (a real
+ * word, just not one this ranker implements) is a different case and is NOT
+ * a no-op: since card C5, rank.mjs's requireFailureReason() fails closed on
+ * it (excludes the candidate with excluded_reason `require:unknown:<key>`)
+ * rather than silently admitting every candidate, so a sovereignty
+ * requirement like `sensitivity=secret` cannot look enforced while doing
+ * nothing.
  *
  * @param {string|string[]|undefined} headerValue raw req.headers["x-sk-require"]
  * @returns {{require:object, prefer?:string[], tier?:string[]}|null}
@@ -802,22 +837,27 @@ export function resolveRankRequirements(query = {}, opts = {}) {
  * entries `/admin/models` and `/v1/models` already read
  * (`getDiscoveredCatalog()`). Reuses `getLifecycle()` (P1.x) and
  * `deriveCapabilities()` (P3.1) exactly as-is: this function does not
- * rebuild either. Pure aside from the injected lookups, same testability
- * discipline as `buildAdminModelsView`/`applyLifecycleView` above.
+ * rebuild either.
+ *
+ * The id-to-capabilities mapping itself lives in `buildCapabilityCatalog()`
+ * (./ranking/catalog.mjs, card C7): router.mjs's live `@match` routing path
+ * delegates to the exact same function, so this admin explain endpoint and
+ * live routing can never again quietly diverge on how a metrics snapshot
+ * feeds capability derivation (they were found to diverge in card C7 because
+ * router.mjs hardcoded its own separate, uninjectable `{ metrics: {} }`).
+ * This wrapper only keeps `buildRankCatalog`'s existing exported name/shape
+ * stable for its callers and tests.
  *
  * @param {Array<object>} full
  * @param {{getLifecycleFn?:(id:string)=>object, deriveCapabilitiesFn?:(card:object, opts:object)=>object, metricsFn?:(id:string)=>object}} [opts]
  * @returns {Array<object>}
  */
 export function buildRankCatalog(full, opts = {}) {
-  const getLifecycleFn = opts.getLifecycleFn || getLifecycle;
-  const deriveCapabilitiesFn = opts.deriveCapabilitiesFn || deriveCapabilities;
-  const metricsFn = opts.metricsFn || (() => ({}));
-  return full.map((entry) => ({
-    ...entry,
-    lifecycle: getLifecycleFn(entry.id),
-    capabilities: deriveCapabilitiesFn(entry, { metrics: metricsFn(entry.id) }),
-  }));
+  return buildCapabilityCatalog(full, {
+    getLifecycleFn: opts.getLifecycleFn || getLifecycle,
+    deriveCapabilitiesFn: opts.deriveCapabilitiesFn || deriveCapabilities,
+    metricsFn: opts.metricsFn,
+  });
 }
 
 // ─── Build proxy config ───

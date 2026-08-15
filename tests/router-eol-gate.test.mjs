@@ -9,7 +9,12 @@
  * would spray the request across every available backend. An id the store
  * has never seen (or still active/suspect) keeps that fall-through
  * unchanged, and an id explicitly claimed by a backend routes normally
- * regardless of lifecycle state.
+ * as long as the lifecycle store still calls it routable.
+ *
+ * The gate is also consulted in the matched branch (an id a Backend.models
+ * snapshot explicitly claims), card C4: that snapshot is only refreshed
+ * once an hour, so a model that flips to eol mid-hour would otherwise keep
+ * routing until the next refresh. See "flips eol mid-hour" below.
  *
  * Run with:  node --test tests/router-eol-gate.test.mjs
  */
@@ -224,6 +229,45 @@ describe("router gates known-eol/dead concrete model ids (card P1.6)", () => {
     );
 
     assert.equal(r.status, 200);
-    assert.equal(up.requestCount, before_ + 1, "an explicitly-claimed model is routed normally, gate never consulted");
+    assert.equal(up.requestCount, before_ + 1, "an explicitly-claimed active model routes normally");
+  });
+
+  test("a model listed in Backend.models that flips eol mid-hour is still gated (card C4)", async () => {
+    _resetCacheForTests();
+    const modelId = `nvidia/stale-snapshot-${Date.now()}`;
+
+    // Backend.models is a startup snapshot (registerDiscoveredRoutes() in
+    // src/index.mjs) that only refreshes once per discovery.refresh_seconds
+    // or on a manual POST /admin/models/refresh. Declare the model here to
+    // simulate a snapshot taken BEFORE the model went eol: this is the
+    // matched branch of candidatesFor() (supportsModel() finds it), not the
+    // fallback branch the other tests in this suite exercise.
+    const router = createRouter({
+      backends: {
+        home: { url: up.base, auth_type: "none", models: [modelId], priority: 1 },
+      },
+    });
+
+    // Now the lifecycle store flips to eol mid-hour, independent of the
+    // stale Backend.models snapshot, exactly like the live reproduction in
+    // card C4 (openai/gpt-oss-20b: state eol in the store, still listed in
+    // Backend.models, and a chat completion returned 200).
+    seedEol(modelId);
+    const lc = getLifecycle(modelId);
+    assert.equal(lc.state, "eol");
+
+    const before_ = up.requestCount;
+    const r = await routeAndSend(
+      router, { model: modelId, agentId: "test" }, "/chat/completions", "POST", HEADERS, bodyFor(modelId), false
+    );
+
+    assert.equal(r.status, 404, "the matched branch must also honor the eol gate (card C4)");
+    assert.equal(
+      up.requestCount, before_,
+      "no backend attempt should have been made even though Backend.models still claims the model"
+    );
+    const payload = JSON.parse(r.body.toString("utf-8"));
+    assert.equal(payload.eol_reason, "provider_410");
+    assert.equal(payload.error.code, 404);
   });
 });

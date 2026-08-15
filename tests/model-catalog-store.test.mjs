@@ -67,13 +67,24 @@ describe("recordModelOutcome, round trip", () => {
     assert.equal(lc.consecutive_permanent_errors, 3);
   });
 
-  test("a 200 in between resets the permanent-error counter", () => {
+  test("a single 200 in between does NOT reset the permanent-error counter (card fb747d52 / C12)", () => {
+    // This test used to assert one 200 zeroed the counter outright. That was
+    // the bug: a model succeeding one request in four never accumulates 3
+    // CONSECUTIVE failures under that rule, because each intermittent
+    // success erased the run, so it parked in `active` forever. Clearing the
+    // counter now needs the same lifecycle.mjs promotionSuccessThreshold
+    // (default 2) consecutive successes that promotion itself needs.
     const path = freshPath();
     recordModelOutcome("nvidia/flaky", { status: 410, now: 1000 }, path);
     recordModelOutcome("nvidia/flaky", { status: 410, now: 2000 }, path);
     recordModelOutcome("nvidia/flaky", { status: 200, now: 3000 }, path);
-    const lc = getLifecycle("nvidia/flaky", path);
-    assert.equal(lc.state, "active");
+    let lc = getLifecycle("nvidia/flaky", path);
+    assert.equal(lc.state, "active", "already active, a first success does not need to wait");
+    assert.equal(lc.consecutive_permanent_errors, 2, "one success is not enough to forgive two failures");
+
+    // A second CONSECUTIVE 200 does clear it.
+    recordModelOutcome("nvidia/flaky", { status: 200, now: 4000 }, path);
+    lc = getLifecycle("nvidia/flaky", path);
     assert.equal(lc.consecutive_permanent_errors, 0);
   });
 

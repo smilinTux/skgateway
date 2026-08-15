@@ -86,12 +86,42 @@ function excludedCandidate(id, reason) {
 }
 
 /**
+ * The only `require` block keys this ranker knows how to enforce (card C5,
+ * design 4.3's four documented dimensions). Anything else in the block is
+ * unimplemented, not merely unmatched, and must never be allowed to fall
+ * through to `return null` (pass): that fell-through-to-pass shape is
+ * exactly card C5's bug, where `require: {sensitivity: secret}` looked
+ * enforced and enforced nothing. See `requireFailureReason()` below for how
+ * an unknown key is handled instead.
+ */
+const KNOWN_REQUIRE_KEYS = new Set(['tool_use', 'min_ctx', 'vision', 'max_latency_p50_ms']);
+
+/**
  * Evaluate the `require` block against one catalog entry's capabilities.
  * Returns the `excluded_reason` string on failure, or `null` if it passes.
  * An unknown/missing value for a required dimension counts as failure
  * EXCEPT `max_latency_p50_ms`, where "no traffic yet" (`latency_p50_ms ===
  * null`) is given the benefit of the doubt rather than penalizing a model
- * nobody has used.
+ * nobody has used. That exception is a considered choice about ONE known
+ * dimension's semantics; it is not the same thing as ignoring a key this
+ * module does not implement at all (see the unknown-key check just below).
+ *
+ * Card C5: a `require` key outside `KNOWN_REQUIRE_KEYS` fails CLOSED
+ * (excludes the candidate) rather than falling through unmatched. Before
+ * this fix every key past the four handled below silently returned `null`
+ * (pass), so an unimplemented requirement admitted every candidate instead
+ * of rejecting or flagging it: a caller writing `require: {sensitivity:
+ * secret}` for the incoming trust-zone/sensitivity gating work (card N1)
+ * got a filter that looked enforced and enforced nothing, i.e. a
+ * sovereignty control that is a placebo. Checked here (fail closed, one
+ * excluded candidate at rank time) rather than rejecting the whole
+ * requirements block at parse time in src/index.mjs's `parseRequireSpec()`/
+ * `parseSkRequireHeader()`: those are documented (P4.3, design 7.1) as
+ * deliberately fail-soft so a caller typo degrades the spec instead of
+ * 500ing the route, so a hard parse-time rejection is not reachable from
+ * there without reversing that design decision. This module is where the
+ * requirements block is actually enforced, so it is where "unknown"
+ * becomes "denied".
  *
  * @param {object} entry catalog entry
  * @param {object} require requirements.require block
@@ -99,6 +129,10 @@ function excludedCandidate(id, reason) {
  */
 function requireFailureReason(entry, require = {}) {
   const caps = entry.capabilities || {};
+
+  for (const key of Object.keys(require)) {
+    if (!KNOWN_REQUIRE_KEYS.has(key)) return `require:unknown:${key}`;
+  }
 
   if (require.tool_use === true) {
     const score = caps.tool_use && caps.tool_use.score;

@@ -148,6 +148,35 @@ describe('hard filters: require block', () => {
     );
     assert.equal(findResult(results, 'unknown-latency').excluded_reason, null);
   });
+
+  // Card C5 negative control (the actual deliverable). Before the fix, an
+  // unrecognized require key fell through `requireFailureReason()` to
+  // `return null` (pass), which silently admitted every candidate: a filter
+  // that looks enforced and enforces nothing. A test that only checked the
+  // four known keys above stayed green through that entire defect, which is
+  // exactly why it shipped. This asserts the opposite: a key the ranker does
+  // not implement (e.g. the incoming trust-zone/sensitivity gating from card
+  // N1) must exclude the candidate, and the reason must name the offending
+  // key so an operator can see what happened, not silently admit it to a
+  // free remote model the config asserts it cannot reach.
+  test('an unimplemented require key excludes the candidate (fails closed, not silently)', () => {
+    const results = rankModels(
+      [entry('would-be-admitted', { capabilities: caps({ tool_use: { score: 1, basis: 'card' } }) })],
+      { require: { sensitivity: 'secret' } },
+    );
+    const r = findResult(results, 'would-be-admitted');
+    assert.equal(r.excluded_reason, 'require:unknown:sensitivity');
+    assert.equal(r.score, null);
+    assert.equal(r.rank, null);
+  });
+
+  test('a known require key alongside an unknown one still fails closed on the unknown key', () => {
+    const results = rankModels(
+      [entry('mixed', { capabilities: caps({ tool_use: { score: 1, basis: 'card' } }) })],
+      { require: { tool_use: true, min_class: 'XL' } },
+    );
+    assert.equal(findResult(results, 'mixed').excluded_reason, 'require:unknown:min_class');
+  });
 });
 
 describe('hard filters: allowlist + availability', () => {
