@@ -30,6 +30,7 @@ import { getLifecycle } from "./discovery/model_catalog_store.mjs";
 import { isRoutable, LIFECYCLE_STATES } from "./discovery/lifecycle.mjs";
 import { rankModels } from "./ranking/rank.mjs";
 import { deriveCapabilities } from "./ranking/capabilities.mjs";
+import { buildCapabilityCatalog } from "./ranking/catalog.mjs";
 import { REGISTRY_PATH } from "./proxy/registry.mjs";
 import { energyRowsFrom, energyHeaders } from "./metrics/energy.mjs";
 import { readFileSync } from "node:fs";
@@ -831,22 +832,27 @@ export function resolveRankRequirements(query = {}, opts = {}) {
  * entries `/admin/models` and `/v1/models` already read
  * (`getDiscoveredCatalog()`). Reuses `getLifecycle()` (P1.x) and
  * `deriveCapabilities()` (P3.1) exactly as-is: this function does not
- * rebuild either. Pure aside from the injected lookups, same testability
- * discipline as `buildAdminModelsView`/`applyLifecycleView` above.
+ * rebuild either.
+ *
+ * The id-to-capabilities mapping itself lives in `buildCapabilityCatalog()`
+ * (./ranking/catalog.mjs, card C7): router.mjs's live `@match` routing path
+ * delegates to the exact same function, so this admin explain endpoint and
+ * live routing can never again quietly diverge on how a metrics snapshot
+ * feeds capability derivation (they were found to diverge in card C7 because
+ * router.mjs hardcoded its own separate, uninjectable `{ metrics: {} }`).
+ * This wrapper only keeps `buildRankCatalog`'s existing exported name/shape
+ * stable for its callers and tests.
  *
  * @param {Array<object>} full
  * @param {{getLifecycleFn?:(id:string)=>object, deriveCapabilitiesFn?:(card:object, opts:object)=>object, metricsFn?:(id:string)=>object}} [opts]
  * @returns {Array<object>}
  */
 export function buildRankCatalog(full, opts = {}) {
-  const getLifecycleFn = opts.getLifecycleFn || getLifecycle;
-  const deriveCapabilitiesFn = opts.deriveCapabilitiesFn || deriveCapabilities;
-  const metricsFn = opts.metricsFn || (() => ({}));
-  return full.map((entry) => ({
-    ...entry,
-    lifecycle: getLifecycleFn(entry.id),
-    capabilities: deriveCapabilitiesFn(entry, { metrics: metricsFn(entry.id) }),
-  }));
+  return buildCapabilityCatalog(full, {
+    getLifecycleFn: opts.getLifecycleFn || getLifecycle,
+    deriveCapabilitiesFn: opts.deriveCapabilitiesFn || deriveCapabilities,
+    metricsFn: opts.metricsFn,
+  });
 }
 
 // ─── Build proxy config ───

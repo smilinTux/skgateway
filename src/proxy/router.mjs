@@ -40,7 +40,7 @@ import { createDecisionCache, decisionKey } from "./decision-cache.mjs";
 import { getConfig } from "../config.mjs";
 import { loadCache as loadDiscoveryCache } from "../discovery.mjs";
 import { rankModels } from "../ranking/rank.mjs";
-import { deriveCapabilities } from "../ranking/capabilities.mjs";
+import { buildCapabilityCatalog } from "../ranking/catalog.mjs";
 import { loadAllowlist } from "../advertise.mjs";
 import { isModelAvailable } from "./advertise.mjs";
 
@@ -1327,10 +1327,17 @@ function matchConfigEpoch() {
  * lifecycle:{state}, capabilities}`) straight off the on-disk discovery
  * cache (the same file discovery.mjs's refresh cycle writes), so the router
  * never depends on index.mjs's in-memory catalog or triggers a network
- * fetch. Mirrors index.mjs's `buildRankCatalog()` (card P3.3) at a smaller
- * scope (no injectable metrics here, same `{}` default that route already
- * uses for the suggest-only rank API). Never throws: a missing/unreadable
- * cache file yields an empty catalog.
+ * fetch. The id-to-capabilities mapping itself is NOT reimplemented here
+ * (card C7): it delegates to `buildCapabilityCatalog()`
+ * (../ranking/catalog.mjs), the same function index.mjs's `buildRankCatalog()`
+ * (card P3.3, the /admin/models/rank suggest-only API) delegates to, so this
+ * live routing path and the admin explain-tool can never again silently
+ * diverge on how a metrics snapshot (or its absence) feeds capability
+ * derivation. Before this card, this function hardcoded
+ * `deriveCapabilities(entry, { metrics: {} })` inline, a second, uninjectable
+ * copy of what buildRankCatalog already did with an injectable
+ * `opts.metricsFn`. Never throws: a missing/unreadable cache file yields an
+ * empty catalog.
  *
  * @returns {Array<object>}
  */
@@ -1342,11 +1349,19 @@ function buildMatchCatalog() {
     cache = {};
   }
   const models = Array.isArray(cache && cache.models) ? cache.models : [];
-  return models.map((entry) => ({
-    ...entry,
-    lifecycle: getLifecycle(entry.id),
-    capabilities: deriveCapabilities(entry, { metrics: {} }),
-  }));
+  return buildCapabilityCatalog(models, { getLifecycleFn: getLifecycle });
+}
+
+/**
+ * Test-only: expose `buildMatchCatalog()` (card C7) so a test can assert the
+ * live `@match` path's catalog/capabilities are identical to what
+ * index.mjs's `buildRankCatalog()` (the /admin/models/rank explain endpoint)
+ * would compute for the same underlying model entries. Not used by
+ * production code.
+ * @returns {Array<object>}
+ */
+export function _buildMatchCatalogForTests() {
+  return buildMatchCatalog();
 }
 
 /**
