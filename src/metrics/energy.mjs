@@ -6,6 +6,8 @@
  * because the gaps are visible and the inventions are not.
  */
 
+import { parseParamsFromId } from '../discovery/model-size.mjs';
+
 /**
  * Energy of the window between two meter reads.
  * @param {{counter_j:number}|null} before
@@ -141,12 +143,16 @@ export const INPUT_TOKEN_RATIO = 0.1;
 /**
  * Pull parameter counts out of a model id.
  *
+ * Delegates to discovery/model-size.mjs, which owns id parsing for the model
+ * catalog's `size_class`. Both were written independently and agreed on every
+ * id tested, so this keeps ONE parser rather than two that drift. Energy only
+ * needs a different SHAPE (effective compute params), not different parsing.
+ *
  * Most ids in this fleet carry their own size: "-9b", "-70b", "-30b-a3b",
- * "-550b-a55b", "122b-a10b". The "aNNb" suffix is the ACTIVE parameter count
- * of a mixture-of-experts model, and compute (therefore energy) tracks active
- * params, not total. A static coefficient table would go stale immediately
- * here because discovery keeps adding free models, so deriving from the id is
- * what keeps this honest without hand maintenance.
+ * "-550b-a55b". The "aNNb" suffix is the ACTIVE parameter count of a
+ * mixture-of-experts model, and compute (therefore energy) tracks active
+ * params, not total. Deriving from the id is what keeps coefficients honest
+ * without hand maintenance, since discovery keeps adding free models.
  *
  * @returns {{total_b:number, active_b:number}|null} null when unparseable,
  *   which is deliberate: an unknown size yields no estimate rather than a
@@ -154,16 +160,12 @@ export const INPUT_TOKEN_RATIO = 0.1;
  */
 export function paramsFromModelId(model) {
   if (!model || typeof model !== 'string') return null;
-  const id = model.toLowerCase();
-  // active params first: "-a17b", "-a3b"
-  const active = id.match(/[-_]a(\d+(?:\.\d+)?)b(?![a-z0-9])/);
-  // total params: the LAST plain "<n>b" that is not the active marker
-  const totals = [...id.matchAll(/(?:^|[-_/])(\d+(?:\.\d+)?)b(?![a-z0-9])/g)];
-  if (!totals.length) return null;
-  const total_b = parseFloat(totals[totals.length - 1][1]);
-  if (!Number.isFinite(total_b) || total_b <= 0) return null;
-  const active_b = active ? parseFloat(active[1]) : total_b;
-  if (!Number.isFinite(active_b) || active_b <= 0) return null;
+  const { params_b, active_params_b } = parseParamsFromId(model);
+  if (params_b == null) return null;
+  const total_b = params_b;
+  // Energy tracks COMPUTE, so a MoE model costs its active parameters, not its
+  // total. A dense model declares no active count and pays its full size.
+  const active_b = active_params_b ?? total_b;
   return { total_b, active_b: Math.min(active_b, total_b) };
 }
 
