@@ -256,10 +256,26 @@ export function applyLifecycleView(data, getLifecycleFn = getLifecycle) {
  * @returns {{active:number, suspect:number, eol:number, dead:number}}
  */
 export function lifecycleCounts(catalog, getLifecycleFn = getLifecycle) {
-  const counts = { active: 0, suspect: 0, eol: 0, dead: 0 };
+  // Seeded from LIFECYCLE_STATES rather than a hand-written literal. The
+  // literal was `{active, suspect, eol, dead}`, so when card f9e8002b added
+  // `not_chat` those models were counted by NOBODY: the hasOwnProperty guard
+  // below silently skipped them, and an operator reading
+  // /admin/models/status would have seen totals that quietly did not add up to
+  // the catalog size.
+  //
+  // A summary that drops a category it does not recognize is the same class of
+  // problem as the rest of this epic: it reports health by omitting the part it
+  // cannot describe. Deriving the buckets from the enum means the next
+  // disposition appears here automatically.
+  const counts = Object.fromEntries(Object.values(LIFECYCLE_STATES).map((s) => [s, 0]));
+  // `unknown` catches any state the store somehow holds that the enum does not
+  // describe, so the totals always reconcile against the catalog length instead
+  // of silently losing entries.
+  counts.unknown = 0;
   for (const m of catalog) {
     const state = getLifecycleFn(m.id)?.state;
     if (state && Object.prototype.hasOwnProperty.call(counts, state)) counts[state] += 1;
+    else counts.unknown += 1;
   }
   return counts;
 }

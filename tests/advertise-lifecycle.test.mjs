@@ -389,3 +389,38 @@ describe("registerDiscoveredRoutes - only active|suspect ids written to Backend.
     assert.ok(backends.openrouter.discovery, "must be flagged so empty models means 'nothing', not 'everything'");
   });
 });
+
+// ── lifecycleCounts must not silently drop a disposition (card f9e8002b) ──
+//
+// The bucket list used to be a hand-written literal {active, suspect, eol,
+// dead}. Adding `not_chat` meant those models were counted by nobody: the
+// hasOwnProperty guard skipped them and the totals quietly stopped reconciling
+// against the catalog size. A summary that omits what it cannot describe is the
+// same failure this whole epic is about.
+test("lifecycleCounts covers every lifecycle state and always reconciles", async () => {
+  const { lifecycleCounts } = await import("../src/index.mjs");
+  const { LIFECYCLE_STATES } = await import("../src/discovery/lifecycle.mjs");
+
+  const catalog = [
+    { id: "a" }, { id: "b" }, { id: "c" }, { id: "d" }, { id: "e" }, { id: "f" },
+  ];
+  const states = {
+    a: LIFECYCLE_STATES.ACTIVE,
+    b: LIFECYCLE_STATES.SUSPECT,
+    c: LIFECYCLE_STATES.EOL,
+    d: LIFECYCLE_STATES.DEAD,
+    e: LIFECYCLE_STATES.NOT_CHAT,
+    f: "some-state-from-the-future",
+  };
+  const counts = lifecycleCounts(catalog, (id) => ({ state: states[id] }));
+
+  assert.equal(counts[LIFECYCLE_STATES.NOT_CHAT], 1, "not_chat must be counted, not skipped");
+  assert.equal(counts.unknown, 1, "an unrecognized state must be surfaced, not dropped");
+
+  const total = Object.values(counts).reduce((a, b) => a + b, 0);
+  assert.equal(total, catalog.length, "counts must reconcile against the catalog size");
+
+  for (const s of Object.values(LIFECYCLE_STATES)) {
+    assert.ok(s in counts, `every state in the enum needs a bucket: ${s}`);
+  }
+});
