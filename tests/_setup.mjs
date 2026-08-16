@@ -32,7 +32,31 @@ if (!process.env.SKGATEWAY_MODEL_CATALOG_STORE_PATH) {
   process.env.SKGATEWAY_MODEL_CATALOG_STORE_PATH = join(dir, 'model_catalog_store.json');
 }
 
-// Same class of bug, second variable. src/proxy/registry.mjs binds
+// SAME CLASS OF BUG, SECOND FILE IN THE SAME DIRECTORY, found 2026-08-16.
+// discovery.mjs's saveCache() defaulted to the PRODUCTION discovery cache
+// (~/.config/skgateway/model_catalog_cache.json) with no env override and no
+// guard, even though router.mjs has read SKGATEWAY_MODEL_CATALOG_CACHE_PATH
+// for its own MATCH_CATALOG_CACHE_PATH since card P4.2. Reader honoured the
+// variable, writer ignored it.
+//
+// Measured: that file held 96 models whose only `local` entry was
+// `c3-neutral`, the fixture id from tests/refresh-catalog-probe-wiring.test.
+// mjs, while the live daemon's in-memory catalog held 111 including 4
+// anthropic, 3 local, 2 chiap08-qwen38 and 7 opencode. The daemon had written
+// a correct catalog and `npm test` had overwritten it, repeatedly: three runs
+// were watched advancing the file's mtime while dropping those rows. Since
+// the bucket router MATCHES against that file, running the test suite
+// silently emptied the sovereign and internal tiers on a live node.
+//
+// Same fix as the store above: set it once, for every test process, before
+// any module is imported. discovery.mjs and router.mjs both bind the path at
+// module load, so an assignment inside a test body is already too late.
+if (!process.env.SKGATEWAY_MODEL_CATALOG_CACHE_PATH) {
+  const dir = mkdtempSync(join(tmpdir(), 'skgw-test-cache-'));
+  process.env.SKGATEWAY_MODEL_CATALOG_CACHE_PATH = join(dir, 'model_catalog_cache.json');
+}
+
+// Same class of bug, third variable. src/proxy/registry.mjs binds
 // REGISTRY_PATH at module load from $SKMODELS_REGISTRY, defaulting to the REAL
 // per-node file ~/.skcapstone/models/registry.yaml. Twelve test files remember
 // to point that at a fixture or a nonexistent path; the rest inherit whatever

@@ -53,6 +53,7 @@ import { defaultLifecycle, applyCatalogPresence, THRESHOLDS as LIFECYCLE_THRESHO
 import {
   STORE_PATH as LIFECYCLE_STORE_PATH,
   assertNotProductionStoreInTest,
+  isTestRun,
 } from './discovery/model_catalog_store.mjs';
 import * as nvidiaAdapter from './discovery/providers/nvidia.mjs';
 import * as openrouterAdapter from './discovery/providers/openrouter.mjs';
@@ -71,7 +72,62 @@ import { getConfig } from './config.mjs';
 // advertise.mjs's tagLocalModels() can never disagree about which ids are paid.
 import { isAnthropicBackend, isAnthropicModelId } from './proxy/anthropic-adapter.mjs';
 
-const CACHE_PATH = join(homedir(), '.config', 'skgateway', 'model_catalog_cache.json');
+/**
+ * The real, per-node discovery cache path, ignoring any env override. Kept
+ * separate from CACHE_PATH so the test guard below still knows which file is
+ * the live one even when a suite has pointed CACHE_PATH somewhere safe. Same
+ * split model_catalog_store.mjs uses for the lifecycle store.
+ */
+export const PRODUCTION_CACHE_PATH = join(homedir(), '.config', 'skgateway', 'model_catalog_cache.json');
+
+/**
+ * Discovery cache path, env override honoured.
+ *
+ * THE OVERRIDE IS NOT NEW, IT WAS ONLY HALF WIRED. router.mjs has read
+ * `SKGATEWAY_MODEL_CATALOG_CACHE_PATH` for its MATCH_CATALOG_CACHE_PATH since
+ * card P4.2, but the WRITER here ignored it and always used the production
+ * path. Reader and writer could therefore point at two different files under
+ * the same env var, which is its own bug, and it meant no suite could redirect
+ * the write at all.
+ *
+ * Measured 2026-08-16: `~/.config/skgateway/model_catalog_cache.json` held 96
+ * models, 79 nvidia, 16 openrouter and exactly one `local` whose id was
+ * `c3-neutral`. That id exists nowhere on this fleet; it is the fixture in
+ * tests/refresh-catalog-probe-wiring.test.mjs. The live daemon's in-memory
+ * catalog at the same moment held 111 models (anthropic 4, local 3,
+ * chiap08-qwen38 2, opencode 7, nvidia 79, openrouter 16), i.e. the daemon
+ * had produced a CORRECT catalog including every sovereign and Anthropic
+ * model and written it here, and the test suite then overwrote the file. Three
+ * `npm test` runs were observed advancing its mtime and lastRefreshedAt while
+ * dropping the anthropic, local and opencode rows.
+ *
+ * This is the same class of defect card affa0aac / C2 fixed for the lifecycle
+ * store, on the second file in the same directory: running the test suite was
+ * a fleet mutation event. See [[test-suites-write-to-the-real-fleet]].
+ */
+const CACHE_PATH =
+  process.env.SKGATEWAY_MODEL_CATALOG_CACHE_PATH || PRODUCTION_CACHE_PATH;
+
+/**
+ * Refuse to let a test run write the live discovery cache. Mirrors
+ * assertNotProductionStoreInTest() exactly, including throwing rather than
+ * no-opping: a silent refusal is the same shape of problem as the silent write
+ * it replaces. tests/_setup.mjs is the belt (it defaults the env var for every
+ * test process before any module is imported); this is the brace, for a runner
+ * invoked without `--import ./tests/_setup.mjs`.
+ *
+ * @param {string} path the path a writer is about to open
+ * @throws {Error} when a test run targets the live cache
+ */
+export function assertNotProductionCacheInTest(path) {
+  if (!isTestRun()) return;
+  if (resolve(path) !== resolve(PRODUCTION_CACHE_PATH)) return;
+  throw new Error(
+    `refusing to write the production discovery cache from a test run: ${PRODUCTION_CACHE_PATH}. ` +
+      'Set SKGATEWAY_MODEL_CATALOG_CACHE_PATH to a temp path before importing any module ' +
+      'that captures it (discovery.mjs and router.mjs both bind it at module load).',
+  );
+}
 
 // Card P2.2: the committed manual card overlay (config/model-cards.overrides.yaml),
 // resolved relative to this file so it works the same from any cwd.
@@ -890,6 +946,9 @@ export function loadCache(path = CACHE_PATH) {
 }
 
 export function saveCache(cache, path = CACHE_PATH) {
+  // Outside the try, same as saveLifecycleStore(): everything inside is
+  // swallowed by design, and a guard that gets swallowed is not a guard.
+  assertNotProductionCacheInTest(path);
   try {
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, JSON.stringify(cache, null, 2));
