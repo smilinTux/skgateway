@@ -2176,8 +2176,37 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         // hangs. Defaults ON; env-tunable (see local-failover.mjs). Sovereign
         // first: cloud is only used while the local backend is unhealthy, and
         // traffic routes back automatically once the probe verdict recovers.
+        // ── Card ba782c14: a backend may declare itself NON-SUBSTITUTABLE ──
+        //
+        // The N1 gate below honours a sensitivity the CALLER declared. That
+        // leaves a hole: when the caller declares nothing, requestZoneCeiling()
+        // returns null and the cloud fallback is allowed. Some roles are defined
+        // by a property no substitute can satisfy, and the BACKEND knows this
+        // even when the caller does not.
+        //
+        // Measured 2026-08-16, before this flag: with qwen-vl's backend refused,
+        // `model=sk-creative` returned 200 with response.model =
+        // openai/gpt-oss-20b, while the router log for that same request said
+        // `backend=qwen-vl model -> Qwen3.6-27b-abliterated-Q4_K_M`. The
+        // abliterated role was answered by a guardrailed cloud model. That does
+        // not degrade the role, it inverts it, and private prompts left the
+        // fleet to do it.
+        //
+        // Declaring `no_failover: true` on the backend makes the request FAIL
+        // with the real upstream error instead. For a capability that cannot be
+        // substituted, failing loudly is the correct answer and answering
+        // quietly is the harmful one. Opt-in: absent means failover is unchanged.
         const fc = getFailoverConfig();
-        const fb = fc.enabled && isLocalUrl(reg.url) ? router.getBackend(fc.fallbackBackend) : null;
+        if (reg.noFailover) {
+          console.warn(
+            `[router] backend=${reg.backend} declares no_failover — NOT substituting ` +
+              `with ${fc.fallbackBackend}; request will fail with the upstream error`,
+          );
+        }
+        const fb =
+          fc.enabled && !reg.noFailover && isLocalUrl(reg.url)
+            ? router.getBackend(fc.fallbackBackend)
+            : null;
         if (fb) {
           // Bound the local completion so a wedged upstream (accepts the socket,
           // never replies) 504s and the candidate loop fails over, instead of

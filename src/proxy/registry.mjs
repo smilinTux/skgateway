@@ -295,6 +295,10 @@ export function resolve({ model, context, service, role } = {}, path = REGISTRY_
     vision: !!bcfg.vision,
     kind: bcfg.kind,
     minOutputTokens: (bcfg && bcfg.min_output_tokens) || 0,
+    // Card ba782c14: this backend must never be substituted by the cloud
+    // failover. Opt-in per backend, so absent means false and failover keeps
+    // its existing behaviour everywhere it is not declared.
+    noFailover: !!(bcfg && bcfg.no_failover),
     anthropic: false,
     via,
     role: roleName,
