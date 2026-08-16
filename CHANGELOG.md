@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `npm test` no longer overwrites the production model catalog cache. `saveCache()`
+  defaulted to the production path with no env override and no guard, while the
+  reader has honored `SKGATEWAY_MODEL_CATALOG_CACHE_PATH` since P4.2. The reader
+  honored the variable and the writer ignored it. Running the suite silently
+  emptied the sovereign and Anthropic tiers on a live node, leaving a fresh mtime
+  the whole time, so every freshness check passed. Fresh-and-wrong is harder to
+  notice than stale-and-wrong. Guarded with an env override, an `_setup.mjs`
+  default, and `assertNotProductionCacheInTest()`.
+- The match catalog is now the union of the discovery cache and the configured
+  serving backends, built in `buildServingCatalog()` upstream of
+  `applyCardOverlays`. Placement matters: `buildMatchCatalog()` never calls
+  `applyCardOverlays`, so a union added in `router.mjs` would arrive with no
+  `size_class`, clear only floor S, and still fail `sk-l-secret` while appearing
+  present in the catalog. Discovery wins on every field it carries; serving
+  config supplies existence only. `provider` deliberately keeps the discovered
+  value, so an id reachable both remotely and via a local declaration retains its
+  `trains` posture rather than being relabelled sovereign.
+- Note for future readers: the union is NOT the fix for the missing sovereign and
+  Anthropic rows. The cache guard is. The union alone would have masked the
+  corruption by restoring exactly the rows the clobber removed.
 - Provider trust-zone postures are now wired into the capability catalog build.
   `loadProviderPostures()` existed but was called from nowhere in `src/`, so
   `deriveTrustZone()` returned zone 2 for every non-local model including
