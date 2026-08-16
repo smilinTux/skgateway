@@ -18,12 +18,17 @@
  * `providers:` map all yield `{}` so a broken/absent overlay never breaks a
  * caller.
  *
- * NOT wired into the live `/admin/models/rank` or `@match` catalog build
- * path by this card: that call site is `src/proxy/router.mjs`'s
- * `buildMatchCatalog()`, out of scope for card N2 (owned by concurrent work
- * on the routing side, card N1). This module is the ready-to-call loader
- * for whichever card wires `deriveCapabilities(entry, { providers:
- * loadProviderPostures() })` at that call site.
+ * WIRED IN as of the trust-zone wiring fix. `src/ranking/catalog.mjs`'s
+ * `buildCapabilityCatalog()` calls this by default and forwards the result to
+ * `deriveCapabilities(entry, { providers })`, so both catalog builders that
+ * exist (index.mjs's `buildRankCatalog()` for /admin/models/rank and
+ * router.mjs's `buildMatchCatalog()` for live `@match` + bucket routing) get
+ * it from the single shared mapping. Card N2 shipped this loader unwired, and
+ * the visible consequence was that `deriveTrustZone()` never saw a
+ * `contractual-zero` posture, so Anthropic was classified zone 2 alongside the
+ * providers that train on submitted content, and the whole `internal`
+ * sensitivity tier was inert. Do not add a second call site: wire through
+ * `buildCapabilityCatalog()` so the two paths cannot drift.
  *
  * @module discovery/provider-posture
  */

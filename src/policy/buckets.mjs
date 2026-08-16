@@ -86,10 +86,22 @@ const BUCKET_RE = /^sk-(s|m|l|xl)-(public|internal|secret)$/i;
 /**
  * Parse a model id as a bucket address, or null when it is an ordinary id.
  *
- * Deliberately strict. A near-miss like `sk-xl-secrets` must NOT silently
- * resolve to something permissive; it falls through as an unknown model and
- * gets today's not-found behavior, which is loud. A typo that quietly widened
- * a sovereignty boundary is the failure this whole epic keeps finding.
+ * Deliberately strict: a near-miss like `sk-xl-secrets` must NOT resolve to
+ * something permissive. But strictness here is only half the job, and the
+ * comment that used to sit at this spot claimed the other half was already
+ * done. It said a near miss "gets today's not-found behavior, which is loud".
+ * THAT WAS FALSE, and measuring it is what produced `looksLikeBucketAttempt()`
+ * below: returning null merely means "not a bucket", and every `sk-*` id is
+ * then swallowed by `isRegistryRouted()` and resolved through the registry's
+ * `defaults.role`, which on this fleet is `sk-auto`, a difficulty classifier.
+ * So `sk-xl-secrets` did not 404 and did not 503. It returned 200 from
+ * whatever model the classifier picked, with no capability floor and no trust
+ * zone ceiling applied. One transposed letter discarded every guarantee the
+ * bucket layer exists to provide, silently. A comment that overstates a
+ * guarantee is how that survived, so it is corrected rather than softened.
+ *
+ * This function's own contract is unchanged (strict parse or null). The loud
+ * behaviour lives in `looksLikeBucketAttempt()` and its caller.
  *
  * @param {string} id
  * @returns {{bucket: string, model_class: string, sensitivity: string}|null}
@@ -108,6 +120,85 @@ export function parseBucketId(id) {
 /** True when this model id addresses a bucket rather than a model. */
 export function isBucketId(id) {
   return parseBucketId(id) !== null;
+}
+
+/**
+ * An id shaped like `sk-<a>-<b>` and nothing more. Three dash-separated parts,
+ * the first literally `sk`. `sk-default` has two parts and never matches;
+ * `sk-code-review-fast` has four and never matches.
+ */
+const BUCKET_SHAPE_RE = /^sk-([^-]*)-([^-]*)$/i;
+
+/**
+ * Did the caller MEAN to address a bucket and get it wrong?
+ *
+ * The dangerous case is not an unrecognized id. It is an id that is one
+ * character away from a sovereignty boundary and silently routes as if no
+ * boundary had been asked for. So this answers a narrower question than
+ * "is this unknown": it answers "does this look like somebody aiming at a
+ * bucket and missing".
+ *
+ * CONSERVATIVE ON PURPOSE, because a false positive here 503s live traffic.
+ * Three conditions must all hold:
+ *
+ *   1. the id is not already a VALID bucket (that case is handled upstream);
+ *   2. the id has the exact `sk-<a>-<b>` shape, which no role in the live
+ *      registry has: `sk-default`, `sk-auto`, `sk-heavy`, `sk-synth`,
+ *      `sk-code`, `sk-vision`, `sk-creative`, `sk-embed` are all two-part, and
+ *      `ornith-tiny` does not start with `sk-` at all;
+ *   3. at least one of the two segments is a REAL token from the canonical
+ *      grade vocabulary, either a model_class letter in the first position or
+ *      a sensitivity word in the second.
+ *
+ * Condition 3 is what keeps this from becoming a generic `sk-a-b` ban. A
+ * future role called `sk-code-review` has neither a class letter first nor a
+ * sensitivity word second, so it is not an attempt and routes untouched.
+ * `sk-xl-secrets` (class letter, misspelled sensitivity) and `sk-xxl-secret`
+ * (bad class letter, real sensitivity) both are.
+ *
+ * The vocabulary is read through `classRank()` and `gradeVocabulary()`, the
+ * same functions the rest of this module uses. There is deliberately no second
+ * copy of the S/M/L/XL or public/internal/secret lists here: a policy check
+ * that keeps its own copy of the vocabulary is how two gates end up
+ * disagreeing.
+ *
+ * Detection only. Whether an attempt is fatal is the caller's decision, since
+ * only the caller knows whether bucket routing is armed and whether the
+ * registry explicitly defines this id.
+ *
+ * @param {string} id
+ * @param {object} [vocab]
+ * @returns {{attempted: boolean, reason: string|null}}
+ */
+export function looksLikeBucketAttempt(id, vocab = gradeVocabulary()) {
+  if (typeof id !== 'string') return { attempted: false, reason: null };
+  const trimmed = id.trim();
+  if (parseBucketId(trimmed)) return { attempted: false, reason: null };
+  const m = BUCKET_SHAPE_RE.exec(trimmed);
+  if (!m) return { attempted: false, reason: null };
+
+  const classPart = m[1].toLowerCase();
+  const sensPart = m[2].toLowerCase();
+  const sensValues = vocab?.sensitivity?.values || ['public', 'internal', 'secret'];
+  const classOk = classRank(classPart, vocab) !== null;
+  const sensOk = sensValues.map((s) => String(s).toLowerCase()).includes(sensPart);
+
+  if (classOk && !sensOk) {
+    return {
+      attempted: true,
+      reason: `model_class "${classPart.toUpperCase()}" is valid but sensitivity "${sensPart}" is not`,
+    };
+  }
+  if (sensOk && !classOk) {
+    return {
+      attempted: true,
+      reason: `sensitivity "${sensPart}" is valid but model_class "${classPart}" is not`,
+    };
+  }
+  // Neither half is vocabulary, so this is an ordinary three-part id, not a
+  // missed bucket. (Both halves valid is impossible here: parseBucketId would
+  // have matched.)
+  return { attempted: false, reason: null };
 }
 
 /**

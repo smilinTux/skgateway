@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Provider trust-zone postures are now wired into the capability catalog build.
+  `loadProviderPostures()` existed but was called from nowhere in `src/`, so
+  `deriveTrustZone()` returned zone 2 for every non-local model including
+  Anthropic. Because `internal` has ceiling 1 and contractual-zero is Anthropic
+  only, `sk-*-internal` admitted local models only and the internal tier was
+  inert. It failed safe, which is why it went unnoticed. Behavioral change worth
+  noting: `internal` buckets widen from local-only to local plus Anthropic.
+  `secret` stays sovereign-only and no training provider moves.
+- The bucket routing path could not execute at all. `resolveBucketCandidates()`
+  referenced `emitSiem`, a const declared inside `routeAndSend`, from a
+  module-level function, so every bucket resolution threw `ReferenceError`
+  before reaching the fail-closed 503. It also never awaited the async
+  `router.route()`, so the Promise was wrapped as a candidate and threw a
+  `TypeError`. The documented `bucket_no_eligible_member` 503 body was therefore
+  unreachable code. A valid bucket id failed exactly as hard as a typo.
+- A mistyped bucket id no longer falls through to `defaults.role`. Previously
+  `sk-xl-secrets` failed the bucket regex, was still caught by
+  `isRegistryRouted()`, and resolved via `sk-auto`, returning 200 from an
+  arbitrary model with no sensitivity ceiling enforced. It now returns 400
+  `invalid_bucket_id`, because the address is wrong and retrying cannot fix it.
+  Registry-defined ids such as `sk-default`, `sk-auto` and `sk-heavy` are
+  exempt and still route.
+
+### Added
+
+- Integration tests for the bucket and sensitivity paths, which previously had
+  none: `tests/` had zero references to `buckets_enabled` or
+  `sensitivity_enforced`. Both 503 contracts are now asserted field by field,
+  and the shadow-versus-enforce toggle uses the identical request on both sides
+  of the flag so it cannot pass while the flag is ignored.
+- Documented in the config example that `routing.sensitivity_enforced` is inert
+  without `routing.match_enabled`, since only the latter populates
+  `request.requirements`. Enabling sensitivity first yields a gate that looks
+  enforced and enforces nothing.
+
 ## [0.6.0] - 2026-08-15
 
 ### Fixed

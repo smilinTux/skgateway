@@ -34,13 +34,47 @@
  */
 
 import { deriveCapabilities } from "./capabilities.mjs";
+import { loadProviderPostures } from "../discovery/provider-posture.mjs";
 
 /**
+ * PROVIDER POSTURE IS PART OF THE MAPPING, not an optional extra.
+ *
+ * `capabilities.mjs`'s `deriveTrustZone()` can only return zone 1
+ * (paid-contractual) when it is handed a provider posture map carrying
+ * `data_retention: 'contractual-zero'`. Until this default existed, no live
+ * caller passed one: `buildRankCatalog()` (the /admin/models/rank explain
+ * tool) and `buildMatchCatalog()` (the live @match + bucket routing path)
+ * both forwarded an opts object with no `providers` key, so
+ * `resolveProviderPosture()` returned null for every entry and EVERY
+ * non-local model, Anthropic included, came back as zone 2 (free-remote).
+ *
+ * That is not a cosmetic mislabel. `DEFAULT_SENSITIVITY_POLICY` maps
+ * `internal` to a ceiling of zone 1, and contractual-zero is Anthropic only
+ * on this fleet (nvidia, openrouter and opencode all train on submitted
+ * content, verified 2026-08-15 in config/model-cards.overrides.yaml's
+ * `providers:` block). With no posture map the `internal` and `secret` tiers
+ * collapsed to the same local-only membership and `sk-xl-internal` could
+ * never resolve at all, because there is no local XL model. The tier failed
+ * SAFE, which is exactly why it went unnoticed, but it was inert.
+ *
+ * Loading the overlay here rather than at each call site keeps the C7
+ * property this module exists to hold: there is ONE mapping, so the admin
+ * explain tool and the live routing path cannot disagree about a model's
+ * trust zone. A caller may still inject `opts.providers` (a fixture in a
+ * test, or a future non-file source); passing `null` explicitly is the way to
+ * ask for the old no-posture behaviour, since only `undefined` triggers the
+ * default.
+ *
+ * Fail-soft by construction: `loadProviderPostures()` yields `{}` on a
+ * missing or malformed overlay, which reproduces the previous zone-2 answer
+ * rather than throwing into a request path.
+ *
  * @param {Array<object>} entries discovered-model cards (`{id, free, ...}`)
  * @param {{
  *   getLifecycleFn: (id:string) => object,
  *   deriveCapabilitiesFn?: (card:object, opts:object) => object,
  *   metricsFn?: (id:string) => object,
+ *   providers?: object|null,
  * }} opts
  *   `getLifecycleFn` is required (callers pass their own `getLifecycle`
  *   import so this module never has to guess a lifecycle store path).
@@ -48,15 +82,18 @@ import { deriveCapabilities } from "./capabilities.mjs";
  *   `metricsFn` defaults to `() => ({})`: an id with no resolved metrics
  *   snapshot degrades every empirical capability dimension to its prior,
  *   exactly as `capabilities.mjs` documents.
+ *   `providers` defaults to the committed overlay's `providers:` block, read
+ *   once per call (not per entry).
  * @returns {Array<object>}
  */
 export function buildCapabilityCatalog(entries, opts = {}) {
   const getLifecycleFn = opts.getLifecycleFn;
   const deriveCapabilitiesFn = opts.deriveCapabilitiesFn || deriveCapabilities;
   const metricsFn = opts.metricsFn || (() => ({}));
+  const providers = opts.providers !== undefined ? opts.providers : loadProviderPostures();
   return entries.map((entry) => ({
     ...entry,
     lifecycle: getLifecycleFn(entry.id),
-    capabilities: deriveCapabilitiesFn(entry, { metrics: metricsFn(entry.id) }),
+    capabilities: deriveCapabilitiesFn(entry, { metrics: metricsFn(entry.id), providers }),
   }));
 }
