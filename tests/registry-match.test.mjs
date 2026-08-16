@@ -176,6 +176,12 @@ describe("regression, everything existing stays byte-identical", () => {
       vision: false,
       kind: "chat",
       minOutputTokens: 0,
+      // Card ba782c14 added this field. The shape genuinely changed, so the
+      // assertion is updated rather than worked around, which is the whole
+      // point of a byte-identical guard: it makes a shape change DELIBERATE.
+      // The value is what matters here — an undeclared backend must read
+      // false, so failover behaviour is unchanged everywhere it is not opted in.
+      noFailover: false,
       anthropic: false,
       via: "role",
       role: "sk-default",
