@@ -52,7 +52,7 @@ export const PRODUCTION_STORE_PATH = join(
  * checked too so a differently-wired runner still trips the guard. Deliberately
  * NOT a config flag: a guard you can forget to switch on is not a guard.
  */
-function isTestRun() {
+export function isTestRun() {
   return Boolean(process.env.NODE_TEST_CONTEXT) || process.env.NODE_ENV === "test";
 }
 

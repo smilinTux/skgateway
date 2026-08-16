@@ -53,6 +53,7 @@ import { defaultLifecycle, applyCatalogPresence, THRESHOLDS as LIFECYCLE_THRESHO
 import {
   STORE_PATH as LIFECYCLE_STORE_PATH,
   assertNotProductionStoreInTest,
+  isTestRun,
 } from './discovery/model_catalog_store.mjs';
 import * as nvidiaAdapter from './discovery/providers/nvidia.mjs';
 import * as openrouterAdapter from './discovery/providers/openrouter.mjs';
@@ -66,8 +67,67 @@ import {
 } from './discovery/probe.mjs';
 import { getPool } from './proxy/connection-pool.mjs';
 import { getConfig } from './config.mjs';
+// Pure predicates, no imports of their own, so this cannot cycle back here.
+// Reused rather than re-derived so servingConfigModels() and
+// advertise.mjs's tagLocalModels() can never disagree about which ids are paid.
+import { isAnthropicBackend, isAnthropicModelId } from './proxy/anthropic-adapter.mjs';
 
-const CACHE_PATH = join(homedir(), '.config', 'skgateway', 'model_catalog_cache.json');
+/**
+ * The real, per-node discovery cache path, ignoring any env override. Kept
+ * separate from CACHE_PATH so the test guard below still knows which file is
+ * the live one even when a suite has pointed CACHE_PATH somewhere safe. Same
+ * split model_catalog_store.mjs uses for the lifecycle store.
+ */
+export const PRODUCTION_CACHE_PATH = join(homedir(), '.config', 'skgateway', 'model_catalog_cache.json');
+
+/**
+ * Discovery cache path, env override honoured.
+ *
+ * THE OVERRIDE IS NOT NEW, IT WAS ONLY HALF WIRED. router.mjs has read
+ * `SKGATEWAY_MODEL_CATALOG_CACHE_PATH` for its MATCH_CATALOG_CACHE_PATH since
+ * card P4.2, but the WRITER here ignored it and always used the production
+ * path. Reader and writer could therefore point at two different files under
+ * the same env var, which is its own bug, and it meant no suite could redirect
+ * the write at all.
+ *
+ * Measured 2026-08-16: `~/.config/skgateway/model_catalog_cache.json` held 96
+ * models, 79 nvidia, 16 openrouter and exactly one `local` whose id was
+ * `c3-neutral`. That id exists nowhere on this fleet; it is the fixture in
+ * tests/refresh-catalog-probe-wiring.test.mjs. The live daemon's in-memory
+ * catalog at the same moment held 111 models (anthropic 4, local 3,
+ * chiap08-qwen38 2, opencode 7, nvidia 79, openrouter 16), i.e. the daemon
+ * had produced a CORRECT catalog including every sovereign and Anthropic
+ * model and written it here, and the test suite then overwrote the file. Three
+ * `npm test` runs were observed advancing its mtime and lastRefreshedAt while
+ * dropping the anthropic, local and opencode rows.
+ *
+ * This is the same class of defect card affa0aac / C2 fixed for the lifecycle
+ * store, on the second file in the same directory: running the test suite was
+ * a fleet mutation event. See [[test-suites-write-to-the-real-fleet]].
+ */
+const CACHE_PATH =
+  process.env.SKGATEWAY_MODEL_CATALOG_CACHE_PATH || PRODUCTION_CACHE_PATH;
+
+/**
+ * Refuse to let a test run write the live discovery cache. Mirrors
+ * assertNotProductionStoreInTest() exactly, including throwing rather than
+ * no-opping: a silent refusal is the same shape of problem as the silent write
+ * it replaces. tests/_setup.mjs is the belt (it defaults the env var for every
+ * test process before any module is imported); this is the brace, for a runner
+ * invoked without `--import ./tests/_setup.mjs`.
+ *
+ * @param {string} path the path a writer is about to open
+ * @throws {Error} when a test run targets the live cache
+ */
+export function assertNotProductionCacheInTest(path) {
+  if (!isTestRun()) return;
+  if (resolve(path) !== resolve(PRODUCTION_CACHE_PATH)) return;
+  throw new Error(
+    `refusing to write the production discovery cache from a test run: ${PRODUCTION_CACHE_PATH}. ` +
+      'Set SKGATEWAY_MODEL_CATALOG_CACHE_PATH to a temp path before importing any module ' +
+      'that captures it (discovery.mjs and router.mjs both bind it at module load).',
+  );
+}
 
 // Card P2.2: the committed manual card overlay (config/model-cards.overrides.yaml),
 // resolved relative to this file so it works the same from any cwd.
@@ -294,6 +354,202 @@ export function mergeCatalog(local, nvidia, openrouter, opencode) {
     }
   }
   return [...seen.values()];
+}
+
+/**
+ * The models the gateway is CONFIGURED TO SERVE, as catalog entries.
+ *
+ * THE INVARIANT THIS EXISTS TO ENCODE: a model the gateway is configured to
+ * serve is a model the router may match. Discovery ENRICHES that set; it must
+ * not DEFINE it. Before this function, the live bucket/@match path defined the
+ * set purely from the on-disk discovery cache, and discovery has exactly three
+ * provider adapters (nvidia, openrouter, opencode). There is no Anthropic
+ * adapter and no adapter for our own hardware, so no amount of refreshing
+ * could ever put a Claude model or an Ornith model in that file. Measured on
+ * this node 2026-08-16: GET /v1/models served 66 models including
+ * ornith-1.0-9b, ornith-tiny and four claude-* ids, while the cache the router
+ * matched against held 96 models of which 79 were nvidia, 16 openrouter and
+ * exactly one `local` (id `c3-neutral`, which is not in any current config).
+ * Neither Ornith nor any Claude model appeared. The cache was FRESH and wrong,
+ * not stale and wrong, so nothing about it looked broken.
+ *
+ * The consequence lands precisely where sovereignty matters. `secret` has a
+ * trust-zone ceiling of 0 and `internal` a ceiling of 1, so an sk-*-secret
+ * bucket could only ever be filled by a local model and an sk-*-internal one
+ * by a local or Anthropic model. With neither in the catalog those buckets
+ * find no eligible member and 503, while the zone-2 free-remote cloud buckets
+ * resolve fine. The feature fails exactly where it matters and succeeds where
+ * it does not.
+ *
+ * SHAPE. `{id, provider, free, url}`, the same shape the provider adapters
+ * emit plus the serving url:
+ *   - `provider` is the OWNING BACKEND NAME, never a blanket "local", because
+ *     that is what capabilities.mjs's resolveProviderPosture() keys on to find
+ *     a data_retention posture (`anthropic`, `anthropic-direct`, `local`, ...).
+ *   - `free` follows tagLocalModels()'s existing rule exactly: a paid cloud
+ *     backend (isAnthropicBackend) OR a paid model family by id
+ *     (isAnthropicModelId) is not free, even when the serving backend is the
+ *     loopback claude-code-api wrapper. Getting this wrong would make
+ *     deriveSovereignty() read a paid Claude as sovereign `local` compute
+ *     purely because the network hop is 127.0.0.1.
+ *   - `url` is carried because deriveSovereignty() falls back to
+ *     `isLocalUrl(url)` for any model with no operator-declared `tier`. Drop
+ *     it and `ornith-tiny` (no overlay entry) derives as `free-remote`, i.e.
+ *     trust zone 2, i.e. silently excluded from every `secret` bucket. A
+ *     sovereign model landing in the exposed zone is the failure this whole
+ *     card is about, so the url is not optional.
+ *
+ * EVERY backend is included, not just the non-discovery ones.
+ * advertise.mjs's tagLocalModels() skips `nvidia` and `openrouter` because
+ * their ids are supposed to come from the live fetch, and for a /v1/models
+ * DISPLAY tag that is right. It is wrong for a MATCH set: measured on this
+ * node, 7 of the 9 concrete ids declared under `backends.nvidia.models`
+ * (qwen3.5-122b-a10b, qwen3.5-397b-a17b, deepseek-v4-flash, deepseek-v4-pro,
+ * mistral-medium-3.5-128b, mistral-large-3-675b, minimax-m2.7) were absent
+ * from the discovery cache while buildModelCatalog() advertised all nine on
+ * /v1/models. Declared-but-undiscovered is still served, so it is still
+ * matchable. Wildcards (`dolphin-*`) are skipped: they are patterns, not ids,
+ * exactly as tagLocalModels() and buildModelCatalog() already skip them.
+ *
+ * Pure: the caller passes `backends` (config.backends). No I/O here.
+ *
+ * @param {Record<string, {models?: string[], url?: string, auth_type?: string}>} [backends]
+ * @returns {Array<{id:string, provider:string, free:boolean, url?:string}>}
+ */
+export function servingConfigModels(backends = {}) {
+  const out = [];
+  if (!backends || typeof backends !== 'object') return out;
+  for (const [name, b] of Object.entries(backends)) {
+    const paidBackend = isAnthropicBackend(b);
+    for (const id of (b && b.models) || []) {
+      if (typeof id !== 'string' || id.includes('*')) continue;
+      const paid = paidBackend || isAnthropicModelId(id);
+      const entry = { id, provider: name, free: !paid };
+      if (typeof b.url === 'string' && b.url) entry.url = b.url;
+      out.push(entry);
+    }
+  }
+  return out;
+}
+
+/**
+ * Union one serving-config entry with the discovery entry of the same id.
+ *
+ * WHICH SIDE WINS, and why. Discovery wins on every field it actually carries;
+ * serving config supplies EXISTENCE and fills only the fields discovery has no
+ * value for (in practice `url`, which no provider adapter emits).
+ *
+ * The reason is that a discovery entry is EVIDENCE and a serving-config entry
+ * is a DECLARATION. The adapters return a provider-declared or probed `card`
+ * (context_length, supported_parameters, size_class off a published parameter
+ * count), a pricing-derived `free`, and a `stale` flag from the fetch cycle
+ * that produced them. A serving-config entry knows none of that; it knows only
+ * that an operator wrote the id under a backend. Letting the declaration win
+ * would overwrite measured capability data with nothing, which is how a model
+ * with a perfectly good discovered card ends up failing a class floor.
+ *
+ * Note this is deliberately NOT the precedence in mergeCatalog(), which puts
+ * `local` first and lets first-seen win the WHOLE entry. That order is correct
+ * inside discoverCatalog(), where the static list is the only description of a
+ * static model and the provider groups describe disjoint id spaces. Here the
+ * two sides overlap on real ids (the nine nvidia declarations above), so a
+ * whole-entry winner would have to discard one side's data. A field-level
+ * merge discards neither.
+ *
+ * The same rule also decides `provider`, and that direction is the fail-closed
+ * one. If an id is reachable BOTH through a remote provider and through a
+ * locally-declared backend, keeping the discovered provider keeps the worse
+ * data-retention posture (`trains`, zone 2) rather than relabelling the model
+ * sovereign because a same-named local backend happens to declare it. No such
+ * collision exists on this fleet today; this is which way to fall if one ever
+ * appears. Per-door enforcement is unaffected either way: router.mjs's
+ * backendTrustZone() still judges the ACTUAL backend at failover time.
+ *
+ * @param {object} serving
+ * @param {object} discovered
+ * @returns {object}
+ */
+function unionEntry(serving, discovered) {
+  const merged = { ...serving };
+  for (const [k, v] of Object.entries(discovered || {})) {
+    if (v !== undefined) merged[k] = v;
+  }
+  return merged;
+}
+
+/**
+ * Build the catalog the router MATCHES against: the discovery cache unioned
+ * with the configured serving backends, then overlaid with the committed card
+ * overlay.
+ *
+ * THE OVERLAY IS THE POINT, not a finishing touch. applyCardOverlays() is
+ * applied at cache WRITE time (discoverCatalog() below) and at the two admin
+ * endpoints in index.mjs, so the curated `size_class` is baked into cached
+ * rows rather than attached when they are read. A union performed downstream
+ * of this function (say, inside router.mjs's buildMatchCatalog) would add
+ * serving-config models that never pass through the overlay at all: they would
+ * arrive with no card, meetsClassFloor() would score them `unknown`, and an
+ * unknown class clears only floor `S`. claude-opus-4-8 would then be present
+ * in the catalog and STILL fail sk-l-secret and sk-xl-internal, which is the
+ * original symptom with an extra step. So the union happens HERE, on the same
+ * side of the overlay as everything it is unioned with.
+ *
+ * applyCardOverlays() is idempotent over already-overlaid cached rows: a card
+ * whose `source` is a live provider is returned untouched, and re-spreading
+ * the same override onto a `source:'manual'` card is a no-op.
+ *
+ * FAILS CLOSED. The union must never WIDEN membership on an error path. A
+ * missing, unreadable or not-yet-loaded config yields zero serving entries and
+ * therefore the discovery cache alone, which is exactly today's behaviour, and
+ * it is logged rather than swallowed silently. Same for the cache side: an
+ * unreadable cache contributes nothing and the serving config stands alone.
+ * Neither failure throws into a request path.
+ *
+ * @param {object} [opts]
+ * @param {string} [opts.cachePath] discovery cache to read (defaults to CACHE_PATH)
+ * @param {Record<string,object>} [opts.backends] config.backends; omit to read the live config
+ * @param {Record<string,object>} [opts.overrides] card overlay; omit to read the committed file
+ * @returns {Array<object>} merged catalog entries, overlay applied
+ */
+export function buildServingCatalog(opts = {}) {
+  let cached = [];
+  try {
+    const cache = loadCache(opts.cachePath || CACHE_PATH);
+    if (Array.isArray(cache && cache.models)) cached = cache.models;
+  } catch {
+    // loadCache is already fail-soft; belt and braces so a surprise here
+    // degrades to "serving config only" rather than breaking routing.
+  }
+
+  let serving = [];
+  if (opts.backends !== undefined) {
+    serving = servingConfigModels(opts.backends);
+  } else {
+    try {
+      serving = servingConfigModels(getConfig().backends || {});
+    } catch (err) {
+      // getConfig() throws when no config has been loaded (every unit test
+      // that never boots the gateway) and _readAndBuild throws on an invalid
+      // one. Either way: no serving entries, no widening.
+      console.warn(
+        `[skgateway:discovery] serving config unavailable, matching against the discovery cache alone: ${err.message}`,
+      );
+      serving = [];
+    }
+  }
+
+  const byId = new Map();
+  for (const m of serving) {
+    if (m && typeof m.id === 'string' && !byId.has(m.id)) byId.set(m.id, m);
+  }
+  for (const m of cached) {
+    if (!m || typeof m.id !== 'string') continue;
+    const existing = byId.get(m.id);
+    byId.set(m.id, existing ? unionEntry(existing, m) : m);
+  }
+
+  const overrides = opts.overrides || loadCardOverrides();
+  return applyCardOverlays([...byId.values()], overrides);
 }
 
 // fetchNvidia/fetchOpenRouter now delegate to the provider adapters (card
@@ -690,6 +946,9 @@ export function loadCache(path = CACHE_PATH) {
 }
 
 export function saveCache(cache, path = CACHE_PATH) {
+  // Outside the try, same as saveLifecycleStore(): everything inside is
+  // swallowed by design, and a guard that gets swallowed is not a guard.
+  assertNotProductionCacheInTest(path);
   try {
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, JSON.stringify(cache, null, 2));

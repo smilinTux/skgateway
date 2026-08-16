@@ -38,7 +38,7 @@ import { createDecisionCache, decisionKey } from "./decision-cache.mjs";
 // routing.match_enabled (config.mjs, unmodified: the DEFAULTS already carry
 // a `routing:` block, card P4.4 adds match_enabled to it later).
 import { getConfig } from "../config.mjs";
-import { loadCache as loadDiscoveryCache } from "../discovery.mjs";
+import { buildServingCatalog } from "../discovery.mjs";
 import { rankModels } from "../ranking/rank.mjs";
 import { buildCapabilityCatalog } from "../ranking/catalog.mjs";
 import { loadAllowlist } from "../advertise.mjs";
@@ -1586,10 +1586,9 @@ function matchConfigEpoch() {
 
 /**
  * Assemble the ranker's catalog input (design 4.1 shape: `{id, free,
- * lifecycle:{state}, capabilities}`) straight off the on-disk discovery
- * cache (the same file discovery.mjs's refresh cycle writes), so the router
- * never depends on index.mjs's in-memory catalog or triggers a network
- * fetch. The id-to-capabilities mapping itself is NOT reimplemented here
+ * lifecycle:{state}, capabilities}`) off the on-disk discovery cache UNIONED
+ * WITH THE CONFIGURED SERVING BACKENDS, so the router never depends on
+ * index.mjs's in-memory catalog or triggers a network fetch. The id-to-capabilities mapping itself is NOT reimplemented here
  * (card C7): it delegates to `buildCapabilityCatalog()`
  * (../ranking/catalog.mjs), the same function index.mjs's `buildRankCatalog()`
  * (card P3.3, the /admin/models/rank suggest-only API) delegates to, so this
@@ -1598,19 +1597,37 @@ function matchConfigEpoch() {
  * derivation. Before this card, this function hardcoded
  * `deriveCapabilities(entry, { metrics: {} })` inline, a second, uninjectable
  * copy of what buildRankCatalog already did with an injectable
- * `opts.metricsFn`. Never throws: a missing/unreadable cache file yields an
- * empty catalog.
+ * `opts.metricsFn`. Never throws: a missing/unreadable cache file yields the
+ * serving config alone, and a missing/unreadable serving config yields the
+ * cache alone.
+ *
+ * THE CACHE ALONE WAS NOT THE SERVED SET. discovery.mjs has three provider
+ * adapters (nvidia, openrouter, opencode) and no producer for Anthropic or for
+ * our own hardware, so the file this function used to read exclusively could
+ * never contain a Claude model or an Ornith model no matter how often it was
+ * refreshed. Measured on this node 2026-08-16: 66 models served on
+ * /v1/models, 96 in the cache, and not one id in common for the two tiers that
+ * matter. `secret` (ceiling zone 0) and `internal` (ceiling zone 1) had no
+ * eligible member at all while the zone-2 cloud buckets worked, so the
+ * sovereignty gate failed exactly where it mattered.
+ *
+ * The union itself lives in discovery.mjs's `buildServingCatalog()`, NOT here,
+ * because it has to happen on the same side of `applyCardOverlays()` as the
+ * cached rows it is unioned with. The overlay is applied when the cache is
+ * WRITTEN; a model added downstream of it arrives with no curated
+ * `size_class`, scores `unknown` in meetsClassFloor(), and clears only floor
+ * `S`. It would be in the catalog and still fail sk-l-secret. See that
+ * function's doc comment.
  *
  * @returns {Array<object>}
  */
 function buildMatchCatalog() {
-  let cache;
+  let models;
   try {
-    cache = loadDiscoveryCache(MATCH_CATALOG_CACHE_PATH);
+    models = buildServingCatalog({ cachePath: MATCH_CATALOG_CACHE_PATH });
   } catch {
-    cache = {};
+    models = [];
   }
-  const models = Array.isArray(cache && cache.models) ? cache.models : [];
   return buildCapabilityCatalog(models, { getLifecycleFn: getLifecycle });
 }
 

@@ -287,8 +287,40 @@ requirements:
 /** Minimal valid skgateway.yaml fixture (defaults cover the rest) with a
  * `routing:` override, written to a fresh temp file each call. */
 let _cfgSeq = 0;
+/**
+ * The gateway config fixture MUST zero the DEFAULTS' backend model lists.
+ *
+ * buildMatchCatalog() now unions the discovery cache with the models the
+ * config declares the gateway SERVES, which is the whole point of that change:
+ * a model on /v1/models must be matchable. config.mjs's DEFAULTS ship
+ * placeholder backends (nvidia declares moonshotai/kimi-k2.6 and
+ * minimaxai/minimax-m2.7, anthropic declares two claude ids), and deepMerge
+ * keeps them for any backend a fixture does not mention. So a fixture that
+ * writes only `routing:` silently inherits four extra serveable ids and this
+ * suite's ranked chain becomes [match-primary, kimi-k2.6, minimax-m2.7,
+ * match-secondary] instead of the two ids the catalog fixture declares. That
+ * is the union working correctly (the effective config does serve them, and
+ * buildModelCatalog would advertise them on /v1/models too), but it is not
+ * what THIS suite is about: it tests rank order and failover across a chain it
+ * defines in writeCatalog().
+ *
+ * A wildcard-only list is the way to say "this backend serves no concrete id
+ * here": config validation rejects an EMPTY models array, and
+ * servingConfigModels() skips patterns because a pattern is not an id. So the
+ * catalog fixture becomes the only source of ranked ids, which is what every
+ * assertion below already assumed. deepMerge REPLACES arrays rather than
+ * concatenating them, so this genuinely clears the default.
+ */
 function writeGatewayConfigFixture({ match_enabled }) {
   const p = join(FIX_DIR, `gw-${_cfgSeq++}.yaml`);
-  writeFileSync(p, `routing:\n  match_enabled: ${match_enabled === true ? "true" : "false"}\n`, "utf8");
+  writeFileSync(
+    p,
+    `routing:\n  match_enabled: ${match_enabled === true ? "true" : "false"}\n` +
+    "backends:\n" +
+    "  nvidia:\n    models: [unused-in-this-fixture-*]\n" +
+    "  anthropic:\n    models: [unused-in-this-fixture-*]\n" +
+    "  ollama:\n    models: [unused-in-this-fixture-*]\n",
+    "utf8",
+  );
   return p;
 }

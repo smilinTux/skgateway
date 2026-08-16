@@ -260,9 +260,32 @@ function writeCatalog(models) {
 }
 
 let _cfgSeq = 0;
+/**
+ * Zeroes the DEFAULTS' backend model lists for the same reason
+ * tests/router-match.test.mjs does: buildMatchCatalog() unions the discovery
+ * cache with the models the config declares the gateway SERVES, and
+ * config.mjs's DEFAULTS ship placeholder backends (nvidia's
+ * moonshotai/kimi-k2.6 and minimaxai/minimax-m2.7, two anthropic claude ids)
+ * that deepMerge keeps for any backend a fixture does not mention. Without
+ * this, the multi-door chain below ranks four ids instead of the two written
+ * by writeCatalog(), and the door-order assertions become accidental. This
+ * suite happened to still pass with the extra ids; that is luck, not a
+ * property worth relying on. A wildcard-only list rather than an empty one
+ * because config validation rejects an empty models array, while
+ * servingConfigModels() skips patterns (a pattern is not an id). deepMerge
+ * REPLACES arrays, so this genuinely clears the default.
+ */
 function writeGatewayConfigFixture() {
   const p = join(FIX_DIR, `gw-match-${_cfgSeq++}.yaml`);
-  writeFileSync(p, "routing:\n  match_enabled: true\n", "utf8");
+  writeFileSync(
+    p,
+    "routing:\n  match_enabled: true\n" +
+    "backends:\n" +
+    "  nvidia:\n    models: [unused-in-this-fixture-*]\n" +
+    "  anthropic:\n    models: [unused-in-this-fixture-*]\n" +
+    "  ollama:\n    models: [unused-in-this-fixture-*]\n",
+    "utf8",
+  );
   return p;
 }
 
