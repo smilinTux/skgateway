@@ -50,6 +50,12 @@
 
 import { LIFECYCLE_STATES } from '../discovery/lifecycle.mjs';
 import { resolveZoneCeiling, isZoneAllowed } from '../policy/sensitivity.mjs';
+// classRank reads the canonical S/M/L/XL ranks straight out of the mirrored
+// joule-grade-vocabulary.json (via policy/buckets.mjs's gradeVocabulary()).
+// Reused rather than retyped: this module's `min_class` floor and buckets.mjs's
+// `model_class` bucket floor both order the same four letters, so one rank
+// table serves both instead of two copies drifting apart.
+import { classRank } from '../policy/buckets.mjs';
 
 /**
  * Basis weights (design 6.2): empirical signal outweighs priors by
@@ -109,6 +115,11 @@ const KNOWN_REQUIRE_KEYS = new Set([
   // Escape hatch for a caller that wants to name the ceiling directly rather
   // than go through a sensitivity label.
   'max_trust_zone',
+  // Card P2 (Joule Economy): the capability FLOOR for a graded card. The
+  // gateway does not grade work; it only enforces a floor a caller declares
+  // (registry role, `require=` query spec, or `x-sk-require` header, all the
+  // same grammar). See requireFailureReason() below for the enforcement.
+  'min_class',
 ]);
 
 /**
@@ -197,6 +208,40 @@ function requireFailureReason(entry, require = {}, sensitivityPolicy = undefined
   if (ceiling !== null && !isZoneAllowed(caps.trust_zone, ceiling)) {
     const z = typeof caps.trust_zone === 'number' ? caps.trust_zone : 'unknown';
     return `require:sensitivity:trust_zone_${z}_exceeds_${ceiling}`;
+  }
+
+  // Card P2: `min_class` is the HARD capability floor for a graded card
+  // (joule-grade-vocabulary.json's `model_class = CLASS[max(size_rank,
+  // risk_rank)]`, "Floor is HARD: never route graded work to a model below
+  // its class"). The gateway does not grade work (that is the job side's
+  // job, and section 11 of the model-metadata spec is explicit that
+  // "graders grade, dispatchers map, the gateway matches and gates"); it
+  // only enforces a `min_class` a caller already declared, comparing it
+  // against the model's OWN `size_class` (capabilities.mjs, surfaced
+  // straight off the card). This is a filter, not the bucket-routing
+  // model_class floor in policy/buckets.mjs, which additionally folds in
+  // measured capability ceilings; that combining logic is out of scope
+  // here, only the rank comparison table is shared via classRank().
+  if (require.min_class !== undefined) {
+    const needRank = typeof require.min_class === 'string' ? classRank(require.min_class) : null;
+    if (needRank === null) return `require:min_class:unrecognized:${require.min_class}`;
+
+    // An unknown/null size_class must NOT silently pass a floor. Chosen
+    // policy: FAIL CLOSED whenever a min_class is declared at all, even the
+    // lowest (S), rather than "admitted only when no floor is declared"
+    // stated as a special case of S. This mirrors the sensitivity/trust_zone
+    // check just above (an unknown trust zone is the least trusted, not
+    // skipped) rather than max_latency_p50_ms's benefit-of-the-doubt: a
+    // trust zone and a capability class are both claims about what a model
+    // demonstrably IS, where being wrong admits work the model cannot
+    // actually do, unlike latency where being wrong only costs a slow
+    // response. A model with no declared size_class has not proven it meets
+    // even the smallest declared floor.
+    const haveRank = classRank(caps.size_class);
+    if (haveRank === null) return 'require:min_class:unknown_size_class';
+    if (haveRank < needRank) {
+      return `require:min_class:${caps.size_class}_below_${require.min_class}`;
+    }
   }
 
   return null;

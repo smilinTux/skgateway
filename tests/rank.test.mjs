@@ -189,11 +189,124 @@ describe('hard filters: require block', () => {
   });
 
   test('a known require key alongside an unknown one still fails closed on the unknown key', () => {
+    // NOTE: this originally used `min_class` as its example of an unknown
+    // key. Card P2 has since implemented it (see the min_class describe
+    // block below), so the example moved to a key that is genuinely
+    // unhandled, same reasoning as the `sensitivity` migration above.
     const results = rankModels(
       [entry('mixed', { capabilities: caps({ tool_use: { score: 1, basis: 'card' } }) })],
-      { require: { tool_use: true, min_class: 'XL' } },
+      { require: { tool_use: true, data_residency: 'eu-only' } },
     );
-    assert.equal(findResult(results, 'mixed').excluded_reason, 'require:unknown:min_class');
+    assert.equal(findResult(results, 'mixed').excluded_reason, 'require:unknown:data_residency');
+  });
+});
+
+describe('hard filters: require.min_class (card P2, Joule Economy capability floor)', () => {
+  test('a model whose size_class ranks below the floor is excluded', () => {
+    const results = rankModels(
+      [entry('too-small', { capabilities: caps({ size_class: 'M' }) })],
+      { require: { min_class: 'L' } },
+    );
+    const r = findResult(results, 'too-small');
+    assert.equal(r.excluded_reason, 'require:min_class:M_below_L');
+    assert.equal(r.score, null);
+    assert.equal(r.rank, null);
+  });
+
+  test('a model AT the floor is included', () => {
+    const results = rankModels(
+      [entry('at-floor', { capabilities: caps({ size_class: 'L' }) })],
+      { require: { min_class: 'L' } },
+    );
+    assert.equal(findResult(results, 'at-floor').excluded_reason, null);
+  });
+
+  test('a model ABOVE the floor is included', () => {
+    const results = rankModels(
+      [entry('above-floor', { capabilities: caps({ size_class: 'XL' }) })],
+      { require: { min_class: 'L' } },
+    );
+    assert.equal(findResult(results, 'above-floor').excluded_reason, null);
+  });
+
+  test('min_class is case-insensitive, same as classRank()', () => {
+    const results = rankModels(
+      [entry('lower', { capabilities: caps({ size_class: 'L' }) })],
+      { require: { min_class: 'l' } },
+    );
+    assert.equal(findResult(results, 'lower').excluded_reason, null);
+  });
+
+  test('an unrecognized min_class value fails closed rather than admitting everyone', () => {
+    const results = rankModels(
+      [entry('would-be-admitted', { capabilities: caps({ size_class: 'XL' }) })],
+      { require: { min_class: 'huge' } },
+    );
+    assert.equal(findResult(results, 'would-be-admitted').excluded_reason, 'require:min_class:unrecognized:huge');
+  });
+
+  test('unknown/null size_class fails closed even against the lowest floor (S)', () => {
+    const results = rankModels(
+      [entry('no-size-class', { capabilities: caps({ size_class: null }) })],
+      { require: { min_class: 'S' } },
+    );
+    assert.equal(findResult(results, 'no-size-class').excluded_reason, 'require:min_class:unknown_size_class');
+  });
+
+  test('unknown/null size_class does NOT exclude when no min_class is declared', () => {
+    const results = rankModels(
+      [entry('no-size-class', { capabilities: caps({ size_class: null }) })],
+      {},
+    );
+    assert.equal(findResult(results, 'no-size-class').excluded_reason, null);
+  });
+
+  test('no min_class declared leaves candidate selection byte-identical to today', () => {
+    const catalog = [
+      entry('a', { capabilities: caps({ size_class: 'S', reasoning: { score: 0.9, basis: 'eval' } }) }),
+      entry('b', { capabilities: caps({ size_class: null, reasoning: { score: 0.4, basis: 'eval' } }) }),
+      entry('c', { capabilities: caps({ size_class: 'XL', reasoning: { score: 0.6, basis: 'eval' } }) }),
+    ];
+    const withoutMinClass = rankModels(catalog, { prefer: ['reasoning'] });
+    const withEmptyRequire = rankModels(catalog, { require: {}, prefer: ['reasoning'] });
+    assert.deepEqual(withoutMinClass, withEmptyRequire);
+    // Every candidate survives; the tier/score chain is exactly today's.
+    for (const r of withoutMinClass) assert.equal(r.excluded_reason, null);
+  });
+
+  test('the filter only removes candidates, never reorders the survivors', () => {
+    // Four candidates in the same tier with distinct scores; two clear the
+    // floor, two do not. Ranking WITHOUT the floor first establishes the
+    // "natural" score order; ranking WITH the floor over just the survivors
+    // must reproduce that exact relative order (only the excluded two drop
+    // out), proving this is a filter, not a re-rank.
+    const wide = [
+      entry('best', { capabilities: caps({ size_class: 'XL', reasoning: { score: 0.9, basis: 'eval' } }) }),
+      entry('mid', { capabilities: caps({ size_class: 'L', reasoning: { score: 0.6, basis: 'eval' } }) }),
+      entry('below-1', { capabilities: caps({ size_class: 'S', reasoning: { score: 0.99, basis: 'eval' } }) }),
+      entry('below-2', { capabilities: caps({ size_class: 'M', reasoning: { score: 0.8, basis: 'eval' } }) }),
+    ];
+    const unfiltered = rankModels(wide, { prefer: ['reasoning'] });
+    const unfilteredSurvivorOrder = unfiltered
+      .filter((r) => r.excluded_reason === null && (r.id === 'best' || r.id === 'mid'))
+      .map((r) => r.id);
+
+    const filtered = rankModels(wide, { require: { min_class: 'L' }, prefer: ['reasoning'] });
+    const filteredSurvivors = filtered.filter((r) => r.excluded_reason === null);
+    assert.deepEqual(filteredSurvivors.map((r) => r.id), unfilteredSurvivorOrder);
+    assert.deepEqual(filtered.find((r) => r.id === 'below-1'), {
+      id: 'below-1', score: null, rank: null, tier: null, breakdown: null,
+      excluded_reason: 'require:min_class:S_below_L',
+    });
+    assert.equal(filtered.find((r) => r.id === 'below-2').excluded_reason, 'require:min_class:M_below_L');
+  });
+
+  test('min_class combines with other require keys (all must pass)', () => {
+    const results = rankModels(
+      [entry('big-but-no-tools', { capabilities: caps({ size_class: 'XL', tool_use: { score: 0, basis: 'card' } }) })],
+      { require: { min_class: 'M', tool_use: true } },
+    );
+    assert.equal(findResult(results, 'big-but-no-tools').excluded_reason, 'require:tool_use');
   });
 });
 
