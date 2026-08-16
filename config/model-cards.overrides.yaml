@@ -104,6 +104,59 @@ overrides:
     structured_outputs: true
     notes: "Pinned to role sk-heavy and the sk-auto hard tier. Costs real money, use the tier ladder to keep it off cheap jobs."
 
+  # Claude 5 family. Added 2026-08-16 after the claude-code-api wrapper's model
+  # discovery was repaired (it had been 401ing since 2026-08-15 by sending the
+  # OAuth token as x-api-key, so the wrapper advertised nothing newer than 4.8
+  # and sk-l-internal was resolving to claude-opus-4-7).
+  #
+  # size_class is CURATED, same call and same reasoning as claude-opus-4-8
+  # above: parameter counts are unpublished and irrelevant for a hosted static
+  # model, so the class is a declared capability floor rather than a derived
+  # one. Without an entry here these models arrive with size_class null, clear
+  # only floor S, and would be silently ineligible for sk-l-internal and every
+  # other bucket above S. Present in the catalog and unusable is worse than
+  # absent, because it looks like it works.
+  claude-opus-5:
+    display_name: "Claude Opus 5"
+    org: Anthropic
+    summary: "Current flagship reasoning and agentic-coding model. Supersedes Opus 4.8 as the heavy tier."
+    good_at: [deep reasoning, agentic coding, long-context synthesis, tool use, vision]
+    context_length: 500000
+    max_output_tokens: 64000
+    supported_parameters: [tools, tool_choice, structured_outputs, reasoning]
+    modality: "text+image->text"
+    tier: paid-cloud
+    quant: "n/a (hosted)"
+    speed: "medium; premium quality"
+    license: proprietary
+    size_class: XL
+    latency_class: interactive
+    reasoning: true
+    structured_outputs: true
+    notes: "Current heavy tier. Verified served by the claude-code-api wrapper and api.anthropic.com on 2026-08-16."
+
+  claude-sonnet-5:
+    display_name: "Claude Sonnet 5"
+    org: Anthropic
+    summary: "Current mid tier. Balanced quality and latency; the workhorse above Haiku and below Opus."
+    good_at: [coding, tool use, summarisation, structured output, vision]
+    context_length: 500000
+    max_output_tokens: 64000
+    supported_parameters: [tools, tool_choice, structured_outputs, reasoning]
+    modality: "text+image->text"
+    tier: paid-cloud
+    quant: "n/a (hosted)"
+    speed: "fast; strong quality per second"
+    license: proprietary
+    # L not XL, mirroring claude-sonnet-4-6. A capability FLOOR of L is what a
+    # bucket asks for; calling this XL would let sk-xl-* work land on a mid-tier
+    # model purely because the label was generous.
+    size_class: L
+    latency_class: interactive
+    reasoning: true
+    structured_outputs: true
+    notes: "Current mid tier. Verified served by the claude-code-api wrapper and api.anthropic.com on 2026-08-16."
+
   claude-opus-4-7:
     display_name: "Claude Opus 4.7"
     org: Anthropic

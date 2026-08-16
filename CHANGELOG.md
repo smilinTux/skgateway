@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Model cards for `claude-opus-5` (size_class XL) and `claude-sonnet-5`
+  (size_class L). Without an overlay entry these arrive with `size_class` null,
+  clear only capability floor S, and are silently ineligible for `sk-l-internal`
+  and every bucket above S. Present in the catalog but unusable is worse than
+  absent, because it looks like it works. `size_class` is curated for the same
+  reason as `claude-opus-4-8`: parameter counts are unpublished and irrelevant
+  for a hosted static model, so the class is a declared floor rather than a
+  derived one. Sonnet 5 is L rather than XL, mirroring Sonnet 4.6, so that
+  `sk-xl-*` work cannot land on a mid-tier model through a generous label.
+
 ### Fixed
 
 - `npm test` no longer overwrites the production model catalog cache. `saveCache()`
