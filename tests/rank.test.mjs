@@ -202,13 +202,19 @@ describe('hard filters: require block', () => {
 });
 
 describe('hard filters: require.min_class (card P2, Joule Economy capability floor)', () => {
-  test('a model whose size_class ranks below the floor is excluded', () => {
+  // This block tests the WIRING (rank.mjs calls meetsClassFloor and turns its
+  // result into an excluded_reason), not meetsClassFloor's own comparison
+  // rules: those cases (declared-vs-measured precedence, "unknown clears
+  // only S") already live in tests/buckets.test.mjs and are not repeated
+  // here, per round 1 review.
+
+  test('a model whose declared size_class ranks below the floor is excluded', () => {
     const results = rankModels(
       [entry('too-small', { capabilities: caps({ size_class: 'M' }) })],
       { require: { min_class: 'L' } },
     );
     const r = findResult(results, 'too-small');
-    assert.equal(r.excluded_reason, 'require:min_class:M_below_L');
+    assert.equal(r.excluded_reason, 'require:min_class:declared-size-prior:M_below_L');
     assert.equal(r.score, null);
     assert.equal(r.rank, null);
   });
@@ -245,12 +251,62 @@ describe('hard filters: require.min_class (card P2, Joule Economy capability flo
     assert.equal(findResult(results, 'would-be-admitted').excluded_reason, 'require:min_class:unrecognized:huge');
   });
 
-  test('unknown/null size_class fails closed even against the lowest floor (S)', () => {
+  // Corrected semantics per round 1 ruling: classRank('S') is the lowest
+  // rank, so an S floor requires no evidence at all, and excluding an
+  // unknown-class model there would silently enforce a DIFFERENT policy
+  // ("only models with populated metadata may work"), not the declared
+  // floor. meetsClassFloor already encodes this (tests/buckets.test.mjs:109,
+  // "UNKNOWN capability clears only the S floor"); this test proves rank.mjs
+  // actually delegates to it instead of re-deriving a stricter answer.
+  test('unknown/null size_class clears the lowest floor (S)', () => {
     const results = rankModels(
       [entry('no-size-class', { capabilities: caps({ size_class: null }) })],
       { require: { min_class: 'S' } },
     );
-    assert.equal(findResult(results, 'no-size-class').excluded_reason, 'require:min_class:unknown_size_class');
+    assert.equal(findResult(results, 'no-size-class').excluded_reason, null);
+  });
+
+  test('unknown/null size_class fails closed at M, L and XL', () => {
+    for (const floorClass of ['M', 'L', 'XL']) {
+      const results = rankModels(
+        [entry('no-size-class', { capabilities: caps({ size_class: null }) })],
+        { require: { min_class: floorClass } },
+      );
+      const r = findResult(results, 'no-size-class');
+      assert.equal(r.excluded_reason, `require:min_class:unknown:unknown_below_${floorClass}`);
+    }
+  });
+
+  test('an invalid declared size_class is distinguished from an absent one in the reason', () => {
+    // "XXL" is truthy (present) but does not rank, unlike size_class: null
+    // (genuinely absent). meetsClassFloor's basis differs for the two cases
+    // ('declared-size-prior' with a named modelClass vs 'unknown' with
+    // none), and that distinction must survive into the exclusion reason.
+    const results = rankModels(
+      [entry('invalid-class', { capabilities: caps({ size_class: 'XXL' }) })],
+      { require: { min_class: 'M' } },
+    );
+    assert.equal(
+      findResult(results, 'invalid-class').excluded_reason,
+      'require:min_class:declared-size-prior:XXL_below_M',
+    );
+  });
+
+  test('a measured capability ceiling overrides a higher declared size_class (proves delegation)', () => {
+    // Declares XL but measurably cannot hold a tool call. The old hand-rolled
+    // comparison read caps.size_class directly and would have admitted this
+    // against an M floor; delegating to meetsClassFloor's effectiveClass()
+    // must judge it on the measured ceiling (capped at S) instead, and
+    // excludes it. This is the case round 1 review specifically asked for.
+    const contradicted = {
+      id: 'big-but-weak',
+      free: true,
+      lifecycle: { ...active(), measured_capabilities: { tool_call: { status: 'fail' } } },
+      capabilities: caps({ size_class: 'XL' }),
+    };
+    const results = rankModels([contradicted], { require: { min_class: 'M' } });
+    const r = findResult(results, 'big-but-weak');
+    assert.match(r.excluded_reason, /^require:min_class:measured-ceiling \(measured tool_call fail\) below declared XL:S_below_M$/);
   });
 
   test('unknown/null size_class does NOT exclude when no min_class is declared', () => {
@@ -296,9 +352,12 @@ describe('hard filters: require.min_class (card P2, Joule Economy capability flo
     assert.deepEqual(filteredSurvivors.map((r) => r.id), unfilteredSurvivorOrder);
     assert.deepEqual(filtered.find((r) => r.id === 'below-1'), {
       id: 'below-1', score: null, rank: null, tier: null, breakdown: null,
-      excluded_reason: 'require:min_class:S_below_L',
+      excluded_reason: 'require:min_class:declared-size-prior:S_below_L',
     });
-    assert.equal(filtered.find((r) => r.id === 'below-2').excluded_reason, 'require:min_class:M_below_L');
+    assert.equal(
+      filtered.find((r) => r.id === 'below-2').excluded_reason,
+      'require:min_class:declared-size-prior:M_below_L',
+    );
   });
 
   test('min_class combines with other require keys (all must pass)', () => {
