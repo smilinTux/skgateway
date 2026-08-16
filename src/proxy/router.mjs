@@ -390,10 +390,16 @@ export function _throttleStateForTests(backendId, model) {
  * @property {number}   [timeout_ms]        Socket idle timeout (fail fast on a wedged upstream; 0 = off)
  *
  * @typedef {Object} HealthSnapshot
- * @property {'up'|'degraded'|'down'} status
- * @property {number}   errorRate     0–1 float
+ * @property {'up'|'degraded'|'down'|'unknown'} status  `unknown` = never observed
+ *   (no request has completed against this backend since start), which is NOT
+ *   the same as healthy. Health is derived from observed outcomes, so an
+ *   unobserved backend has no evidence either way. See `getHealth()`.
+ * @property {boolean}  observed      false = no request has ever completed here.
+ *   When false, `errorRate`, `latencyP50` and `totalErrors` are computed over an
+ *   empty sample and carry no information; do not render them as good news.
+ * @property {number}   errorRate     0-1 float (meaningless when observed=false)
  * @property {number}   latencyP50    ms (median of recent requests)
- * @property {number}   lastCheck     epoch ms of last successful or failed request
+ * @property {number}   lastCheck     epoch ms of last successful or failed request; 0 = never
  * @property {number}   totalRequests
  * @property {number}   totalErrors
  *
@@ -725,11 +731,32 @@ export class Backend {
 
   /**
    * Returns a point-in-time snapshot of this backend's health.
+   *
+   * `status` reports `"unknown"` when this backend has never been observed
+   * (`_lastCheck === 0`). Health here is DERIVED FROM OBSERVED REQUEST
+   * OUTCOMES, never from active probing, so a backend nobody has called yet
+   * still carries the optimistic `"up"` this class is constructed with. That
+   * made a never-probed backend indistinguishable from a healthy one.
+   *
+   * Not hypothetical. On 2026-08-16 the machine hosting `local`
+   * (192.168.0.100:8082, ornith) and `ollama` (192.168.0.100:11434) was hard
+   * down for over an hour. `/health` reported BOTH as `status: "up",
+   * errorRate: 0`, because neither had been called since start, while
+   * `sk-default` silently failed over to a cloud model and answered
+   * perfectly. The failover behaved correctly; the REPORTING is what lied.
+   *
+   * So this fixes the reporting and deliberately leaves selection alone.
+   * `isAvailable()` is unchanged: an unobserved backend stays selectable
+   * exactly as before. Treating unknown as down would refuse every backend at
+   * startup, trading a silent lie for a loud outage.
+   *
    * @returns {HealthSnapshot}
    */
   getHealth() {
+    const observed = this._lastCheck !== 0;
     return {
-      status: this._status,
+      status: observed ? this._status : "unknown",
+      observed,
       errorRate: this._computeErrorRate(),
       latencyP50: this._latency.p50(),
       lastCheck: this._lastCheck,
