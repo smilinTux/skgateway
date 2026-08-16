@@ -373,6 +373,29 @@ discovery:
 ## FAILS CLOSED with 503. It never falls back across a zone. A fallback that
 ## quietly downgrades sovereignty looks healthy, which is exactly how
 ## sk-default ended up serving from cloud after its local backend died.
+##
+## !! sensitivity_enforced ALONE DOES NOTHING. IT REQUIRES match_enabled. !!
+##
+## The gate only applies to a request that DECLARED a sensitivity, and the only
+## thing that puts a declared sensitivity on a live request is the
+## `x-sk-require` header, which src/index.mjs parses through
+## resolveRequestRequirements(). That function hard-returns undefined while
+## routing.match_enabled is off. So with match_enabled off, no request ever
+## carries a sensitivity, requestZoneCeiling() always returns null, and this
+## flag is inert whether it is true or false.
+##
+## Nothing tells you. There is no error, no warning, and the shadow soak
+## reports zero would-be blocks, which reads exactly like "nothing needed
+## blocking" rather than "the gate never ran". Rollout order is therefore:
+##
+##   1. match_enabled: true          (requests can now declare a sensitivity)
+##   2. sensitivity_enforced: false  (soak; grep sensitivity_gate / "shadow")
+##   3. sensitivity_enforced: true   (enforce, once the soak is clean)
+##
+## Step 1 is not optional and is not just for @match roles. Note also that
+## match_enabled is read ONCE at boot in index.mjs (module scope), unlike
+## sensitivity_enforced and buckets_enabled which are re-read per request, so
+## flipping it needs a restart rather than a SIGHUP.
 # routing:
 #   sensitivity_enforced: false
 
@@ -407,5 +430,24 @@ discovery:
 ##
 ## Ships OFF. With it off a bucket id is not special and routes as it would
 ## today. Turn it on only after reviewing what the pools actually resolve to.
+##
+## A MISTYPED BUCKET ID IS REFUSED, not routed. With this flag ON, an id shaped
+## like a bucket that is not one (`sk-xl-secrets`, `sk-xxl-secret`) returns 400
+## `invalid_bucket_id` listing the valid buckets. It used to return 200: an
+## unparseable bucket id fell through to registry routing, matched on the bare
+## `sk-` prefix, and resolved through defaults.role to sk-auto, so one
+## transposed letter served the request from an arbitrary model with no
+## capability floor and no trust-zone ceiling. Ids the registry explicitly
+## defines are exempt, so a deliberately-named role is never mistaken for a
+## typo, and ids that are not bucket-shaped (sk-default, sk-auto, sk-heavy,
+## sk-vision, ...) are untouched.
+##
+## Bucket MEMBERSHIP depends on the provider posture block in
+## config/model-cards.overrides.yaml. `internal` (ceiling zone 1) admits our own
+## hardware plus any provider with a verified `contractual-zero` retention
+## posture, which today is Anthropic only. If that block is missing or
+## unreadable, every remote model degrades to zone 2 and `internal` silently
+## narrows to sovereign-only, which looks like a working strict policy rather
+## than a broken one.
 # routing:
 #   buckets_enabled: false

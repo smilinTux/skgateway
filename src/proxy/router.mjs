@@ -49,7 +49,7 @@ import {
   policyFromRegistry,
   TRUST_ZONES,
 } from "../policy/sensitivity.mjs";
-import { parseBucketId, resolveBucket, selectMember } from "../policy/buckets.mjs";
+import { parseBucketId, resolveBucket, selectMember, looksLikeBucketAttempt, allBuckets } from "../policy/buckets.mjs";
 
 // sk-auto routing decision cache (TTL+LRU); keyed by request fingerprint + config epoch.
 const _autoDecisionCache = createDecisionCache({ ttlMs: 60_000, maxEntries: 500 });
@@ -1863,6 +1863,70 @@ function isBucketsEnabled() {
 const _bucketCounters = new Map();
 
 /**
+ * Does the registry explicitly define this id (as a role, a context key, or a
+ * backend name)? The escape hatch for the typo gate below.
+ *
+ * An operator who deliberately names a role `sk-l-fast` has declared it in the
+ * registry, and a declared role must keep working no matter what it is called.
+ * Only an id nothing defines can be a typo. Fail-soft to "not defined" on an
+ * unreadable registry: the typo gate is opt-in behind buckets_enabled, and
+ * refusing a bucket-shaped id we cannot vouch for is the fail-closed direction.
+ *
+ * @param {string} id
+ * @returns {boolean}
+ */
+function registryDefinesId(id) {
+  if (typeof id !== "string" || !id) return false;
+  try {
+    const reg = loadRegistry();
+    const has = (m) => !!m && Object.prototype.hasOwnProperty.call(m, id);
+    return has(reg?.roles) || has(reg?.contexts) || has(reg?.backends);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A bucket-shaped id that is not a bucket must FAIL, and say why.
+ *
+ * Measured on this code before the fix: with buckets_enabled ON,
+ * `model=sk-xl-secrets` returned HTTP 200. parseBucketId() correctly refused
+ * it, the bucket branch was skipped, isRegistryRouted() then matched it purely
+ * on the `sk-` prefix, nothing in the registry defined it, and it resolved
+ * through defaults.role to sk-auto, the difficulty classifier. A caller asking
+ * for XL-capable work on secret data got an arbitrary model with neither the
+ * capability floor nor the trust-zone ceiling applied, and a 200 telling them
+ * everything was fine.
+ *
+ * 400, not 503. 503 says "unavailable, retry later" and would earn a retry
+ * storm against an id that will never work; the address itself is wrong and
+ * nothing about waiting fixes it. The body carries the full valid bucket list
+ * so the caller can see the correction rather than guess at it.
+ *
+ * @param {string} id the model id the caller sent
+ * @param {string} reason from looksLikeBucketAttempt()
+ */
+function invalidBucketIdResponse(id, reason) {
+  return {
+    status: 400,
+    headers: { "content-type": "application/json" },
+    body: Buffer.from(JSON.stringify({
+      error: {
+        message:
+          `"${id}" is not a valid bucket address (${reason}). A bucket is ` +
+          `sk-<class>-<sensitivity>. It was NOT routed: a near-miss bucket id ` +
+          `would otherwise be served with no capability floor and no trust-zone ceiling.`,
+        code: 400,
+        type: "invalid_bucket_id",
+        model: id,
+        reason,
+        valid_buckets: allBuckets().map((b) => b.bucket),
+      },
+    }), "utf-8"),
+  };
+}
+
+/**
  * Resolve a bucket address to router candidates, or to a fail-closed 503.
  *
  * Returns `{candidates}` on success, or `{failClosed}` carrying the response to
@@ -1871,12 +1935,24 @@ const _bucketCounters = new Map();
  * ceiling this caller asked for, and serving it from something that misses
  * either would be a silent policy violation dressed up as availability.
  *
+ * `emitSiem` is a PARAMETER, not a closure reference. It used to be the
+ * latter, and since this is a module-level function while `emitSiem` is a
+ * `const` declared inside `routeAndSend`'s body, the identifier simply did not
+ * resolve: every call reached the `emitSiem("bucket_resolve", ...)` line and
+ * threw `ReferenceError: emitSiem is not defined`. No test ever called this
+ * function, so nothing caught it, and buckets_enabled has never been on in
+ * production, so nothing exercised it there either. It meant a VALID bucket id
+ * failed exactly as hard as an invalid one, the fail-closed 503 body below was
+ * unreachable, and the bucket layer could not have worked at all on the day
+ * somebody flipped the flag.
+ *
  * @param {object} router
  * @param {{bucket:string, model_class:string, sensitivity:string}} addr
  * @param {object} request
  * @param {Buffer} body raw request body, rewritten to the chosen concrete model
+ * @param {(type:string, details?:object, ctx?:object)=>void} [emitSiem]
  */
-function resolveBucketCandidates(router, addr, request, body) {
+async function resolveBucketCandidates(router, addr, request, body, emitSiem = () => {}) {
   let catalog = [];
   try {
     catalog = buildMatchCatalog();
@@ -1951,7 +2027,19 @@ function resolveBucketCandidates(router, addr, request, body) {
   // failover, quarantine, pooling and the throttle cooldowns all apply
   // unchanged. Every alternate door for that id is kept, which is what makes
   // card 9e28de88's same-model-different-provider preference work inside a pool.
-  const results = router.route({ ...request, model: picked.id, agentId: request.agentId });
+  //
+  // AWAITED. `router.route()` is async (it resolves each candidate's auth
+  // headers via `await b.buildAuthHeaders()`), and this call site used to take
+  // its return value directly. The Promise is not an array and is truthy, so
+  // the `Array.isArray(...) ? ... : results ? [results] : []` normalization
+  // wrapped the Promise itself as the single candidate, spread it into an
+  // empty object, and produced a candidate with no backendId, no backendUrl and
+  // no authHeaders. routeAndSend then threw `TypeError: Cannot convert
+  // undefined or null to object` on `Object.entries(authHeaders)`. The @match
+  // path does await the same call; this one was simply missed, and no test ever
+  // reached it. The normalization is kept for the resolved value, which really
+  // can be a single object or an array.
+  const results = await router.route({ ...request, model: picked.id, agentId: request.agentId });
   const list = Array.isArray(results) ? results : results ? [results] : [];
   return {
     candidates: list.map((r) => ({
@@ -2049,11 +2137,30 @@ export async function routeAndSend(router, request, upstreamPath, method, client
   // that is the correct answer but not one to discover in production on a
   // Friday. With the flag off a bucket id simply is not special and falls
   // through to today's behavior.
-  const bucketAddr = isBucketsEnabled() ? parseBucketId(request.model) : null;
+  const bucketsOn = isBucketsEnabled();
+  const bucketAddr = bucketsOn ? parseBucketId(request.model) : null;
   if (bucketAddr) {
-    const resolved = resolveBucketCandidates(router, bucketAddr, request, body);
+    const resolved = await resolveBucketCandidates(router, bucketAddr, request, body, emitSiem);
     if (resolved.failClosed) return resolved.failClosed;
     candidates = resolved.candidates;
+  } else if (bucketsOn) {
+    // A near miss is the dangerous case, not an unknown id. See
+    // invalidBucketIdResponse() above for the measured 200 this prevents. An
+    // id the registry actually defines is never a typo, so it is exempt and
+    // routes exactly as it did before.
+    const attempt = looksLikeBucketAttempt(request.model);
+    if (attempt.attempted && !registryDefinesId(request.model)) {
+      console.warn(
+        `[router] REFUSED bucket-shaped id "${request.model}": ${attempt.reason}. ` +
+          `Not falling through to registry defaults, which would apply no ` +
+          `capability floor and no trust-zone ceiling.`,
+      );
+      emitSiem("invalid_bucket_id", {
+        model: request.model,
+        reason: attempt.reason,
+      }, {});
+      return invalidBucketIdResponse(request.model, attempt.reason);
+    }
   }
 
   if (!candidates && isRegistryRouted(request)) {
