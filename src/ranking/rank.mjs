@@ -50,6 +50,14 @@
 
 import { LIFECYCLE_STATES } from '../discovery/lifecycle.mjs';
 import { resolveZoneCeiling, isZoneAllowed } from '../policy/sensitivity.mjs';
+// meetsClassFloor is the ONE hard-floor comparison over the S/M/L/XL grade
+// vocabulary (design doc, joule-grade-vocabulary.json). Card P2 review round
+// 1 caught this module reimplementing that comparison by hand and disagreeing
+// with it (size_class read as work-difficulty class instead of the labelled
+// parameter-size PRIOR it actually is, and no fold-in of measured capability
+// evidence). Delegated here rather than aligned, because two copies of one
+// rule is the defect: aligning them today only means they drift apart later.
+import { meetsClassFloor } from '../policy/buckets.mjs';
 
 /**
  * Basis weights (design 6.2): empirical signal outweighs priors by
@@ -109,6 +117,11 @@ const KNOWN_REQUIRE_KEYS = new Set([
   // Escape hatch for a caller that wants to name the ceiling directly rather
   // than go through a sensitivity label.
   'max_trust_zone',
+  // Card P2 (Joule Economy): the capability FLOOR for a graded card. The
+  // gateway does not grade work; it only enforces a floor a caller declares
+  // (registry role, `require=` query spec, or `x-sk-require` header, all the
+  // same grammar). See requireFailureReason() below for the enforcement.
+  'min_class',
 ]);
 
 /**
@@ -197,6 +210,52 @@ function requireFailureReason(entry, require = {}, sensitivityPolicy = undefined
   if (ceiling !== null && !isZoneAllowed(caps.trust_zone, ceiling)) {
     const z = typeof caps.trust_zone === 'number' ? caps.trust_zone : 'unknown';
     return `require:sensitivity:trust_zone_${z}_exceeds_${ceiling}`;
+  }
+
+  // Card P2: `min_class` is the HARD capability floor for a graded card
+  // (joule-grade-vocabulary.json's `model_class = CLASS[max(size_rank,
+  // risk_rank)]`, "Floor is HARD: never route graded work to a model below
+  // its class"). The gateway does not grade work (that is the job side's
+  // job, and section 11 of the model-metadata spec is explicit that
+  // "graders grade, dispatchers map, the gateway matches and gates"); it
+  // only enforces a `min_class` a caller already declared.
+  //
+  // Delegates entirely to `meetsClassFloor()` (policy/buckets.mjs) rather
+  // than comparing `caps.size_class` directly, because `size_class` is
+  // model PARAMETER SIZE, a labelled PRIOR for the work-difficulty class a
+  // floor is expressed in, not the same axis (buckets.mjs's own module
+  // comment: "TWO THINGS NAMED S/M/L/XL, AND THEY ARE NOT THE SAME THING").
+  // `meetsClassFloor` also folds in any measured capability ceiling ahead of
+  // the declared prior, so a model whose measured behavior contradicts its
+  // advertised size is judged on the measurement. Round 1 review found this
+  // module hand-rolling that comparison and disagreeing with the existing
+  // function; this replaces the hand-roll rather than aligning it, so the
+  // two can never drift apart again.
+  if (require.min_class !== undefined) {
+    const floor = meetsClassFloor(entry, require.min_class);
+    if (!floor.ok) {
+      // basis 'unknown-floor' means `require.min_class` itself was not a
+      // recognized S/M/L/XL letter: a caller error, not a fact about the
+      // model, so it gets the same `unrecognized:` shape as the sensitivity
+      // check above rather than being read as a class name.
+      if (floor.basis === 'unknown-floor') {
+        return `require:min_class:unrecognized:${require.min_class}`;
+      }
+      // Otherwise the model failed to meet the floor. `floor.basis` explains
+      // why: 'declared-size-prior' (the card's own claim, including an
+      // invalid value like "XXL", which still fails to rank), a
+      // 'measured-ceiling (...)' override, or 'unknown' when there is no
+      // declared size_class AND no measured evidence at all. Surfaced
+      // verbatim, same diagnostic discipline as the other require reasons.
+      // At an S floor this branch is never reached for an unknown class:
+      // `meetsClassFloor` treats "no evidence" as clearing the lowest floor
+      // (classRank('S') is 0, tests/buckets.test.mjs's own "UNKNOWN
+      // capability clears only the S floor"), so `floor.ok` is already true
+      // there and this `if` does not run. M/L/XL are where unknown
+      // genuinely fails.
+      const cls = floor.modelClass || 'unknown';
+      return `require:min_class:${floor.basis}:${cls}_below_${require.min_class}`;
+    }
   }
 
   return null;
