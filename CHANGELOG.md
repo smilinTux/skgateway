@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A never-probed backend reports `status: "unknown"`, not `"up"`.** Backend
+  health is derived from observed request outcomes, never from active probing,
+  so `BackendState` is constructed at the optimistic `"up"` and keeps it until
+  something fails. A backend nobody had called was therefore indistinguishable
+  from a healthy one. On 2026-08-16 the machine hosting `local`
+  (`192.168.0.100:8082`, ornith) and `ollama` (`192.168.0.100:11434`) was hard
+  down for over an hour while `/health` reported both as `up` with
+  `errorRate: 0` and `lastCheck: 0`, and `sk-default` failed over to a cloud
+  model and answered perfectly. `getHealth()` now also returns `observed`, so
+  "0 errors out of 0 requests" cannot read as a clean bill of health. Selection
+  is deliberately unchanged: `isAvailable()` still admits an unobserved
+  backend, because the failover behaved correctly and treating unknown as down
+  would refuse every backend at boot.
+
 ### Added
 
 - Model cards for `claude-opus-5` (size_class XL) and `claude-sonnet-5`
