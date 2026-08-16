@@ -8,7 +8,7 @@
  *
  * Run with:  node --test tests/lifecycle.test.mjs
  */
-import { test } from 'node:test';
+import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   LIFECYCLE_STATES,
@@ -31,6 +31,10 @@ test('defaultLifecycle() shape', () => {
     last_verified_at: null,
     consecutive_permanent_errors: 0,
     consecutive_successes: 0,
+    // Added with probe-failure escalation: without a counter here, a probe
+    // timeout demoted to suspect and stopped, leaving a model that answers
+    // nothing advertised forever.
+    consecutive_probe_failures: 0,
     absent_cycles: 0,
     eol_reason: null,
     eol_at: null,
@@ -470,4 +474,82 @@ test('thresholds are injected, not read from env or a module-level clock', () =>
     thresholds: customThresholds,
   });
   assert.equal(lc.state, 'active', 'custom threshold of 5 must not demote after 1 absent cycle');
+});
+
+// ── repeated probe failures must eventually retire a model ──────────────────
+//
+// Before this, a probe timeout demoted active -> suspect and then stopped
+// forever. `suspect` is still routable and still advertised, so a model that
+// answered nothing on every sweep stayed in the catalog indefinitely: an id
+// nothing could ever retire, which is the same shape as the bug this whole
+// epic exists to close. Measured 2026-08-16, six NVIDIA ids timed out on every
+// verification run and would have sat suspect forever.
+describe('probe failures escalate, but only after ambiguity is exhausted', () => {
+  const now = 1_800_000_000_000;
+  const fail = (lc, status = null) => applyProbeOutcome(lc, { ok: false, status, now });
+
+  test('a single timeout demotes to suspect, not eol', () => {
+    const r = fail(defaultLifecycle());
+    assert.equal(r.state, LIFECYCLE_STATES.SUSPECT, 'one ambiguous failure is not a retirement');
+    assert.equal(r.consecutive_probe_failures, 1);
+  });
+
+  test('repeated failures eventually reach eol, with a distinct reason', () => {
+    let lc = defaultLifecycle();
+    for (let i = 0; i < THRESHOLDS.probeFailureEolThreshold; i++) lc = fail(lc);
+    assert.equal(lc.state, LIFECYCLE_STATES.EOL);
+    assert.equal(
+      lc.eol_reason,
+      'probe_unresponsive',
+      'distinct from probe_failed (a 410) so an operator can tell "answers nothing" from "provider says gone"',
+    );
+  });
+
+  test('NEGATIVE CONTROL: it does not stop at suspect forever', () => {
+    // The bug. Twenty consecutive failures must not leave it routable.
+    let lc = defaultLifecycle();
+    for (let i = 0; i < 20; i++) lc = fail(lc);
+    assert.notEqual(lc.state, LIFECYCLE_STATES.SUSPECT);
+    assert.equal(isRoutable(lc), false, 'a model that answers nothing must stop being routable');
+  });
+
+  test('one good probe clears the streak outright', () => {
+    let lc = defaultLifecycle();
+    lc = fail(lc); lc = fail(lc);
+    assert.equal(lc.consecutive_probe_failures, 2);
+    lc = applyProbeOutcome(lc, { ok: true, now });
+    assert.equal(lc.consecutive_probe_failures, 0);
+    assert.equal(lc.state, LIFECYCLE_STATES.ACTIVE);
+  });
+
+  test('an intermittent model never accumulates enough to be retired', () => {
+    // Alternating fail/succeed is a slow or flaky model, not a dead one. It
+    // must stay usable, which is why the streak must be CONSECUTIVE.
+    let lc = defaultLifecycle();
+    for (let i = 0; i < 30; i++) {
+      lc = fail(lc);
+      lc = applyProbeOutcome(lc, { ok: true, now });
+    }
+    assert.equal(lc.state, LIFECYCLE_STATES.ACTIVE);
+  });
+
+  test('a 429 still advances nothing, not even the failure streak', () => {
+    // Throttled means alive and popular. Retiring for it would evict the models
+    // we use most.
+    let lc = defaultLifecycle();
+    for (let i = 0; i < 20; i++) lc = fail(lc, 429);
+    assert.equal(lc.state, LIFECYCLE_STATES.ACTIVE);
+    assert.equal(lc.consecutive_probe_failures || 0, 0);
+  });
+
+  test('a 410 still retires immediately, without waiting for the streak', () => {
+    const r = fail(defaultLifecycle(), 410);
+    assert.equal(r.state, LIFECYCLE_STATES.EOL);
+    assert.equal(r.eol_reason, 'probe_failed', 'the provider stating it is gone is stronger evidence');
+  });
+
+  test('a 400 still means not_chat, not unresponsive', () => {
+    const r = fail(defaultLifecycle(), 400);
+    assert.equal(r.state, LIFECYCLE_STATES.NOT_CHAT);
+  });
 });

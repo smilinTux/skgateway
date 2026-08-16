@@ -44,6 +44,22 @@ export const LIFECYCLE_STATES = {
 export const THRESHOLDS = {
   // consecutive 404/410 completions before a model flips active/suspect -> eol.
   eolErrorThreshold: 3,
+  // Consecutive PROBE failures (timeout, 5xx, connection error) before a
+  // suspect model is finally retired.
+  //
+  // Without this, a probe failure demoted active -> suspect and then stopped
+  // forever: `suspect` is still routable and still advertised, so a model that
+  // times out on every single sweep stayed in the catalog indefinitely. That is
+  // the same shape as the bug this whole epic exists to close, an id nothing
+  // could ever retire. Measured 2026-08-15/16, six NVIDIA ids timed out on
+  // every verification run for a day and would have sat suspect forever.
+  //
+  // Deliberately higher than eolErrorThreshold's 3-in-a-row on 404/410,
+  // because a 404 is the provider stating the model is gone while a timeout is
+  // ambiguous: it can be load, a cold start, or a genuinely slow model. At the
+  // daily sweep cadence 4 means roughly four days of never answering, which is
+  // no longer ambiguous. A single successful probe resets it to 0.
+  probeFailureEolThreshold: 4,
   // consecutive absent-from-catalog cycles before active -> suspect, per
   // provider (openrouter's free tier churns daily, so it gets more slack).
   // Card C8: opencode gets the same slack as openrouter, not more. Measured
@@ -83,6 +99,7 @@ export function defaultLifecycle() {
     last_verified_at: null,
     consecutive_permanent_errors: 0,
     consecutive_successes: 0,
+    consecutive_probe_failures: 0,
     absent_cycles: 0,
     eol_reason: null,
     eol_at: null,
@@ -345,13 +362,17 @@ export function applyCatalogPresence(lc, { present, provider, now, thresholds = 
  * not_chat: it is a request we authored, not a data point contaminated by
  * whatever a caller happened to send.
  */
-export function applyProbeOutcome(lc, { ok, status, now }) {
+export function applyProbeOutcome(lc, { ok, status, now, thresholds = THRESHOLDS }) {
   if (ok) {
     return {
       ...lc,
       state: LIFECYCLE_STATES.ACTIVE,
       consecutive_permanent_errors: 0,
       consecutive_successes: 0,
+      // One good probe clears the unresponsive streak outright. Unlike the
+      // completion-path counters this needs no earned-clear rule: a probe is a
+      // request we control, so a success is unambiguous evidence it answers.
+      consecutive_probe_failures: 0,
       absent_cycles: 0,
       eol_reason: null,
       eol_at: null,
@@ -389,10 +410,30 @@ export function applyProbeOutcome(lc, { ok, status, now }) {
     };
   }
 
-  if (lc.state === LIFECYCLE_STATES.ACTIVE) {
-    return { ...lc, state: LIFECYCLE_STATES.SUSPECT };
+  // An ambiguous failure: timeout, 5xx, connection error. Not a statement from
+  // the provider, so it is weaker evidence than a 404/410 and must not retire a
+  // model on its own. But it MUST accumulate, or a model that never answers
+  // stays advertised forever (see probeFailureEolThreshold).
+  const consecutive_probe_failures = (lc.consecutive_probe_failures || 0) + 1;
+  const threshold = (thresholds && thresholds.probeFailureEolThreshold) || THRESHOLDS.probeFailureEolThreshold;
+
+  if (consecutive_probe_failures >= threshold) {
+    return {
+      ...lc,
+      state: LIFECYCLE_STATES.EOL,
+      consecutive_probe_failures,
+      // Distinct from 'probe_failed' (a 410 during a probe, i.e. the provider
+      // said it is gone) so /admin/models shows WHY: this model answers
+      // nothing, which is an operator-actionable difference.
+      eol_reason: 'probe_unresponsive',
+      eol_at: now,
+    };
   }
-  return { ...lc };
+
+  if (lc.state === LIFECYCLE_STATES.ACTIVE) {
+    return { ...lc, state: LIFECYCLE_STATES.SUSPECT, consecutive_probe_failures };
+  }
+  return { ...lc, consecutive_probe_failures };
 }
 
 /**
