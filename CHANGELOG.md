@@ -83,6 +83,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Two canonicalisers for one agent id, so the same caller could be attributed
+  twice** (card 316dd167 / A8). `extractIdentity()` has always applied
+  `.trim().toLowerCase()` to `X-Agent-Id`, while the inline identity object
+  `src/index.mjs` builds when `identity.enabled` is false used the raw header.
+  The same caller was therefore recorded as `Lumina` or `lumina` purely
+  depending on a config flag, and `getTokenUsage()` / `getCosts()` filter with
+  `agent_id = @agentId`, an exact match, so one agent's spend would split
+  silently across two keys that no query joins back together.
+  `normalizeAgentId()` in `src/identity/capauth.mjs` is now the single
+  definition and both paths call it.
+
+  It also maps the literal `anonymous` to null. `ANONYMOUS_AGENT_ID` is the
+  value the resolver returns to mean "nobody identified themselves", so storing
+  it would make unattributed traffic aggregate under what looks like a real
+  agent. **Behaviour change worth a reviewer's eye:** because `extractIdentity`
+  now returns `method: 'anonymous'` for that header, the opt-in
+  `require_agent_id` auth gate rejects it where it previously passed, i.e. the
+  gate could be satisfied by typing the sentinel that means "I am not
+  identified". That gate is OFF by default and OFF on this fleet, so nothing
+  live changes.
+
+  For the record on the rest of `agent_id`: the write path itself was already
+  correct, and none of the current live callers sends any identity at all.
+  skcode / Claude Code sends `Authorization: Bearer sk-local`, `user-agent:
+  claude-cli/...` and `x-app: cli`; skos, skcapstone, skchat and the Hermes
+  provider send `Content-Type` and nothing else. That bearer literal is shared
+  verbatim by skcode, the pi adapter and the opencode adapter, so it names a
+  class of caller rather than an agent, and a user-agent names client software.
+  Deriving an agent from either would be inventing one, so on those paths the
+  gateway records NULL and the call site now documents exactly what it looked at
+  and why. Attribution for them is a client-side change (send `X-Agent-Id`).
+
 - **`request_log.backend` is NULL on every row written since 2026-08-15, and the
   table has never held one complete row.** Measured on the live database: 6,638
   of 8,130 rows DO carry a backend, and those are exactly the rows whose
