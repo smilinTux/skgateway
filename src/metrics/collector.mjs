@@ -415,7 +415,8 @@ export function createMetricsCollector(config) {
         SET status_code = @status_code,
             first_byte_ms = @first_byte_ms,
             total_ms = @total_ms,
-            error_msg = @error_msg
+            error_msg = @error_msg,
+            backend = COALESCE(@backend, backend)
         WHERE id = @id
       `),
       insertTokenUsage: db.prepare(`
@@ -787,6 +788,16 @@ export function createMetricsCollector(config) {
         first_byte_ms: firstByteMs   ?? null,
         total_ms:      total,
         error_msg:     errorMsg      ?? null,
+        // The serving backend, which is only knowable AFTER dispatch. The
+        // insert above runs before routing resolves and can only write NULL
+        // here, so without this update request_log.backend was NULL for every
+        // row ever written, even though the column exists and token_usage /
+        // cost_log / latency_log next to it were all populated. Card 3351d25b
+        // returns this same fact to the caller as x-sk-backend, and a header
+        // that names a backend the row it points at leaves blank is a join
+        // that answers half the question. COALESCE so an unknown backend
+        // leaves whatever is already there rather than erasing it.
+        backend:       backend       ?? null,
         _tokens: tokenRow,
         _cost:   costRow,
         _latency: {
