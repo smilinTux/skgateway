@@ -362,6 +362,34 @@ async function verifyPgpSignature(data, signatureArmor, publicKeyArmor) {
 }
 
 /**
+ * Canonical form of a caller-supplied agent id, or `null` when no agent is
+ * knowable.
+ *
+ * ONE definition, because there were two (card 316dd167 / A8). `extractIdentity`
+ * below has always applied `.trim().toLowerCase()`, while the inline fallback
+ * `src/index.mjs` builds when `identity.enabled` is false used the raw header.
+ * The same caller was therefore attributed as `Lumina` or `lumina` depending on
+ * a config flag, and `getTokenUsage()` / `getCosts()` filter with
+ * `agent_id = @agentId`, an exact match, so one agent's spend split silently
+ * across two keys that no query joins back together.
+ *
+ * The anonymous SENTINEL maps to null on purpose. `ANONYMOUS_AGENT_ID` is the
+ * value the resolver returns to say "nobody identified themselves"; a caller
+ * that literally sends `X-Agent-Id: anonymous` must not be stored as an agent
+ * by that name, or unattributed traffic would aggregate under what looks like a
+ * real agent.
+ *
+ * @param {unknown} raw  Header value, or an already-resolved agent id.
+ * @returns {string|null} lower-cased, trimmed id, or null for unknown.
+ */
+export function normalizeAgentId(raw) {
+  if (typeof raw !== 'string') return null;
+  const v = raw.trim().toLowerCase();
+  if (!v || v === ANONYMOUS_AGENT_ID) return null;
+  return v;
+}
+
+/**
  * Extract and resolve an agent identity from an incoming HTTP request.
  *
  * Resolution order:
@@ -381,7 +409,18 @@ export async function extractIdentity(req, registry) {
   // ── 1. CapAuth PGP signature ──────────────────────────────────────────────
   const capAuthSig  = h['x-capauth-signature'];
   const capAuthTs   = h['x-capauth-timestamp'];
-  const agentIdHdr  = h['x-agent-id']?.trim().toLowerCase();
+  // One canonicaliser for the whole gateway (card 316dd167 / A8). This used to
+  // be an inline `.trim().toLowerCase()` here and a raw header read in
+  // index.mjs, which is how the same caller got two different agent_ids.
+  //
+  // BEHAVIOUR CHANGE, called out because it touches the auth gate: this now
+  // also maps the literal `anonymous` to null. Previously `X-Agent-Id:
+  // anonymous` returned method 'header', so it satisfied `require_agent_id`,
+  // meaning the gate could be passed by typing the sentinel that means "I am
+  // not identified". It now resolves to method 'anonymous' and the gate rejects
+  // it. The gate is OFF by default and OFF on this fleet, so nothing live
+  // changes; a deployment that turns it on gets the semantics it asked for.
+  const agentIdHdr  = normalizeAgentId(h['x-agent-id']);
 
   if (capAuthSig && capAuthTs && agentIdHdr) {
     const tsSeconds = parseInt(capAuthTs, 10);

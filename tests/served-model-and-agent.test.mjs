@@ -55,6 +55,7 @@ import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 
 import { createMetricsCollector } from "../src/metrics/collector.mjs";
+import { normalizeAgentId, extractIdentity } from "../src/identity/capauth.mjs";
 import { loadConfig } from "../src/config.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -213,6 +214,57 @@ describe("model_served migration against a pre-existing database", () => {
   });
 });
 
+// ─── 2b. unit: one canonical form for a caller-supplied agent id ───────────
+
+describe("normalizeAgentId", () => {
+  test("trims and lower-cases, so one caller is one agent in the rollups", () => {
+    // getTokenUsage()/getCosts() filter with `agent_id = @agentId`, an exact
+    // match. "Lumina" and "lumina" landing in different rows splits one agent's
+    // spend across two keys that no query joins back together.
+    assert.equal(normalizeAgentId("  LUMINA  "), "lumina");
+    assert.equal(normalizeAgentId("lumina"), "lumina");
+  });
+
+  test("absent, blank and non-string all mean UNKNOWN, which is null", () => {
+    assert.equal(normalizeAgentId(undefined), null);
+    assert.equal(normalizeAgentId(null), null);
+    assert.equal(normalizeAgentId(""), null);
+    assert.equal(normalizeAgentId("   "), null);
+    assert.equal(normalizeAgentId(123), null);
+  });
+
+  test("the anonymous SENTINEL is not an agent and never becomes one", () => {
+    // ANONYMOUS_AGENT_ID is the value the resolver returns to say "nobody
+    // identified themselves". A caller that literally sends
+    // `X-Agent-Id: anonymous` must not be recorded as an agent named
+    // "anonymous", because that row would be indistinguishable from a real
+    // agent and would aggregate with every unattributed request.
+    assert.equal(normalizeAgentId("anonymous"), null);
+    assert.equal(normalizeAgentId("Anonymous"), null);
+  });
+
+  test("extractIdentity uses the SAME canonicaliser, so there is one answer", async () => {
+    const registry = { byName: new Map(), byToken: new Map(), defaultAgent: null };
+    const resolved = await extractIdentity(
+      { method: "POST", url: "/v1/chat/completions", headers: { "x-agent-id": "  LUMINA  " } },
+      registry,
+    );
+    assert.equal(resolved.agent_id, "lumina");
+    assert.equal(resolved.method, "header");
+
+    // And the sentinel is not an identity here either. This also closes a gate
+    // bypass: `require_agent_id` rejects on `method === 'anonymous'`, so before
+    // this a caller could satisfy the gate by sending the literal word that
+    // means "I am not identified". The gate is OFF by default and OFF on this
+    // fleet, so nothing live changes.
+    const sentinel = await extractIdentity(
+      { method: "POST", url: "/v1/chat/completions", headers: { "x-agent-id": "anonymous" } },
+      registry,
+    );
+    assert.equal(sentinel.method, "anonymous");
+  });
+});
+
 // ─── live-server harness ────────────────────────────────────────────────────
 
 /** Ask the OS for a free loopback port, then release it. */
@@ -278,7 +330,7 @@ function startUpstream() {
 }
 
 /** Boot the REAL gateway as a subprocess; resolve once it logs "listening". */
-function bootGateway({ port, dashPort, upstreamUrl, dbPath, storePath }) {
+function bootGateway({ port, dashPort, upstreamUrl, dbPath, storePath, identity = true }) {
   const dir = mkdtempSync(join(tmpdir(), "skgw-a8-gw-"));
   const cfgPath = join(dir, "gw.yaml");
   writeFileSync(cfgPath, [
@@ -290,10 +342,12 @@ function bootGateway({ port, dashPort, upstreamUrl, dbPath, storePath }) {
     "  enabled: false",
     "dashboard:",
     `  port: ${dashPort}`,
-    // Identity ON: this suite is about the agent_id write path, and the
-    // registry-backed resolver is the path production actually runs.
+    // Identity ON by default: this suite is about the agent_id write path, and
+    // the registry-backed resolver is the path production actually runs. One
+    // section below flips it OFF, because the two configurations used to
+    // attribute the SAME caller under two different ids.
     "identity:",
-    "  enabled: true",
+    `  enabled: ${identity}`,
     "metrics:",
     "  enabled: true",
     `  db_path: ${dbPath}`,
@@ -380,6 +434,15 @@ describe("model_served and agent_id on the live gateway", () => {
     await post("anon", { model: "a8-model", messages: msgs });
     await post("stream", { model: "a8-model", stream: true, messages: msgs });
     await post("nomodel", { model: "a8-nomodel", messages: msgs });
+    await post("shouty", { model: "a8-model", messages: msgs }, { "x-agent-id": "  LUMINA  " });
+    await post("sentinel", { model: "a8-model", messages: msgs }, { "x-agent-id": "anonymous" });
+    // What skcode and the Anthropic frontend actually put on the wire: a shared
+    // literal bearer token and a client user-agent, and no identity at all.
+    await post("skcodeish", { model: "a8-model", messages: msgs }, {
+      authorization: "Bearer sk-local",
+      "user-agent": "claude-cli/1.0.0 (external, cli)",
+      "x-app": "cli",
+    });
   });
 
   after(async () => {
@@ -447,5 +510,96 @@ describe("model_served and agent_id on the live gateway", () => {
     assert.ok(row, "no closed request_log row for the anonymous call");
     assert.equal(row.agent_id, null, "no agent is knowable here, so record none");
     assert.notEqual(row.agent_id, "anonymous", "the sentinel is not an agent and must not be stored");
+  });
+
+  test("a caller-supplied agent id is canonicalised, so one agent is one key", async () => {
+    const row = await rowFor(calls.shouty.headers["x-sk-req-id"]);
+    assert.equal(row.agent_id, "lumina", "'  LUMINA  ' and 'lumina' are the same agent");
+  });
+
+  test("NEGATIVE CONTROL: X-Agent-Id: anonymous is the sentinel, not an agent named anonymous", async () => {
+    const row = await rowFor(calls.sentinel.headers["x-sk-req-id"]);
+    assert.equal(
+      row.agent_id, null,
+      "storing the sentinel would make unattributed traffic aggregate as a real agent",
+    );
+  });
+
+  test("NEGATIVE CONTROL: the real skcode/Claude-Code header set carries NO knowable agent", async () => {
+    // This is what those callers genuinely send: `Authorization: Bearer
+    // sk-local` (a shared literal used by skcode, the pi adapter AND the
+    // opencode adapter, so it names a class of caller and not an agent),
+    // `user-agent: claude-cli/...` and `x-app: cli` (client software, not an
+    // agent). None of it identifies WHO is asking. Deriving an agent from any
+    // of it would be inventing one, so the row stays NULL and says so.
+    const row = await rowFor(calls.skcodeish.headers["x-sk-req-id"]);
+    assert.ok(row, "no closed request_log row for the skcode-shaped call");
+    assert.equal(row.agent_id, null);
+    assert.notEqual(row.agent_id, "claude-cli", "the client binary is not an agent");
+    assert.notEqual(row.agent_id, "sk-local", "a shared literal token is not an agent");
+  });
+});
+
+// ─── 4. the identity flag must not change WHO a request is attributed to ────
+
+describe("agent_id is the same with identity resolution disabled", () => {
+  let up, gw, port, dbPath, dbDir;
+  let reqId = null;
+
+  before(async () => {
+    up = await startUpstream();
+    port = await freePort();
+    const dashPort = await freePort();
+    dbDir = mkdtempSync(join(tmpdir(), "skgw-a8-db2-"));
+    dbPath = join(dbDir, "metrics.db");
+    const storePath = join(dbDir, "lifecycle-store.json");
+    writeFileSync(storePath, "{}");
+    // identity.enabled: false takes a SEPARATE branch in index.mjs that builds
+    // the identity object inline from the raw header instead of calling
+    // extractIdentity(). Those two branches used to disagree about casing, so
+    // the same caller was attributed under two different ids depending on a
+    // config flag, and per-agent spend silently split in half.
+    gw = await bootGateway({ port, dashPort, upstreamUrl: up.url, dbPath, storePath, identity: false });
+
+    const r = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-agent-id": "  LUMINA  " },
+      body: JSON.stringify({ model: "a8-model", messages: [{ role: "user", content: "hi" }] }),
+    });
+    await r.text();
+    reqId = r.headers.get("x-sk-req-id");
+  });
+
+  after(async () => {
+    if (gw) { try { gw.child.kill("SIGKILL"); } catch {} rmSync(gw.dir, { recursive: true, force: true }); }
+    if (up) await up.close();
+    if (dbDir) rmSync(dbDir, { recursive: true, force: true });
+  });
+
+  test("the same header yields the same canonical agent_id as with identity ON", async () => {
+    assert.ok(reqId, "no req id returned");
+    let row = null;
+    for (let i = 0; i < 40 && !row; i++) {
+      if (existsSync(dbPath)) {
+        const db = new Database(dbPath, { readonly: true });
+        try {
+          const r = db.prepare("SELECT * FROM request_log WHERE id = ?").get(reqId) ?? null;
+          if (r && r.status_code !== null) row = r;
+        } catch {}
+        db.close();
+      }
+      if (!row) await sleep(300);
+    }
+    assert.ok(row, "no closed request_log row");
+    assert.equal(row.agent_id, "lumina", "the identity flag must not change WHO this is");
+  });
+
+  test("model_served still lands with identity resolution off", async () => {
+    const db = new Database(dbPath, { readonly: true });
+    try {
+      assert.equal(db.prepare("SELECT model_served FROM request_log WHERE id = ?").get(reqId).model_served, SERVED_ID);
+    } finally {
+      db.close();
+    }
   });
 });
