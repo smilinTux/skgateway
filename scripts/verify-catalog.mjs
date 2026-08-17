@@ -152,6 +152,9 @@
  */
 
 import { fileURLToPath } from "node:url";
+import { writeFileSync, renameSync, mkdirSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { homedir } from "node:os";
 import { resolveFailoverCandidates, loadRegistry, REGISTRY_PATH } from "../src/proxy/registry.mjs";
 import { fireSkAlert } from "./lib/sk-alert.mjs";
 import { MIN_OUTPUT_TOKEN_LADDER } from "../src/discovery/capability-assessment.mjs";
@@ -178,6 +181,23 @@ export const MIN_FAILOVER_LIVE = 2;
 
 export const EXIT_OK = 0;
 export const EXIT_DRIFT = 1;
+
+// ── the artifact skwatchdog consumes (card 99c33052) ────────────────────────
+//
+// skgateway owns the probe and stays the SINGLE prober. skwatchdog READS this
+// rather than running its own, because one fact with two sources of truth is
+// the defect this fleet keeps producing, and two probes would drift while both
+// looked authoritative.
+//
+// Bump ARTIFACT_VERSION on any BREAKING shape change. Readers are expected to
+// refuse a version they do not understand and degrade to a gap, the same
+// discipline skos/watchdog/rubric.py already applies to SCHEMA_VERSION. That is
+// why the version exists: so a reader can say "I cannot read this" instead of
+// guessing at fields and reporting a confident wrong answer.
+export const ARTIFACT_VERSION = 1;
+
+/** Where the artifact lands unless overridden. Stable path, gateway-owned. */
+export const DEFAULT_ARTIFACT_PATH = join(homedir(), ".skcapstone", "gateway", "catalog-verify.json");
 export const EXIT_ERROR = 2;
 
 const PROBE_PROMPT = "Reply with the single word: ok.";
@@ -670,6 +690,30 @@ async function getJson(endpoint, path, { fetchImpl = fetch, timeoutMs = 10000 } 
  * @param {object} [args]
  * @returns {Promise<object>} the full structured result, exit code, and which alerts fired
  */
+
+/**
+ * Write the skwatchdog artifact atomically (temp + rename), so a reader can
+ * never observe a half-written file and mistake a truncated parse for a result.
+ *
+ * Never throws: a verification run that PROVED something must not be discarded
+ * because the artifact could not be persisted. The failure is reported to the
+ * caller's log instead, and the reader will see a stale `finished_at` and treat
+ * it as a gap, which is the correct outcome.
+ */
+export function writeArtifact(path, payload, { log } = {}) {
+  if (!path) return false;
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    const tmp = `${path}.tmp-${process.pid}`;
+    writeFileSync(tmp, JSON.stringify(payload, null, 2) + "\n", "utf8");
+    renameSync(tmp, path);
+    return true;
+  } catch (e) {
+    if (log) log(`[verify-catalog] could not write artifact ${path}: ${e.message}`);
+    return false;
+  }
+}
+
 export async function runVerification({
   endpoint = DEFAULT_ENDPOINT,
   registryPath = DEFAULT_REGISTRY_PATH,
@@ -683,6 +727,14 @@ export async function runVerification({
   sleepImpl = defaultSleep,
   resolveCandidatesFn = resolveFailoverCandidates,
   alertImpl = fireSkAlert,
+  // NULL by default, deliberately. An earlier draft defaulted this to
+  // DEFAULT_ARTIFACT_PATH and the test suite promptly wrote a real artifact
+  // into the operator's ~/.skcapstone/gateway/. Writing to a live path is the
+  // ENTRY POINT's decision, never a library default, or every caller inherits
+  // a side effect it never asked for. main() passes the real path; tests pass
+  // a temp one; anything else writes nothing.
+  artifactPath = null,
+  nowFn = () => new Date(),
 } = {}) {
   let models, adminModels, status;
   try {
@@ -692,6 +744,20 @@ export async function runVerification({
       getJson(endpoint, "/admin/models/status", { fetchImpl }),
     ]);
   } catch (e) {
+    // An unreachable gateway still produces an artifact. "Could not check" and
+    // "checked and clean" must never look alike to the reader; conflating them
+    // is how the .100 outage stayed invisible for four hours.
+    writeArtifact(artifactPath, {
+      artifact_version: ARTIFACT_VERSION,
+      finished_at: nowFn().toISOString(),
+      endpoint,
+      checked: false,
+      error: e.message,
+      drift: null,
+      role_fidelity: null,
+      liveness: null,
+      failover: null,
+    });
     return {
       reachable: false,
       error: e.message,
@@ -790,6 +856,28 @@ export async function runVerification({
     const res = await alertImpl({ message, level: "crit", key: ALERT_ROLE_KEY, ttlSeconds: alertTtlSeconds });
     alertsFired.push({ key: ALERT_ROLE_KEY, ...res });
   }
+
+  // The artifact skwatchdog consumes. Written on EVERY completed run, clean or
+  // not, so "no news" is never mistaken for good news: the reader ages
+  // `finished_at` and raises a gap when the check has not run recently, which
+  // is the half that catches a dead checker.
+  writeArtifact(artifactPath, {
+    artifact_version: ARTIFACT_VERSION,
+    finished_at: nowFn().toISOString(),
+    endpoint,
+    checked: true,
+    error: null,
+    drift,
+    role_fidelity: {
+      alarm: roleFidelity.alarm,
+      // Every role, not only the bad ones. A reader that sees only mismatches
+      // cannot tell "all faithful" from "nothing was checked".
+      entries: roleFidelity.entries,
+      mismatches: roleFidelity.mismatches,
+    },
+    liveness: { dead_count: liveness.deadCount, dead: liveness.deadIds },
+    failover: { live_count: failover.liveCount, alarm: failover.alarm },
+  });
 
   return {
     reachable: true,
@@ -898,6 +986,7 @@ export function parseArgs(argv = []) {
       case "--timeout": out.timeoutMs = Number(argv[++i]) || DEFAULT_TIMEOUT_MS; break;
       case "--delay": out.delayMs = Number(argv[++i]); if (Number.isNaN(out.delayMs)) out.delayMs = DEFAULT_DELAY_MS; break;
       case "--alert": out.alert = true; break;
+      case "--artifact": out.artifact = argv[++i]; break;
       case "--json": out.json = true; break;
       case "-q": case "--quiet": out.quiet = true; break;
       case "-h": case "--help": out.help = true; break;
@@ -919,6 +1008,8 @@ Usage: node scripts/verify-catalog.mjs [options]
       --timeout MS          per-completion timeout (default ${DEFAULT_TIMEOUT_MS})
       --delay MS            pacing delay between completions (default ${DEFAULT_DELAY_MS})
       --alert               fire sk-alert on a genuine failure (or SKGATEWAY_VERIFY_ALERT=1)
+      --artifact PATH       write the skwatchdog artifact here (default when run
+                            as the CLI: ~/.skcapstone/gateway/catalog-verify.json)
       --json                emit structured JSON
   -q, --quiet                suppress the human report
   -h, --help                 this help
@@ -953,6 +1044,15 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     sleepImpl: deps.sleepImpl,
     resolveCandidatesFn: deps.resolveCandidatesFn,
     alertImpl: deps.alertImpl,
+    // Still not the live path by default. Tests call main() as an ordinary
+    // function, so defaulting HERE polluted ~/.skcapstone/gateway/ too. The only
+    // caller allowed to name a real path is the CLI invocation at the bottom of
+    // this file, which is the one place that genuinely IS "running the job".
+    // Precedence: an explicit --artifact wins; otherwise the caller's default
+    // (only the CLI guard supplies one); otherwise NOTHING is written. Tests
+    // call main() as a function and supply neither, so they cannot touch a
+    // real path even by omission.
+    artifactPath: opts.artifact ?? deps.defaultArtifactPath ?? null,
   });
 
   if (opts.json) {
@@ -964,7 +1064,9 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
-  main().then((code) => process.exit(code)).catch((err) => {
+  // Running as the CLI is the one context that writes the operator's artifact.
+  main(process.argv.slice(2), { defaultArtifactPath: DEFAULT_ARTIFACT_PATH })
+    .then((code) => process.exit(code)).catch((err) => {
     process.stderr.write(`verify-catalog fatal: ${err.stack || err.message}\n`);
     process.exit(EXIT_ERROR);
   });
