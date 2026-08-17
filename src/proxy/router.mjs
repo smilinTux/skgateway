@@ -1821,6 +1821,7 @@ function eolGatedResponse(err) {
  *   headers: Record<string, string>,
  *   body: Buffer,
  *   backendId: string,
+ *   servedModel?: string,
  *   failover: boolean,
  *   queueWaitMs?: number,
  * }>}
@@ -2837,7 +2838,15 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       });
     }
 
-    lastResult = { ...res, backendId, failover: didFailover, queueWaitMs };
+    // servedModel: the model THIS door actually served, which is not always
+    // request.model (the @match chain, the cloud-fallback candidate and the
+    // registry candidates all rewrite it). Card 3351d25b / A6.2 returns it to
+    // the caller as x-sk-model-served, and a caller that asked for "sk-default"
+    // and was served "qwen3-38b" needs the served id, not the alias it typed.
+    // Set from the attempt that is about to be returned, so on a failover it
+    // names the SERVING attempt and never a blend across attempts, which is
+    // the same ruling the energy headers already follow.
+    lastResult = { ...res, backendId, servedModel: candidateModel, failover: didFailover, queueWaitMs };
     if (attemptEnergy) lastResult.energy = attemptEnergy;
     // Only attached when something was actually observed, so the disabled
     // path returns a result whose shape is unchanged, field for field.

@@ -33,6 +33,7 @@ import { deriveCapabilities } from "./ranking/capabilities.mjs";
 import { buildCapabilityCatalog } from "./ranking/catalog.mjs";
 import { REGISTRY_PATH } from "./proxy/registry.mjs";
 import { energyRowsFrom, energyHeaders } from "./metrics/energy.mjs";
+import { attributionHeaders } from "./metrics/attribution.mjs";
 import { readFileSync } from "node:fs";
 import { load as yamlLoad } from "js-yaml";
 
@@ -1595,9 +1596,41 @@ export const server = http.createServer(async (req, res) => {
       // basis and can be aggregated honestly.
       const eHeaders = energyHeaders(result?.energy);
 
+      // Attribution headers (card 3351d25b / A6.2): x-sk-req-id /
+      // x-sk-backend / x-sk-model-served. request_log already recorded
+      // (id, agent_id, model, backend, session_id) for this call and returned
+      // none of it, so a caller holding a response had no key to join on.
+      // These ride the SAME merge path as the energy headers rather than a
+      // parallel one, which is why the streaming branch below needs no extra
+      // work: SSEWriter's extraHeaders option already carries them.
+      //
+      // Computed here, AFTER routeAndSend has resolved, and that is safe: the
+      // gateway buffers whole responses including streamed ones, so the
+      // serving backend is already known and unambiguous at header-write time
+      // and there is no mid-stream window in which the answer could change.
+      //
+      // Same ruling as the energy headers directly above, deliberately, so the
+      // fleet does not carry two answers to "which attempt does this header
+      // describe": the SERVING attempt only. On a failover, backendId and
+      // servedModel come from the attempt that produced the bytes the client
+      // is holding, never a blend. Per-attempt detail lives in the logs.
+      //
+      // Unknown fields are ABSENT, never empty, exactly as energyHeaders does
+      // it. A request that never reached a backend (EOL-gated 404,
+      // all-candidates-throttled 429, no result at all) has no serving backend
+      // to name and says so by not claiming one. A header that is always
+      // present would prove nothing about the call in hand.
+      const aHeaders = attributionHeaders(metricsReqId, result);
+      const skHeaders = { ...eHeaders, ...aHeaders };
+
       if (!result) {
         if (!res.headersSent) {
-          res.writeHead(502, { "content-type": "application/json" });
+          // No backend produced anything, so aHeaders carries the req id alone
+          // (backend and served model are genuinely unknown and stay absent).
+          // The row still exists in request_log, written by closeMetrics
+          // below, so the id is exactly the join key a caller needs to find
+          // out what happened to a request that failed.
+          res.writeHead(502, { "content-type": "application/json", ...aHeaders });
           res.end(JSON.stringify({ error: { message: "No backend produced a response", code: 502 } }));
         }
       } else if (anthropicWant) {
@@ -1607,7 +1640,7 @@ export const server = http.createServer(async (req, res) => {
         if (result.status >= 300 || !oai) {
           // Upstream error / unparseable: pass it through so the Anthropic client
           // sees the real status rather than a fabricated success.
-          const headers = { ...result.headers, ...eHeaders };
+          const headers = { ...result.headers, ...skHeaders };
           delete headers["content-length"];
           delete headers["transfer-encoding"];
           delete headers["content-encoding"];
@@ -1619,7 +1652,7 @@ export const server = http.createServer(async (req, res) => {
             // Serialise the complete Anthropic message as the streaming event
             // sequence (message_start -> content_block_* -> message_delta ->
             // message_stop -> [DONE]); jsonToSSE auto-detects the Anthropic shape.
-            const writer = new SSEWriter(res, { keepAliveMs: 0, extraHeaders: eHeaders });
+            const writer = new SSEWriter(res, { keepAliveMs: 0, extraHeaders: skHeaders });
             writer.start();
             jsonToSSE(writer, amsg);
           } else {
@@ -1627,13 +1660,13 @@ export const server = http.createServer(async (req, res) => {
             res.writeHead(200, {
               "content-type": "application/json",
               "content-length": outBuf.length,
-              ...eHeaders,
+              ...skHeaders,
             });
             res.end(outBuf);
           }
         }
       } else {
-        const headers = { ...result.headers, ...eHeaders };
+        const headers = { ...result.headers, ...skHeaders };
         delete headers["content-length"];
         delete headers["transfer-encoding"];
         delete headers["content-encoding"];
