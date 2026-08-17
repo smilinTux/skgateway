@@ -17,7 +17,7 @@ import { buildModelCatalog, reconcileModeFromConfig, tagLocalModels, mergeDiscov
 import { loadAllowlist, saveAllowlist, applyAllowlist } from "./advertise.mjs";
 import { discoverCatalog, loadCache, saveCache, fetchNvidia, fetchOpenRouter, fetchOpencode, catalogStatus, loadCardOverrides, applyCardOverlays } from "./discovery.mjs";
 import { getPool, resetPool } from "./proxy/connection-pool.mjs";
-import { loadAgentRegistry, extractIdentity, ANONYMOUS_AGENT_ID } from "./identity/capauth.mjs";
+import { loadAgentRegistry, extractIdentity, normalizeAgentId, ANONYMOUS_AGENT_ID } from "./identity/capauth.mjs";
 import { createAuthzClient } from "./policy/authz_decide.mjs";
 import { classifyRoute } from "./policy/authz_routes.mjs";
 import { authzEnforceEnabled, authorizeRequest } from "./policy/authz_gate.mjs";
@@ -1344,10 +1344,16 @@ export const server = http.createServer(async (req, res) => {
     // Resolve the caller BEFORE routing so the verified agent identity drives
     // routing, metrics, and every SIEM event. Fail-safe: any error degrades to
     // anonymous, never crashes the request. Only the opt-in auth gate blocks.
+    // normalizeAgentId, not the raw header: extractIdentity() below has always
+    // trimmed and lower-cased, and this branch did not, so the SAME caller was
+    // attributed as "Lumina" here and "lumina" there purely on the identity
+    // flag. Per-agent spend queries are exact matches, so that split one agent
+    // into two keys nothing joins back together.
+    const headerAgent = normalizeAgentId(req.headers["x-agent-id"]);
     let identity = {
-      agent_id: req.headers["x-agent-id"] || ANONYMOUS_AGENT_ID,
+      agent_id: headerAgent ?? ANONYMOUS_AGENT_ID,
       verified: false,
-      method: req.headers["x-agent-id"] ? "header" : "anonymous",
+      method: headerAgent ? "header" : "anonymous",
       session_id: req.headers["x-session-id"] || null,
       fingerprint: null,
     };
@@ -1454,9 +1460,35 @@ export const server = http.createServer(async (req, res) => {
     // (falls back to X-Agent-Id / anonymous) rather than the raw header alone,
     // so spend cannot be attributed to a spoofable header. Computed once here
     // and reused by recordRequest and closeMetrics below so both always agree.
-    const metricsAgentId = identity.agent_id !== ANONYMOUS_AGENT_ID
-      ? identity.agent_id
-      : (req.headers["x-agent-id"] || undefined);
+    //
+    // WHAT IS ACTUALLY KNOWABLE HERE, established for card 316dd167 / A8 by
+    // reading every caller in the fleet rather than assuming. Three real
+    // sources, in the order extractIdentity() resolves them:
+    //   1. a verified CapAuth PGP signature  (X-CapAuth-Signature)
+    //   2. a bearer token the agent registry maps to a named agent
+    //   3. the X-Agent-Id header
+    // All three are wired and land in request_log.agent_id, token_usage and
+    // cost_log; tests/served-model-and-agent.test.mjs pins that end to end.
+    //
+    // AND FOR THE CURRENT LIVE CALLERS, NONE OF THEM IS PRESENT. agent_id was
+    // NULL on all 8,199 rows of the live database not because the gateway drops
+    // an identity but because nothing sends one: skcode/Claude Code sends only
+    // `Authorization: Bearer sk-local` plus `user-agent: claude-cli/...` and
+    // `x-app: cli`; skos, skcapstone, skchat and the Hermes provider send
+    // `Content-Type` and nothing else. That bearer literal is shared verbatim by
+    // skcode, the pi adapter and the opencode adapter, so it names a CLASS of
+    // caller, not an agent, and the user-agent names client software, not who
+    // is asking. Deriving an agent from either would be inventing one, so on
+    // those paths no agent is knowable and this stays undefined, which records
+    // NULL. Attribution for them is a client-side change (send X-Agent-Id),
+    // not something this call site can synthesise.
+    //
+    // The anonymous sentinel is NOT an agent: normalizeAgentId maps it to null
+    // so a caller sending `X-Agent-Id: anonymous` cannot make unattributed
+    // traffic aggregate under what looks like a real agent.
+    const metricsAgentId = normalizeAgentId(identity.agent_id)
+      ?? normalizeAgentId(req.headers["x-agent-id"])
+      ?? undefined;
 
     // Metrics must never be able to fail a real inference. recordRequest runs
     // synchronously, before dispatch, with nothing else guarding it, so a
@@ -1489,7 +1521,7 @@ export const server = http.createServer(async (req, res) => {
     // failure here must not become a second, fabricated error stacked on top
     // of whatever the request path already did.
     let metricsClosed = false;
-    function closeMetrics({ statusCode, responseHeaders, responseBody, backend, errorMsg, energy, energyAttempts } = {}) {
+    function closeMetrics({ statusCode, responseHeaders, responseBody, backend, modelServed, errorMsg, energy, energyAttempts } = {}) {
       if (!metrics || !metricsReqId || metricsClosed) return;
       metricsClosed = true;
       try {
@@ -1501,6 +1533,13 @@ export const server = http.createServer(async (req, res) => {
           responseBody: responseBody ?? null,
           agentId: metricsAgentId,
           model: parsedModel || "unknown",
+          // The model the UPSTREAM said it served, which is a DIFFERENT fact
+          // from `model` directly above it: that one is what the caller asked
+          // for. Passed through untouched, including when it is undefined,
+          // because "we did not observe it" has to survive as NULL. Never
+          // falls back to parsedModel. See recordResponse() in
+          // metrics/collector.mjs for the full ruling.
+          modelServed,
           backend,
           errorMsg,
         });
@@ -1710,6 +1749,28 @@ export const server = http.createServer(async (req, res) => {
           responseHeaders: result?.headers ?? {},
           responseBody: parsedBody,
           backend: result?.backendId,
+          // Card 316dd167 / A8: the one fact that distinguishes a silent
+          // substitution from an ordinary call, and it was already sitting in
+          // memory here. The gateway relays the upstream body verbatim
+          // (rewriteBodyModel is request-side only), so parsedBody.model is
+          // what the backend SAID answered, not an echo of what we asked for.
+          // Measured live: a call for `sk-default` came back naming
+          // `ornith-1.0-9b`, and one for `sk-m-internal` came back naming
+          // `claude-sonnet-5`.
+          //
+          // Note this is deliberately NOT result.servedModel, which is what
+          // the ROUTER dispatched and therefore echoes the request whenever no
+          // rewrite happened; that value is the one returned as the
+          // x-sk-model-served header by card 3351d25b. The two can disagree,
+          // and when they do the disagreement IS the finding.
+          //
+          // parsedBody is already null when the body is SSE or non-JSON, so
+          // this is undefined on exactly those paths and the column stays NULL
+          // meaning unobserved. That is by construction, not by a special
+          // case, and it must never be widened to `|| parsedModel`.
+          modelServed: typeof parsedBody?.model === "string" && parsedBody.model
+            ? parsedBody.model
+            : undefined,
           energy: result?.energy,
           energyAttempts: result?.energyAttempts,
         });

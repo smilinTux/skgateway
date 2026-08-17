@@ -9,6 +9,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`request_log.model_served`: the model the upstream actually answered with**
+  (card 316dd167 / A8). No table in `metrics.db` carried a served-model column.
+  `request_log.model` and `token_usage.model` are both the model the CALLER
+  ASKED FOR, and across all 1,445 joined rows on the live database they never
+  once disagreed, because they are copies of one value. So the gateway was
+  throwing away the only fact that distinguishes a silent substitution from an
+  ordinary call: a backend that quietly answered with something else wrote a row
+  identical to one that served exactly what was requested. The value is read
+  from the response body already parsed at the metrics call site
+  (`src/index.mjs`), so this adds zero parsing and zero network. Verified live
+  before implementing: a request for `sk-default` came back naming
+  `ornith-1.0-9b`, and one for `sk-m-internal` came back naming
+  `claude-sonnet-5`.
+
+  **NULL means UNOBSERVED and never "same as requested."** When the body is SSE
+  or non-JSON the parsed body is already null, so the column is naturally NULL
+  on exactly those paths with no special-casing, the same discipline
+  `energyHeaders()` follows ("individually absent, never empty, for any field we
+  do not know"). Defaulting it to the requested id would make every request look
+  like it got what it asked for, turning an absence of evidence into fabricated
+  evidence of a match. Two negative controls in
+  `tests/served-model-and-agent.test.mjs` pin that against the live gateway.
+
+  This is a DIFFERENT fact from the `x-sk-model-served` header added by card
+  3351d25b, which carries `result.servedModel`, the model id the ROUTER
+  dispatched. That echoes the request whenever no rewrite happened. Measured
+  against a stub upstream answering with a different id, the header said
+  `a8-model` (what was asked for) while the body said `stub-substituted-9b`
+  (what answered). Only the column can expose a substitution.
+
+- **A schema-migration path for `metrics.db`, which had none.** The whole schema
+  was a single `CREATE TABLE IF NOT EXISTS` block, which is exactly the
+  statement that does nothing to a table that already exists, so any column
+  added to the DDL after a node's first boot landed only on databases created
+  fresh afterwards and silently never reached the live one. `ensureColumn()` /
+  `migrate()` in `src/metrics/collector.mjs` run on every collector
+  construction, are idempotent, and are additive only: SQLite's `ALTER TABLE ADD
+  COLUMN` rewrites no rows, so it is safe against the live 8,199-row file. There
+  is still no version counter and no down-migration; this is the smallest thing
+  that makes one additive column land, not a general migration framework, and it
+  is flagged as such in the code.
+
+  **Existing rows are NOT backfilled.** `model_served` reads NULL on every row
+  written before this change, which is the correct value: history is not
+  retroactively attributed on this fleet.
+
+- **Regression cover for the `request_log.agent_id` write path**, which was
+  NULL on all 8,199 rows on the live database and had never once been populated.
+  Measured against unmodified `main` while writing these tests: the write path
+  itself is CORRECT today, and a caller sending `X-Agent-Id` is attributed all
+  the way through `request_log`, `token_usage` and `cost_log`. The column is
+  empty because no live caller sends any identity at all, not because the
+  gateway drops one. There was no test asserting it ever lands, which is how it
+  stayed empty across a call-site rewrite; there is now.
+
 - **Attribution response headers on every `/v1/*` reply: `x-sk-req-id`,
   `x-sk-backend`, `x-sk-model-served`** (card 3351d25b / A6.2). The gateway has
   always written `(id, agent_id, model, backend, session_id, ...)` into
@@ -27,6 +82,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cloud-fallback and registry candidates).
 
 ### Fixed
+
+- **Two canonicalisers for one agent id, so the same caller could be attributed
+  twice** (card 316dd167 / A8). `extractIdentity()` has always applied
+  `.trim().toLowerCase()` to `X-Agent-Id`, while the inline identity object
+  `src/index.mjs` builds when `identity.enabled` is false used the raw header.
+  The same caller was therefore recorded as `Lumina` or `lumina` purely
+  depending on a config flag, and `getTokenUsage()` / `getCosts()` filter with
+  `agent_id = @agentId`, an exact match, so one agent's spend would split
+  silently across two keys that no query joins back together.
+  `normalizeAgentId()` in `src/identity/capauth.mjs` is now the single
+  definition and both paths call it.
+
+  It also maps the literal `anonymous` to null. `ANONYMOUS_AGENT_ID` is the
+  value the resolver returns to mean "nobody identified themselves", so storing
+  it would make unattributed traffic aggregate under what looks like a real
+  agent. **Behaviour change worth a reviewer's eye:** because `extractIdentity`
+  now returns `method: 'anonymous'` for that header, the opt-in
+  `require_agent_id` auth gate rejects it where it previously passed, i.e. the
+  gate could be satisfied by typing the sentinel that means "I am not
+  identified". That gate is OFF by default and OFF on this fleet, so nothing
+  live changes.
+
+  For the record on the rest of `agent_id`: the write path itself was already
+  correct, and none of the current live callers sends any identity at all.
+  skcode / Claude Code sends `Authorization: Bearer sk-local`, `user-agent:
+  claude-cli/...` and `x-app: cli`; skos, skcapstone, skchat and the Hermes
+  provider send `Content-Type` and nothing else. That bearer literal is shared
+  verbatim by skcode, the pi adapter and the opencode adapter, so it names a
+  class of caller rather than an agent, and a user-agent names client software.
+  Deriving an agent from either would be inventing one, so on those paths the
+  gateway records NULL and the call site now documents exactly what it looked at
+  and why. Attribution for them is a client-side change (send `X-Agent-Id`).
 
 - **`request_log.backend` is NULL on every row written since 2026-08-15, and the
   table has never held one complete row.** Measured on the live database: 6,638
