@@ -123,3 +123,79 @@ describe("checkRoleFidelity", () => {
     assert.deepEqual(checked.sort(), ["sk-creative", "sk-default"]);
   });
 });
+
+// ── the alert, not just the exit code ───────────────────────────────────────
+//
+// Check 5 first shipped setting `drift` (exit 1) and firing NO alert. The
+// scheduled job runs with `notify: off` and depends entirely on this script's
+// own sk-alert call, so a substituted role would have been detected daily and
+// reported to nobody. That is the same defect the check exists to catch, one
+// layer up, so it gets its own regression test rather than a comment.
+
+import { runVerification, ALERT_ROLE_KEY, EXIT_DRIFT } from "../scripts/verify-catalog.mjs";
+
+function gatewayWithRoles(servedByRole) {
+  return async (url, opts) => {
+    const u = new URL(url, "http://x");
+    const empty = { data: [] };
+    if (u.pathname === "/v1/models") return { ok: true, status: 200, json: async () => empty };
+    if (u.pathname === "/admin/models") return { ok: true, status: 200, json: async () => empty };
+    if (u.pathname === "/admin/models/status") return { ok: true, status: 200, json: async () => ({ providers: {} }) };
+    if (u.pathname === "/v1/chat/completions") {
+      const body = JSON.parse(opts.body);
+      const served = servedByRole[body.model] ?? body.model;
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: (h) => (h.toLowerCase() === "x-sk-model-served" ? served : null) },
+        json: async () => ({ model: served, choices: [{ message: { content: "ok" } }] }),
+      };
+    }
+    throw new Error(`unexpected request to ${u.pathname}`);
+  };
+}
+
+describe("role substitution PAGES, it does not merely set an exit code", () => {
+  test("a substituted role fires sk-alert under its own dedupe key", async () => {
+    const calls = [];
+    const alertImpl = async (args) => { calls.push(args); return { fired: true, bin: "/fake/sk-alert" }; };
+
+    const result = await runVerification({
+      endpoint: "http://x",
+      registryPath: fixture(),
+      fetchImpl: gatewayWithRoles({
+        "sk-default": "ornith-1.0-9b",
+        "sk-creative": "openai/gpt-oss-20b", // the measured incident
+      }),
+      sleepImpl: async () => {},
+      doAlert: true,
+      alertImpl,
+    });
+
+    assert.equal(result.exitCode, EXIT_DRIFT, "a substitution is drift");
+    const keys = calls.map((c) => c.key);
+    assert.ok(keys.includes(ALERT_ROLE_KEY), `expected a page under ${ALERT_ROLE_KEY}, got ${JSON.stringify(keys)}`);
+    const page = calls.find((c) => c.key === ALERT_ROLE_KEY);
+    assert.equal(page.level, "crit");
+    // The message has to name both sides or it is not actionable at 3am.
+    assert.match(page.message, /sk-creative/);
+    assert.match(page.message, /openai\/gpt-oss-20b/);
+  });
+
+  test("a faithful run pages nobody", async () => {
+    const calls = [];
+    const alertImpl = async (args) => { calls.push(args); return { fired: true }; };
+    await runVerification({
+      endpoint: "http://x",
+      registryPath: fixture(),
+      fetchImpl: gatewayWithRoles({
+        "sk-default": "ornith-1.0-9b",
+        "sk-creative": "qwen3.8-27b-huihui-abliterated-q4_k_m",
+      }),
+      sleepImpl: async () => {},
+      doAlert: true,
+      alertImpl,
+    });
+    assert.equal(calls.filter((c) => c.key === ALERT_ROLE_KEY).length, 0);
+  });
+});
