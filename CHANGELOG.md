@@ -28,14 +28,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **`request_log.backend` was NULL on every row ever written.** The column is
-  populated by the insert that runs BEFORE dispatch, when no backend has been
-  chosen yet, and the post-response `UPDATE` never touched it, even though
-  `token_usage`, `cost_log` and `latency_log` beside it all recorded the
-  backend correctly. Found while proving the new `x-sk-backend` header joins to
-  its row: the header named `stub` and the row it pointed at named nothing. The
-  update now sets `backend = COALESCE(@backend, backend)`, so a known serving
-  backend lands and an unknown one leaves whatever is already there.
+- **`request_log.backend` is NULL on every row written since 2026-08-15, and the
+  table has never held one complete row.** Measured on the live database: 6,638
+  of 8,130 rows DO carry a backend, and those are exactly the rows whose
+  `status_code` and `total_ms` are null. The complement is exact. Before the
+  cutover a row carried the serving backend and no outcome; after it, the
+  outcome and no backend. `recordRequest` was moved to run BEFORE dispatch, where
+  the backend genuinely is not yet known, and the post-response `UPDATE` never
+  touched that column (it dates to the table's creation), so nothing filled it
+  back in. The code comment saying `// not chosen yet; overridden on response`
+  asserts an override the SQL does not perform. `token_usage`, `cost_log` and
+  `latency_log` beside it all record the backend correctly from the same
+  close-time data, which is what localised the bug to this one statement. Found
+  while proving the new `x-sk-backend` header joins to its row: the header named
+  `stub` and the row it pointed at named nothing. The update now sets
+  `backend = COALESCE(@backend, backend)`, so a known serving backend lands and
+  an unknown one leaves whatever is already there. NOTE for anyone reading the
+  historical data: do NOT discard the pre-2026-08-15 rows as empty, they are the
+  only rows that carry a trustworthy backend.
 
 - **A never-probed backend reports `status: "unknown"`, not `"up"`.** Backend
   health is derived from observed request outcomes, never from active probing,
