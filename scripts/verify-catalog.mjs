@@ -8,7 +8,7 @@
  * POSTed through the gateway and only openai/gpt-oss-20b answered 200. This
  * script is the standing job that catches that class of drift again.
  *
- * FOUR checks, all in one run, reported PER PROVIDER not just in aggregate:
+ * FIVE checks, all in one run, reported PER PROVIDER not just in aggregate:
  *
  *   1. LIVENESS. Every id GET /v1/models advertises gets one small real chat
  *      completion. 2xx = alive. 429 = alive-but-throttled (a free tier being
@@ -56,9 +56,22 @@
  *      a fallback list is only ever read once the primary is already down, so
  *      a rotted entry is invisible until the exact moment it is load-bearing.
  *
- * ALERTING. Exactly two genuine failure conditions page (see ALERT_CATALOG_KEY
- * / ALERT_FAILOVER_KEY below): a dead/unrepresented advertised model, and
- * failover redundancy below 2. Both go through scripts/lib/sk-alert.mjs, which
+ *   5. ROLE FIDELITY. Each chat ROLE gets a completion and the answer must come
+ *      from the model that role RESOLVES to, read from x-sk-model-served (card
+ *      3351d25b/A6.2), which on a failover names the serving attempt. The other
+ *      four are structurally blind to this: roles are not in GET /v1/models at
+ *      all, and a substituted role is ALIVE. Measured 2026-08-16, both 200 the
+ *      whole time: sk-creative (the ABLITERATED role) answered by
+ *      openai/gpt-oss-20b, which inverts the capability rather than degrading
+ *      it; and sk-default answered from cloud through a ~4h outage of .100,
+ *      which HID the outage behind healthy responses. A role that ERRORS is not
+ *      a fidelity failure (failing loudly is correct for a no_failover backend,
+ *      and liveness is check 1's job) - only served-but-wrong counts.
+ *
+ * ALERTING. Exactly three genuine failure conditions page (ALERT_CATALOG_KEY /
+ * ALERT_FAILOVER_KEY / ALERT_ROLE_KEY below): a dead/unrepresented advertised
+ * model, failover redundancy below 2, and a role answered by a model it does
+ * not resolve to. All three go through scripts/lib/sk-alert.mjs, which
  * resolves the real ~/.skenv/bin/sk-alert by an ABSOLUTE path and passes the
  * message as an argv element, copying the one proven-working invocation in
  * this fleet rather than inventing a new one (see that module's header for the
@@ -157,6 +170,10 @@ export const DEFAULT_ALERT_TTL_SECONDS = 43200; // 12h: re-pages once per calend
 
 export const ALERT_CATALOG_KEY = "skgateway-catalog-verify";
 export const ALERT_FAILOVER_KEY = "skgateway-failover-redundancy";
+/** Dedupe key for the role-substitution page (card ba782c14). Distinct from the
+ *  catalog key so a substituted role and a dead advertised model do not
+ *  suppress each other through sk-alert's -k/-t window. */
+export const ALERT_ROLE_KEY = "skgateway-role-fidelity";
 export const MIN_FAILOVER_LIVE = 2;
 
 export const EXIT_OK = 0;
@@ -755,6 +772,23 @@ export async function runVerification({
     const message = `skgateway failover redundancy DOWN (${endpoint}): ${failover.liveCount}/${MIN_FAILOVER_LIVE} local_fallback entries live [${list}]. If you need one, get two.`;
     const res = await alertImpl({ message, level: "crit", key: ALERT_FAILOVER_KEY, ttlSeconds: alertTtlSeconds });
     alertsFired.push({ key: ALERT_FAILOVER_KEY, ...res });
+  }
+
+  // Role fidelity pages too. It shipped in the previous commit setting the exit
+  // code but firing NO alert, which is the same defect the check exists to
+  // catch, one layer up: detected, then not announced. The scheduled job runs
+  // with notify: off and depends entirely on this sk-alert call, so without it
+  // a silent substitution would be found daily and told to nobody.
+  if (doAlert && roleDrift) {
+    const list = roleFidelity.mismatches
+      .map((m) => `${m.role}: expected ${m.expected} (${m.backend}), SERVED ${m.served}`)
+      .join("; ");
+    const message =
+      `skgateway ROLE SUBSTITUTION (${endpoint}): ${roleFidelity.mismatches.length} role(s) answered by a model ` +
+      `they do not resolve to [${list}]. A 200 from the wrong model is not degraded service, it can invert the ` +
+      `capability (a guardrailed model answering an uncensored role) and it hides outages behind healthy responses.`;
+    const res = await alertImpl({ message, level: "crit", key: ALERT_ROLE_KEY, ttlSeconds: alertTtlSeconds });
+    alertsFired.push({ key: ALERT_ROLE_KEY, ...res });
   }
 
   return {
