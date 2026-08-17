@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Registry-routed doors (`reg:<name>`) now appear in `getHealth()`.** They
+  live in the module-level `_regBackends` map rather than the router's
+  configured `backends`, and `getHealth()` only walked the latter, so the path
+  that serves most traffic recorded outcomes into objects nothing ever read. A
+  request through `sk-default` records against `reg:ornith` while `/health`
+  reported on `local` / `ollama` / `anthropic`, sets that never intersect. That
+  is why those two sat at `lastCheck: 0` indefinitely and a hard-down machine
+  read as healthy on 2026-08-16. The outcomes were recorded correctly the whole
+  time; they were never reported. Configured backends win on an id collision, so
+  a `reg:` door can never shadow a declared backend's health.
+
 ### Added
 
 - **`request_log.model_served`: the model the upstream actually answered with**

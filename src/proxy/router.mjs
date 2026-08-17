@@ -1377,12 +1377,36 @@ export function createRouter(config = {}) {
   // -------------------------------------------------------------------------
 
   /**
-   * Return a snapshot of every backend's health.
+   * Return a snapshot of every backend's health, INCLUDING registry-routed
+   * doors (`reg:<name>`, created on demand by `getRegBackend()`).
+   *
+   * Those live in the module-level `_regBackends` map rather than in this
+   * router's configured `backends`, so for as long as this only walked
+   * `backends` the health surface could not see the path that serves most
+   * traffic. A request through a registry alias like `sk-default` records its
+   * outcome against `reg:ornith`, and nothing was reading it.
+   *
+   * That is why `local` and `ollama` sat at `lastCheck: 0` indefinitely and a
+   * hard-down machine could read as healthy on 2026-08-16: not merely an
+   * optimistic default, but a health signal that real traffic never updated.
+   * The outcomes were being recorded correctly the whole time; they were
+   * simply never reported. Same class as the energy meters keyed by backend
+   * name instead of host, which missed `reg:ornith` for the same reason.
+   *
+   * `_regBackends` is module-level and therefore shared across routers in the
+   * same process. That is pre-existing and harmless in production (one router)
+   * but means a test creating two routers sees the same reg doors in both.
+   *
+   * Configured backends win on an id collision: a `reg:` door can never
+   * shadow a declared backend's health.
    *
    * @returns {Record<string, HealthSnapshot>}
    */
   function getHealth() {
     const out = {};
+    for (const [id, backend] of _regBackends) {
+      out[id] = backend.getHealth();
+    }
     for (const [id, backend] of backends) {
       out[id] = backend.getHealth();
     }
@@ -1554,6 +1578,19 @@ function getRegBackend(id, url) {
   const b = new Backend({ id, url: clean, auth_type: "none", models: ["*"], priority: 1 });
   _regBackends.set(id, b);
   return b;
+}
+
+/**
+ * Test-only: create/fetch a registry-routed door the way the live registry
+ * path does, so a test can assert that `getHealth()` reports it. Not used by
+ * production code.
+ *
+ * @param {string} id  e.g. `reg:ornith`
+ * @param {string} url upstream base
+ * @returns {Backend}
+ */
+export function _getRegBackendForTests(id, url) {
+  return getRegBackend(id, url);
 }
 
 // ---------------------------------------------------------------------------
