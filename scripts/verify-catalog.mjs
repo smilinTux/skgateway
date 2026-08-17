@@ -139,7 +139,7 @@
  */
 
 import { fileURLToPath } from "node:url";
-import { resolveFailoverCandidates, REGISTRY_PATH } from "../src/proxy/registry.mjs";
+import { resolveFailoverCandidates, loadRegistry, REGISTRY_PATH } from "../src/proxy/registry.mjs";
 import { fireSkAlert } from "./lib/sk-alert.mjs";
 import { MIN_OUTPUT_TOKEN_LADDER } from "../src/discovery/capability-assessment.mjs";
 
@@ -540,6 +540,94 @@ export async function checkFailoverRedundancy({
   return { candidates, entries, liveCount, alarm: liveCount < MIN_FAILOVER_LIVE };
 }
 
+// ── 5. ROLE FIDELITY ────────────────────────────────────────────────────────
+
+/**
+ * Ask each chat ROLE for a completion and assert the answer came from the model
+ * that role actually resolves to. Card ba782c14.
+ *
+ * The other four checks cannot see this failure. Roles are not in
+ * GET /v1/models at all, so the liveness sweep never touches them, and the
+ * failure mode is not "no answer" but "an answer from something else", which
+ * every liveness-shaped check reads as healthy.
+ *
+ * Two measured incidents on 2026-08-16, both HTTP 200 the whole time:
+ *   sk-creative, the ABLITERATED role, answered by openai/gpt-oss-20b after its
+ *     sovereign backend was refused. A guardrailed model serving an uncensored
+ *     role does not degrade it, it inverts it.
+ *   sk-default, during a ~4h outage of .100, also answered from cloud, which
+ *     HID the outage. Every probe stayed green while the box was gone.
+ *
+ * Skips what it cannot meaningfully assert: marker roles like sk-auto, which
+ * resolve per-request by design, and non-chat backends like embeddings.
+ *
+ * @returns {Promise<{entries:object[], mismatches:object[], alarm:boolean}>}
+ */
+export async function checkRoleFidelity({
+  registryPath,
+  endpoint,
+  maxTokens = DEFAULT_MAX_TOKENS,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  delayMs = DEFAULT_DELAY_MS,
+  fetchImpl = fetch,
+  sleepImpl = defaultSleep,
+} = {}) {
+  const reg = loadRegistry(registryPath);
+  const backends = reg?.backends || {};
+  const roles = reg?.roles || {};
+  const base = String(endpoint || DEFAULT_ENDPOINT).replace(/\/+$/, "");
+
+  const entries = [];
+  let first = true;
+  for (const [role, target] of Object.entries(roles)) {
+    const backend = backends[target];
+    // A marker (sk-auto -> "auto") has no backend entry; embeddings are not
+    // chat completions. Neither is broken, so neither is reported as such.
+    if (!backend || (backend.kind && backend.kind !== "chat")) continue;
+
+    if (!first) await sleepImpl(delayMs);
+    first = false;
+
+    const expected = backend.model;
+    let served = null;
+    let error = null;
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), timeoutMs);
+    try {
+      const resp = await fetchImpl(`${base}/v1/chat/completions`, {
+        method: "POST",
+        signal: ac.signal,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: role,
+          messages: [{ role: "user", content: PROBE_PROMPT }],
+          max_tokens: maxTokens,
+        }),
+      });
+      // Prefer the header the gateway now attaches (card 3351d25b / A6.2): on a
+      // failover it names the SERVING attempt specifically. Fall back to the
+      // body's model for a gateway that predates it.
+      const hdr = resp.headers?.get?.("x-sk-model-served");
+      const body = await resp.json().catch(() => null);
+      served = hdr || body?.model || null;
+      if (!resp.ok) error = `http_${resp.status}`;
+    } catch (e) {
+      error = e?.name === "AbortError" ? "timeout" : `network:${e?.message || e}`;
+    } finally {
+      clearTimeout(timer);
+    }
+
+    // A role that FAILS is not a fidelity problem. Failing loudly is the correct
+    // behaviour for a non-substitutable backend (no_failover), and liveness is
+    // check 1's job. Only a served-but-wrong answer is a mismatch here.
+    const faithful = error ? null : served === expected;
+    entries.push({ role, backend: target, expected, served, error, faithful });
+  }
+
+  const mismatches = entries.filter((e) => e.faithful === false);
+  return { entries, mismatches, alarm: mismatches.length > 0 };
+}
+
 // ── fetching live gateway state ─────────────────────────────────────────────
 
 /** Fetch and parse JSON from `path` off `endpoint`, or throw with a clear message. */
@@ -630,9 +718,22 @@ export async function runVerification({
     resolveCandidatesFn,
   });
 
+  const roleFidelity = await checkRoleFidelity({
+    registryPath,
+    endpoint,
+    maxTokens,
+    timeoutMs,
+    delayMs,
+    fetchImpl,
+    sleepImpl,
+  });
+
   const catalogDrift = liveness.deadCount > 0 || representationGaps.length > 0;
   const failoverDrift = failover.alarm;
-  const drift = catalogDrift || failoverDrift;
+  // A substituted role is drift in its own right. It cannot show up in the other
+  // three: roles are not in GET /v1/models, and a substituted role is ALIVE.
+  const roleDrift = roleFidelity.alarm;
+  const drift = catalogDrift || failoverDrift || roleDrift;
 
   const alertsFired = [];
   if (doAlert && catalogDrift) {
@@ -663,6 +764,7 @@ export async function runVerification({
     representation: { gaps: representationGaps },
     countDivergence,
     failover,
+    roleFidelity,
     drift,
     alertsFired,
   };
@@ -707,6 +809,22 @@ export function formatReport(result, endpoint) {
   L.push(`  4. FAILOVER REDUNDANCY: ${failover.liveCount}/${MIN_FAILOVER_LIVE} required live` + (failover.alarm ? " - ALARM" : ""));
   for (const e of failover.entries) {
     L.push(`     ${e.alive ? "alive " : "DEAD  "} ${e.model} - ${e.reason}`);
+  }
+
+  const rf = result.roleFidelity;
+  if (rf) {
+    L.push(`  5. ROLE FIDELITY: ${rf.mismatches.length} substituted` + (rf.alarm ? " - ALARM" : ""));
+    for (const e of rf.entries) {
+      if (e.faithful === false) {
+        // Name both sides: "wrong model" is not actionable, "asked for the
+        // abliterated model and got a cloud one" is.
+        L.push(`     SUBSTITUTED ${e.role} -> expected ${e.expected} (${e.backend}), SERVED ${e.served}`);
+      } else if (e.error) {
+        L.push(`     unchecked   ${e.role} - ${e.error} (a failing role is check 1's business, not fidelity)`);
+      } else {
+        L.push(`     ok          ${e.role} -> ${e.served}`);
+      }
+    }
   }
 
   if (result.alertsFired.length) {
