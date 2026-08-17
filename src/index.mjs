@@ -1489,7 +1489,7 @@ export const server = http.createServer(async (req, res) => {
     // failure here must not become a second, fabricated error stacked on top
     // of whatever the request path already did.
     let metricsClosed = false;
-    function closeMetrics({ statusCode, responseHeaders, responseBody, backend, errorMsg, energy, energyAttempts } = {}) {
+    function closeMetrics({ statusCode, responseHeaders, responseBody, backend, modelServed, errorMsg, energy, energyAttempts } = {}) {
       if (!metrics || !metricsReqId || metricsClosed) return;
       metricsClosed = true;
       try {
@@ -1501,6 +1501,13 @@ export const server = http.createServer(async (req, res) => {
           responseBody: responseBody ?? null,
           agentId: metricsAgentId,
           model: parsedModel || "unknown",
+          // The model the UPSTREAM said it served, which is a DIFFERENT fact
+          // from `model` directly above it: that one is what the caller asked
+          // for. Passed through untouched, including when it is undefined,
+          // because "we did not observe it" has to survive as NULL. Never
+          // falls back to parsedModel. See recordResponse() in
+          // metrics/collector.mjs for the full ruling.
+          modelServed,
           backend,
           errorMsg,
         });
@@ -1710,6 +1717,28 @@ export const server = http.createServer(async (req, res) => {
           responseHeaders: result?.headers ?? {},
           responseBody: parsedBody,
           backend: result?.backendId,
+          // Card 316dd167 / A8: the one fact that distinguishes a silent
+          // substitution from an ordinary call, and it was already sitting in
+          // memory here. The gateway relays the upstream body verbatim
+          // (rewriteBodyModel is request-side only), so parsedBody.model is
+          // what the backend SAID answered, not an echo of what we asked for.
+          // Measured live: a call for `sk-default` came back naming
+          // `ornith-1.0-9b`, and one for `sk-m-internal` came back naming
+          // `claude-sonnet-5`.
+          //
+          // Note this is deliberately NOT result.servedModel, which is what
+          // the ROUTER dispatched and therefore echoes the request whenever no
+          // rewrite happened; that value is the one returned as the
+          // x-sk-model-served header by card 3351d25b. The two can disagree,
+          // and when they do the disagreement IS the finding.
+          //
+          // parsedBody is already null when the body is SSE or non-JSON, so
+          // this is undefined on exactly those paths and the column stays NULL
+          // meaning unobserved. That is by construction, not by a special
+          // case, and it must never be widened to `|| parsedModel`.
+          modelServed: typeof parsedBody?.model === "string" && parsedBody.model
+            ? parsedBody.model
+            : undefined,
           energy: result?.energy,
           energyAttempts: result?.energyAttempts,
         });

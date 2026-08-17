@@ -194,14 +194,20 @@ PRAGMA synchronous  = NORMAL;
 CREATE TABLE IF NOT EXISTS request_log (
   id            TEXT PRIMARY KEY,
   agent_id      TEXT,
-  model         TEXT,
+  model         TEXT,               -- the model the CALLER ASKED FOR
   backend       TEXT,
   session_id    TEXT,
   started_at    INTEGER NOT NULL,   -- Unix ms
   status_code   INTEGER,
   first_byte_ms INTEGER,            -- ms to first byte
   total_ms      INTEGER,            -- total round-trip ms
-  error_msg     TEXT
+  error_msg     TEXT,
+  -- The model the UPSTREAM SAID it served, read from the response body. NULL
+  -- means UNOBSERVED (SSE, non-JSON, or a body with no model field) and never
+  -- "same as requested"; see recordResponse() for why that distinction is the
+  -- entire value of the column. Declared LAST on purpose so a database created
+  -- fresh and one migrated by ensureColumn() below have the same column order.
+  model_served  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS token_usage (
@@ -271,6 +277,63 @@ CREATE INDEX IF NOT EXISTS idx_energy_day        ON energy_log (day_bucket);
 CREATE INDEX IF NOT EXISTS idx_energy_card       ON energy_log (card_id);
 CREATE INDEX IF NOT EXISTS idx_energy_backend    ON energy_log (backend, ts);
 `;
+
+// ─── schema migration ────────────────────────────────────────────────────────
+
+/**
+ * Add a column to an existing table when it is absent, and do nothing when it
+ * is already there.
+ *
+ * WHY THIS EXISTS AT ALL, flagged deliberately: before card 316dd167 this file
+ * had NO migration mechanism. The whole schema was one `CREATE TABLE IF NOT
+ * EXISTS` block, which is exactly the statement that does nothing to a table
+ * that already exists. So every column added to the DDL after a node's first
+ * boot appeared only on databases created fresh afterwards, and silently never
+ * appeared on the live one. On this node that is an 8,199-row file that has
+ * been open since long before this change. There is still no version counter
+ * and no down-migration, and this helper is not a substitute for one; it is the
+ * smallest thing that makes ONE additive column land on an existing file
+ * without touching a byte of its data.
+ *
+ * Additive only, and that is not an accident: `ALTER TABLE ADD COLUMN` in
+ * SQLite rewrites no rows, so it is safe against a live database and the new
+ * column reads NULL on every pre-existing row. That NULL is the correct value.
+ * History is not retroactively attributed on this fleet: rows written before
+ * the gateway observed a fact do not get that fact invented for them.
+ *
+ * @param {import('better-sqlite3').Database} db
+ * @param {string} table   Table name (a literal from this module, never caller input).
+ * @param {string} column  Column name (likewise).
+ * @param {string} decl    Type/constraint text, e.g. 'TEXT'.
+ * @returns {boolean} true if the column was added by this call.
+ */
+function ensureColumn(db, table, column, decl) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all();
+  // No rows means the table does not exist, which is the DDL's job, not ours.
+  // ALTERing it here would throw and take the whole collector down with it.
+  if (cols.length === 0) return false;
+  if (cols.some((c) => c.name === column)) return false;
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${decl}`);
+  return true;
+}
+
+/**
+ * Bring an existing metrics database up to the current schema.
+ *
+ * Every entry must be idempotent and additive, because this runs on EVERY
+ * collector construction, against a file that may be brand new or years old.
+ *
+ * @param {import('better-sqlite3').Database} db
+ * @returns {void}
+ */
+function migrate(db) {
+  // card 316dd167 / A8. request_log.model has always held the REQUESTED model,
+  // and so has token_usage.model: across 1,445 joined rows on the live database
+  // the two never once disagreed, because they are copies of one value. Nothing
+  // recorded what actually answered, so a silent substitution and an ordinary
+  // call produced identical rows.
+  ensureColumn(db, 'request_log', 'model_served', 'TEXT');
+}
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
@@ -399,6 +462,10 @@ export function createMetricsCollector(config) {
     mkdirSync(dirname(dbPath), { recursive: true });
     db = new Database(dbPath);
     db.exec(DDL);
+    // CREATE TABLE IF NOT EXISTS does nothing to a table that already exists,
+    // so the DDL above only ever reaches a fresh file. Everything additive that
+    // has to reach the live 8,199-row database goes through migrate().
+    migrate(db);
   }
 
   // ── prepared statements ──────────────────────────────────────────────────
@@ -416,7 +483,8 @@ export function createMetricsCollector(config) {
             first_byte_ms = @first_byte_ms,
             total_ms = @total_ms,
             error_msg = @error_msg,
-            backend = COALESCE(@backend, backend)
+            backend = COALESCE(@backend, backend),
+            model_served = COALESCE(@model_served, model_served)
         WHERE id = @id
       `),
       insertTokenUsage: db.prepare(`
@@ -698,7 +766,11 @@ export function createMetricsCollector(config) {
    * @param {Record<string, string>} [meta.responseHeaders]  Raw upstream response headers
    * @param {object}  [meta.responseBody]  Parsed upstream response body
    * @param {string}  [meta.agentId]    Override agent (if not known at recordRequest time)
-   * @param {string}  [meta.model]      Override model
+   * @param {string}  [meta.model]      Override model (the REQUESTED id)
+   * @param {string}  [meta.modelServed] The model the UPSTREAM said it served,
+   *   taken from the response body. Omit it when the body could not be read;
+   *   the column then stays NULL, which is what "we did not observe it" means.
+   *   It MUST NOT be defaulted to `model`.
    * @param {string}  [meta.backend]    Override backend
    * @param {string}  [meta.sessionId]  Override sessionId
    * @returns {object|null} anomaly record if this request was a ≥3-sigma latency
@@ -714,6 +786,7 @@ export function createMetricsCollector(config) {
     responseBody,
     agentId: agentOverride,
     model: modelOverride,
+    modelServed,
     backend: backendOverride,
     sessionId: sessionOverride,
   } = {}) {
@@ -798,6 +871,26 @@ export function createMetricsCollector(config) {
         // that answers half the question. COALESCE so an unknown backend
         // leaves whatever is already there rather than erasing it.
         backend:       backend       ?? null,
+        // The model the upstream SAID it served (card 316dd167 / A8). Both
+        // request_log.model and token_usage.model are the model the caller
+        // ASKED FOR, and on the live database they never once disagreed across
+        // 1,445 joined rows, because they are copies of the same value. So a
+        // backend that quietly answered with something else produced a row
+        // indistinguishable from one that served exactly what was requested.
+        //
+        // NULL MEANS UNOBSERVED, AND MUST NEVER MEAN "same as requested". The
+        // caller passes this straight from the parsed response body, so when
+        // the body is SSE or otherwise unparseable it is already undefined and
+        // the column is correctly NULL with no special-casing here. Defaulting
+        // it to `model` would make every request look like it got what it asked
+        // for, which is strictly worse than having no column: it would turn an
+        // absence of evidence into fabricated evidence of a match. Same
+        // discipline energyHeaders() follows for joules, deliberately.
+        //
+        // Empty string is unknown, not a model named "". COALESCE for the same
+        // reason the backend line above uses it: an unknown value must leave a
+        // known one alone rather than erase it.
+        model_served:  (typeof modelServed === 'string' && modelServed) ? modelServed : null,
         _tokens: tokenRow,
         _cost:   costRow,
         _latency: {
