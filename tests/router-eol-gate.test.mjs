@@ -16,6 +16,18 @@
  * once an hour, so a model that flips to eol mid-hour would otherwise keep
  * routing until the next refresh. See "flips eol mid-hour" below.
  *
+ * 2026-08-18 refinement (incident inc-2026-08-18-qwen38-eol / problem
+ * prob-2026-08-18-model-discovery-validation): a claim is only preempted by
+ * a verdict ATTRIBUTED TO THE CLAIMING SIDE (isEffectivelyRoutable,
+ * lifecycle.mjs). The C4 live case was a verdict tagged with the claiming
+ * provider (nvidia 410'd the id, nvidia is the only claimer, and the record
+ * carries the nvidia provider tag from reconcilePresence) — that still
+ * gates. An UNATTRIBUTED verdict (provider tag null — the 404s that
+ * accumulated for qwen38-abliterated came from non-claiming backends in a
+ * fail-over spray) or a verdict against a DIFFERENT provider does not
+ * overrule a local claim, so the healthy local door keeps routing. Those
+ * two scenarios are the last three tests in this suite.
+ *
  * Run with:  node --test tests/router-eol-gate.test.mjs
  */
 
@@ -232,7 +244,7 @@ describe("router gates known-eol/dead concrete model ids (card P1.6)", () => {
     assert.equal(up.requestCount, before_ + 1, "an explicitly-claimed active model routes normally");
   });
 
-  test("a model listed in Backend.models that flips eol mid-hour is still gated (card C4)", async () => {
+  test("a model listed in Backend.models that flips eol mid-hour is still gated when the verdict implicates the claimer (card C4)", async () => {
     _resetCacheForTests();
     const modelId = `nvidia/stale-snapshot-${Date.now()}`;
 
@@ -253,15 +265,31 @@ describe("router gates known-eol/dead concrete model ids (card P1.6)", () => {
     // card C4 (openai/gpt-oss-20b: state eol in the store, still listed in
     // Backend.models, and a chat completion returned 200).
     seedEol(modelId);
+    // 2026-08-18 (incident inc-2026-08-18-qwen38-eol): C4's live record was
+    // ATTRIBUTED to the claiming provider — reconcilePresence tags a model
+    // declared under backends.nvidia with provider 'nvidia' (see
+    // sliceByProvider/reconcilePresence in src/discovery.mjs), and the C4
+    // claimer IS the nvidia backend. Attribute the fixture the same way so
+    // the test pins the production shape: a verdict that implicates the
+    // claimer still gates. (An unattributed verdict no longer preempts a
+    // claim — see the next tests.)
+    let store = {};
+    try {
+      store = JSON.parse(readFileSync(STORE_PATH, "utf8"));
+    } catch { /* no store yet */ }
+    store[modelId] = { ...store[modelId], provider: "home" };
+    writeFileSync(STORE_PATH, JSON.stringify(store, null, 2));
+    _resetCacheForTests();
     const lc = getLifecycle(modelId);
     assert.equal(lc.state, "eol");
+    assert.equal(lc.provider, "home");
 
     const before_ = up.requestCount;
     const r = await routeAndSend(
       router, { model: modelId, agentId: "test" }, "/chat/completions", "POST", HEADERS, bodyFor(modelId), false
     );
 
-    assert.equal(r.status, 404, "the matched branch must also honor the eol gate (card C4)");
+    assert.equal(r.status, 404, "a claimer-attributed eol verdict must still gate the matched branch (card C4)");
     assert.equal(
       up.requestCount, before_,
       "no backend attempt should have been made even though Backend.models still claims the model"
@@ -269,5 +297,79 @@ describe("router gates known-eol/dead concrete model ids (card P1.6)", () => {
     const payload = JSON.parse(r.body.toString("utf-8"));
     assert.equal(payload.eol_reason, "provider_410");
     assert.equal(payload.error.code, 404);
+  });
+
+  test("an unattributed eol verdict does NOT preempt a healthy claimer (incident: qwen38-abliterated)", async () => {
+    _resetCacheForTests();
+    const modelId = `local/qwen38-abliterated-${Date.now()}`;
+
+    // The incident shape: a custom alias declared under a local backend
+    // (chiap08-qwen38), an eol record with provider tag NULL — the
+    // 404/410s that condemned it came from non-claiming backends in a
+    // fail-over spray, not from the local door that actually serves it.
+    seedEol(modelId);
+    const lc = getLifecycle(modelId);
+    assert.equal(lc.state, "eol");
+    assert.equal(lc.provider, undefined, "the fixture must be unattributed (completion-path records carry no provider tag at all)");
+
+    const router = createRouter({
+      backends: {
+        // The healthy local claimer (chiap08-qwen38 in production): the
+        // name-agnostic llama.cpp door that serves the alias fine.
+        local: { url: up.base, auth_type: "none", models: [modelId], priority: 3 },
+        // A non-claiming door that 404'd the alias in the spray that formed
+        // the false positive.
+        nvidia: { url: up.base, auth_type: "none", models: ["some-nvidia-model"], priority: 1 },
+      },
+    });
+
+    const before_ = up.requestCount;
+    const r = await routeAndSend(
+      router, { model: modelId, agentId: "test" }, "/chat/completions", "POST", HEADERS, bodyFor(modelId), false
+    );
+
+    assert.equal(r.status, 200, "the healthy claimer must keep routing despite the unattributed eol verdict");
+    assert.equal(r.backendId, "local", "the request must land on the claiming backend");
+    assert.equal(up.requestCount, before_ + 1, "the claiming backend WAS attempted");
+  });
+
+  test("a verdict against a FOREIGN provider does NOT preempt a local claim (multi-provider)", async () => {
+    _resetCacheForTests();
+    const modelId = `multi/both-${Date.now()}`;
+
+    // The model is declared under both a remote provider and a local
+    // backend. The remote provider retired it (record tagged with the
+    // remote provider, as reconcilePresence would), but the local claimer
+    // still serves it: only EOL if ALL providers fail, so a single
+    // provider's verdict must not gate the id out of existence.
+    seedEol(modelId);
+    let store = {};
+    try {
+      store = JSON.parse(readFileSync(STORE_PATH, "utf8"));
+    } catch { /* no store yet */ }
+    store[modelId] = { ...store[modelId], provider: "remote" };
+    writeFileSync(STORE_PATH, JSON.stringify(store, null, 2));
+    _resetCacheForTests();
+
+    const router = createRouter({
+      backends: {
+        remote: { url: up.base, auth_type: "none", models: [modelId], priority: 1 },
+        local: { url: up.base, auth_type: "none", models: [modelId], priority: 3 },
+      },
+    });
+
+    const before_ = up.requestCount;
+    const r = await routeAndSend(
+      router, { model: modelId, agentId: "test" }, "/chat/completions", "POST", HEADERS, bodyFor(modelId), false
+    );
+
+    // Before the fix this request died at the gate: a clean 404 + eol_reason
+    // with ZERO backend attempts. With a surviving claimer outside the
+    // verdict's provider the id must route (the primary claimer here is
+    // healthy in this fixture and answers 200; in production the same
+    // request either lands on the healthy door or fails over to the local
+    // claimer instead of being preempted).
+    assert.equal(r.status, 200, "a claimer outside the verdict's provider must keep the id routable");
+    assert.equal(up.requestCount, before_ + 1, "a backend WAS attempted — the gate did not preempt the claim");
   });
 });

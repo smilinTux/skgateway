@@ -135,6 +135,17 @@ describe("GET /v1/models + GET /admin/models/status - lifecycle-aware advertise 
     // p14-active-1 and p14-unrecorded ids are deliberately absent from the
     // store (defaultLifecycle() => active), proving the common case needs no
     // fixture entry at all.
+    //
+    // 2026-08-18 (incident inc-2026-08-18-qwen38-eol): the eol/dead/not_chat
+    // fixtures below are each declared by the `local` backend in the config
+    // above. applyLifecycleView() now applies the same claim-over-verdict
+    // rule as the router's gate (isEffectivelyRoutable): a verdict only
+    // hides a claimed id when it is ATTRIBUTED TO THE CLAIMER. These records
+    // therefore carry `provider: "local"` — the claimer's own verdict — so
+    // they keep pinning the "eol/dead/not_chat ids are absent from
+    // /v1/models" behavior this suite was written to prove. (An unattributed
+    // verdict on a claimed id is now RESCUED by the claim — that is the
+    // incident's fix, pinned in tests/model-claimer-lifecycle.test.mjs.)
     writeFileSync(
       storePath,
       JSON.stringify({
@@ -153,6 +164,7 @@ describe("GET /v1/models + GET /admin/models/status - lifecycle-aware advertise 
           absent_cycles: 0,
           eol_reason: "provider_410",
           eol_at: 1000,
+          provider: "local",
         },
         "p14-dead-1": {
           state: "dead",
@@ -161,6 +173,7 @@ describe("GET /v1/models + GET /admin/models/status - lifecycle-aware advertise 
           absent_cycles: 0,
           eol_reason: "dropped_from_catalog",
           eol_at: 1000,
+          provider: "local",
         },
         // Card f9e8002b / C14: a healthy, probe-classified non-chat model
         // (e.g. nvidia/nemotron-parse). Must be excluded from /v1/models
@@ -173,6 +186,7 @@ describe("GET /v1/models + GET /admin/models/status - lifecycle-aware advertise 
           absent_cycles: 0,
           eol_reason: "not_chat",
           eol_at: 1000,
+          provider: "local",
         },
       }),
     );

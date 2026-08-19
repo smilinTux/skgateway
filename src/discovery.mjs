@@ -192,6 +192,48 @@ function declaredModelsFor(provider) {
 }
 
 /**
+ * The concrete model ids DECLARED by backends other than `probeProvider`
+ * (incident inc-2026-08-18-qwen38-eol / problem
+ * prob-2026-08-18-model-discovery-validation).
+ *
+ * The probe sweep for a provider hits that ONE provider's endpoint, so a 410
+ * from it is evidence about that provider only. An id a different backend
+ * declares — a local llama.cpp alias like `qwen38-abliterated` on chiap08, or
+ * a multi-provider id still live on another remote provider — must not be
+ * retired on one provider's say-so: "only EOL if ALL providers fail". Those
+ * ids are excluded from the sweep (probe.mjs's `excludedIds`); the
+ * claimer's own 410s from real traffic still count via the claimer-aware
+ * `recordModelOutcome()` (model_catalog_store.mjs), so a genuinely dead
+ * model on its only claimer is still condemned.
+ *
+ * Wildcard patterns (`dolphin-*`) are skipped: they are patterns, not ids,
+ * the same convention `declaredModelsFor()` follows. Fail-soft like
+ * `declaredModelsFor()`: no config loaded => empty set => the sweep behaves
+ * exactly as before.
+ *
+ * @param {string} probeProvider the provider the sweep probes (e.g. 'nvidia')
+ * @param {Record<string, {models?: string[]}>} [backends] config.backends; omit to read the live config
+ * @returns {Set<string>}
+ */
+export function declaredModelsElsewhere(probeProvider, backends) {
+  if (backends === undefined) {
+    try {
+      backends = getConfig()?.backends;
+    } catch {
+      backends = undefined;
+    }
+  }
+  const out = new Set();
+  for (const [name, b] of Object.entries(backends || {})) {
+    if (name === probeProvider || !b) continue;
+    for (const m of b.models || []) {
+      if (typeof m === 'string' && !m.includes('*')) out.add(m);
+    }
+  }
+  return out;
+}
+
+/**
  * The subset of `fullStore` that belongs to `provider` for presence
  * reconciliation, plus the ids `provider` is declared to serve.
  *
@@ -706,6 +748,10 @@ export async function discoverCatalog(opts) {
     probePool,
     probeRunProbe,
     probeProvider = 'nvidia',
+    // Incident inc-2026-08-18-qwen38-eol: ids another backend declares are
+    // excluded from THIS provider's sweep (see declaredModelsElsewhere). 
+    // Injectable for tests; the default reads the live config.
+    probeExcludedIds = declaredModelsElsewhere(probeProvider),
     nvidiaApiKey = process.env.NVIDIA_API_KEY,
     // Card 2ba73bf9 / C9 (measurement half): the tier-2 capability battery
     // rides this same probe sweep (see probe.mjs's probeModels doc comment).
@@ -839,6 +885,7 @@ export async function discoverCatalog(opts) {
           timeoutMs: probeTimeoutMs,
           maxTokens: probeMaxTokens,
           provider: probeProvider,
+          excludedIds: probeExcludedIds,
           pool: probePool || getPool(),
           poolBackendId: DEFAULT_POOL_BACKEND_ID,
           now: () => at,

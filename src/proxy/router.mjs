@@ -29,7 +29,7 @@ import { getFailoverConfig, isLocalUrl, probeLocalHealth, recordLocalOutcome } f
 import { readMeter } from "./meter-client.mjs";
 import { marginalJoules, imputeJoules, resolveBasis, coeffsForModel, backendIsLocal, usageFromSSE, resolveMeterUrl } from "../metrics/energy.mjs";
 import { recordModelOutcome, getLifecycle } from "../discovery/model_catalog_store.mjs";
-import { isRoutable } from "../discovery/lifecycle.mjs";
+import { isRoutable, isEffectivelyRoutable } from "../discovery/lifecycle.mjs";
 import { applyReasoningFloor } from "./core.mjs";
 import { createDecisionCache, decisionKey } from "./decision-cache.mjs";
 // card P4.2 (@match routing): reuse the existing ranker + capability deriver
@@ -1233,7 +1233,17 @@ export function createRouter(config = {}) {
     // per-request cost.
     if (matched.length > 0) {
       const lcMatched = getLifecycle(model);
-      if (!isRoutable(lcMatched)) {
+      // Claimer-aware (incident inc-2026-08-18-qwen38-eol): the gate only
+      // preempts a claim when the verdict is attributed to the claiming side
+      // (isEffectivelyRoutable). An unattributed verdict (provider tag null —
+      // real-traffic 404/410s recorded without a provider, which may have
+      // come from NON-claiming backends in a fail-over spray; that is exactly
+      // how the qwen38 false positive formed, nvidia 404-ing an alias chiap08
+      // serves fine) or a verdict against a DIFFERENT provider does not
+      // overrule this backend's declaration. A verdict tagged with the
+      // claiming provider (the C4 case: nvidia 410'd the id and nvidia is the
+      // only claimer) still gates, so card C4's protection is intact.
+      if (!isEffectivelyRoutable(lcMatched, matched.map((b) => b.id))) {
         const gated = [];
         gated.eolGated = true;
         gated.eolReason = lcMatched.eol_reason;
@@ -1451,6 +1461,10 @@ export function createRouter(config = {}) {
    * @param {string} id
    * @returns {Backend|null}
    */
+  function getBackends() {
+    return [...backends.values()];
+  }
+
   function getBackend(id) {
     return backends.get(id) || null;
   }
@@ -1480,7 +1494,7 @@ export function createRouter(config = {}) {
   // Return router interface
   // -------------------------------------------------------------------------
 
-  return { route, getHealth, addBackend, removeBackend, getBackend, resolveAgentTarget };
+  return { route, getHealth, addBackend, removeBackend, getBackend, getBackends, resolveAgentTarget };
 }
 
 // ---------------------------------------------------------------------------
@@ -2841,7 +2855,27 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // 2xx/404/410, so a 429 or 402 here is a verified no-op for eol
     // bookkeeping (card C12 covers this; card 9e28de88 fix #4 re-verifies
     // it rather than duplicating the gate here).
-    recordModelOutcome(request.model, { status: res.status, now: Date.now() });
+    // Claimer-aware EOL bookkeeping (incident inc-2026-08-18-qwen38-eol / 
+    // problem prob-2026-08-18-model-discovery-validation): a 404/410 from a
+    // backend that does NOT claim this model is evidence about that backend's
+    // catalog, not about the model — the model may be served fine by a backend
+    // that does claim it (the qwen38 false positive: nvidia 404'd
+    // `qwen38-abliterated` while chiap08's llama.cpp served it name-
+    // agnostically, and the 404s still accumulated to an EOL record). 
+    // recordModelOutcome() skips such permanent errors when `claiming` is 
+    // false; a 2xx always counts (a success is a success from any door). When
+    // NO backend claims the id, every door's 404 is the best evidence 
+    // available and counts, exactly as before (card P1.6's spray-avoidance 
+    // for unclaimed ids is preserved).
+    const claimsHere = request.model && typeof backend.supportsModel === "function"
+      ? backend.supportsModel(request.model)
+      : false;
+    const anyClaimer = typeof router.getBackends === "function" && request.model
+      ? router.getBackends().some(
+          (b) => typeof b.supportsModel === "function" && b.supportsModel(request.model)
+        )
+      : false;
+    recordModelOutcome(request.model, { status: res.status, now: Date.now(), claiming: claimsHere || !anyClaimer });
 
     // Feed the real completion outcome back into the local-health verdict so a
     // wedged local backend that got past the probe but then hung/errored is

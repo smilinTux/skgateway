@@ -459,3 +459,47 @@ export function ageDeadModels(lc, { now, deadAfterMs = THRESHOLDS.deadAfterMs })
 export function isRoutable(lc) {
   return lc.state === LIFECYCLE_STATES.ACTIVE || lc.state === LIFECYCLE_STATES.SUSPECT;
 }
+
+/**
+ * Effective routability for an id that backends EXPLICITLY claim (incident
+ * inc-2026-08-18-qwen38-eol / problem
+ * prob-2026-08-18-model-discovery-validation).
+ *
+ * A backend's `models` list is an operator DECLARATION that it serves that id
+ * (llama.cpp and the like serve name-agnostically, so a custom alias like
+ * `qwen38-abliterated` works there even though it is in no provider catalog).
+ * That declaration must not be overruled by a lifecycle verdict the
+ * declaration's provider never produced:
+ *
+ *   - `active`/`suspect` (or no record at all) is routable, always — the
+ *     common case, identical to isRoutable().
+ *   - A non-routable record with NO claimers behaves exactly like
+ *     isRoutable(): eol|dead|not_chat gates the request (card P1.6).
+ *   - A non-routable record WITH claimers is still routable when the verdict
+ *     is unattributed (`provider` tag null — the completion path records
+ *     real-traffic 404/410s without a provider, and those 404s may have come
+ *     from NON-claiming backends in the fail-over spray, which is exactly how
+ *     the 2026-08-18 qwen38 incident's false positive formed: nvidia answered
+ *     404 to an alias chiap08 serves fine) or when at least one claiming
+ *     backend is NOT the verdict's provider (a multi-provider id condemned by
+ *     one provider is not dead while another provider still claims and serves
+ *     it). The claimer's own 410s keep counting toward the record via the
+ *     claimer-aware `recordModelOutcome()` (model_catalog_store.mjs), so a
+ *     model that is genuinely dead on its only claimer is still condemned —
+ *     and once every claimer is implicated or gone, this predicate gates the
+ *     same way isRoutable() did.
+ *
+ * Pure, synchronous, no I/O. `claimers` is the list of backend names whose
+ * `models` list declares the id (see callers for how it is derived).
+ *
+ * @param {object} lc lifecycle record (lifecycle.mjs `defaultLifecycle()` shape)
+ * @param {string[]} [claimers] backend names claiming the id
+ * @returns {boolean}
+ */
+export function isEffectivelyRoutable(lc, claimers = []) {
+  if (lc == null) return true;
+  if (lc.state === LIFECYCLE_STATES.ACTIVE || lc.state === LIFECYCLE_STATES.SUSPECT) return true;
+  if (!Array.isArray(claimers) || claimers.length === 0) return false;
+  if (lc.provider == null) return true;
+  return claimers.some((name) => name !== lc.provider);
+}

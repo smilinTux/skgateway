@@ -27,7 +27,7 @@ import { handleModuleManifest } from "./operator/manifest.mjs";
 import { fromAnthropicRequest, toAnthropicMessage, modelRetrieveObject } from "./proxy/anthropic-frontend.mjs";
 import { SSEWriter, jsonToSSE } from "./proxy/stream.mjs";
 import { getLifecycle } from "./discovery/model_catalog_store.mjs";
-import { isRoutable, LIFECYCLE_STATES } from "./discovery/lifecycle.mjs";
+import { isRoutable, isEffectivelyRoutable, LIFECYCLE_STATES } from "./discovery/lifecycle.mjs";
 import { rankModels } from "./ranking/rank.mjs";
 import { deriveCapabilities } from "./ranking/capabilities.mjs";
 import { buildCapabilityCatalog } from "./ranking/catalog.mjs";
@@ -234,18 +234,52 @@ export function registerDiscoveredRoutes(cfg, catalog, opts = {}) {
  * aside from the injected lookup, for the same testability reason as
  * filterRoutableModelIds above.
  *
+ * Claimer-aware (incident inc-2026-08-18-qwen38-eol): a non-routable verdict
+ * does not preempt a backend's explicit declaration of the id unless the
+ * verdict is attributed to the claiming side — the SAME rule as the router's
+ * gate (isEffectivelyRoutable), so the advertised catalog and the routable
+ * set cannot disagree: a model that routes (a local claimer over an
+ * unattributed or foreign-provider EOL verdict) is advertised, and a model
+ * that does not route is not. `claimersFor` omitted/`null` keeps the original
+ * isRoutable behavior exactly (every pre-incident caller and test).
+ *
  * @param {Array<object>} data
  * @param {(id: string) => object} [getLifecycleFn]
+ * @param {((id: string) => string[])|null} [claimersFor] backend names declaring each id
  * @returns {Array<object>}
  */
-export function applyLifecycleView(data, getLifecycleFn = getLifecycle) {
+export function applyLifecycleView(data, getLifecycleFn = getLifecycle, claimersFor = null) {
   const out = [];
   for (const m of data) {
     const lc = getLifecycleFn(m.id);
-    if (!isRoutable(lc)) continue; // hide eol/dead
+    const claimers = claimersFor ? (claimersFor(m.id) || []) : [];
+    if (!isEffectivelyRoutable(lc, claimers)) continue; // hide eol/dead not rescued by a live claim
     out.push(lc.state === LIFECYCLE_STATES.SUSPECT ? { ...m, lifecycle: "suspect" } : m);
   }
   return out;
+}
+
+/**
+ * For each concrete model id in `backends` (config.backends), the list of
+ * backend names whose `models` list declares it — the claimer context
+ * applyLifecycleView() (and the router's gate, via candidatesFor) uses for
+ * the claim-over-verdict rule (incident inc-2026-08-18-qwen38-eol). Wildcard
+ * patterns (`dolphin-*`) are patterns, not ids, and are skipped, the same
+ * convention buildModelCatalog()/declaredModelsFor() follow. Pure, no I/O.
+ *
+ * @param {Record<string, {models?: string[]}>} [backends]
+ * @returns {(id: string) => string[]}
+ */
+export function modelClaimersFor(backends = {}) {
+  const map = new Map();
+  for (const [name, b] of Object.entries(backends || {})) {
+    for (const m of (b?.models || [])) {
+      if (typeof m !== "string" || m.includes("*")) continue;
+      if (!map.has(m)) map.set(m, []);
+      map.get(m).push(name);
+    }
+  }
+  return (id) => map.get(id) || [];
 }
 
 /**
@@ -1095,14 +1129,17 @@ export const server = http.createServer(async (req, res) => {
       // Picker badges (card P2.4): additive ctx_tokens/tools/vision derived
       // from each surviving entry's card, if it has one. Superset-only.
       // Public-safe: strip internal card fields (notes) before the funnel.
-      const data = stripInternalCardFields(applyPickerBadges(applyLifecycleView(allowed)));
+      // Claimer-aware lifecycle view (incident inc-2026-08-18-qwen38-eol):
+      // the advertised set honors the same claim-over-verdict rule as the
+      // router's gate, so /v1/models and routability stay consistent.
+      const data = stripInternalCardFields(applyPickerBadges(applyLifecycleView(allowed, getLifecycle, modelClaimersFor(config.backends || {}))));
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ object: "list", data }));
     } catch (e) {
       console.warn("[skgateway] /v1/models discovery merge failed, falling back to static catalog:", e.message);
       let data = [];
       try {
-        data = stripInternalCardFields(applyPickerBadges(applyLifecycleView(buildModelCatalog(config.backends || {}, router, advertiseReconcileMode))));
+        data = stripInternalCardFields(applyPickerBadges(applyLifecycleView(buildModelCatalog(config.backends || {}, router, advertiseReconcileMode), getLifecycle, modelClaimersFor(config.backends || {}))));
       } catch (e2) {
         console.warn("[skgateway] /v1/models static catalog fallback also failed, serving empty list:", e2.message);
       }

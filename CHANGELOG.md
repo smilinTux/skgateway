@@ -9,6 +9,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A backend's declaration of a model id now beats a lifecycle verdict the
+  declaration's provider never produced** (incident `inc-2026-08-18-qwen38-eol`
+  / problem `prob-2026-08-18-model-discovery-validation`). `qwen38-abliterated`,
+  declared under the local `chiap08-qwen38` backend (llama.cpp serves it
+  name-agnostically, verified 200), was condemned to `eol/provider_410` by
+  404/410s from NON-claiming backends in a fail-over spray — nvidia answers
+  404 to an alias it does not host — and the EOL record then gated the healthy
+  local door in `candidatesFor()`'s matched branch (card C4), so every request
+  404'd while chiap08 served it fine. Four coordinated changes:
+  1. `isEffectivelyRoutable()` (`src/discovery/lifecycle.mjs`), now used by
+     the router's gate in BOTH `candidatesFor()` branches: a non-routable
+     record only preempts a claim when it is attributed to the claiming side
+     (provider tag set and equal to every claimer's name — the card C4 shape:
+     nvidia 410'd the id and nvidia is the only claimer). An unattributed
+     record (completion-path records carry no provider tag) or a verdict
+     against a different provider does not overrule a claim — multi-provider
+     ids stay routable while any other claimer survives, and a locally-served
+     alias is never gated by a foreign catalog's say-so. No claimers: exactly
+     the card P1.6 behavior.
+  2. `recordModelOutcome()` (`src/discovery/model_catalog_store.mjs`) is
+     claimer-aware: the router now passes whether the attempted backend
+     DECLARES the model, and a 404/410 from a non-claiming door no longer
+     accumulates toward the model's EOL (a 2xx always counts; no claimers at
+     all counts, so card P1.6's spray-avoidance for unclaimed ids is intact).
+     Genuinely dead on the only claimer is still condemned by the claimer's
+     own 410s.
+  3. The provider probe sweep skips ids another backend declares
+     (`selectProbeCandidates`/`probeModels` `excludedIds`, computed from the
+     live config by `declaredModelsElsewhere()` in `src/discovery.mjs`), so
+     nvidia's 410 during a sweep cannot retire a locally-served or
+     multi-provider id — "only EOL if ALL providers fail."
+  4. `applyLifecycleView()` (`src/index.mjs`) uses the same claim-aware rule
+     with per-id claimers (`modelClaimersFor()`), so the advertised
+     `/v1/models` catalog and the routable set cannot disagree: a model that
+     routes is advertised, one that does not route is not. `reconcile: hide`
+     still omits anything with no available serving backend on top of that.
+
+  Verified end to end on the live node: with a residual EOL record seeded for
+  `qwen38-abliterated`, `POST /v1/chat/completions` resolves 200 through the
+  gateway onto chiap08 (content `alive`, served id
+  `qwen3.8-27b-huihui-abliterated-q4_k_m`), then recovers eol → suspect →
+  active under the normal promotion thresholds; a claimer-attributed EOL id
+  (`qwen/qwen3.5-122b-a10b`, nvidia-tagged, nvidia-claimed) still answers a
+  clean 404 + `eol_reason` with no upstream attempt. New suite
+  `tests/model-claimer-lifecycle.test.mjs` (23 tests) plus the two new
+  `tests/router-eol-gate.test.mjs` scenarios; 1305/1305 passing.
+
 - **Registry-routed doors (`reg:<name>`) now appear in `getHealth()`.** They
   live in the module-level `_regBackends` map rather than the router's
   configured `backends`, and `getHealth()` only walked the latter, so the path

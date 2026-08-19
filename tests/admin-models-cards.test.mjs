@@ -64,6 +64,12 @@ describe("card P2.4: /admin/models cards+lifecycle, /v1/models picker badges", (
           absent_cycles: 0,
           eol_reason: "provider_410",
           eol_at: 1000,
+          // 2026-08-18 (incident inc-2026-08-18-qwen38-eol): declared by the
+          // `local` backend below, so the verdict is attributed to the
+          // claimer to keep pinning "eol id hidden from /v1/models". An
+          // unattributed verdict on a claimed id is rescued by the claim
+          // (see tests/model-claimer-lifecycle.test.mjs).
+          provider: "local",
         },
       }),
     );

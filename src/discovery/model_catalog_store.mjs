@@ -202,17 +202,34 @@ export function getLifecycle(modelId, path = STORE_PATH) {
  * untouched; `not_chat` is set exclusively by `applyProbeOutcome`, reached
  * only from the probe sweep (src/discovery/probe.mjs), never from here.
  *
+ * Claimer-aware permanent errors (incident inc-2026-08-18-qwen38-eol /
+ * problem prob-2026-08-18-model-discovery-validation): `claiming` tells the
+ * store whether the backend the attempt hit DECLARES this model (its
+ * `models` list) or was only a fail-over fallback that happened to be
+ * available. A 404/410 from a non-claiming backend is evidence about THAT
+ * backend's catalog, not about the model — the model may be served perfectly
+ * by a backend that does claim it (the qwen38 false positive: nvidia 404'd
+ * `qwen38-abliterated` while chiap08's llama.cpp served it name-agnostically,
+ * and those 404s still accumulated to an EOL record that then gated the
+ * healthy local door). So with `claiming === false`, a 404/410 is a no-op:
+ * the record is left exactly as it was. A 2xx always counts regardless (a
+ * success is a success from any door), and `claiming === true` or `undefined`
+ * (legacy/test callers) keep the original behavior, including the case where
+ * NO backend claims the id and every door's 404 is the best evidence
+ * available (card P1.6).
+ *
  * @param {string} modelId
- * @param {{status: number, now?: number}} outcome
+ * @param {{status: number, now?: number, claiming?: boolean}} outcome
  * @param {string} [path]
  * @returns {void}
  */
-export function recordModelOutcome(modelId, { status, now = Date.now() } = {}, path = STORE_PATH) {
+export function recordModelOutcome(modelId, { status, now = Date.now(), claiming } = {}, path = STORE_PATH) {
   if (!modelId) return;
   // Guard before the fail-soft try: this function's catch swallows everything,
   // so a guard inside it would silently do nothing. See
   // assertNotProductionStoreInTest.
   assertNotProductionStoreInTest(path);
+  if (claiming === false && (status === 404 || status === 410)) return;
   try {
     const store = loadCatalogStore(path);
     const prev = store[modelId] || defaultLifecycle();

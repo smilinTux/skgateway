@@ -80,6 +80,16 @@ export const DEFAULT_PROBE_SECONDS = 24 * 60 * 60;
  *   per design 5.2, since it must go through the NVIDIA connection pool;
  *   left generic here so tests, and any future multi-provider sweep, are not
  *   hardcoded to one provider name).
+ * - `excludedIds` (a Set, incident inc-2026-08-18-qwen38-eol / problem
+ *   prob-2026-08-18-model-discovery-validation): ids another backend
+ *   DECLARES are excluded from this provider's sweep. The sweep's probes hit
+ *   ONE provider's endpoint, so a 410 from that provider is evidence about
+ *   THAT provider only; a model a different backend claims and serves (a
+ *   local llama.cpp alias, or a multi-provider id still live on the other
+ *   provider) must not be retired on one provider's say-so — "only EOL if
+ *   ALL providers fail". Production computes the set from the config (see
+ *   `declaredModelsElsewhere()` in discovery.mjs); left generic here so
+ *   tests inject it directly.
  *
  * Ordered oldest-verified-first (never-verified ids sort before any
  * previously-verified one) so a budget-limited sweep works through the true
@@ -87,18 +97,19 @@ export const DEFAULT_PROBE_SECONDS = 24 * 60 * 60;
  * synchronous, no I/O.
  *
  * @param {Record<string, object>} store
- * @param {{budget?: number, now: number, trafficWindowMs?: number, provider?: string}} opts
+ * @param {{budget?: number, now: number, trafficWindowMs?: number, provider?: string, excludedIds?: Set<string>}} opts
  * @returns {string[]}
  */
 export function selectProbeCandidates(
   store,
-  { budget = DEFAULT_PROBE_BUDGET, now, trafficWindowMs = DEFAULT_TRAFFIC_WINDOW_MS, provider } = {},
+  { budget = DEFAULT_PROBE_BUDGET, now, trafficWindowMs = DEFAULT_TRAFFIC_WINDOW_MS, provider, excludedIds } = {},
 ) {
   if (!(budget > 0)) return [];
 
   const entries = Object.entries(store || {})
     .filter(([, lc]) => lc && lc.state !== LIFECYCLE_STATES.DEAD)
     .filter(([, lc]) => (provider ? lc.provider === provider : true))
+    .filter(([id]) => !excludedIds || !excludedIds.has(id))
     .filter(([, lc]) => {
       const lastVerified = lc.last_verified_at;
       return lastVerified == null || now - lastVerified >= trafficWindowMs;
@@ -184,6 +195,8 @@ export function selectProbeCandidates(
  * @param {number} [opts.maxTokens]
  * @param {number} [opts.trafficWindowMs]
  * @param {string} [opts.provider]
+ * @param {Set<string>} [opts.excludedIds] ids claimed by another backend,
+ *   excluded from this provider's sweep (see selectProbeCandidates' doc).
  * @param {{acquire: Function, release: Function}} [opts.pool]
  * @param {string} [opts.poolBackendId]
  * @param {number|(() => number)} [opts.now]
@@ -212,6 +225,7 @@ export async function probeModels(store, opts = {}) {
     maxTokens = DEFAULT_MAX_TOKENS,
     trafficWindowMs = DEFAULT_TRAFFIC_WINDOW_MS,
     provider,
+    excludedIds,
     pool,
     poolBackendId = DEFAULT_POOL_BACKEND_ID,
     now = Date.now,
@@ -230,7 +244,7 @@ export async function probeModels(store, opts = {}) {
     return { ...safeStore };
   }
 
-  const candidates = selectProbeCandidates(safeStore, { budget, now: nowMs, trafficWindowMs, provider });
+  const candidates = selectProbeCandidates(safeStore, { budget, now: nowMs, trafficWindowMs, provider, excludedIds });
   if (candidates.length === 0) {
     return { ...safeStore };
   }
