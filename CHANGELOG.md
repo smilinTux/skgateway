@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- Reworked the SOP into the complete graded-routing runbook: card grade to
+  `skharness` override to SKGateway bucket pool, live membership/failover,
+  Ornith 1.5's verified 32768 context, custom-alias lifecycle semantics,
+  GitHub-only fleet rollout, duplicate-listener diagnosis, and hermetic drift
+  checks for the new surfaces.
+
 ### Fixed
 
 - **T-shirt sizing buckets are now visible and truthful end to end.** When

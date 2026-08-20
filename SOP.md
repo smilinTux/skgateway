@@ -54,6 +54,35 @@ The default logical role is `sk-default` (`src/classifiers/empirical.mjs:46`,
 `src/classifiers/difficulty.mjs:104`); callers should ask for the role, not a concrete
 model name, and let the router resolve it.
 
+### T-shirt sizing: grade to bucket to concrete model
+
+The graded workflow addresses a capability/trust **pool**, not a named model. Upstream
+`skharness` computes a complete `work_grade`; SKGateway consumes only its already-derived
+`model_class` and `sensitivity`. It never re-grades the card.
+
+```mermaid
+flowchart LR
+    CARD["coord card"] -->|"complete work_grade"| HARNESS["skharness"]
+    HARNESS -->|"model = sk-&lt;class&gt;-&lt;sensitivity&gt;"| GW2["skgateway"]
+    GW2 -->|"class floor + trust-zone ceiling"| POOL["eligible bucket pool"]
+    POOL -->|"rotate; retry eligible members"| MODEL["concrete serving model"]
+    MODEL -->|"x-sk-bucket + x-sk-bucket-member"| HARNESS
+```
+
+There are exactly 12 addresses: the cross-product of `S`, `M`, `L`, `XL` and
+`public`, `internal`, `secret`. `routing.buckets_enabled: true` arms routing and makes
+all 12 visible in `/v1/models`; `/admin/buckets` explains current membership and
+rejections. A class is a hard capability floor; sensitivity resolves to a hard maximum
+trust zone. A larger capable model may serve, but a smaller model or a model outside the
+zone may not.
+
+The pool is derived from the same serving-config/discovery union, provider posture,
+lifecycle state, and claimer-aware routing rule used by requests. Rotation selects a
+starting member, then `402`, `429`, `5xx`, and bucket-scoped `404`/`410` advance through
+the remaining eligible members. An empty pool fails closed with
+`503 bucket_no_eligible_member`; a near-miss such as `sk-xl-secrets` fails with
+`400 invalid_bucket_id` and never falls through to `sk-auto`.
+
 ```mermaid
 flowchart TD
     CLIENTS["AI clients<br/>OpenClaw · Claude Code · skvoice · skchat · custom apps"]
@@ -212,7 +241,17 @@ possible failure mode for a gate, so the default is now "no registry configured"
 every test process. A suite that needs a registry still assigns `SKMODELS_REGISTRY`
 itself at module scope before importing `registry.mjs`, and that assignment still wins.
 
-**Verified 2026-08-15, this worktree, Node 22.23.2: 1148 tests, 1148 pass, 0 fail.**
+**Verified 2026-08-20:** the focused bucket/catalog/claim-aware lifecycle suite passes
+69/69, and the complete suite passes 1307/1307 on Node 22.23.2. Re-run the focused gate:
+
+```bash
+node --test --import ./tests/_setup.mjs \
+  tests/bucket-routing-integration.test.mjs \
+  tests/admin-buckets.test.mjs \
+  tests/advertise-lifecycle.test.mjs \
+  tests/model-claimer-lifecycle.test.mjs \
+  tests/attribution-headers.test.mjs
+```
 
 ## 5. Release / Deploy
 
@@ -270,6 +309,24 @@ tag is authoritative. Release flow: dated `CHANGELOG.md` entry, run `npm test` l
 
 Front-end / Exposure: see §2, including the `0.0.0.0` deviation.
 
+### Fleet rollout from GitHub
+
+The live checkout must be a fast-forward of GitHub, never a copied working tree:
+
+```bash
+git -C ~/clawd/skcapstone-repos/skgateway fetch --tags origin
+git -C ~/clawd/skcapstone-repos/skgateway status --short
+git -C ~/clawd/skcapstone-repos/skgateway pull --ff-only origin main
+systemctl --user restart skgateway
+systemctl --user is-active skgateway
+curl -fsS http://127.0.0.1:18780/healthz
+```
+
+Stop if `status --short` is non-empty; preserve and reconcile local work before pulling.
+After restart, compare `git rev-parse HEAD` with `git rev-parse origin/main` and verify
+both `/v1/models` and `/admin/buckets`. A process listening on `:18780` whose PID is not
+the unit's `MainPID` is an unmanaged duplicate and must not be treated as the deploy.
+
 ## 6. Configuration / Usage
 
 Config covers server, backends, tools, sanitizer, metrics and pricing, plus
@@ -293,6 +350,20 @@ in-repo `config/skgateway.yaml` is the pre-migration fallback and is almost cert
 *not* what the running service read. Confirm with
 `systemctl --user show skgateway -p ExecStart` before you edit anything.
 
+### Live local-model invariants
+
+- `.100:8082` serves `ornith-1.5-9b` from
+  `/mnt/comfyui/models/beellama/Ornith-1.5-9B-Q6_K.gguf`. The live process uses a
+  **32768-token context**; registry and gateway limits must not advertise 131072.
+- `sk-default` resolves through registry backend `ornith` to that alias. A successful
+  response reports `x-sk-backend: reg:ornith` and
+  `x-sk-model-served: ornith-1.5-9b`.
+- Local aliases are declarations by their local backend. A foreign provider catalog
+  cannot retire them: probes exclude ids declared elsewhere, completion EOL evidence is
+  claimer-aware, and routing/catalog visibility both use `isEffectivelyRoutable()`.
+  Thus NVIDIA's lack of `qwen38-abliterated` is not evidence that chiap08's local alias
+  is EOL. Backend reachability is still a separate prerequisite.
+
 Secrets sourcing (never inline a live secret):
 - Backend API keys are referenced by env-var NAME, not value. Config carries
   `api_key_env: NVIDIA_API_KEY`; the process reads the key from the environment at
@@ -313,7 +384,7 @@ Proxy (`:18780`):
 |---|---|---|
 | `POST` | `/v1/chat/completions` | Chat completions (SSE streaming + JSON). OpenAI-compatible. |
 | `POST` | `/v1/messages` | **Anthropic-compatible** Messages surface. Translated to the OpenAI shape and routed down the same pipeline, then translated back (`src/index.mjs:1347`). Matched by **pathname**, so `?beta=true` from Claude Code still hits it. |
-| `GET`  | `/v1/models` | Aggregated model catalog across configured backends. |
+| `GET`  | `/v1/models` | Aggregated concrete catalog plus all 12 bucket aliases when buckets are enabled. |
 | `GET`  | `/v1/models/<id>` | Single-model detail. |
 | `GET`  | `/health`, `/healthz` | Liveness: `{ status, uptime, backends }` (`src/index.mjs:935`). |
 | `GET`  | `/status` | Self-report: `{ status, version, uptime, backends, pool, metrics }`. `metrics` is the collector's `getStats()` or `null` if disabled. ⚠️ `version` is hardcoded, see §9. |
@@ -322,6 +393,7 @@ Proxy (`:18780`):
 | `GET`  | `/admin/models`, `/admin/models/status`, `/admin/models/rank` | Model catalog administration (read). |
 | `PUT`  | `/admin/models/advertise` | Advertise a model into the catalog. |
 | `POST` | `/admin/models/refresh` | Force a catalog refresh. |
+| `GET`  | `/admin/buckets` | Bucket enablement, live eligible members, ceiling and rejection reasons for all 12 buckets. |
 | `GET`  | `/`, `/dashboard` | 302 redirect to the dashboard port. |
 
 Dashboard (`:18781`): `GET /` (SOC HTML), `GET /api/metrics`, `GET /api/metrics/history`,
@@ -338,6 +410,11 @@ canonical check that metrics are recording (non-null object once enabled).
 | Requests 403 unexpectedly | A policy rule denied. Inspect `logs/audit.jsonl` and the dashboard Security Events panel; check `config/policies.yaml` rule order (first deny wins). |
 | Requests 429 | Rate limit hit. Check `rate_limits` for the agent/model in `config/policies.yaml`. |
 | Backend 4xx/5xx / model not found | `GET /v1/models` for the aggregated catalog; check backend `priority` and `models` globs and that the backend's `api_key_env` var is set in the environment. |
+| Buckets absent from `/v1/models` | Confirm the **serving** config has `routing.buckets_enabled: true`; then compare `GET /admin/buckets`. Remember the live unit normally reads `~/.skcapstone/gateway/skgateway.yaml`, not the repo fallback. |
+| A bucket is visible but has no members | Inspect `/admin/buckets` rejection reasons. Membership requires the class floor, trust-zone ceiling, provider posture, an available serving backend, and effective lifecycle routability. Do not add a hardcoded member to conceal the rejected condition. |
+| Valid bucket returns 503 | `bucket_no_eligible_member` is fail-closed. Restore an eligible backend or correct its model card/lifecycle claim; do not fall back to `sk-default`. |
+| `qwen38-abliterated` reports EOL despite a local declaration | Run the claim-aware tests and inspect the lifecycle record's provider attribution. A non-claiming NVIDIA 404/410 must neither accumulate EOL nor preempt `chiap08-qwen38`; separately verify `100.81.238.58:11439` is reachable. |
+| Restart succeeds but code/config appears stale | Compare the listener PID (`ss -ltnp`) with `systemctl --user show skgateway -p MainPID`. A second unmanaged Node process can own `:18780` while the managed unit crash-loops. Stop the duplicate, then restart and probe the unit. |
 | `better-sqlite3` fails to load (`Could not locate the bindings file`) | The native addon was not built. Most often the install ran with `--ignore-scripts`, which skips it and fails 19 metrics/energy/SIEM tests. Re-run plain `npm ci` or `npm install` (needs a `node-gyp` toolchain). |
 | Config edits not taking effect | Two causes, check both. (a) Config is read once at startup and only re-read on `SIGHUP`: `systemctl --user kill -s HUP skgateway`. (b) **You probably edited the wrong file.** The effective command passes no `--config`, so the service loads `~/.skcapstone/gateway/skgateway.yaml`, not the in-repo `config/skgateway.yaml`. Confirm with `systemctl --user show skgateway -p ExecStart` (§5, §6). |
 | Behaviour changed and nothing was committed / a fix "disappeared" after a pull | `ExecStart` runs the source directly out of the **shared working checkout** `~/clawd/skcapstone-repos/skgateway`, with no build and no deployed artifact. An uncommitted edit there is live behaviour, and any later `git pull`/`checkout`/`reset` by another session silently erases it. `git -C ~/clawd/skcapstone-repos/skgateway status` before you conclude anything. Never edit that checkout: use a worktree, commit, then pull. |
@@ -386,7 +463,7 @@ canonical check that metrics are recording (non-null object once enabled).
 ---
 
 <!-- docs-evidence
-verified: 2026-08-15
+verified: 2026-08-20
 checks:
   - name: documented ports and the 0.0.0.0 bind default are still the code defaults
     run: grep -qxF '    port: 18780,' src/config.mjs && grep -qxF '    dashboard_port: 18781,' src/config.mjs && grep -qxF "    bind: '0.0.0.0'," src/config.mjs
@@ -408,6 +485,12 @@ checks:
     run: grep -qF 'if (explicit) return expandHome(explicit);' src/config.mjs && grep -qF 'if (process.env.SKGATEWAY_CONFIG) return expandHome(process.env.SKGATEWAY_CONFIG);' src/config.mjs && grep -qxF "export const SYNCED_CONFIG_PATH = resolve(homedir(), '.skcapstone', 'gateway', 'skgateway.yaml');" src/config.mjs
   - name: sk-default is still the default logical role
     run: grep -qxF 'const DEFAULT_ROLE = "sk-default";' src/classifiers/empirical.mjs && grep -qxF 'const DEFAULT_DEFAULT_ROLE = "sk-default";' src/classifiers/difficulty.mjs
+  - name: all twelve bucket addresses are derived and advertised only when enabled
+    run: grep -qF 'export function allBuckets' src/policy/buckets.mjs && grep -qF 'cfg?.routing?.buckets_enabled === true' src/index.mjs && grep -qF 'if (cfg?.routing?.buckets_enabled === true)' src/index.mjs
+  - name: bucket attribution headers and admin inspection route are present
+    run: grep -qF 'out["x-sk-bucket"] = result.bucket' src/metrics/attribution.mjs && grep -qF 'out["x-sk-bucket-member"] = result.bucketMember' src/metrics/attribution.mjs && grep -qF 'req.url === "/admin/buckets"' src/index.mjs
+  - name: custom aliases are protected from foreign lifecycle verdicts
+    run: grep -qF 'export function isEffectivelyRoutable' src/discovery/lifecycle.mjs && grep -qF 'export function declaredModelsElsewhere' src/discovery.mjs && test -f tests/model-claimer-lifecycle.test.mjs
   - name: the stale hardcoded /status version documented in section 9 is still stale (fix it and update section 9)
     run: grep -qxF '      version: "0.1.0",' src/index.mjs
 -->
