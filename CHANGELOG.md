@@ -15,6 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   GitHub-only fleet rollout, duplicate-listener diagnosis, and hermetic drift
   checks for the new surfaces.
 
+### Added
+
+- Added the GitHub-tracked `.100` Ornith 1.5 launcher and user unit, pinning the
+  verified model alias, model path, port, 32768 context, CUDA settings, and
+  restart backoff so the backend is reproducible by clone/pull rather than an
+  untracked script in the third-party inference checkout.
+
 ### Fixed
 
 - **T-shirt sizing buckets are now visible and truthful end to end.** When
