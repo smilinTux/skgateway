@@ -100,6 +100,23 @@ describe("attributionHeaders", () => {
     assert.equal("x-sk-req-id" in h, false);
     assert.equal(h["x-sk-backend"], "stub");
   });
+
+  test("bucket attribution names the requested pool and the serving member", () => {
+    const h = attributionHeaders("req-bucket", {
+      backendId: "local",
+      servedModel: "ornith-1.0-9b",
+      bucket: "sk-m-secret",
+      bucketMember: "ornith-1.0-9b",
+    });
+    assert.equal(h["x-sk-bucket"], "sk-m-secret");
+    assert.equal(h["x-sk-bucket-member"], "ornith-1.0-9b");
+  });
+
+  test("non-bucket responses do not grow empty bucket headers", () => {
+    const h = attributionHeaders("req-plain", { backendId: "local", servedModel: "m" });
+    assert.equal("x-sk-bucket" in h, false);
+    assert.equal("x-sk-bucket-member" in h, false);
+  });
 });
 
 // ─── live-server harness ────────────────────────────────────────────────────

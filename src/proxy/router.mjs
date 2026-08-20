@@ -2067,7 +2067,14 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = (
     bucket: addr,
     catalog,
     sensitivityPolicy: policy,
-    isRoutable: (e) => isRoutable(getLifecycle(e.id)),
+    isRoutable: (e) => {
+      const claimers = typeof router.getBackends === "function"
+        ? router.getBackends()
+          .filter((backend) => backend.supportsModel(e.id))
+          .map((backend) => backend.id)
+        : [];
+      return isEffectivelyRoutable(getLifecycle(e.id), claimers);
+    },
   });
 
   emitSiem("bucket_resolve", {
@@ -2112,6 +2119,8 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = (
   const n = (_bucketCounters.get(addr.bucket) || 0) + 1;
   _bucketCounters.set(addr.bucket, n);
   const picked = selectMember(members, n);
+  const start = members.indexOf(picked);
+  const orderedMembers = [...members.slice(start), ...members.slice(0, start)];
 
   console.log(
     `[router] bucket ${addr.bucket} -> ${picked.id} ` +
@@ -2135,14 +2144,69 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = (
   // path does await the same call; this one was simply missed, and no test ever
   // reached it. The normalization is kept for the resolved value, which really
   // can be a single object or an array.
-  const results = await router.route({ ...request, model: picked.id, agentId: request.agentId });
-  const list = Array.isArray(results) ? results : results ? [results] : [];
+  const candidates = [];
+  const seen = new Set();
+  const skipped = [];
+  for (const member of orderedMembers) {
+    let results;
+    try {
+      results = await router.route({ ...request, model: member.id, agentId: request.agentId });
+    } catch (err) {
+      if (err instanceof ModelEolError) {
+        skipped.push(member.id);
+        emitSiem("bucket_member_skipped", {
+          bucket: addr.bucket,
+          member: member.id,
+          eol_reason: err.reason || err.message,
+        }, {});
+        continue;
+      }
+      throw err;
+    }
+    const list = Array.isArray(results) ? results : results ? [results] : [];
+    for (const result of list) {
+      const key = `${result.backendId}:${member.id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      candidates.push({
+        ...result,
+        bodyOverride: rewriteBodyModel(body, member.id),
+        model: member.id,
+        bucket: addr.bucket,
+        bucketMember: member.id,
+      });
+    }
+  }
+
+  if (candidates.length === 0) {
+    return {
+      failClosed: {
+        status: 503,
+        headers: { "content-type": "application/json" },
+        body: Buffer.from(JSON.stringify({
+          error: {
+            message: `No model satisfies bucket ${addr.bucket} after lifecycle gating.`,
+            code: 503,
+            type: "bucket_no_eligible_member",
+            bucket: addr.bucket,
+            model_class: addr.model_class,
+            sensitivity: addr.sensitivity,
+            ceiling,
+            excluded: skipped.map((id) => ({ id, reason: "eol-gated" })),
+          },
+        }), "utf-8"),
+      },
+    };
+  }
+
+  emitSiem("bucket_resolve", {
+    bucket: addr.bucket,
+    chain_length: candidates.length,
+    skipped,
+  }, {});
   return {
-    candidates: list.map((r) => ({
-      ...r,
-      bodyOverride: rewriteBodyModel(body, picked.id),
-      model: picked.id,
-    })),
+    candidates,
+    isBucketChain: true,
   };
 }
 
@@ -2221,6 +2285,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
   // upstream to the resolved backend. Otherwise fall through to normal
   // model-name routing (full backward-compat).
   let candidates = null;
+  let isBucketChain = false;
 
   // ── Bucket pools (card 2ba73bf9 / C9) ──
   // `sk-<class>-<sensitivity>` addresses a POOL, not a model. Checked BEFORE
@@ -2239,6 +2304,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     const resolved = await resolveBucketCandidates(router, bucketAddr, request, body, emitSiem);
     if (resolved.failClosed) return resolved.failClosed;
     candidates = resolved.candidates;
+    isBucketChain = resolved.isBucketChain === true;
   } else if (bucketsOn) {
     // A near miss is the dangerous case, not an unknown id. See
     // invalidBucketIdResponse() above for the measured 200 this prevents. An
@@ -2867,15 +2933,15 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // NO backend claims the id, every door's 404 is the best evidence 
     // available and counts, exactly as before (card P1.6's spray-avoidance 
     // for unclaimed ids is preserved).
-    const claimsHere = request.model && typeof backend.supportsModel === "function"
-      ? backend.supportsModel(request.model)
+    const claimsHere = candidateModel && typeof backend.supportsModel === "function"
+      ? backend.supportsModel(candidateModel)
       : false;
-    const anyClaimer = typeof router.getBackends === "function" && request.model
+    const anyClaimer = typeof router.getBackends === "function" && candidateModel
       ? router.getBackends().some(
-          (b) => typeof b.supportsModel === "function" && b.supportsModel(request.model)
+          (b) => typeof b.supportsModel === "function" && b.supportsModel(candidateModel)
         )
       : false;
-    recordModelOutcome(request.model, { status: res.status, now: Date.now(), claiming: claimsHere || !anyClaimer });
+    recordModelOutcome(candidateModel, { status: res.status, now: Date.now(), claiming: claimsHere || !anyClaimer });
 
     // Feed the real completion outcome back into the local-health verdict so a
     // wedged local backend that got past the probe but then hung/errored is
@@ -2918,6 +2984,10 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // names the SERVING attempt and never a blend across attempts, which is
     // the same ruling the energy headers already follow.
     lastResult = { ...res, backendId, servedModel: candidateModel, failover: didFailover, queueWaitMs };
+    if (isBucketChain) {
+      lastResult.bucket = bucketAddr.bucket;
+      lastResult.bucketMember = candidateModel;
+    }
     if (attemptEnergy) lastResult.energy = attemptEnergy;
     // Only attached when something was actually observed, so the disabled
     // path returns a result whose shape is unchanged, field for field.
@@ -2927,7 +2997,8 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // throttled door advances the loop instead of being handed back to the
     // caller. `healthy` above already kept backend health/lifecycle out of
     // this decision entirely.
-    const retryElsewhere = isFailoverStatus(res.status);
+    const retryElsewhere = isFailoverStatus(res.status) ||
+      (isBucketChain && (res.status === 404 || res.status === 410));
     const throttled = isThrottleStatus(res.status);
 
     if (!retryElsewhere) {

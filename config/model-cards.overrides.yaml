@@ -265,7 +265,7 @@ overrides:
     org: DeepReinforce (self-hosted)
     summary: "The small, fast sovereign reasoner on the .100 5060 Ti. NVFP4 + MTP. Pairs with the 35B."
     good_at: [fast reasoning, cheap sovereign inference, drafts]
-    context_length: 131072
+    context_length: 32768
     max_output_tokens: 16384
     supported_parameters: [tools, tool_choice, reasoning]
     modality: "text->text"
@@ -281,6 +281,26 @@ overrides:
     reasoning: true
     min_output_tokens: 8192
     notes: "Registry role ornith-tiny. Default reply model for lumina/opus agent contexts."
+
+  ornith-1.5-9b:
+    display_name: "Ornith 1.5 9B"
+    org: DeepReinforce (self-hosted)
+    summary: "Current small sovereign reasoner on the .100 RTX 5060 Ti."
+    good_at: [fast reasoning, coding, tool use, sovereign/private work]
+    context_length: 131072
+    max_output_tokens: 16384
+    supported_parameters: [tools, tool_choice, reasoning]
+    modality: "text->text"
+    params: "9B"
+    quant: "Q6_K"
+    tier: local
+    speed: "fast"
+    params_b: 9
+    size_class: M
+    latency_class: interactive
+    reasoning: true
+    min_output_tokens: 8192
+    notes: "Current registry sk-default target on .100:8082; deployed 2026-08-20."
 
   # qwen38 = Qwen3.8 27B UD-Q5_K_XL on chiap08 :11439 (registry backend
   # `qwen38`). No overlay entry existed for this id before card N2 even

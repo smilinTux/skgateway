@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **T-shirt sizing buckets are now visible and truthful end to end.** When
+  `routing.buckets_enabled` is on, `/v1/models` advertises all 12 canonical
+  `sk-<class>-<sensitivity>` addresses and `/admin/buckets` evaluates the same
+  serving-config/discovery union, provider postures, lifecycle state and
+  claimer-aware gate as the request path. This fixes internal/secret pools
+  appearing empty while routable local and Anthropic models existed.
+- **A bucket now fails over across members, not only across doors for one
+  member.** Rotation chooses the first member, then 402/429/5xx and
+  bucket-scoped 404/410 advance through the remaining eligible members without
+  changing concrete-model semantics. Responses expose `x-sk-bucket` and
+  `x-sk-bucket-member` from the serving attempt.
+
 - **A backend's declaration of a model id now beats a lifecycle verdict the
   declaration's provider never produced** (incident `inc-2026-08-18-qwen38-eol`
   / problem `prob-2026-08-18-model-discovery-validation`). `qwen38-abliterated`,

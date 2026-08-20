@@ -15,7 +15,7 @@ import { createProxyServer, handleRequest, buildConfig } from "./proxy/core.mjs"
 import { createRouter, routeAndSend } from "./proxy/router.mjs";
 import { buildModelCatalog, reconcileModeFromConfig, tagLocalModels, mergeDiscoveredCatalog, isModelAvailable } from "./proxy/advertise.mjs";
 import { loadAllowlist, saveAllowlist, applyAllowlist } from "./advertise.mjs";
-import { discoverCatalog, loadCache, saveCache, fetchNvidia, fetchOpenRouter, fetchOpencode, catalogStatus, loadCardOverrides, applyCardOverlays } from "./discovery.mjs";
+import { discoverCatalog, loadCache, saveCache, fetchNvidia, fetchOpenRouter, fetchOpencode, catalogStatus, loadCardOverrides, applyCardOverlays, buildServingCatalog } from "./discovery.mjs";
 import { getPool, resetPool } from "./proxy/connection-pool.mjs";
 import { loadAgentRegistry, extractIdentity, normalizeAgentId, ANONYMOUS_AGENT_ID } from "./identity/capauth.mjs";
 import { createAuthzClient } from "./policy/authz_decide.mjs";
@@ -34,6 +34,9 @@ import { buildCapabilityCatalog } from "./ranking/catalog.mjs";
 import { REGISTRY_PATH } from "./proxy/registry.mjs";
 import { energyRowsFrom, energyHeaders } from "./metrics/energy.mjs";
 import { attributionHeaders } from "./metrics/attribution.mjs";
+import { allBuckets, resolveBucket } from "./policy/buckets.mjs";
+import { loadRegistry, REGISTRY_PATH as _REGISTRY_PATH } from "./proxy/registry.mjs";
+import { policyFromRegistry } from "./policy/sensitivity.mjs";
 import { readFileSync } from "node:fs";
 import { load as yamlLoad } from "js-yaml";
 
@@ -270,6 +273,93 @@ export function applyLifecycleView(data, getLifecycleFn = getLifecycle, claimers
  * @param {Record<string, {models?: string[]}>} [backends]
  * @returns {(id: string) => string[]}
  */
+/**
+ * Advertise buckets + roles on /v1/models and /admin/models.
+ *
+ * Two complementary views, one gated on `routing.buckets_enabled` (buckets
+ * only make sense when the feature is on) and one unconditional (registry
+ * roles are always routable via skmodels, regardless of any flag).
+ *
+ * Buckets come from `allBuckets()` (policy/buckets.mjs) — single source of
+ * truth, never retyped. The 12 taxonomy entries (S/M/L/XL ×
+ * public/internal/secret) become additive catalog entries with
+ * `kind: "bucket"`, `free: false` (honest: cost depends on which member
+ * serves), and the class/sensitivity fields so a picker can render them.
+ *
+ * Roles come from the live registry's `roles:` keys via `loadRegistry()`
+ * (proxy/registry.mjs), fail-soft to `[]` when the registry is unavailable.
+ * Each gets `kind: "role"`. Unconditional because any `sk-*` id is
+ * registry-routed today; advertising them needs no flag gate.
+ *
+ * Injection order: AFTER `applyAllowlist()` (line ≈1126) in both the
+ * /v1/models and /admin/models paths, with dedupe by id (concrete models
+ * win, same first-seen-wins rule as `mergeDiscoveredCatalog`). When a
+ * non-empty allowlist is in effect, alias entries are filtered through it
+ * too, so an operator allowlist stays an allowlist.
+ *
+ * Exported purely so tests can assert the helper's behaviour without booting
+ * a live server (see tests/advertise-lifecycle.test.mjs's
+ * `registerDiscoveredRoutes` group).
+ *
+ * @param {object} [cfg] gateway config, for the `routing.buckets_enabled` check
+ * @returns {Array<object>} bucket entries (when enabled) + role entries (always)
+ */
+export function aliasCatalogEntries(cfg = {}) {
+  const out = [];
+  const seen = new Set();
+
+  // Buckets: gated on routing.buckets_enabled, built from allBuckets().
+  if (cfg?.routing?.buckets_enabled === true) {
+    for (const b of allBuckets()) {
+      const id = b.bucket;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      out.push({
+        id,
+        object: "model",
+        created: 0,
+        provider: "skgateway",
+        free: false,
+        owned_by: "skgateway",
+        kind: "bucket",
+        model_class: b.model_class,
+        sensitivity: b.sensitivity,
+      });
+    }
+  }
+
+  // Roles: always advertised (registry routing is unconditional).
+  try {
+    const reg = loadRegistry();
+    if (reg?.roles) {
+      for (const role of Object.keys(reg.roles)) {
+        if (seen.has(role)) continue;
+        seen.add(role);
+        out.push({
+          id: role,
+          object: "model",
+          created: 0,
+          provider: "skgateway",
+          free: false,
+          owned_by: "skgateway",
+          kind: "role",
+        });
+      }
+    }
+  } catch {
+    // Registry unavailable: fail-soft, no roles advertised. Buckets
+    // already injected above are unaffected.
+  }
+
+  return out;
+}
+
+function allowAliases(aliases, allowlist) {
+  if (!Array.isArray(allowlist) || allowlist.length === 0) return aliases;
+  const allowedIds = new Set(allowlist);
+  return aliases.filter((entry) => allowedIds.has(entry.id));
+}
+
 export function modelClaimersFor(backends = {}) {
   const map = new Map();
   for (const [name, b] of Object.entries(backends || {})) {
@@ -1123,7 +1213,13 @@ export const server = http.createServer(async (req, res) => {
       // carries a non-empty provider (see src/proxy/advertise.mjs). The
       // allowlist is applied last, exactly as on /admin/models.
       const merged = mergeDiscoveredCatalog(reconciled, discovered);
-      const allowed = applyAllowlist(merged, loadAllowlist());
+      const allowlist = loadAllowlist();
+      const allowed = applyAllowlist(merged, allowlist);
+      // Aliases (buckets + registry roles): additive, allowlist-aware,
+      // dedupe concrete-first. Buckets only when buckets_enabled is true.
+      const aliases = allowAliases(aliasCatalogEntries(getConfig()), allowlist);
+      const seenIds = new Set(allowed.map((m) => m.id));
+      const enriched = [...allowed, ...aliases.filter((e) => !seenIds.has(e.id))];
       // Lifecycle view (card P1.4): hide eol/dead ids, flag suspect ones.
       // Composes with (does not replace) the allowlist filter above.
       // Picker badges (card P2.4): additive ctx_tokens/tools/vision derived
@@ -1132,16 +1228,22 @@ export const server = http.createServer(async (req, res) => {
       // Claimer-aware lifecycle view (incident inc-2026-08-18-qwen38-eol):
       // the advertised set honors the same claim-over-verdict rule as the
       // router's gate, so /v1/models and routability stay consistent.
-      const data = stripInternalCardFields(applyPickerBadges(applyLifecycleView(allowed, getLifecycle, modelClaimersFor(config.backends || {}))));
+      const data = stripInternalCardFields(applyPickerBadges(applyLifecycleView(enriched, getLifecycle, modelClaimersFor(config.backends || {}))));
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ object: "list", data }));
     } catch (e) {
       console.warn("[skgateway] /v1/models discovery merge failed, falling back to static catalog:", e.message);
-      let data = [];
+      const fallback = buildModelCatalog(config.backends || {}, router, advertiseReconcileMode);
+      const allowlist = loadAllowlist();
+      const allowed = applyAllowlist(fallback, allowlist);
+      const aliases = allowAliases(aliasCatalogEntries(getConfig()), allowlist);
+      const seenIds = new Set(allowed.map((m) => m.id));
+      let data = [...allowed, ...aliases.filter((e) => !seenIds.has(e.id))];
       try {
-        data = stripInternalCardFields(applyPickerBadges(applyLifecycleView(buildModelCatalog(config.backends || {}, router, advertiseReconcileMode), getLifecycle, modelClaimersFor(config.backends || {}))));
+        data = stripInternalCardFields(applyPickerBadges(applyLifecycleView(data, getLifecycle, modelClaimersFor(config.backends || {}))));
       } catch (e2) {
         console.warn("[skgateway] /v1/models static catalog fallback also failed, serving empty list:", e2.message);
+        data = [];
       }
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ object: "list", data }));
@@ -1206,10 +1308,14 @@ export const server = http.createServer(async (req, res) => {
       // fields here, not just the discovered ones (model-dex work).
       const full = applyCardOverlays(await getDiscoveredCatalog(), loadCardOverrides());
       const allow = loadAllowlist();
+      // Aliases (buckets + registry roles): additive to the admin view.
+      // Buckets gated on routing.buckets_enabled; roles always advertised.
+      const aliases = allowAliases(aliasCatalogEntries(getConfig()), allow);
+      const enriched = [...full, ...aliases];
       // Card P2.4: each entry keeps its `card` (from P2.1 + the overlay above)
       // and gains a `lifecycle` record alongside the existing `advertised`
       // allowlist flag.
-      const data = buildAdminModelsView(full, allow);
+      const data = buildAdminModelsView(enriched, allow);
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ object: "list", data }));
     } catch (e) {
@@ -1328,6 +1434,72 @@ export const server = http.createServer(async (req, res) => {
       console.warn("[skgateway] /admin/models/refresh status failed:", e.message);
       res.writeHead(500, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: { message: "internal error building catalog status", code: 500 } }));
+    }
+    return;
+  }
+
+  // ── GET /admin/buckets — live per-bucket pool membership (Part 1b) ──
+  // Loopback only, read-only (pattern: /admin/models/rank).
+  if (req.url === "/admin/buckets" && req.method === "GET") {
+    if (!isLoopback(req)) {
+      res.writeHead(403, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "Admin routes are loopback only", code: 403 } }));
+      return;
+    }
+    try {
+      // Use the same serving-config + discovery union and capability mapper as
+      // the live bucket request path. Raw discovery omits local/Anthropic
+      // entries and carries no derived trust_zone, which made this endpoint
+      // report every internal and secret pool as empty while routing disagreed.
+      const catalog = buildCapabilityCatalog(buildServingCatalog(), {
+        getLifecycleFn: getLifecycle,
+      });
+      const policy = policyFromRegistry(loadRegistry());
+      const isRoutableFn = (e) => {
+        const claimers = router.getBackends()
+          .filter((backend) => backend.supportsModel(e.id))
+          .map((backend) => backend.id);
+        return isEffectivelyRoutable(getLifecycle(e.id), claimers);
+      };
+      const cfg = getConfig();
+      const bucketsEnabled = cfg?.routing?.buckets_enabled === true;
+      const all = allBuckets();
+      const out = [];
+      for (const b of all) {
+        try {
+          const { members, rejected, ceiling } = resolveBucket({
+            bucket: b,
+            catalog,
+            sensitivityPolicy: policy,
+            isRoutable: isRoutableFn,
+          });
+          out.push({
+            bucket: b.bucket,
+            model_class: b.model_class,
+            sensitivity: b.sensitivity,
+            ceiling,
+            members,
+            rejected,
+          });
+        } catch (e) {
+          console.warn("[skgateway] /admin/buckets failed for", b.bucket, ":", e.message);
+          out.push({
+            bucket: b.bucket,
+            model_class: b.model_class,
+            sensitivity: b.sensitivity,
+            ceiling: 0,
+            members: [],
+            rejected: [],
+            error: e.message,
+          });
+        }
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ buckets_enabled: bucketsEnabled, buckets: out }));
+    } catch (e) {
+      console.warn("[skgateway] /admin/buckets failed:", e.message);
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "internal error building bucket status", code: 500 } }));
     }
     return;
   }
