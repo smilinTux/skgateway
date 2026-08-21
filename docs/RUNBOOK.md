@@ -347,6 +347,33 @@ After a wrapper outage, `/health` reflects the `anthropic` backend degrading to
 wrapper, then the `anthropic` backend recovers to `up` on the cooldown re-probe
 and reclaims priority automatically.
 
+### Client disconnect and model-slot release (card a4f1066d)
+
+SKGateway propagates a downstream socket close to the active upstream request.
+The router records the internal outcome as `499/client_closed`, immediately
+releases the backend pool slot, and does **not** fail over, penalize backend
+health, or mutate model lifecycle state. This matters most for long local
+generation: without propagation, llama.cpp continued generating after the
+caller timed out and could hold an Ornith slot through service shutdown.
+
+Qualification after a gateway change:
+
+1. Start a long request through `:18780`, then close or time out the client.
+2. Confirm the model-server log records cancellation and its slot returns idle.
+3. Send a short follow-up request and verify that it starts promptly.
+4. Confirm the gateway did not log `FAILOVER`, quarantine the backend, or add a
+   404/410 lifecycle observation for the cancelled request.
+5. Restart the model service and verify shutdown remains within its normal
+   bounded stop interval rather than reaching `TimeoutStopSec`.
+
+The focused regression is:
+
+```bash
+node --test --import ./tests/_setup.mjs \
+  --test-name-pattern='downstream client cancellation' \
+  tests/anthropic-spof.test.mjs
+```
+
 ---
 
 ## Lingering requirement

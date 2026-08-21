@@ -27,6 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Propagated downstream client disconnects to the active model request. The
+  router now cancels upstream generation immediately, releases its pool slot,
+  records a distinct `499/client_closed` outcome, and deliberately skips
+  failover, backend-health penalties, and model-lifecycle mutation.
+
 - Qualified and deployed three parallel Ornith slots on `.100`, each retaining
   the full 65,536-token window (`--parallel 3 --ctx-size 196608`). Three-way
   32K/48K concurrency, direct cancellation, and bounded restart gates passed;

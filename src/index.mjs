@@ -1820,10 +1820,24 @@ export const server = http.createServer(async (req, res) => {
     // leaking one entry per failed request for the life of the process.
     let result;
     let dispatchError = null;
+    const upstreamAbort = new AbortController();
+    const onClientClose = () => {
+      if (!res.writableEnded) {
+        upstreamAbort.abort(new Error("downstream client disconnected"));
+      }
+    };
+    res.once("close", onClientClose);
+    if (res.destroyed) onClientClose();
     try {
       result = await routeAndSend(
         router, routeRequest, routePath, req.method, req.headers, routeBody, true, siemHook,
+        upstreamAbort.signal,
       );
+
+      // The socket is already gone. routeAndSend has released the upstream
+      // request and pool slot; do not attempt to write a synthetic 499 to a
+      // dead response. The finally block still closes request metrics.
+      if (result?.cancelled || res.destroyed) return;
 
       // Return energy to the caller (spec 4.5): x-sk-energy-joules /
       // -basis / -node. Cost was being recorded and never returned, so no
@@ -1929,6 +1943,7 @@ export const server = http.createServer(async (req, res) => {
       dispatchError = err;
       throw err;
     } finally {
+      res.off("close", onClientClose);
       if (dispatchError) {
         // routeAndSend or a response-writing branch threw. res.headersSent
         // tells us whether the outer catch (which runs right after this

@@ -94,19 +94,40 @@ export function buildUpstreamUrl(reqUrl, targetUrl) {
  *   Socket idle timeout in milliseconds. When > 0, if the upstream sends no
  *   data for this long (connect that never replies, or a wedged wrapper), the
  *   request is aborted and resolves with `status: 504`. 0 disables the timeout.
+ * @param {AbortSignal|null} [signal=null]
+ *   Downstream-client lifetime. Aborting it destroys the active upstream
+ *   request and resolves with `status: 499` / `client_closed`.
  * @returns {Promise<{ status: number, headers: Record<string, string>, body: Buffer }>}
  *   Always resolves.  Network failures resolve with `status: 502`; an idle
  *   timeout resolves with `status: 504`; both carry a JSON `{ error }` body.
  */
-export function sendUpstream(reqUrl, method, headers, body, targetUrl, timeoutMs = 0) {
+export function sendUpstream(reqUrl, method, headers, body, targetUrl, timeoutMs = 0, signal = null) {
   return new Promise((resolve) => {
     const upstream = buildUpstreamUrl(reqUrl, targetUrl);
 
     // Guard against double-resolution: a timeout-triggered destroy() also fires
     // the 'error' handler, and we must resolve exactly once.
     let settled = false;
-    const done = (r) => { if (!settled) { settled = true; resolve(r); } };
+    let onAbort = null;
+    const done = (r) => {
+      if (settled) return;
+      settled = true;
+      if (signal && onAbort) signal.removeEventListener("abort", onAbort);
+      resolve(r);
+    };
     let timedOut = false;
+    let cancelled = false;
+    const cancellationResult = () => ({
+      status: 499,
+      headers: {},
+      body: Buffer.from(JSON.stringify({
+        error: {
+          message: "downstream client disconnected",
+          code: "client_closed",
+        },
+      })),
+      cancelled: true,
+    });
 
     const proxyHeaders = { ...headers };
     proxyHeaders.host = upstream.host;
@@ -139,6 +160,16 @@ export function sendUpstream(reqUrl, method, headers, body, targetUrl, timeoutMs
       },
     );
 
+    onAbort = () => {
+      cancelled = true;
+      done(cancellationResult());
+      upstreamReq.destroy(new Error("downstream client disconnected"));
+    };
+    if (signal) {
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (signal.aborted) onAbort();
+    }
+
     // Idle-timeout the upstream so a wedged backend fails fast (504) and the
     // router can fail over, instead of hanging the request indefinitely.
     if (timeoutMs > 0) {
@@ -150,18 +181,25 @@ export function sendUpstream(reqUrl, method, headers, body, targetUrl, timeoutMs
 
     upstreamReq.on("error", (err) => {
       done({
-        status: timedOut ? 504 : 502,
+        status: cancelled ? 499 : (timedOut ? 504 : 502),
         headers: {},
         body: Buffer.from(JSON.stringify({
           error: {
-            message: timedOut ? `upstream idle timeout after ${timeoutMs}ms` : err.message,
-            code: timedOut ? "upstream_timeout" : "upstream_unreachable",
+            message: cancelled
+              ? "downstream client disconnected"
+              : (timedOut ? `upstream idle timeout after ${timeoutMs}ms` : err.message),
+            code: cancelled
+              ? "client_closed"
+              : (timedOut ? "upstream_timeout" : "upstream_unreachable"),
           },
         })),
+        ...(cancelled ? { cancelled: true } : {}),
       });
     });
 
-    upstreamReq.write(body);
-    upstreamReq.end();
+    if (!cancelled) {
+      upstreamReq.write(body);
+      upstreamReq.end();
+    }
   });
 }

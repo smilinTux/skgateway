@@ -122,6 +122,64 @@ describe("sendUpstream idle timeout", () => {
   });
 });
 
+// ── 2b. downstream cancellation: stop work, do not classify as failure ─────
+
+describe("downstream client cancellation", () => {
+  let primary, fallback;
+  afterEach(async () => {
+    if (primary) { await primary.close(); primary = null; }
+    if (fallback) { await fallback.close(); fallback = null; }
+  });
+
+  test("sendUpstream destroys a wedged upstream request on abort", async () => {
+    let upstreamClosed;
+    const closed = new Promise((resolve) => { upstreamClosed = resolve; });
+    primary = await startServer((req, _res) => req.once("close", upstreamClosed));
+    const controller = new AbortController();
+    const t0 = Date.now();
+    const pending = sendUpstream("/v1/chat/completions", "POST", HEADERS, BODY,
+      new URL(primary.base), 0, controller.signal);
+    setTimeout(() => controller.abort(), 50);
+    const res = await pending;
+
+    assert.equal(res.status, 499);
+    assert.equal(res.cancelled, true);
+    assert.equal(JSON.parse(res.body.toString("utf-8")).error.code, "client_closed");
+    assert.ok(Date.now() - t0 < 2000, "abort must resolve promptly");
+    await Promise.race([
+      closed,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("upstream socket stayed open")), 1000)),
+    ]);
+  });
+
+  test("routeAndSend does not fail over or penalize health after cancellation", async () => {
+    let fallbackCalls = 0;
+    primary = await startServer(wedge());
+    fallback = await startServer((req, res) => {
+      fallbackCalls += 1;
+      respond(200, { from: "fallback" })(req, res);
+    });
+    const router = createRouter({ backends: {
+      primary: { url: primary.base, auth_type: "none", models: ["claude-test"], priority: 1 },
+      fallback: { url: fallback.base, auth_type: "none", models: ["claude-test"], priority: 2 },
+    }});
+    const backend = router.getBackend("primary");
+    const failuresBefore = backend.consecutiveFailures;
+    const controller = new AbortController();
+    const pending = routeAndSend(router, { model: "claude-test" },
+      "/v1/chat/completions", "POST", HEADERS, BODY, false, null, controller.signal);
+    setTimeout(() => controller.abort(), 50);
+    const res = await pending;
+
+    assert.equal(res.status, 499);
+    assert.equal(res.backendId, "primary");
+    assert.equal(res.failover, false);
+    assert.equal(fallbackCalls, 0, "client cancellation must never retry elsewhere");
+    assert.equal(backend.consecutiveFailures, failuresBefore,
+      "client cancellation must not affect backend health");
+  });
+});
+
 // ── 3. routeAndSend failover: wrapper down → fall over to the fallback ───────
 
 describe("routeAndSend failover for claude-* (wrapper down → fallback)", () => {

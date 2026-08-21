@@ -2210,7 +2210,7 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = (
   };
 }
 
-export async function routeAndSend(router, request, upstreamPath, method, clientHeaders, body, usePool = true, siem = null) {
+export async function routeAndSend(router, request, upstreamPath, method, clientHeaders, body, usePool = true, siem = null, abortSignal = null) {
   const pool = usePool ? getPool() : null;
 
   // Read fresh off getConfig() every request (not cached at module scope) so
@@ -2820,19 +2820,23 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         if (tr) {
           const aHeaders = { ...forwardHeaders, ...tr.headers };
           delete aHeaders["content-length"];
-          const raw = await sendUpstream(tr.path, method, aHeaders, tr.body, targetUrl, backend.timeout_ms);
-          if (raw && raw.status >= 400) {
-            let d = "";
-            try { d = raw.body?.toString("utf-8").slice(0, 600); } catch { /* ignore */ }
-            const reqTokens = (() => { try { return JSON.parse(tr.body.toString("utf-8")).max_tokens; } catch { return "?"; } })();
-            console.warn(`[router] anthropic ${raw.status} err (sent max_tokens=${reqTokens}): ${d}`);
+          const raw = await sendUpstream(tr.path, method, aHeaders, tr.body, targetUrl, backend.timeout_ms, abortSignal);
+          if (raw?.cancelled) {
+            res = raw;
+          } else {
+            if (raw && raw.status >= 400) {
+              let d = "";
+              try { d = raw.body?.toString("utf-8").slice(0, 600); } catch { /* ignore */ }
+              const reqTokens = (() => { try { return JSON.parse(tr.body.toString("utf-8")).max_tokens; } catch { return "?"; } })();
+              console.warn(`[router] anthropic ${raw.status} err (sent max_tokens=${reqTokens}): ${d}`);
+            }
+            res = toOpenAIResponse(raw, request.model);
           }
-          res = toOpenAIResponse(raw, request.model);
         } else {
-          res = await sendUpstream(upstreamPath, method, forwardHeaders, attemptBody, targetUrl, backend.timeout_ms);
+          res = await sendUpstream(upstreamPath, method, forwardHeaders, attemptBody, targetUrl, backend.timeout_ms, abortSignal);
         }
       } else {
-        res = await sendUpstream(upstreamPath, method, forwardHeaders, attemptBody, targetUrl, backend.timeout_ms);
+        res = await sendUpstream(upstreamPath, method, forwardHeaders, attemptBody, targetUrl, backend.timeout_ms, abortSignal);
       }
       attemptConcurrency = meterUrl ? inFlightOnMeter(meterUrl) : 1;
     } catch (err) {
@@ -2856,6 +2860,32 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     }
 
     const latencyMs = (Date.now() - queueStart) - meterBeforeMs;
+
+    // A downstream disconnect is not evidence about the backend or model.
+    // Return immediately after releasing the pool/meter slot in `finally`,
+    // before energy reads, health/lifecycle writes, or failover can run.
+    if (res?.cancelled || res?.status === 499) {
+      lastResult = {
+        ...res,
+        backendId,
+        servedModel: candidateModel,
+        failover: didFailover,
+        queueWaitMs,
+        cancelled: true,
+      };
+      if (isBucketChain) {
+        lastResult.bucket = bucketAddr.bucket;
+        lastResult.bucketMember = candidateModel;
+      }
+      emitSiem("response", {
+        status: 499,
+        latency_ms: latencyMs,
+        queue_wait_ms: queueWaitMs,
+        failover: false,
+        cancelled: true,
+      }, { backend: backendId });
+      return lastResult;
+    }
 
     // Second meter read + energy accounting for this attempt, gated the same
     // way as the pre-read above: when energy metering is disabled the whole
