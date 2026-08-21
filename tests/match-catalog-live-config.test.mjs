@@ -54,7 +54,7 @@ const CONFIG_YAML = [
   '    url: http://100.81.238.58:11439/v1',
   '    auth_type: none',
   '    priority: 2',
-  '    models: [qwen3.8-27b-ud-q5_k_xl, qwen3.8-27b]',
+  '    models: [qwen3.8-27b-huihui-abliterated-q4_k_m, qwen3.8-27b-ud-q5_k_xl, qwen3.8-27b, qwen38-abliterated]',
   '  anthropic:',
   '    url: http://127.0.0.1:18782/v1',
   '    auth_type: none',

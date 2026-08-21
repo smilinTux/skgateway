@@ -27,6 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Aligned the checked-in chiap08 Qwen3.8 declaration with the model actually
+  served by `llama-qwen38.service`: `qwen3.8-27b-huihui-abliterated-q4_k_m` is
+  now the canonical first model, while the former UD-Q5 id, short id, and
+  `qwen38-abliterated` are explicitly documented compatibility aliases. All
+  four ids now share truthful Huihui Q4_K_M model cards and the qualified 256K
+  sanitizer limits, with a hermetic source-config regression test.
 - Propagated downstream client disconnects to the active model request. The
   router now cancels upstream generation immediately, releases its pool slot,
   records a distinct `499/client_closed` outcome, and deliberately skips

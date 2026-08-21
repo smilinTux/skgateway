@@ -81,11 +81,13 @@ backends:
       - ornith-1.0-35b
       - ornith-big            # short alias -> same backend (llama.cpp serves name-agnostically)
     priority: 4
-  ## qwen3.8-27b (UD-Q5_K_XL) — llama.cpp (llama-server :11439) on chiap08,
-  ## 262144 ctx, reasoning model, VISION-capable (mmproj-F16.gguf is loaded by
-  ## ~skuser01/bin/launch-chiap08-llama-qwen38.sh, unit `llama-qwen38.service`).
+  ## Qwen3.8 27B Huihui abliterated Q4_K_M — llama.cpp (llama-server :11439)
+  ## on chiap08, 262144 ctx, reasoning model, VISION-capable (mmproj is loaded
+  ## by ~skuser01/bin/launch-chiap08-llama-qwen38.sh, unit
+  ## `llama-qwen38.service`). The server reports the full Huihui id below; the
+  ## other three ids are retained request aliases for the same loaded weights.
   ##
-  ## 2026-08-14: added as the sk-default target. `ornith-aeon.service` on chiap08
+  ## 2026-08-14: added as the then-current sk-default target. `ornith-aeon.service` on chiap08
   ## (the 35B behind :11436) is inactive/dead, so :11436 is connection-REFUSED and
   ## every ornith-1.0-35b request 502s. sk-default resolved to ornith-big -> that
   ## dead port -> the cloud local_fallback, where it intermittently landed on a
@@ -100,7 +102,8 @@ backends:
     url: http://100.81.238.58:11439/v1
     auth_type: none
     models:
-      - qwen3.8-27b-ud-q5_k_xl   # the llama-server --alias, i.e. the id it reports
+      - qwen3.8-27b-huihui-abliterated-q4_k_m   # exact llama-server --alias / served id
+      - qwen3.8-27b-ud-q5_k_xl   # retained pre-cutover request alias; serves Huihui Q4_K_M
       - qwen3.8-27b              # short alias -> same backend (llama.cpp is name-agnostic)
       # 2026-08-18 (incident inc-2026-08-18-qwen38-eol): custom alias re-added
       # after the discovery fix. Declaring it here is what the discovery fix
@@ -253,10 +256,11 @@ model_limits:
   ## 256K context (ornith-1.0-35b on Tyler's .150/.153:8087 — verified n_ctx=256000)
   ornith-1.0-35b:                             { max_body_bytes: 800000,   max_system_bytes: 320000  }
   ornith-big:                                 { max_body_bytes: 800000,   max_system_bytes: 320000  }  # alias of ornith-1.0-35b
-  ## 256K context (qwen3.8-27b on chiap08 :11439, CTX_SIZE=262144) — same window
-  ## as ornith-1.0-35b, so it carries the same limits.
+  ## 256K context (Huihui Qwen3.8 27B on chiap08 :11439, CTX_SIZE=262144) —
+  ## the exact served id and all compatibility aliases carry the same limits.
+  qwen3.8-27b-huihui-abliterated-q4_k_m:      { max_body_bytes: 800000,   max_system_bytes: 320000  }
   qwen3.8-27b-ud-q5_k_xl:                     { max_body_bytes: 800000,   max_system_bytes: 320000  }
-  qwen3.8-27b:                                { max_body_bytes: 800000,   max_system_bytes: 320000  }  # alias of qwen3.8-27b-ud-q5_k_xl
+  qwen3.8-27b:                                { max_body_bytes: 800000,   max_system_bytes: 320000  }  # short alias of the Huihui served id
   qwen38-abliterated:                         { max_body_bytes: 800000,   max_system_bytes: 320000  }  # 2026-08-18: custom alias of the same chiap08 :11439 model (incident inc-2026-08-18-qwen38-eol)
   ## 256K context (kimi-k2.6)
   moonshotai/kimi-k2.6:                       { max_body_bytes: 800000,   max_system_bytes: 320000  }

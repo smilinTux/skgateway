@@ -394,6 +394,14 @@ in-repo `config/skgateway.yaml` is the pre-migration fallback and is almost cert
   claimer-aware, and routing/catalog visibility both use `isEffectivelyRoutable()`.
   Thus NVIDIA's lack of `qwen38-abliterated` is not evidence that chiap08's local alias
   is EOL. Backend reachability is still a separate prerequisite.
+- `chiap08-qwen38` serves
+  `qwen3.8-27b-huihui-abliterated-q4_k_m`. The ids
+  `qwen3.8-27b-ud-q5_k_xl`, `qwen3.8-27b`, and `qwen38-abliterated` are request
+  aliases for those same Huihui Q4_K_M weights; the former UD-Q5 id does not prove
+  that the old quant is loaded. The checked-in fallback config must declare the exact
+  served id first, and every id must have the same model limit plus a truthful Q4_K_M
+  model card. Run `node --test --import ./tests/_setup.mjs
+  tests/qwen38-source-config.test.mjs` after changing this backend.
 - `auto.max_local_context_chars` must track the live local window with room for
   output and tokenizer variance. `auto.context_role` is the dedicated long-context
   escape route and may differ from `auto.heavy_role`. After changing Ornith context,
@@ -527,6 +535,8 @@ checks:
     run: grep -qF 'out["x-sk-bucket"] = result.bucket' src/metrics/attribution.mjs && grep -qF 'out["x-sk-bucket-member"] = result.bucketMember' src/metrics/attribution.mjs && grep -qF 'req.url === "/admin/buckets"' src/index.mjs
   - name: custom aliases are protected from foreign lifecycle verdicts
     run: grep -qF 'export function isEffectivelyRoutable' src/discovery/lifecycle.mjs && grep -qF 'export function declaredModelsElsewhere' src/discovery.mjs && test -f tests/model-claimer-lifecycle.test.mjs
+  - name: qwen38 source config binds the exact Huihui served id and all compatibility aliases
+    run: node --test --import ./tests/_setup.mjs tests/qwen38-source-config.test.mjs
   - name: node100 Ornith launcher is reproducible and advertises only the verified context
     run: grep -qF -- '--alias ornith-1.5-9b' scripts/nodes/node100/run-ornith-1.5.sh && grep -qF -- '--parallel 3 --ctx-size 196608' scripts/nodes/node100/run-ornith-1.5.sh && grep -qF 'scripts/nodes/node100/run-ornith-1.5.sh' scripts/nodes/node100/skai-beellama.service
   - name: the stale hardcoded /status version documented in section 9 is still stale (fix it and update section 9)

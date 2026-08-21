@@ -302,51 +302,97 @@ overrides:
     min_output_tokens: 8192
     notes: "Current registry sk-default target on .100:8082; qualified 2026-08-21 at live n_ctx=65536 with 32K/48K/60K prompt generation gates."
 
-  # qwen38 = Qwen3.8 27B UD-Q5_K_XL on chiap08 :11439 (registry backend
-  # `qwen38`). No overlay entry existed for this id before card N2 even
-  # though it made sk-default 2026-08-14 and is a reasoning model with the
-  # exact same <think>-starvation trait as the two Ornith models above
-  # (registry.yaml backends.qwen38.min_output_tokens: 8192, measured: 121
-  # completion tokens to answer "say alive"; max_tokens 16 -> empty string).
-  # Two ids because the llama-server serves it name-agnostically and the
-  # registry advertises both (skgateway.yaml backends.chiap08-qwen38.models).
-  qwen3.8-27b-ud-q5_k_xl:
-    display_name: "Qwen3.8 27B UD-Q5_K_XL (chiap08, sk-default)"
-    org: "Qwen (self-hosted)"
-    summary: "Sovereign reasoning + tool-use + vision model on chiap08, the current sk-default target."
-    good_at: [reasoning, coding, tool use, vision, sovereign/private work]
+  # qwen38 = Huihui Qwen3.8 27B abliterated Q4_K_M on chiap08 :11439
+  # (registry backend `qwen38`). The server reports the full Huihui id. The
+  # former UD-Q5 id, short id, and qwen38-abliterated are compatibility request
+  # aliases; llama.cpp serves all four name-agnostically from the same loaded
+  # Huihui weights. Every card below therefore describes the ACTUAL Q4_K_M
+  # served model rather than inferring model identity from the requested alias.
+  # It has the same <think>-starvation trait as the Ornith models above
+  # (registry.yaml backends.qwen38.min_output_tokens: 8192).
+  qwen3.8-27b-huihui-abliterated-q4_k_m:
+    display_name: "Huihui Qwen3.8 27B Abliterated Q4_K_M (chiap08)"
+    org: "Huihui AI / Qwen (self-hosted)"
+    summary: "Exact model served on chiap08 :11439; sovereign abliterated reasoning, tool use, and vision."
+    good_at: [reasoning, coding, tool use, vision, uncensored/creative text, sovereign/private work]
     context_length: 262144
     max_output_tokens: 16384
     supported_parameters: [tools, tool_choice, reasoning]
     modality: "text+image->text"
     vision: true
     params: "27B"
-    quant: "UD-Q5_K_XL"
+    quant: "Q4_K_M"
     tier: local
-    speed: "medium"
+    speed: "fast"
     params_b: 27
     size_class: L
     latency_class: interactive
     reasoning: true
     min_output_tokens: 8192
-    notes: "Registry backend qwen38, unit llama-qwen38.service. mmproj-F16.gguf loaded (vision-capable)."
+    notes: "Canonical served id for registry backend qwen38 and llama-qwen38.service; mmproj loaded and vision verified."
 
-  qwen3.8-27b:
-    display_name: "Qwen3.8 27B (short alias)"
-    org: "Qwen (self-hosted)"
-    summary: "Registry alias for qwen3.8-27b-ud-q5_k_xl, same backend."
-    good_at: [reasoning, coding, tool use, vision, sovereign/private work]
+  qwen3.8-27b-ud-q5_k_xl:
+    display_name: "Huihui Qwen3.8 27B (legacy UD-Q5 request alias)"
+    org: "Huihui AI / Qwen (self-hosted)"
+    summary: "Pre-cutover request alias; chiap08 actually serves the Huihui abliterated Q4_K_M model."
+    good_at: [reasoning, coding, tool use, vision, uncensored/creative text, sovereign/private work]
     context_length: 262144
     max_output_tokens: 16384
     supported_parameters: [tools, tool_choice, reasoning]
     modality: "text+image->text"
     vision: true
+    params: "27B"
+    quant: "Q4_K_M"
     tier: local
+    speed: "fast"
     params_b: 27
     size_class: L
     latency_class: interactive
     reasoning: true
     min_output_tokens: 8192
+    notes: "Alias only: response.model is qwen3.8-27b-huihui-abliterated-q4_k_m. Do not treat this id as evidence that UD-Q5 weights are loaded."
+
+  qwen3.8-27b:
+    display_name: "Qwen3.8 27B (short alias)"
+    org: "Huihui AI / Qwen (self-hosted)"
+    summary: "Short request alias for the Huihui abliterated Q4_K_M model on chiap08."
+    good_at: [reasoning, coding, tool use, vision, uncensored/creative text, sovereign/private work]
+    context_length: 262144
+    max_output_tokens: 16384
+    supported_parameters: [tools, tool_choice, reasoning]
+    modality: "text+image->text"
+    vision: true
+    params: "27B"
+    quant: "Q4_K_M"
+    tier: local
+    speed: "fast"
+    params_b: 27
+    size_class: L
+    latency_class: interactive
+    reasoning: true
+    min_output_tokens: 8192
+    notes: "Alias only: response.model is qwen3.8-27b-huihui-abliterated-q4_k_m."
+
+  qwen38-abliterated:
+    display_name: "Huihui Qwen3.8 27B (qwen38-abliterated alias)"
+    org: "Huihui AI / Qwen (self-hosted)"
+    summary: "Custom abliterated request alias owned by chiap08-qwen38; serves the canonical Huihui Q4_K_M model."
+    good_at: [reasoning, coding, tool use, vision, uncensored/creative text, sovereign/private work]
+    context_length: 262144
+    max_output_tokens: 16384
+    supported_parameters: [tools, tool_choice, reasoning]
+    modality: "text+image->text"
+    vision: true
+    params: "27B"
+    quant: "Q4_K_M"
+    tier: local
+    speed: "fast"
+    params_b: 27
+    size_class: L
+    latency_class: interactive
+    reasoning: true
+    min_output_tokens: 8192
+    notes: "Alias only and locally claimed; foreign provider lifecycle verdicts cannot retire it while chiap08-qwen38 serves it."
 
   # ───────────────────────── OUR VISION MODEL (local) ─────────────────────────
   qwen3.6-27b-abliterated:

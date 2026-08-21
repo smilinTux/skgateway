@@ -72,7 +72,12 @@ const SERVING_BACKENDS = {
   'chiap08-qwen38': {
     url: 'http://100.81.238.58:11439/v1',
     auth_type: 'none',
-    models: ['qwen3.8-27b-ud-q5_k_xl', 'qwen3.8-27b'],
+    models: [
+      'qwen3.8-27b-huihui-abliterated-q4_k_m',
+      'qwen3.8-27b-ud-q5_k_xl',
+      'qwen3.8-27b',
+      'qwen38-abliterated',
+    ],
   },
   nvidia: {
     url: 'https://integrate.api.nvidia.com/v1',
@@ -336,9 +341,9 @@ describe('the union fails closed', () => {
 describe('the buckets that could not resolve, now can, and the ones that must not, still do not', () => {
   test('an sk-l-secret bucket is no longer empty', () => {
     // FAILS ON THE UNFIXED CODE: zero members, a permanent 503.
-    // qwen3.8-27b / qwen3.8-27b-ud-q5_k_xl are declared under chiap08-qwen38
-    // (a tailscale 100.64/10 address, so isLocalUrl) and the overlay curates
-    // them size_class L.
+    // The exact Huihui served id and its three aliases are declared under
+    // chiap08-qwen38 (a tailscale 100.64/10 address, so isLocalUrl), and the
+    // overlay curates all four as size_class L.
     const catalog = realCatalog();
     const { members } = resolveBucket({ bucket: { model_class: 'L', sensitivity: 'secret' }, catalog });
     assert.ok(members.length > 0, 'sk-l-secret must have an eligible member');
