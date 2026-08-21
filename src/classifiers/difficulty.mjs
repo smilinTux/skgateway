@@ -221,7 +221,7 @@ function looksAgentic(text) {
  *   reason  — short human-readable justification (for logs)
  *   signals — the individual heuristic hits that fired
  */
-/** Local-context guard threshold: chars across ALL messages (~100k tokens, under ornith 128k). */
+/** Character guard; production should override this to match the live local window. */
 const DEFAULT_MAX_LOCAL_CONTEXT_CHARS = 400000;
 
 /**
@@ -251,6 +251,7 @@ export function classifyDifficulty(messages, opts = {}) {
   const msgs = Array.isArray(messages) ? messages : [];
 
   const heavyRole = opts.heavy_role || DEFAULT_HEAVY_ROLE;
+  const contextRole = opts.context_role || heavyRole;
   const visionRole = opts.vision_role || DEFAULT_VISION_ROLE;
   const defaultRole = opts.default_role || DEFAULT_DEFAULT_ROLE;
   const maxEasyChars =
@@ -272,7 +273,7 @@ export function classifyDifficulty(messages, opts = {}) {
     return { role: visionRole, reason: "image content part present", signals };
   }
 
-  // ── 1b. CONTEXT-SIZE GUARD → heavy model (local window protection) ──
+  // ── 1b. CONTEXT-SIZE GUARD → configured long-context route ──
   // Route by TOTAL prompt size (all messages), not just the user ask, so a huge
   // conversation never overflows the small local model's window.
   const maxLocalCtxChars =
@@ -283,7 +284,7 @@ export function classifyDifficulty(messages, opts = {}) {
   if (totalChars > maxLocalCtxChars) {
     signals.push(`ctx(${totalChars}>${maxLocalCtxChars})`);
     return {
-      role: heavyRole,
+      role: contextRole,
       reason: `total context ${totalChars} chars > ${maxLocalCtxChars} — exceeds local window`,
       signals,
     };

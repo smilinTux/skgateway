@@ -390,6 +390,11 @@ in-repo `config/skgateway.yaml` is the pre-migration fallback and is almost cert
   claimer-aware, and routing/catalog visibility both use `isEffectivelyRoutable()`.
   Thus NVIDIA's lack of `qwen38-abliterated` is not evidence that chiap08's local alias
   is EOL. Backend reachability is still a separate prerequisite.
+- `auto.max_local_context_chars` must track the live local window with room for
+  output and tokenizer variance. `auto.context_role` is the dedicated long-context
+  escape route and may differ from `auto.heavy_role`. After changing Ornith context,
+  prove a prompt just above the guard routes to the context role before returning
+  long-lived `sk-auto` chats to service.
 
 Secrets sourcing (never inline a live secret):
 - Backend API keys are referenced by env-var NAME, not value. Config carries

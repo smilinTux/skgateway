@@ -27,6 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Added a distinct `auto.context_role` for oversized conversations so context
+  overflow can route to a long-context backend without changing ordinary hard
+  prompt routing. This prevents 32K Ornith from receiving large Hermes DMs.
 - **T-shirt sizing buckets are now visible and truthful end to end.** When
   `routing.buckets_enabled` is on, `/v1/models` advertises all 12 canonical
   `sk-<class>-<sensitivity>` addresses and `/admin/buckets` evaluates the same

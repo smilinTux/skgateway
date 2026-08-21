@@ -129,6 +129,18 @@ describe("classifyDifficulty — default", () => {
 });
 
 describe("classifyDifficulty — opts overrides", () => {
+  test("context_role separates overflow routing from generic hard routing", () => {
+    const msgs = [{ role: "system", content: "x".repeat(101) }];
+    const opts = {
+      max_local_context_chars: 100,
+      max_easy_chars: 10,
+      context_role: "sk-long",
+      heavy_role: "sk-heavy",
+    };
+    assert.equal(classifyDifficulty(msgs, opts).role, "sk-long");
+    assert.equal(classifyDifficulty(userMsg("please refactor this"), opts).role, "sk-heavy");
+  });
+
   test("lower max_easy_chars flips a short prompt to hard", () => {
     const r = classifyDifficulty(userMsg("a".repeat(50)), { max_easy_chars: 10 });
     assert.equal(r.role, "sk-heavy");
