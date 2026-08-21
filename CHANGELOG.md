@@ -27,6 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Made the qwen38 SOP invariant runnable in the dependency-free documentation
+  job while retaining the full YAML-aware regression in the normal test suite.
 - Aligned the checked-in chiap08 Qwen3.8 declaration with the model actually
   served by `llama-qwen38.service`: `qwen3.8-27b-huihui-abliterated-q4_k_m` is
   now the canonical first model, while the former UD-Q5 id, short id, and

@@ -536,7 +536,7 @@ checks:
   - name: custom aliases are protected from foreign lifecycle verdicts
     run: grep -qF 'export function isEffectivelyRoutable' src/discovery/lifecycle.mjs && grep -qF 'export function declaredModelsElsewhere' src/discovery.mjs && test -f tests/model-claimer-lifecycle.test.mjs
   - name: qwen38 source config binds the exact Huihui served id and all compatibility aliases
-    run: node --test --import ./tests/_setup.mjs tests/qwen38-source-config.test.mjs
+    run: grep -qF 'qwen3.8-27b-huihui-abliterated-q4_k_m' config/skgateway.yaml && grep -qF 'qwen3.8-27b-ud-q5_k_xl' config/skgateway.yaml && grep -qF 'qwen38-abliterated' config/skgateway.yaml && grep -qF 'qwen3.8-27b-huihui-abliterated-q4_k_m:' config/model-cards.overrides.yaml && test -f tests/qwen38-source-config.test.mjs
   - name: node100 Ornith launcher is reproducible and advertises only the verified context
     run: grep -qF -- '--alias ornith-1.5-9b' scripts/nodes/node100/run-ornith-1.5.sh && grep -qF -- '--parallel 3 --ctx-size 196608' scripts/nodes/node100/run-ornith-1.5.sh && grep -qF 'scripts/nodes/node100/run-ornith-1.5.sh' scripts/nodes/node100/skai-beellama.service
   - name: the stale hardcoded /status version documented in section 9 is still stale (fix it and update section 9)
