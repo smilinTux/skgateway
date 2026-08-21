@@ -1,7 +1,7 @@
 # Qwen3.8 shared admission domain — 2026-08-21
 
-This is bounded implementation evidence for card `8b64febc`. It does not claim
-deployment, restart, or a new call to a live model service.
+This is implementation and bounded post-deploy qualification evidence for card
+`8b64febc`.
 
 ## Invariant
 
@@ -53,21 +53,75 @@ Observed in the implementation worktree on 2026-08-21:
 - full `npm test`: 1,325 passed, 0 failed; and
 - SK Standards documentation checks: tiers 1, 2, and 3 passed.
 
-## Deferred live gate
+## Live AC5 qualification on `.41`
 
-The task explicitly prohibited deployment, restart, and live model calls, so
-the fifth acceptance criterion's post-deploy observation is not represented as
-passed. After the source change is deployed through the normal release path:
+The live gate ran against `http://localhost:18780` on
+`cbrd21-laptop12thgenintelcore` without changing gateway/model configuration,
+restarting services, or changing llama.cpp parallelism.
 
-1. verify `/queue` exposes only `chiap08-qwen38` for both route ids;
-2. hold four bounded mixed direct/`sk-creative` requests and confirm `active: 4`;
-3. submit excess mixed requests and confirm a fifth waits while a ninth returns
-   structured `503 capacity_exceeded` in less than 60 seconds;
-4. leave one waiter queued past 30 seconds and confirm `503 queue_timeout`;
-5. cancel one queued request and confirm `499`, no upstream attempt, and an
-   incremented `totalCancelled`; and
-6. release/cancel every holder and require `active: 0` and `queued: 0`.
+- run id: `ac5-8b64febc-1787349857924`
+- run interval: `2026-08-21T22:04:17.924Z`–`2026-08-21T22:04:48.615Z`
+- deployed commit/tag: `95ac1bd011e041df21d808f2d0674a0f5c7004ff` / `v0.7.10`
+- config SHA-256: `558bafbcc4c8317ee15a44dcf078525d229b5674c423f865ad7d19bb9ca4c11b`
+- service state before and after: `active`
 
-Record the deployed commit, config hash, timestamps, response headers/bodies,
-and before/peak/after `/queue` snapshots. Do not raise the four-slot ceiling or
-change llama.cpp parallelism as part of this gate.
+The idle snapshot at `2026-08-21T22:04:18.155Z` exposed the configured domain
+before traffic:
+
+```json
+{"pool":{"totalActive":0,"totalQueued":0,"totalCapacity":4,"utilization":0},"backends":{"chiap08-qwen38":{"capacityDomain":"chiap08-qwen38","members":["chiap08-qwen38","reg:qwen38"],"active":0,"queued":0,"max":4,"maxQueue":4,"queueTimeoutMs":30000,"totalProcessed":0,"totalDropped":0,"totalTimedOut":0,"totalCancelled":0,"peakActive":0,"peakQueue":0}},"timestamp":"2026-08-21T22:04:18.155Z"}
+```
+
+Four bounded holders—two direct `qwen3.8-27b` and two `sk-creative`—produced
+`active: 4`, `queued: 0`, and `totalProcessed: 4` at
+`2026-08-21T22:04:18.397Z`. Four further mixed requests filled the FIFO queue:
+
+```json
+{"pool":{"totalActive":4,"totalQueued":4,"totalCapacity":4,"utilization":1},"backends":{"chiap08-qwen38":{"capacityDomain":"chiap08-qwen38","members":["chiap08-qwen38","reg:qwen38"],"active":4,"queued":4,"max":4,"maxQueue":4,"queueTimeoutMs":30000,"totalProcessed":4,"totalDropped":0,"totalTimedOut":0,"totalCancelled":0,"peakActive":4,"peakQueue":4}},"timestamp":"2026-08-21T22:04:18.634Z"}
+```
+
+The ninth request (`648ed235-70dc-4073-a044-548f04e33b87`) requested
+`sk-creative` and failed in 25 ms at `2026-08-21T22:04:18.665Z`. Its redacted
+response was HTTP 503 with `Content-Type: application/json`, `Retry-After: 30`,
+and `x-sk-backend: reg:qwen38`:
+
+```json
+{"error":{"message":"Capacity domain chiap08-qwen38 queue is full.","code":"capacity_exceeded","backend":"reg:qwen38","capacity_domain":"chiap08-qwen38","retryable":true,"retry_after_seconds":30}}
+```
+
+The client then explicitly aborted queued direct request
+`0479857a-e923-4283-a14a-4532197205e2`. At
+`2026-08-21T22:04:18.687Z`, the domain showed `active: 4`, `queued: 3`,
+`totalCancelled: 1`, and an unchanged `totalProcessed: 4`, proving the queued
+request was removed without an upstream attempt. The gateway audit independently
+recorded HTTP 499, `cancelled: true`, `failover: false`, and 256 ms queue wait.
+
+Queued role request `f05dc716-aa59-4989-8e38-9afbd099edc2` returned at
+`2026-08-21T22:04:48.437Z` after 30,028 ms. Its redacted response was HTTP 503
+with `Content-Type: application/json`, `Retry-After: 30`, and
+`x-sk-backend: reg:qwen38`:
+
+```json
+{"error":{"message":"Capacity domain chiap08-qwen38 queue wait timed out.","code":"queue_timeout","backend":"reg:qwen38","capacity_domain":"chiap08-qwen38","retryable":true,"retry_after_seconds":30}}
+```
+
+The direct holder request ids were
+`0d303cb4-5bf3-4c8f-a5e3-2a2b24c7b149` and
+`87e559b1-86d5-4965-b57d-7f10a0f4509e`; role holder request ids were
+`23a0e2b1-3ace-4719-957e-2c7339839d97` and
+`fe1cdfce-1a05-4ffc-b752-fe4de547e542`. Gateway audit resolved the role to
+`qwen3.8-27b-huihui-abliterated-q4_k_m` on `reg:qwen38`; direct requests used
+`chiap08-qwen38`. No successful generation was awaited, so there is deliberately
+no completion response or `x-sk-model-served` response header to claim.
+
+Finally, all client controllers were cancelled and every process was reaped.
+The terminal snapshot proved all permits and waiters were released:
+
+```json
+{"pool":{"totalActive":0,"totalQueued":0,"totalCapacity":4,"utilization":0},"backends":{"chiap08-qwen38":{"capacityDomain":"chiap08-qwen38","members":["chiap08-qwen38","reg:qwen38"],"active":0,"queued":0,"max":4,"maxQueue":4,"queueTimeoutMs":30000,"totalProcessed":4,"totalDropped":1,"totalTimedOut":3,"totalCancelled":1,"peakActive":4,"peakQueue":4}},"timestamp":"2026-08-21T22:04:48.612Z"}
+```
+
+A second post-run check at `2026-08-21T22:05:22.144Z` again reported
+`active: 0` and `queued: 0`, the same commit/tag/config hash, an active gateway,
+and no remaining qualification driver. This satisfies the fifth acceptance
+criterion while keeping the test bounded and cancellable.
