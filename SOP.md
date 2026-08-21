@@ -327,6 +327,31 @@ After restart, compare `git rev-parse HEAD` with `git rev-parse origin/main` and
 both `/v1/models` and `/admin/buckets`. A process listening on `:18780` whose PID is not
 the unit's `MainPID` is an unmanaged duplicate and must not be treated as the deploy.
 
+#### Bootstrap a headless node's GitHub access
+
+Do not copy a workstation's general-purpose SSH identity or put a token in the remote
+URL. Prefer, in order, a repository-scoped GitHub App installation token, a fine-grained
+PAT with read-only Contents access to `smilinTux/skgateway`, or an organization-approved
+machine identity. Store the credential in a node-local file with mode `0600` and bind
+the helper only in this repository:
+
+```bash
+install -d -m 700 ~/.config/git
+install -m 600 /dev/null ~/.config/git/skgateway-credentials
+git -C ~/clawd/skcapstone-repos/skgateway config --local \
+  credential.helper "store --file $HOME/.config/git/skgateway-credentials"
+git -C ~/clawd/skcapstone-repos/skgateway remote set-url origin \
+  https://github.com/smilinTux/skgateway.git
+```
+
+Write the credential through protected standard input; never place it in shell history,
+logs, card evidence, or command output. Prove access with `git fetch --tags origin`, then
+perform the clean fast-forward procedure above. A classic PAT with broad scopes is an
+explicitly time-bounded break-glass fallback only: record the exception on the board,
+replace it with read-only repository access, and revoke the broad token after rotation.
+The credential file is plaintext despite its permissions, so the node and its backups
+remain sensitive until that rotation is complete.
+
 ## 6. Configuration / Usage
 
 Config covers server, backends, tools, sanitizer, metrics and pricing, plus

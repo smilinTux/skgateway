@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- Documented least-privilege GitHub authentication bootstrap for headless fleet
+  nodes, including repository-local credential isolation, secret-handling rules,
+  verification, and the required rotation of broad break-glass PATs.
 - Reworked the SOP into the complete graded-routing runbook: card grade to
   `skharness` override to SKGateway bucket pool, live membership/failover,
   Ornith 1.5's verified 32768 context, custom-alias lifecycle semantics,
