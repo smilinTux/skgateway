@@ -140,7 +140,7 @@ export function selectProbeCandidates(
  * is safe to call with nothing wired up regardless.
  *
  * `pool` gates concurrency the same way the router already does
- * (`pool.acquire(backendId)` / `pool.release(backendId)`, mirroring
+ * (`ticket = pool.acquire(backendId)` / `pool.release(ticket)`, mirroring
  * src/proxy/connection-pool.mjs) so a sweep can never fan out past the
  * pool's concurrency limit alongside live traffic. A pool is optional (tests
  * may omit it); when present, a failed `acquire` (queue full/timeout) skips
@@ -261,9 +261,10 @@ export async function probeModels(store, opts = {}) {
 
   await Promise.all(
     candidates.map(async (id) => {
+      let poolTicket = null;
       if (canPool) {
         try {
-          await pool.acquire(poolBackendId);
+          poolTicket = await pool.acquire(poolBackendId);
         } catch {
           // Pool exhausted or queue timeout: not evidence the model is
           // dead, just skip it this sweep and let it come back up next time.
@@ -307,7 +308,7 @@ export async function probeModels(store, opts = {}) {
 
         next[id] = { ...probedLc, measured_capabilities: capRecord };
       } finally {
-        if (canPool) pool.release(poolBackendId);
+        if (poolTicket) pool.release(poolTicket);
       }
     }),
   );

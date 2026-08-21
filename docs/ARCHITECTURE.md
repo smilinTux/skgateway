@@ -37,7 +37,7 @@ flowchart TD
 
     CLI --> CORE["src/proxy/core.mjs<br/>handleRequest() pipeline"]
     CLI --> ROUTER["src/proxy/router.mjs<br/>backend registry + health"]
-    CLI --> POOL["src/proxy/connection-pool.mjs<br/>per-backend concurrency + FIFO queue"]
+    CLI --> POOL["src/proxy/connection-pool.mjs<br/>capacity-domain concurrency + FIFO queue"]
     CLI -. "lazy import" .-> METRICS["src/metrics/collector.mjs"]
     CLI -. "lazy import" .-> DASH["src/dashboard/server.mjs<br/>:18781 HTTP + WebSocket"]
 
@@ -262,7 +262,7 @@ flowchart LR
     HC -->|"down (cooldown)"| NXT["next backend by priority"]
     HC -->|"degraded / up"| POOL["pool.acquire(backendId)"]
     POOL -->|"slot free"| UP["sendUpstream()"]
-    POOL -->|"at cap"| Q["FIFO queue (timeout 5m)"]
+    POOL -->|"at cap"| Q["bounded FIFO queue"]
     Q --> UP
     UP --> RESP["response (status, headers, body)"]
     RESP --> POOL2["pool.release(backendId)"]
@@ -273,9 +273,13 @@ flowchart LR
   requests). Crossing 10% marks a backend *degraded*; 50% marks it *down* and starts a 60 s
   cooldown, after which one probe request promotes it back to *degraded*. Backends are tried in
   ascending `priority`. Runtime `addBackend`/`removeBackend` are supported.
-- **`connection-pool.mjs`** enforces per-backend concurrency (NVIDIA NIM caps at 20). Excess
-  requests wait in a FIFO queue (default cap 1000, 5-minute timeout) and queue depth is exposed
-  for the dashboard.
+- **`connection-pool.mjs`** enforces concurrency per explicit capacity domain,
+  falling back to one domain per backend. This prevents direct and registry
+  aliases for one physical service from multiplying its limit. Excess requests
+  wait in a bounded FIFO queue; abort removes a waiter immediately, and
+  `/queue` exposes configured domains even while idle plus timeout, drop, and
+  cancellation counters. Each admitted slot has a pool-owned, single-use
+  object ticket; release by string, copy, duplicate, or foreign pool is inert.
 - **`upstream.mjs`** is the only module that does network I/O to the model. It buffers the full
   response, strips hop-by-hop headers, and **always resolves** (synthetic `502` on failure).
 
@@ -354,7 +358,7 @@ the payload `event` field, not the topic suffix. `info`-level events are dropped
 | `src/integration.mjs` | Optional file-based skcapstone bridge (sk-alert publish + service discovery) |
 | `src/proxy/core.mjs` | The pipeline + retry ladder + response fixups; `handleRequest()` / `createProxyServer()` |
 | `src/proxy/router.mjs` | Backend registry, name/glob+priority selection, sliding-window health, failover |
-| `src/proxy/connection-pool.mjs` | Per-backend concurrency cap + FIFO request queue + queue-depth stats |
+| `src/proxy/connection-pool.mjs` | Capacity-domain concurrency cap + bounded FIFO admission + queue outcome stats |
 | `src/proxy/upstream.mjs` | Stateless HTTP/HTTPS relay; always resolves (synthetic 502 on failure) |
 | `src/proxy/tools.mjs` | Tool reduction — guaranteed set + semantic keyword scoring to a budget |
 | `src/proxy/sanitizer.mjs` | Response/request sanitization, PII detection (Luhn), DLP pattern scan |

@@ -615,6 +615,7 @@ const poolConfig = {
   defaultMaxQueue: config.pooling?.default_max_queue || 1000,
   queueTimeoutMs: config.pooling?.queue_timeout_ms || 300000,
   perBackend: config.pooling?.per_backend || {},
+  capacityDomains: config.pooling?.capacity_domains || {},
 };
 const pool = getPool(poolConfig);
 

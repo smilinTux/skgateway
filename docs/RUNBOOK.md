@@ -38,9 +38,11 @@ Four unauthenticated control endpoints on `18780`:
 - **`GET /status`**: adds `version`, `uptime`, connection-`pool` totals, and the
   `metrics` object. `metrics: null` means the metrics store failed to open.
 - **`GET /queue`**: connection-pool depth: `totalActive`, `totalQueued`,
-  `totalCapacity`, `utilization`, plus per-backend stats. Use it when requests
-  are slow to see whether they are queued behind the per-backend concurrency
-  cap.
+  `totalCapacity`, `utilization`, plus per-domain stats. An ungrouped backend
+  is its own domain. Each entry includes `active`, `queued`, `max`, `maxQueue`,
+  `queueTimeoutMs`, `totalTimedOut`, `totalDropped`, and `totalCancelled`.
+  Configured domains are present with zero counters before first traffic and
+  contribute capacity once, not once per member alias.
 - **`GET /v1/models`**: the aggregated model catalog across configured backends.
 
 `GET /` and `GET /dashboard` redirect (302) to the dashboard on `18781`.
@@ -277,11 +279,15 @@ a health state machine (`src/proxy/router.mjs`):
 - After cooldown it transitions **down to degraded** and is allowed one probe
   request to determine liveness.
 
-Connection pooling enforces per-backend concurrency (`pooling`): NVIDIA is capped
-at 20 concurrent (its NIM limit), with per-backend `max` / `maxQueue` overrides;
-requests beyond the cap queue up to `maxQueue` and time out after
-`queue_timeout_ms` (default 5 minutes). The skmodels registry bridge keeps a
-last-good cache so a registry hiccup does not break routing.
+Connection pooling enforces concurrency (`pooling`): NVIDIA is capped at 20
+concurrent (its NIM limit), with per-backend `max` / `maxQueue` overrides.
+Logical routes that reach one physical service belong in one explicit
+`capacity_domains` entry so they cannot each consume a separate limit.
+Requests beyond a cap queue FIFO up to `maxQueue` and time out after the
+configured queue SLA; `maxQueue: 0` is fail-fast. The `chiap08-qwen38` and
+`reg:qwen38` routes share four active slots, four queued slots, and a 30-second
+SLA. Pool topology changes require a process restart. The skmodels registry
+bridge keeps a last-good cache so a registry hiccup does not break routing.
 
 `degraded` and `down` transitions raise `warn`+ SIEM events, which reach the
 sk-alert bus when the skcapstone tree is present.

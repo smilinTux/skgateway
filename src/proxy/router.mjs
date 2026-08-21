@@ -23,7 +23,7 @@ import { randomUUID } from "node:crypto";
 import { sendUpstream } from "./upstream.mjs";
 import { createEvent } from "../siem/events.mjs";
 import { isAnthropicBackend, toAnthropicRequest, toOpenAIResponse } from "./anthropic-adapter.mjs";
-import { getPool } from "./connection-pool.mjs";
+import { getPool, PoolAdmissionError } from "./connection-pool.mjs";
 import { isRegistryRouted, resolve as resolveRegistry, getAutoConfig, getConfigEpoch, loadRegistry } from "./registry.mjs";
 import { getFailoverConfig, isLocalUrl, probeLocalHealth, recordLocalOutcome } from "./local-failover.mjs";
 import { readMeter } from "./meter-client.mjs";
@@ -2740,27 +2740,77 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     let slot = null;
     if (pool) {
       try {
-        slot = await pool.acquire(backendId);
+        slot = await pool.acquire(backendId, { signal: abortSignal });
       } catch (err) {
-        // Pool rejected (queue full) — log and fall back to serving a 503
+        // A client which leaves while queued is the same neutral 499 as one
+        // which leaves after dispatch: no failover and no backend-health write.
+        if (err instanceof PoolAdmissionError && err.code === "client_closed") {
+          const queueWaitMs = Date.now() - queueStart;
+          emitSiem("response", {
+            status: 499,
+            latency_ms: queueWaitMs,
+            queue_wait_ms: queueWaitMs,
+            failover: false,
+            cancelled: true,
+          }, { backend: backendId });
+          return {
+            status: 499,
+            headers: {},
+            body: Buffer.from(JSON.stringify({
+              error: {
+                message: "downstream client disconnected",
+                code: "client_closed",
+              },
+            })),
+            backendId,
+            capacityDomain: err.capacityDomain,
+            queueWaitMs,
+            failover: false,
+            cancelled: true,
+          };
+        }
+
+        // Queue-full and queue-timeout are distinct retryable admission
+        // outcomes. Neither is evidence that the model/backend is unhealthy.
+        const code = err instanceof PoolAdmissionError
+          ? err.code
+          : "capacity_exceeded";
+        const capacityDomain = err instanceof PoolAdmissionError
+          ? err.capacityDomain
+          : backendId;
+        const retryAfterSeconds = err instanceof PoolAdmissionError
+          ? err.retryAfterSeconds
+          : 1;
         console.error(`[routeAndSend] pool rejected backend=${backendId}: ${err.message}`);
         emitSiem("error", {
-          type: "pool_capacity_exceeded",
+          type: code === "queue_timeout" ? "pool_queue_timeout" : "pool_capacity_exceeded",
           status_code: 503,
           backend: backendId,
+          capacity_domain: capacityDomain,
+          retry_after_seconds: retryAfterSeconds,
           message: err.message,
         }, { backend: backendId });
         return {
           status: 503,
-          headers: { "content-type": "application/json" },
+          headers: {
+            "content-type": "application/json",
+            "retry-after": String(retryAfterSeconds),
+          },
           body: Buffer.from(JSON.stringify({
             error: {
-              message: `Backend ${backendId} is at capacity. Queue full.`,
-              code: "capacity_exceeded",
+              message: code === "queue_timeout"
+                ? `Capacity domain ${capacityDomain} queue wait timed out.`
+                : `Capacity domain ${capacityDomain} queue is full.`,
+              code,
               backend: backendId,
+              capacity_domain: capacityDomain,
+              retryable: true,
+              retry_after_seconds: retryAfterSeconds,
             }
           })),
           backendId,
+          capacityDomain,
+          queueWaitMs: Date.now() - queueStart,
           failover: didFailover,
         };
       }
@@ -2850,7 +2900,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     } finally {
       // Always release the slot, even on error
       if (pool && slot) {
-        pool.release(backendId);
+        pool.release(slot);
       }
       // Pair every enterMeter with an exit here, even on a thrown upstream,
       // so the in-flight count can never leak and drift upward. This runs

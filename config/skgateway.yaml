@@ -38,6 +38,15 @@ pooling:
   default_max_concurrent: 20    # Max concurrent requests per backend
   default_max_queue: 1000        # Max queue depth per backend
   queue_timeout_ms: 300000        # Max time a request waits in queue (5 min)
+  # A capacity domain joins every logical route to one physical service. The
+  # direct aliases below route as chiap08-qwen38, while sk-creative/sk-vision
+  # materialize as reg:qwen38; both consume the same four llama.cpp slots.
+  capacity_domains:
+    chiap08-qwen38:
+      members: [chiap08-qwen38, "reg:qwen38"]
+      max: 4
+      maxQueue: 4
+      queueTimeoutMs: 30000       # Return retryable 503 before 60s clients give up
   per_backend:                   # Per-backend overrides
     nvidia:
       max: 20                     # NVIDIA NIM: 20 concurrent

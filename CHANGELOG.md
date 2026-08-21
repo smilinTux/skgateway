@@ -27,6 +27,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Bound the direct `chiap08-qwen38` route and registry-backed `reg:qwen38`
+  route to one explicit four-slot admission domain. The domain has a bounded
+  four-request FIFO queue and a 30-second queue SLA; full and expired queues
+  now return distinct retryable `503` responses with `Retry-After`, while a
+  queued client disconnect is removed immediately and remains a no-failover
+  `499`. `/queue` exposes active, queued, timeout, drop, and cancellation
+  counters for the shared domain, including its zeroed idle state. Admission
+  tickets are unique, pool-owned, and single-use, so duplicate, forged,
+  foreign-pool, or legacy string releases cannot under-report active work or
+  promote a queued request early.
 - Made the qwen38 SOP invariant runnable in the dependency-free documentation
   job while retaining the full YAML-aware regression in the normal test suite.
 - Aligned the checked-in chiap08 Qwen3.8 declaration with the model actually

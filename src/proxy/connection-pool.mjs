@@ -2,8 +2,8 @@
  * connection-pool.mjs — Connection pooler with request queue for SKGateway
  *
  * NVIDIA NIM has a 20 concurrent request limit. This module enforces that
- * limit per-backend, queues excess requests, and exposes queue depth for
- * monitoring.
+ * limit per capacity domain (or per backend when ungrouped), queues excess
+ * requests, and exposes admission outcomes for monitoring.
  *
  * Architecture:
  *   ┌─────────────┐     ┌──────────────────┐     ┌─────────────┐
@@ -18,8 +18,8 @@
  *                       └───────────────┘
  *
  * Public API:
- *   pool.acquire(backendId)      → Promise<void> - wait for slot
- *   pool.release(backendId)      → return slot
+ *   pool.acquire(backendId)      → Promise<ticket> - wait for slot
+ *   pool.release(ticket)         → return slot
  *   pool.getStats(backendId?)    → { active, queued, max }
  *   pool.getAllStats()           → Record<backendId, Stats>
  *
@@ -29,7 +29,7 @@
  *     const res = await sendUpstream(...);
  *     return res;
  *   } finally {
- *     pool.release("nvidia");
+ *     pool.release(slot);
  *   }
  */
 
@@ -40,22 +40,41 @@
 const DEFAULT_MAX_CONCURRENT = 20;
 const DEFAULT_MAX_QUEUE = 1000;
 const DEFAULT_QUEUE_TIMEOUT_MS = 300_000; // 5 minutes max wait
+let nextPoolInstanceId = 1;
+
+/** Typed admission failure consumed by the router's structured retry path. */
+export class PoolAdmissionError extends Error {
+  constructor(code, capacityDomain, message, retryAfterSeconds) {
+    super(message);
+    this.name = "PoolAdmissionError";
+    this.code = code;
+    this.capacityDomain = capacityDomain;
+    this.retryAfterSeconds = retryAfterSeconds;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Per-backend pool state
 // ---------------------------------------------------------------------------
 
 class PoolState {
-  constructor(id, maxConcurrent = DEFAULT_MAX_CONCURRENT, maxQueue = DEFAULT_MAX_QUEUE) {
+  constructor(id, {
+    maxConcurrent = DEFAULT_MAX_CONCURRENT,
+    maxQueue = DEFAULT_MAX_QUEUE,
+    queueTimeoutMs = DEFAULT_QUEUE_TIMEOUT_MS,
+    members = [id],
+  } = {}) {
     this.id = id;
     this.max = Math.max(1, maxConcurrent);
     this.maxQueue = Math.max(0, maxQueue);
+    this.queueTimeoutMs = Math.max(1, queueTimeoutMs);
+    this.members = [...members];
 
     /** Active in-flight requests */
     this.active = 0;
 
     /** Queued requests waiting for a slot */
-    /** @type {Array<{resolve: Function, reject: Function, enqueuedAt: number}>} */
+    /** @type {Array<{promote: Function, enqueuedAt: number}>} */
     this.queue = [];
 
     /** Total requests ever processed (metrics) */
@@ -63,6 +82,12 @@ class PoolState {
 
     /** Total dropped due to full queue (metrics) */
     this.totalDropped = 0;
+
+    /** Total waiters rejected when their domain queue SLA expired */
+    this.totalTimedOut = 0;
+
+    /** Total queued waiters removed on downstream cancellation */
+    this.totalCancelled = 0;
 
     /** Peak active connections ever reached */
     this.peakActive = 0;
@@ -82,7 +107,8 @@ export class ConnectionPool {
    * @param {number} [config.defaultMaxConcurrent=20]    Default max concurrent per backend
    * @param {number} [config.defaultMaxQueue=1000]         Default max queue depth per backend
    * @param {number} [config.queueTimeoutMs=300000]        Max time a request waits in queue
-   * @param {object} [config.perBackend]                   Per-backend overrides: { [id]: { max, maxQueue } }
+   * @param {object} [config.perBackend]                   Per-backend overrides: { [id]: { max, maxQueue, queueTimeoutMs } }
+   * @param {object} [config.capacityDomains]              Shared domains: { [id]: { members, max, maxQueue, queueTimeoutMs } }
    */
   constructor(config = {}) {
     this._defaultMax = config.defaultMaxConcurrent ?? DEFAULT_MAX_CONCURRENT;
@@ -92,24 +118,76 @@ export class ConnectionPool {
     /** @type {Map<string, PoolState>} */
     this._pools = new Map();
 
+    /**
+     * Issued slot tickets. Weak object-identity ownership makes tickets
+     * unforgeable across pool instances and lets released tickets be collected.
+     * @type {WeakMap<object, PoolState>}
+     */
+    this._issuedTickets = new WeakMap();
+    this._poolInstanceId = nextPoolInstanceId++;
+    this._nextTicketId = 1;
+
     /** Per-backend overrides from config */
     this._overrides = config.perBackend || {};
+
+    /** Explicit aliases which consume one physical service's shared capacity. */
+    this._capacityDomains = config.capacityDomains || {};
+    this._memberDomains = new Map();
+    for (const [domainId, domain] of Object.entries(this._capacityDomains)) {
+      const members = [...new Set([domainId, ...(domain.members || [])])];
+      for (const member of members) {
+        const existing = this._memberDomains.get(member);
+        if (existing && existing !== domainId) {
+          throw new Error(
+            `[connection-pool] member=${member} belongs to both ${existing} and ${domainId}`
+          );
+        }
+        this._memberDomains.set(member, domainId);
+      }
+    }
   }
 
   // -----------------------------------------------------------------------
   // Internal helpers
   // -----------------------------------------------------------------------
 
+  _domainId(id) {
+    return this._memberDomains.get(id) || id;
+  }
+
+  _settings(id) {
+    const domainId = this._domainId(id);
+    const domain = this._capacityDomains[domainId];
+    const override = domain || this._overrides[id] || {};
+    const members = domain
+      ? [...new Set([domainId, ...(domain.members || [])])]
+      : [id];
+    return {
+      domainId,
+      maxConcurrent: override.max ?? this._defaultMax,
+      maxQueue: override.maxQueue ?? this._defaultMaxQueue,
+      queueTimeoutMs: override.queueTimeoutMs ?? this._queueTimeoutMs,
+      members,
+    };
+  }
+
   _getOrCreate(id) {
-    if (!this._pools.has(id)) {
-      const ov = this._overrides[id] || {};
-      this._pools.set(id, new PoolState(
-        id,
-        ov.max ?? this._defaultMax,
-        ov.maxQueue ?? this._defaultMaxQueue
-      ));
+    const settings = this._settings(id);
+    if (!this._pools.has(settings.domainId)) {
+      this._pools.set(settings.domainId, new PoolState(settings.domainId, settings));
     }
-    return this._pools.get(id);
+    return this._pools.get(settings.domainId);
+  }
+
+  _issueTicket(state, backendId) {
+    const ticket = Object.freeze({
+      id: state.id,
+      backendId,
+      acquiredAt: Date.now(),
+      ticketId: `${this._poolInstanceId}:${state.id}:${this._nextTicketId++}`,
+    });
+    this._issuedTickets.set(ticket, state);
+    return ticket;
   }
 
   // -----------------------------------------------------------------------
@@ -121,54 +199,113 @@ export class ConnectionPool {
    * If the pool is at capacity, this resolves when a slot becomes available.
    *
    * @param {string} backendId
-   * @returns {Promise<{id: string, acquiredAt: number}>}
+   * @param {{signal?:AbortSignal|null}} [options]
+   * @returns {Promise<{id: string, backendId: string, acquiredAt: number, ticketId: string}>}
    *   Resolves with a ticket that MUST be passed to release().
    *   Rejects if the queue is full or the wait times out.
    */
-  acquire(backendId) {
+  acquire(backendId, { signal = null } = {}) {
     const state = this._getOrCreate(backendId);
+    const retryAfterSeconds = Math.max(1, Math.ceil(state.queueTimeoutMs / 1000));
 
     return new Promise((resolve, reject) => {
+      if (signal?.aborted) {
+        state.totalCancelled++;
+        reject(new PoolAdmissionError(
+          "client_closed",
+          state.id,
+          `[connection-pool] backend=${backendId} client disconnected before admission`,
+          retryAfterSeconds,
+        ));
+        return;
+      }
+
       // Fast path: slot available right now
       if (state.active < state.max) {
         state.active++;
         state.totalProcessed++;
         if (state.active > state.peakActive) state.peakActive = state.active;
-        resolve({ id: backendId, acquiredAt: Date.now() });
+        resolve(this._issueTicket(state, backendId));
         return;
       }
 
       // Slow path: must queue
-      if (state.maxQueue > 0 && state.queue.length >= state.maxQueue) {
+      // maxQueue=0 means fail fast. It must never mean "disable the cap".
+      if (state.queue.length >= state.maxQueue) {
         state.totalDropped++;
-        reject(new Error(
-          `[connection-pool] backend=${backendId} queue full (${state.queue.length}/${state.maxQueue}). Request dropped.`
+        reject(new PoolAdmissionError(
+          "capacity_exceeded",
+          state.id,
+          `[connection-pool] domain=${state.id} queue full ` +
+            `(${state.queue.length}/${state.maxQueue}). Request dropped.`,
+          retryAfterSeconds,
         ));
         return;
       }
 
       // Enqueue the waiter
+      let settled = false;
+      let timer = null;
+      let onAbort = null;
+      const cleanup = () => {
+        if (timer) clearTimeout(timer);
+        timer = null;
+        if (signal && onAbort) signal.removeEventListener("abort", onAbort);
+      };
+      const remove = (waiter) => {
+        const idx = state.queue.indexOf(waiter);
+        if (idx < 0) return false;
+        state.queue.splice(idx, 1);
+        return true;
+      };
       const waiter = {
-        resolve: (ticket) => {
+        promote: () => {
+          if (settled) return false;
+          settled = true;
+          cleanup();
           state.totalProcessed++;
-          resolve(ticket);
+          resolve(this._issueTicket(state, backendId));
+          return true;
         },
-        reject,
         enqueuedAt: Date.now(),
       };
       state.queue.push(waiter);
       if (state.queue.length > state.peakQueue) state.peakQueue = state.queue.length;
 
       // Timeout guard
-      setTimeout(() => {
-        const idx = state.queue.indexOf(waiter);
-        if (idx >= 0) {
-          state.queue.splice(idx, 1);
-          reject(new Error(
-            `[connection-pool] backend=${backendId} queue timeout after ${this._queueTimeoutMs}ms`
+      timer = setTimeout(() => {
+        if (!settled && remove(waiter)) {
+          settled = true;
+          cleanup();
+          state.totalTimedOut++;
+          reject(new PoolAdmissionError(
+            "queue_timeout",
+            state.id,
+            `[connection-pool] domain=${state.id} queue timeout after ` +
+              `${state.queueTimeoutMs}ms`,
+            retryAfterSeconds,
           ));
         }
-      }, this._queueTimeoutMs);
+      }, state.queueTimeoutMs);
+
+      onAbort = () => {
+        if (!settled && remove(waiter)) {
+          settled = true;
+          cleanup();
+          state.totalCancelled++;
+          reject(new PoolAdmissionError(
+            "client_closed",
+            state.id,
+            `[connection-pool] backend=${backendId} client disconnected while queued`,
+            retryAfterSeconds,
+          ));
+        }
+      };
+      if (signal) {
+        signal.addEventListener("abort", onAbort, { once: true });
+        // Close the race between the initial check and listener registration.
+        if (signal.aborted) onAbort();
+      }
 
       // This is intentionally NOT logged per-request to avoid log spam.
       // Use getStats() to inspect the queue.
@@ -179,25 +316,36 @@ export class ConnectionPool {
    * Release a previously-acquired slot.
    * If the queue has waiters, the oldest one is promoted immediately.
    *
-   * @param {string} backendId
+   * A ticket is owned by this pool and may be released exactly once. Legacy
+   * string ids, copied/forged objects, foreign tickets, and duplicates are
+   * rejected without changing counters or promoting a waiter.
+   *
+   * @param {object} ticket
+   * @returns {boolean} true only when this call released an owned active slot
    */
-  release(backendId) {
-    const state = this._getOrCreate(backendId);
+  release(ticket) {
+    if (!ticket || typeof ticket !== "object") return false;
+    const state = this._issuedTickets.get(ticket);
+    if (!state) return false;
 
-    if (state.active > 0) {
-      state.active--;
-    }
+    // Consume ownership before mutating counters so a re-entrant/duplicate
+    // release can never free the same slot twice.
+    this._issuedTickets.delete(ticket);
+    if (state.active <= 0) return false;
+    state.active--;
 
     // Promote the next waiter from the queue
     while (state.queue.length > 0) {
       const waiter = state.queue.shift();
       if (state.active < state.max) {
-        state.active++;
-        if (state.active > state.peakActive) state.peakActive = state.active;
-        waiter.resolve({ id: backendId, acquiredAt: Date.now() });
-        break; // Only one slot released
+        if (waiter.promote()) {
+          state.active++;
+          if (state.active > state.peakActive) state.peakActive = state.active;
+          break; // Only one slot released
+        }
       }
     }
+    return true;
   }
 
   // -----------------------------------------------------------------------
@@ -207,33 +355,59 @@ export class ConnectionPool {
   /**
    * Get current stats for a specific backend pool.
    * @param {string} backendId
-   * @returns {{ active: number, queued: number, max: number, maxQueue: number, totalProcessed: number, totalDropped: number, peakActive: number, peakQueue: number }}
+   * @returns {{ capacityDomain: string, members: string[], active: number, queued: number, max: number, maxQueue: number, queueTimeoutMs: number, totalProcessed: number, totalDropped: number, totalTimedOut: number, totalCancelled: number, peakActive: number, peakQueue: number }}
    */
   getStats(backendId) {
-    const state = this._pools.get(backendId);
+    const settings = this._settings(backendId);
+    const state = this._pools.get(settings.domainId);
     if (!state) {
-      return { active: 0, queued: 0, max: this._defaultMax, maxQueue: this._defaultMaxQueue,
-        totalProcessed: 0, totalDropped: 0, peakActive: 0, peakQueue: 0 };
+      return {
+        capacityDomain: settings.domainId,
+        members: settings.members,
+        active: 0,
+        queued: 0,
+        max: settings.maxConcurrent,
+        maxQueue: settings.maxQueue,
+        queueTimeoutMs: settings.queueTimeoutMs,
+        totalProcessed: 0,
+        totalDropped: 0,
+        totalTimedOut: 0,
+        totalCancelled: 0,
+        peakActive: 0,
+        peakQueue: 0,
+      };
     }
     return {
+      capacityDomain: state.id,
+      members: [...state.members],
       active: state.active,
       queued: state.queue.length,
       max: state.max,
       maxQueue: state.maxQueue,
+      queueTimeoutMs: state.queueTimeoutMs,
       totalProcessed: state.totalProcessed,
       totalDropped: state.totalDropped,
+      totalTimedOut: state.totalTimedOut,
+      totalCancelled: state.totalCancelled,
       peakActive: state.peakActive,
       peakQueue: state.peakQueue,
     };
   }
 
   /**
-   * Get stats for all registered backend pools.
+   * Get stats for all configured domains and runtime-created backend pools.
    * @returns {Record<string, ReturnType<ConnectionPool['getStats']>>}
    */
   getAllStats() {
     const out = {};
-    for (const [id] of this._pools) {
+    // Configured domains are a bounded operator-owned set and should be
+    // observable before first traffic. Runtime-only ungrouped pools join the
+    // set only after a real acquire; arbitrary getStats() lookups never do.
+    const domainIds = new Set([
+      ...Object.keys(this._capacityDomains),
+      ...this._pools.keys(),
+    ]);
+    for (const id of domainIds) {
       out[id] = this.getStats(id);
     }
     return out;
@@ -248,10 +422,10 @@ export class ConnectionPool {
     let totalActive = 0;
     let totalQueued = 0;
     let totalCapacity = 0;
-    for (const state of this._pools.values()) {
-      totalActive += state.active;
-      totalQueued += state.queue.length;
-      totalCapacity += state.max;
+    for (const stats of Object.values(this.getAllStats())) {
+      totalActive += stats.active;
+      totalQueued += stats.queued;
+      totalCapacity += stats.max;
     }
     return { totalActive, totalQueued, totalCapacity };
   }

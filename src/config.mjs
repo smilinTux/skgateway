@@ -601,6 +601,64 @@ export function assertProviderRoutes(cfg, errs = [], registryPath = undefined) {
     }
   }
 
+  // 2b. Shared physical-capacity domains. A configured backend id and a
+  // registry-materialised id (reg:<backend>) may be two logical doors to the
+  // same llama service, so admission must join them explicitly. Registry ids
+  // are syntax-checked rather than existence-checked: the registry is a
+  // fail-soft, independently synced source and may be temporarily unavailable
+  // while this config remains valid for direct routes.
+  const capacityDomains = cfg.pooling && typeof cfg.pooling === 'object'
+    ? cfg.pooling.capacity_domains
+    : null;
+  if (capacityDomains != null) {
+    if (typeof capacityDomains !== 'object' || Array.isArray(capacityDomains)) {
+      errs.push('pooling.capacity_domains must be an object');
+    } else {
+      const owners = new Map();
+      for (const [domainId, domain] of Object.entries(capacityDomains)) {
+        const prefix = `pooling.capacity_domains.${domainId}`;
+        if (!domain || typeof domain !== 'object' || Array.isArray(domain)) {
+          errs.push(`${prefix} must be an object`);
+          continue;
+        }
+        if (!Number.isInteger(domain.max) || domain.max < 1) {
+          errs.push(`${prefix}.max must be an integer >= 1`);
+        }
+        if (!Number.isInteger(domain.maxQueue) || domain.maxQueue < 0) {
+          errs.push(`${prefix}.maxQueue must be an integer >= 0 (0 means fail fast)`);
+        }
+        if (!Number.isInteger(domain.queueTimeoutMs) || domain.queueTimeoutMs < 1) {
+          errs.push(`${prefix}.queueTimeoutMs must be an integer >= 1`);
+        }
+        if (!Array.isArray(domain.members) || domain.members.length === 0) {
+          errs.push(`${prefix}.members must be a non-empty array`);
+          continue;
+        }
+        if (!domain.members.includes(domainId)) {
+          errs.push(`${prefix}.members must include its stable domain id ${domainId}`);
+        }
+        for (const member of domain.members) {
+          if (typeof member !== 'string' || member.length === 0) {
+            errs.push(`${prefix}.members entries must be non-empty strings`);
+            continue;
+          }
+          if (!backendIds.has(member) && !/^reg:[A-Za-z0-9._-]+$/.test(member)) {
+            errs.push(
+              `${prefix}.members contains unknown route ${member}; expected a declared ` +
+              'backend or reg:<backend>',
+            );
+          }
+          const prior = owners.get(member);
+          if (prior) {
+            errs.push(`${prefix}.members route ${member} already belongs to ${prior}`);
+          } else {
+            owners.set(member, domainId);
+          }
+        }
+      }
+    }
+  }
+
   // 3. registry `agent:*` context targets must resolve to a known route (CR-5.1).
   //    The per-agent pin moved from config `routing.per_agent` into the skmodels
   //    registry `agent:<id>` contexts (the single source of truth). We validate

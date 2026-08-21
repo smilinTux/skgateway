@@ -239,8 +239,8 @@ describe('probeModels (fake completion runner + fake pool + fake clock)', () => 
         acquired.push(id);
         return { id };
       },
-      release: (id) => {
-        released.push(id);
+      release: (ticket) => {
+        released.push(ticket);
       },
     };
     const store = { a: lc({ last_verified_at: null }), b: lc({ last_verified_at: null }) };
@@ -253,6 +253,7 @@ describe('probeModels (fake completion runner + fake pool + fake clock)', () => 
     assert.equal(acquired.length, 2);
     assert.equal(released.length, 2);
     assert.ok(acquired.every((id) => id === 'nvidia'));
+    assert.ok(released.every((ticket) => ticket.id === 'nvidia'));
   });
 
   test('a pool acquire failure (queue full) skips that id without marking it dead', async () => {

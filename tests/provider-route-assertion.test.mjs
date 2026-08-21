@@ -164,6 +164,51 @@ describe("assertProviderRoutes() rule coverage", () => {
     assert.match(errs[0], /pooling\.per_backend\.ghost/);
     assert.match(errs[0], /unknown backend/);
   });
+
+  test("one capacity domain may join a declared backend and a registry route", () => {
+    const errs = assertProviderRoutes({
+      backends: baseBackends,
+      pooling: {
+        capacity_domains: {
+          local: {
+            members: ["local", "reg:local-model"],
+            max: 4,
+            maxQueue: 4,
+            queueTimeoutMs: 30_000,
+          },
+        },
+      },
+    });
+    assert.deepEqual(errs, []);
+  });
+
+  test("capacity domains reject ambiguous membership and unsafe limits", () => {
+    const errs = assertProviderRoutes({
+      backends: baseBackends,
+      pooling: {
+        capacity_domains: {
+          local: {
+            members: ["local", "reg:shared"],
+            max: 0,
+            maxQueue: -1,
+            queueTimeoutMs: 0,
+          },
+          other: {
+            members: ["other", "reg:shared", "ghost"],
+            max: 1,
+            maxQueue: 0,
+            queueTimeoutMs: 1,
+          },
+        },
+      },
+    });
+    assert.ok(errs.some((problem) => /local\.max must be an integer >= 1/.test(problem)));
+    assert.ok(errs.some((problem) => /local\.maxQueue/.test(problem)));
+    assert.ok(errs.some((problem) => /local\.queueTimeoutMs/.test(problem)));
+    assert.ok(errs.some((problem) => /other.*unknown route other/.test(problem)));
+    assert.ok(errs.some((problem) => /reg:shared already belongs to local/.test(problem)));
+    assert.ok(errs.some((problem) => /unknown route ghost/.test(problem)));
+  });
 });
 
 // ── 2. boot: fail fast on a dangling provider route ──────────────────────────

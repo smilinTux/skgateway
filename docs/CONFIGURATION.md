@@ -8,6 +8,7 @@
 4. [SIGHUP Hot-Reload](#sighup-hot-reload)
 5. [Full Field Reference](#full-field-reference)
    - [server](#server)
+   - [pooling](#pooling)
    - [backends](#backends)
    - [tools](#tools)
    - [sanitizer](#sanitizer)
@@ -126,6 +127,44 @@ server:
 | `port` | integer | `18780` | Port the proxy HTTP server listens on. The proxy handles `/v1/chat/completions`, `/health`, and `/status` on this port. |
 | `dashboard_port` | integer | `18781` | Port the SOC dashboard HTTP server and WebSocket listens on. Set to `0` to disable the dashboard. |
 | `bind` | string | `"0.0.0.0"` | Network interface to bind. Use `"127.0.0.1"` to restrict to loopback only. |
+
+---
+
+### `pooling`
+
+Admission limits apply to one backend by default. Use `capacity_domains` when
+multiple logical backend ids reach the same physical service; all listed
+members then consume the domain's shared active and queued limits.
+
+```yaml
+pooling:
+  default_max_concurrent: 20
+  default_max_queue: 1000
+  queue_timeout_ms: 300000
+  capacity_domains:
+    chiap08-qwen38:
+      members: [chiap08-qwen38, "reg:qwen38"]
+      max: 4
+      maxQueue: 4
+      queueTimeoutMs: 30000
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `default_max_concurrent` | integer | `20` | Active-request limit for an unconfigured backend. |
+| `default_max_queue` | integer | `1000` | Waiting-request limit for an unconfigured backend. |
+| `queue_timeout_ms` | integer | `300000` | Queue SLA for an unconfigured backend. |
+| `capacity_domains.<id>.members` | string[] | _(required)_ | Logical backend ids sharing one physical capacity limit. Include the stable domain id itself; registry ids use `reg:<backend>`. |
+| `capacity_domains.<id>.max` | integer >= 1 | _(required)_ | Combined active-request limit. |
+| `capacity_domains.<id>.maxQueue` | integer >= 0 | _(required)_ | Combined FIFO waiting limit. `0` means fail fast, never unlimited. |
+| `capacity_domains.<id>.queueTimeoutMs` | integer >= 1 | _(required)_ | Maximum queue wait. Expiry returns retryable `503 queue_timeout`. |
+
+A full queue returns retryable `503 capacity_exceeded`; both rejection types
+include `Retry-After`. A queued client disconnect returns `499 client_closed`,
+is removed immediately, and never fails over. Capacity topology is constructed
+at process startup, so restart the gateway after changing this section.
+Configured domains appear in `GET /queue` with zero active/queued counters
+before first traffic; each domain contributes its capacity exactly once.
 
 ---
 
