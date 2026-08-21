@@ -16,7 +16,7 @@
  * nothing: it writes a skgateway.yaml, calls the production loadConfig(), and
  * asks _buildMatchCatalogForTests() (the exact function the live @match and
  * bucket paths call) what it sees. On the unfixed code that answer is the
- * discovery cache and only the discovery cache, so ornith-1.0-9b and every
+ * discovery cache and only the discovery cache, so ornith-1.5-9b and every
  * claude-* id are simply missing and every assertion below fails.
  *
  * Run with:  node --test --import ./tests/_setup.mjs tests/match-catalog-live-config.test.mjs
@@ -49,7 +49,7 @@ const CONFIG_YAML = [
   '    url: http://192.168.0.100:8082/v1',
   '    auth_type: none',
   '    priority: 1',
-  '    models: [ornith-tiny, ornith-1.0-9b, qwen3.6-27b-abliterated]',
+  '    models: [ornith-1.5-9b]',
   '  chiap08-qwen38:',
   '    url: http://100.81.238.58:11439/v1',
   '    auth_type: none',
@@ -101,9 +101,9 @@ describe('the live match catalog, built from the real loaded config', () => {
   test('serves-implies-matches: ornith at zone 0 and Claude at zone 1, both with a usable class', () => {
     const cat = byId(_buildMatchCatalogForTests());
 
-    assert.ok(cat['ornith-1.0-9b'], 'the sovereign model the fleet uses must be matchable');
-    assert.equal(cat['ornith-1.0-9b'].capabilities.trust_zone, TRUST_ZONES.SOVEREIGN_LOCAL);
-    assert.equal(cat['ornith-1.0-9b'].capabilities.size_class, 'M');
+    assert.ok(cat['ornith-1.5-9b'], 'the sovereign model the fleet uses must be matchable');
+    assert.equal(cat['ornith-1.5-9b'].capabilities.trust_zone, TRUST_ZONES.SOVEREIGN_LOCAL);
+    assert.equal(cat['ornith-1.5-9b'].capabilities.size_class, 'M');
 
     assert.ok(cat['claude-opus-4-8'], 'a served Claude model must be matchable');
     assert.equal(cat['claude-opus-4-8'].capabilities.trust_zone, TRUST_ZONES.PAID_CONTRACTUAL);

@@ -54,9 +54,7 @@ backends:
     url: http://192.168.0.100:8082/v1
     auth_type: none
     models:
-      - ornith-tiny              # canonical short label -> the 9B NVFP4+MTP on .100:8082 (pairs with ornith-big=35B)
-      - ornith-1.0-9b
-      - qwen3.6-27b-abliterated  # legacy alias -> same :8082 (ornith)
+      - ornith-1.5-9b            # exact llama-server alias on .100:8082
     priority: 1
 
   ## ornith-1.0-35b (Q4_K_M) — llama.cpp (llama-server :11436, sm120) on chiap08,
@@ -249,10 +247,9 @@ sanitizer:
 # Per-model context limits.  Formula: max_body_bytes = context_tokens * 4 bytes * 0.80
 # max_system_bytes = max_body_bytes * 0.40.  Values from NVIDIA NIM model cards (2026-05-12).
 model_limits:
-  ## 128K context (ornith-1.0-9b on .100:8082 — verified GPU max; 256K OOMs)
-  ornith-1.0-9b:                              { max_body_bytes: 419000,   max_system_bytes: 168000  }
-  ornith-tiny:                                { max_body_bytes: 419000,   max_system_bytes: 168000  }  # alias of ornith-1.0-9b (NVFP4+MTP)
-  qwen3.6-27b-abliterated:                    { max_body_bytes: 419000,   max_system_bytes: 168000  }
+  ## 32K live context (Ornith 1.5 Q6_K on .100:8082). Do not advertise the
+  ## model's larger training window: this deployment is intentionally n_ctx=32768.
+  ornith-1.5-9b:                              { max_body_bytes: 104857,   max_system_bytes: 41943   }
   ## 256K context (ornith-1.0-35b on Tyler's .150/.153:8087 — verified n_ctx=256000)
   ornith-1.0-35b:                             { max_body_bytes: 800000,   max_system_bytes: 320000  }
   ornith-big:                                 { max_body_bytes: 800000,   max_system_bytes: 320000  }  # alias of ornith-1.0-35b
