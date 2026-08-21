@@ -27,6 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Qualified and deployed three parallel Ornith slots on `.100`, each retaining
+  the full 65,536-token window (`--parallel 3 --ctx-size 196608`). Three-way
+  32K/48K concurrency, direct cancellation, and bounded restart gates passed;
+  a fourth slot is intentionally rejected for insufficient VRAM headroom.
 - Qualified Ornith 1.5 on node `.100` at a 65,536-token live context with
   successful 32K, 48K, and 60K prompt-generation gates and more than 6GB VRAM
   headroom; updated its card, sanitizer limits, launcher, and operator SOP.
