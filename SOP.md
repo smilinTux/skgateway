@@ -379,7 +379,8 @@ in-repo `config/skgateway.yaml` is the pre-migration fallback and is almost cert
 
 - `.100:8082` serves `ornith-1.5-9b` from
   `/mnt/comfyui/models/beellama/Ornith-1.5-9B-Q6_K.gguf`. The live process uses a
-  **32768-token context**; registry and gateway limits must not advertise 131072. Its
+  **65536-token context**, qualified at 32K/48K/60K prompt depths; registry and gateway
+  limits must not advertise the unqualified 262144 training window. Its
   GitHub-tracked launcher and unit are under `scripts/nodes/node100/`; install the unit
   to `~/.config/systemd/user/skai-beellama.service`, daemon-reload, and restart.
 - `sk-default` resolves through registry backend `ornith` to that alias. A successful
@@ -524,7 +525,7 @@ checks:
   - name: custom aliases are protected from foreign lifecycle verdicts
     run: grep -qF 'export function isEffectivelyRoutable' src/discovery/lifecycle.mjs && grep -qF 'export function declaredModelsElsewhere' src/discovery.mjs && test -f tests/model-claimer-lifecycle.test.mjs
   - name: node100 Ornith launcher is reproducible and advertises only the verified context
-    run: grep -qF -- '--alias ornith-1.5-9b' scripts/nodes/node100/run-ornith-1.5.sh && grep -qF -- '--ctx-size 32768' scripts/nodes/node100/run-ornith-1.5.sh && grep -qF 'scripts/nodes/node100/run-ornith-1.5.sh' scripts/nodes/node100/skai-beellama.service
+    run: grep -qF -- '--alias ornith-1.5-9b' scripts/nodes/node100/run-ornith-1.5.sh && grep -qF -- '--ctx-size 65536' scripts/nodes/node100/run-ornith-1.5.sh && grep -qF 'scripts/nodes/node100/run-ornith-1.5.sh' scripts/nodes/node100/skai-beellama.service
   - name: the stale hardcoded /status version documented in section 9 is still stale (fix it and update section 9)
     run: grep -qxF '      version: "0.1.0",' src/index.mjs
 -->

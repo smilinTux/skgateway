@@ -27,6 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Qualified Ornith 1.5 on node `.100` at a 65,536-token live context with
+  successful 32K, 48K, and 60K prompt-generation gates and more than 6GB VRAM
+  headroom; updated its card, sanitizer limits, launcher, and operator SOP.
 - Added a distinct `auto.context_role` for oversized conversations so context
   overflow can route to a long-context backend without changing ordinary hard
   prompt routing. This prevents 32K Ornith from receiving large Hermes DMs.
