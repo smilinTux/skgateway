@@ -15,7 +15,7 @@ import { createProxyServer, handleRequest, buildConfig } from "./proxy/core.mjs"
 import { createRouter, routeAndSend } from "./proxy/router.mjs";
 import { buildModelCatalog, reconcileModeFromConfig, tagLocalModels, mergeDiscoveredCatalog, isModelAvailable } from "./proxy/advertise.mjs";
 import { loadAllowlist, saveAllowlist, applyAllowlist } from "./advertise.mjs";
-import { discoverCatalog, loadCache, saveCache, fetchNvidia, fetchOpenRouter, fetchOpencode, catalogStatus, loadCardOverrides, applyCardOverlays, buildServingCatalog } from "./discovery.mjs";
+import { discoverCatalog, loadCache, saveCache, fetchNvidia, fetchOpenRouter, fetchOpencode, fetchAnthropicWrapper, catalogStatus, loadCardOverrides, applyCardOverlays, buildServingCatalog } from "./discovery.mjs";
 import { getPool, resetPool } from "./proxy/connection-pool.mjs";
 import { loadAgentRegistry, extractIdentity, normalizeAgentId, ANONYMOUS_AGENT_ID } from "./identity/capauth.mjs";
 import { createAuthzClient } from "./policy/authz_decide.mjs";
@@ -167,8 +167,13 @@ function providerBackend(provider, cfg) {
  * @param {(id: string) => object} [getLifecycleFn]
  * @returns {string[]}
  */
-export function filterRoutableModelIds(ids, getLifecycleFn = getLifecycle) {
-  return ids.filter((id) => isRoutable(getLifecycleFn(id)));
+export function filterRoutableModelIds(ids, getLifecycleFn = getLifecycle, claimers = []) {
+  return ids.filter((id) => {
+    const lifecycle = getLifecycleFn(id);
+    if (isRoutable(lifecycle)) return true;
+    if (lifecycle?.state === LIFECYCLE_STATES.NOT_CHAT || lifecycle?.provider == null) return false;
+    return isEffectivelyRoutable(lifecycle, claimers);
+  });
 }
 
 /**
@@ -206,12 +211,22 @@ export function registerDiscoveredRoutes(cfg, catalog, opts = {}) {
     if (!byProvider.has(be)) byProvider.set(be, new Set());
     byProvider.get(be).add(m.id);
   }
+  for (const [name, backendCfg] of Object.entries(cfg.backends || {})) {
+    const source = backendCfg?.discovery;
+    if (typeof source !== "string" || !byProvider.has(source) || name === source) continue;
+    byProvider.set(name, new Set(byProvider.get(source)));
+  }
   for (const [name, ids] of byProvider) {
     const backend = getBackend(name);
     if (!backend) continue; // provider not configured as a router backend, nothing to route to
-    const staticModels = (cfg.backends?.[name]?.models || []).filter((x) => typeof x === "string");
+    // For discovery-managed backends the configured list is a cold-start seed,
+    // not a permanent union. The first authoritative cycle replaces it so a
+    // retired model can actually leave routing.
+    const staticModels = cfg.backends?.[name]?.discovery
+      ? []
+      : (cfg.backends?.[name]?.models || []).filter((x) => typeof x === "string");
     const merged = [...new Set([...staticModels, ...ids])];
-    backend.models = filterRoutableModelIds(merged, getLifecycleFn);
+    backend.models = filterRoutableModelIds(merged, getLifecycleFn, [name]);
     // Lifecycle pruning can legitimately empty this list (every known id for
     // this provider is currently eol/dead). Backend#supportsModel() treats an
     // EMPTY models array as "wildcard match everything" UNLESS the backend is
@@ -540,6 +555,7 @@ export async function refreshCatalog(cfg, discoverCatalogFn = discoverCatalog) {
   // Built-but-unreachable is the failure mode this fleet keeps rediscovering,
   // so the wiring lands with the feature even when the feature ships off.
   const ocEnabled = d.providers?.opencode?.enabled === true;
+  const anthropicEnabled = d.providers?.anthropic?.enabled === true;
   const nvidiaKey = process.env[cfg.backends?.nvidia?.api_key_env || "NVIDIA_API_KEY"];
   const { models } = await discoverCatalogFn({
     localModels: localModels(cfg),
@@ -548,6 +564,12 @@ export async function refreshCatalog(cfg, discoverCatalogFn = discoverCatalog) {
     opencodeFetch: ocEnabled
       ? () => fetchOpencode(process.env[cfg.backends?.opencode?.api_key_env || "OPENCODE_API_KEY"])
       : async () => ({ zen: { data: [] }, modelsDev: null }),
+    anthropicFetch: anthropicEnabled
+      ? () => fetchAnthropicWrapper(
+          cfg.backends?.anthropic?.url,
+          process.env[cfg.backends?.anthropic?.api_key_env || "CCAPI_TOKEN"],
+        )
+      : null,
     cache: _discoveryCache,
     probeSeconds: d.probe_seconds || 0,
     probeBudget: d.probe_budget,

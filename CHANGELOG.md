@@ -27,6 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- SKGateway now consumes the authenticated `claude-code-api` model catalog as
+  an authoritative Anthropic discovery source. Newly available Claude IDs are
+  advertised and routable automatically, retired IDs accrue lifecycle absence,
+  and wrapper outages retain the last-good catalog.
+
 - Bound the direct `chiap08-qwen38` route and registry-backed `reg:qwen38`
   route to one explicit four-slot admission domain. The domain has a bounded
   four-request FIFO queue and a 30-second queue SLA; full and expired queues

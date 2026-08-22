@@ -402,6 +402,27 @@ describe("registerDiscoveredRoutes - only active|suspect ids written to Backend.
     // flag an all-eol provider would silently start accepting every model id.
     assert.ok(backends.openrouter.discovery, "must be flagged so empty models means 'nothing', not 'everything'");
   });
+
+  test("an authoritative catalog populates its primary and configured fallback", () => {
+    const backends = {
+      anthropic: { models: [], discovery: "anthropic" },
+      "anthropic-direct": { models: [], discovery: "anthropic" },
+    };
+    mod.registerDiscoveredRoutes(
+      { backends: {
+        anthropic: { discovery: "anthropic" },
+        "anthropic-direct": { discovery: "anthropic" },
+      } },
+      [{ id: "claude-new", provider: "anthropic" }],
+      {
+        getBackend: (name) => backends[name],
+        // A foreign provider's EOL verdict cannot suppress this claimer.
+        getLifecycleFn: () => ({ state: "eol", provider: "opencode" }),
+      },
+    );
+    assert.deepEqual(backends.anthropic.models, ["claude-new"]);
+    assert.deepEqual(backends["anthropic-direct"].models, ["claude-new"]);
+  });
 });
 
 // ── lifecycleCounts must not silently drop a disposition (card f9e8002b) ──

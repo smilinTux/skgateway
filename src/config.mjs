@@ -279,6 +279,7 @@ const DEFAULTS = {
     providers: {
       nvidia: { enabled: true, free_only: true, chat_only: true },
       openrouter: { enabled: true, free_only: true, chat_only: true },
+      anthropic: { enabled: false, free_only: false, chat_only: true },
     },
   },
 

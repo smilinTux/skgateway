@@ -353,6 +353,28 @@ After a wrapper outage, `/health` reflects the `anthropic` backend degrading to
 wrapper, then the `anthropic` backend recovers to `up` on the cooldown re-probe
 and reclaims priority automatically.
 
+### Dynamic Claude catalog and OAuth verification
+
+The `anthropic` and `anthropic-direct` backends are discovery-managed from the
+authenticated wrapper catalog. `discovery.providers.anthropic.enabled: true`
+causes SKGateway to call `claude-code-api /v1/models` with `CCAPI_TOKEN`; each
+successful cycle replaces both routing lists. New Claude IDs therefore appear
+without YAML edits, and IDs removed by Anthropic leave routing and progress
+through lifecycle absence. A wrapper failure preserves the cached last-good
+catalog and marks provider discovery stale.
+
+After Claude login/token rotation:
+
+1. Restart `claude-code-api` to clear any inherited OAuth environment override.
+2. Verify `/health` reports `model_discovery.ok=true` and `stale=false`.
+3. Call the wrapper `/v1/models` with its `CCAPI_TOKEN` and record only IDs,
+   never either token.
+4. Restart SKGateway (backend topology is not hot-reloaded), then invoke
+   `POST /admin/models/refresh`.
+5. Compare Claude IDs from wrapper `/v1/models`, gateway `/v1/models`, and both
+   live backend routing lists; then run one exact-response completion through
+   SKGateway and confirm `x-sk-backend: anthropic`.
+
 ### Client disconnect and model-slot release (card a4f1066d)
 
 SKGateway propagates a downstream socket close to the active upstream request.

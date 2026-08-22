@@ -164,14 +164,24 @@ backends:
     # raw OAuth token is treated by Anthropic as a third-party app that draws from
     # extra-usage (not the plan), which starves the subscription and 400s under
     # load. The wrapper IS Claude Code, so it uses the plan correctly.
-    # OpenAI-compatible → auth_type none (no Messages-API translation, no oauth).
+    # OpenAI-compatible wrapper; the shared secret is supplied from the
+    # service EnvironmentFile and never committed.
     url: http://127.0.0.1:18782/v1
-    auth_type: none
-    models:
-      - claude-opus-4-8
-      - claude-opus-4-7
-      - claude-sonnet-4-6
+    auth_type: api_key
+    api_key_env: CCAPI_TOKEN
+    discovery: anthropic
+    models: &claude_cold_start_models
+      - claude-fable-5
       - claude-haiku-4-5
+      - claude-haiku-4-5-20251001
+      - claude-opus-4-5-20251101
+      - claude-opus-4-6
+      - claude-opus-4-7
+      - claude-opus-4-8
+      - claude-opus-5
+      - claude-sonnet-4-5-20250929
+      - claude-sonnet-4-6
+      - claude-sonnet-5
     priority: 2
     # SPOF fail-fast: the wrapper is a single local service outside this repo.
     # If it wedges (accepts the socket but never replies) the request would hang
@@ -194,11 +204,8 @@ backends:
     url: https://api.anthropic.com/v1
     auth_type: oauth
     credentials_path: ~/.claude/.credentials.json
-    models:
-      - claude-opus-4-8
-      - claude-opus-4-7
-      - claude-sonnet-4-6
-      - claude-haiku-4-5
+    discovery: anthropic
+    models: *claude_cold_start_models
     priority: 8
     timeout_ms: 120000
 
@@ -379,5 +386,6 @@ discovery:
   enabled: true
   refresh_seconds: 3600
   providers:
+    anthropic:  { enabled: true, free_only: false, chat_only: true }
     nvidia:     { enabled: true, free_only: true, chat_only: true }
     openrouter: { enabled: true, free_only: true, chat_only: true }

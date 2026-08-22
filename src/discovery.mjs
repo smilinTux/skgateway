@@ -58,6 +58,7 @@ import {
 import * as nvidiaAdapter from './discovery/providers/nvidia.mjs';
 import * as openrouterAdapter from './discovery/providers/openrouter.mjs';
 import * as opencodeAdapter from './discovery/providers/opencode.mjs';
+import * as anthropicWrapperAdapter from './discovery/providers/anthropic-wrapper.mjs';
 import {
   probeModels,
   DEFAULT_PROBE_BUDGET,
@@ -388,9 +389,9 @@ export function applyCardOverlays(models, overrides) {
   return models.map((m) => applyCardOverlay(m, overrides));
 }
 
-export function mergeCatalog(local, nvidia, openrouter, opencode) {
+export function mergeCatalog(local, nvidia, openrouter, opencode, anthropic) {
   const seen = new Map();
-  for (const group of [local || [], nvidia || [], openrouter || [], opencode || []]) {
+  for (const group of [local || [], nvidia || [], openrouter || [], opencode || [], anthropic || []]) {
     for (const m of group) {
       if (!seen.has(m.id)) seen.set(m.id, m);
     }
@@ -617,6 +618,10 @@ export async function fetchOpencode(apiKey) {
   return opencodeAdapter.fetch(apiKey);
 }
 
+export async function fetchAnthropicWrapper(baseUrl, token) {
+  return anthropicWrapperAdapter.fetch(baseUrl, token);
+}
+
 /**
  * Record the outcome of one provider's fetch cycle onto the cache so the
  * freshness endpoint can report per-provider health (last success, last error,
@@ -704,6 +709,7 @@ export async function discoverCatalog(opts) {
     //      required like nvidiaFetch/openrouterFetch would flip `stale` to
     //      true on all of them.
     opencodeFetch = async () => ({ zen: { data: [] }, modelsDev: null }),
+    anthropicFetch = null,
     cache = {},
     now = Date.now,
     // Card P1.3: where the shared model lifecycle store (model_catalog_store.mjs)
@@ -778,9 +784,11 @@ export async function discoverCatalog(opts) {
   let nvidia = [];
   let openrouter = [];
   let opencode = [];
+  let anthropic = [];
   let nvidiaOk = false;
   let openrouterOk = false;
   let opencodeOk = false;
+  let anthropicOk = false;
   try {
     // Card P2.1: normalize() (not the legacy parseNvidia()) so the merged
     // catalog carries the full ModelCard, not just the id.
@@ -817,6 +825,17 @@ export async function discoverCatalog(opts) {
     stale = true;
     opencode = (cache.models || []).filter((m) => m.provider === 'opencode');
     recordProvider(cache, 'opencode', { ok: false, count: opencode.length, at, error: String(e?.message || e) });
+  }
+  if (typeof anthropicFetch === 'function') {
+    try {
+      anthropic = anthropicWrapperAdapter.normalize(await anthropicFetch());
+      anthropicOk = true;
+      recordProvider(cache, 'anthropic', { ok: true, count: anthropic.length, at });
+    } catch (e) {
+      stale = true;
+      anthropic = (cache.models || []).filter((m) => m.provider === 'anthropic');
+      recordProvider(cache, 'anthropic', { ok: false, count: anthropic.length, at, error: String(e?.message || e) });
+    }
   }
 
   // Catalog-absence tracking (card P1.3): only a REAL live fetch is evidence
@@ -859,7 +878,17 @@ export async function discoverCatalog(opts) {
         );
         updated = { ...updated, ...reconciled };
       }
-      if (nvidiaOk || openrouterOk || opencodeOk) saveLifecycleStore(updated, lifecycleStorePath);
+      if (anthropicOk) {
+        const reconciled = reconcilePresence(
+          sliceByProvider(fullStore, 'anthropic', declaredModels?.anthropic ?? declaredModelsFor('anthropic')),
+          anthropic.map((m) => m.id),
+          'anthropic',
+          at,
+          thresholds,
+        );
+        updated = { ...updated, ...reconciled };
+      }
+      if (nvidiaOk || openrouterOk || opencodeOk || anthropicOk) saveLifecycleStore(updated, lifecycleStorePath);
     } catch {
       // fail-soft, see doc comment above.
     }
@@ -909,7 +938,10 @@ export async function discoverCatalog(opts) {
   }
 
   const overrides = cardOverrides || loadCardOverrides(cardOverridesPath);
-  const models = applyCardOverlays(mergeCatalog(localModels, nvidia, openrouter, opencode), overrides).map((m) => ({ ...m, stale }));
+  const models = applyCardOverlays(
+    mergeCatalog(localModels, nvidia, openrouter, opencode, anthropic),
+    overrides,
+  ).map((m) => ({ ...m, stale }));
   cache.models = models;
   // Freshness observability: record when this discovery cycle completed. The
   // cycle is fail-soft (a throwing provider falls back to cache above and only
