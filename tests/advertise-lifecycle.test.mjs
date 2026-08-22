@@ -423,6 +423,21 @@ describe("registerDiscoveredRoutes - only active|suspect ids written to Backend.
     assert.deepEqual(backends.anthropic.models, ["claude-new"]);
     assert.deepEqual(backends["anthropic-direct"].models, ["claude-new"]);
   });
+
+  test("live discovery models replace cold-start seeds for advertisement", () => {
+    const configured = {
+      anthropic: { discovery: "anthropic", models: ["claude-live", "claude-retired"] },
+      local: { models: ["local-model"] },
+    };
+    const live = {
+      anthropic: { models: ["claude-live", "claude-new"] },
+    };
+    const effective = mod.effectiveAdvertiseBackends(configured, {
+      getBackend: (name) => live[name] || null,
+    });
+    assert.deepEqual(effective.anthropic.models, ["claude-live", "claude-new"]);
+    assert.deepEqual(effective.local.models, ["local-model"]);
+  });
 });
 
 // ── lifecycleCounts must not silently drop a disposition (card f9e8002b) ──

@@ -387,6 +387,18 @@ export function modelClaimersFor(backends = {}) {
   return (id) => map.get(id) || [];
 }
 
+/** Replace cold-start config seeds with live models on discovery-managed backends. */
+export function effectiveAdvertiseBackends(backends = {}, liveRouter = router) {
+  const out = {};
+  for (const [name, cfg] of Object.entries(backends || {})) {
+    const live = cfg?.discovery ? liveRouter?.getBackend?.(name) : null;
+    out[name] = live && Array.isArray(live.models)
+      ? { ...cfg, models: [...live.models] }
+      : cfg;
+  }
+  return out;
+}
+
 /**
  * Lifecycle state counts over a catalog (card P1.4, GET /admin/models/status).
  * Pure aside from the injected lookup, same reason as above.
@@ -1230,7 +1242,8 @@ export const server = http.createServer(async (req, res) => {
     // catalog it can assemble, never 500, never crash.
     try {
       const discovered = await getDiscoveredCatalog();
-      const reconciled = buildModelCatalog(config.backends || {}, router, advertiseReconcileMode);
+      const advertiseBackends = effectiveAdvertiseBackends(config.backends || {}, router);
+      const reconciled = buildModelCatalog(advertiseBackends, router, advertiseReconcileMode);
       // mergeDiscoveredCatalog() layers the discovered provider/free/stale tags
       // onto the reconciled health/status entries and GUARANTEES every model
       // carries a non-empty provider (see src/proxy/advertise.mjs). The
@@ -1251,19 +1264,20 @@ export const server = http.createServer(async (req, res) => {
       // Claimer-aware lifecycle view (incident inc-2026-08-18-qwen38-eol):
       // the advertised set honors the same claim-over-verdict rule as the
       // router's gate, so /v1/models and routability stay consistent.
-      const data = stripInternalCardFields(applyPickerBadges(applyLifecycleView(enriched, getLifecycle, modelClaimersFor(config.backends || {}))));
+      const data = stripInternalCardFields(applyPickerBadges(applyLifecycleView(enriched, getLifecycle, modelClaimersFor(advertiseBackends))));
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ object: "list", data }));
     } catch (e) {
       console.warn("[skgateway] /v1/models discovery merge failed, falling back to static catalog:", e.message);
-      const fallback = buildModelCatalog(config.backends || {}, router, advertiseReconcileMode);
+      const advertiseBackends = effectiveAdvertiseBackends(config.backends || {}, router);
+      const fallback = buildModelCatalog(advertiseBackends, router, advertiseReconcileMode);
       const allowlist = loadAllowlist();
       const allowed = applyAllowlist(fallback, allowlist);
       const aliases = allowAliases(aliasCatalogEntries(getConfig()), allowlist);
       const seenIds = new Set(allowed.map((m) => m.id));
       let data = [...allowed, ...aliases.filter((e) => !seenIds.has(e.id))];
       try {
-        data = stripInternalCardFields(applyPickerBadges(applyLifecycleView(data, getLifecycle, modelClaimersFor(config.backends || {}))));
+        data = stripInternalCardFields(applyPickerBadges(applyLifecycleView(data, getLifecycle, modelClaimersFor(advertiseBackends))));
       } catch (e2) {
         console.warn("[skgateway] /v1/models static catalog fallback also failed, serving empty list:", e2.message);
         data = [];
@@ -1292,7 +1306,7 @@ export const server = http.createServer(async (req, res) => {
     if (!id) { notFound(); return; }
     try {
       const discovered = await getDiscoveredCatalog();
-      const reconciled = buildModelCatalog(config.backends || {}, router, advertiseReconcileMode);
+      const reconciled = buildModelCatalog(effectiveAdvertiseBackends(config.backends || {}, router), router, advertiseReconcileMode);
       const merged = mergeDiscoveredCatalog(reconciled, discovered);
       const data = applyAllowlist(merged, loadAllowlist());
       const entry = data.find((m) => m.id === id);

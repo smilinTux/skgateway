@@ -31,6 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an authoritative Anthropic discovery source. Newly available Claude IDs are
   advertised and routable automatically, retired IDs accrue lifecycle absence,
   and wrapper outages retain the last-good catalog.
+  Cold-start YAML entries are replaced after a successful refresh and cannot
+  leak a retired alias back into the cache or `/v1/models`.
 
 - Bound the direct `chiap08-qwen38` route and registry-backed `reg:qwen38`
   route to one explicit four-slot admission domain. The domain has a bounded

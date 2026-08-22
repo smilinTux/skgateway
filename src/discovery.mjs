@@ -938,8 +938,14 @@ export async function discoverCatalog(opts) {
   }
 
   const overrides = cardOverrides || loadCardOverrides(cardOverridesPath);
+  // Static entries on the Anthropic backends are cold-start seeds only. Once
+  // the authenticated wrapper answered successfully, exclude those seeds so
+  // an absent/retired id cannot leak back into the cache through localModels.
+  const effectiveLocal = anthropicOk
+    ? localModels.filter((m) => m.provider !== 'anthropic' && m.provider !== 'anthropic-direct')
+    : localModels;
   const models = applyCardOverlays(
-    mergeCatalog(localModels, nvidia, openrouter, opencode, anthropic),
+    mergeCatalog(effectiveLocal, nvidia, openrouter, opencode, anthropic),
     overrides,
   ).map((m) => ({ ...m, stale }));
   cache.models = models;
