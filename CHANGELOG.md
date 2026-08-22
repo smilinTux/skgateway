@@ -20,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added `scripts/sync-pi-models.mjs` and `npm run sync:pi-models` to
+  synchronize Pi's `skgateway` provider from the live `/v1/models` catalog.
+  The tool includes bucket aliases, preserves unrelated Pi configuration,
+  refuses empty catalogs, supports dry-run, and writes atomically.
+
 - Added the GitHub-tracked `.100` Ornith 1.5 launcher and user unit, pinning the
   verified model alias, model path, port, 32768 context, CUDA settings, and
   restart backoff so the backend is reproducible by clone/pull rather than an

@@ -444,3 +444,19 @@ already contains upstream outages.
 | rotated key, still 401 | `SIGHUP` does not re-read EnvironmentFile | full restart |
 | service dies on logout / no boot start | lingering not enabled | `loginctl enable-linger $USER` |
 | CapAuth sigs never `verified` | `openpgp` not installed | `npm install openpgp`; restart |
+# Synchronize Pi models and buckets
+
+Pi keeps custom providers in `~/.pi/agent/models.json`; it does not dynamically
+consume OpenAI model catalogs. Synchronize its `skgateway` provider after a
+gateway discovery refresh or release:
+
+```bash
+npm run sync:pi-models -- --dry-run
+npm run sync:pi-models
+pi --list-models skgateway
+```
+
+Use `--gateway-url http://HOST:18780` and `--pi-models PATH` for another node.
+The command replaces only the `skgateway` provider, preserves every unrelated
+Pi provider and top-level setting, refuses empty catalogs, and uses an atomic
+rename. It never reads or copies gateway provider credentials.
