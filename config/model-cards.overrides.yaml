@@ -212,6 +212,125 @@ overrides:
     latency_class: interactive
     structured_outputs: true
 
+  # ──────────────── OPENAI CODEX FLEET (ChatGPT subscription, paid cloud) ───────
+  # Reached via the codex backend (chatgpt.com/backend-api/codex, OpenAI
+  # Responses API, auth_type codex_oauth against a synced Codex CLI auth.json;
+  # see src/proxy/codex-adapter.mjs). First-party SUBSCRIPTION usage: inference
+  # draws down a ChatGPT plan quota (Pro / ProLite), never a per-token API bill.
+  # Catalog facts (context 272K, reasoning levels, input modalities) are the
+  # backend's own /models declaration via the codex discovery provider; these
+  # entries add the curated fields that provider cannot declare.
+  #
+  # size_class is CURATED on capability-floor evidence, same call as the Claude
+  # entries above: parameter counts are unpublished, so the class follows the
+  # provider's own priority ordering (its /models `priority` field: sol 1,
+  # terra 2, luna 3, gpt-5.5 7, gpt-5.4 16, gpt-5.4-mini 23) plus frontier
+  # family membership. Without an entry here a discovered codex model arrives
+  # with size_class null, clears only floor S, and is silently ineligible for
+  # every bucket above S.
+  #
+  # TRUST: ChatGPT consumer-plan terms are NOT contractual-zero retention
+  # (training can be excluded per-account with data controls, but the default
+  # posture is not a zero-retention contract like Anthropic's commercial terms).
+  # The providers.codex entry below therefore records `trains`, which derives
+  # trust zone 2: codex models join sk-*-public buckets only, never internal
+  # or secret. That is the honest boundary for a consumer subscription and it
+  # matches the fleet rule that protected matter content never leaves the local
+  # stack through this route.
+  gpt-5.6-sol:
+    display_name: "GPT-5.6 Sol"
+    org: OpenAI
+    summary: "Subscription frontier agentic-coding model. Top of the Codex catalog."
+    good_at: [agentic coding, tool use, long-context synthesis, reasoning]
+    context_length: 272000
+    max_output_tokens: null
+    supported_parameters: [tools, tool_choice, reasoning]
+    modality: "text+image->text"
+    tier: paid-cloud
+    speed: "fast; priority service tier available (1.5x, higher quota draw)"
+    license: proprietary
+    size_class: XL
+    latency_class: interactive
+    reasoning: true
+    structured_outputs: false
+    notes: "Efforts low..ultra. Unsupported by the backend (400): temperature, stop, max_output_tokens; the codex-adapter drops them. Priority order 1 of 8 in the provider catalog."
+
+  gpt-5.6-terra:
+    display_name: "GPT-5.6 Terra"
+    org: OpenAI
+    summary: "Second-priority GPT-5.6 variant on the Codex subscription."
+    good_at: [agentic coding, tool use, reasoning]
+    context_length: 272000
+    supported_parameters: [tools, tool_choice, reasoning]
+    modality: "text+image->text"
+    tier: paid-cloud
+    size_class: XL
+    latency_class: interactive
+    reasoning: true
+    structured_outputs: false
+    notes: "Priority order 2 of 8 in the provider catalog. Same wire contract as gpt-5.6-sol."
+
+  gpt-5.6-luna:
+    display_name: "GPT-5.6 Luna"
+    org: OpenAI
+    summary: "Third GPT-5.6 variant, lighter reasoning ladder (no ultra effort)."
+    good_at: [coding, tool use, everyday reasoning]
+    context_length: 272000
+    supported_parameters: [tools, tool_choice, reasoning]
+    modality: "text+image->text"
+    tier: paid-cloud
+    size_class: L
+    latency_class: interactive
+    reasoning: true
+    structured_outputs: false
+    notes: "Priority order 3 of 8. Curated L, not XL: no ultra effort tier declared."
+
+  gpt-5.5:
+    display_name: "GPT-5.5"
+    org: OpenAI
+    summary: "Previous-generation frontier on the Codex subscription."
+    good_at: [coding, tool use, general reasoning]
+    context_length: 272000
+    supported_parameters: [tools, tool_choice, reasoning]
+    modality: "text+image->text"
+    tier: paid-cloud
+    size_class: XL
+    latency_class: interactive
+    reasoning: true
+    structured_outputs: false
+    notes: "Priority order 7 of 8."
+
+  gpt-5.4:
+    display_name: "GPT-5.4"
+    org: OpenAI
+    summary: "Mature GPT-5.4 tier on the Codex subscription."
+    good_at: [coding, tool use]
+    context_length: 272000
+    supported_parameters: [tools, tool_choice, reasoning]
+    modality: "text+image->text"
+    tier: paid-cloud
+    size_class: L
+    latency_class: interactive
+    reasoning: true
+    structured_outputs: false
+    notes: "Priority order 16 in the provider catalog. Efforts low..high."
+
+  gpt-5.4-mini:
+    display_name: "GPT-5.4 Mini"
+    org: OpenAI
+    summary: "Small fast member of the Codex subscription family."
+    good_at: [short tasks, classification, quick tool use]
+    context_length: 272000
+    supported_parameters: [tools, tool_choice, reasoning]
+    modality: "text+image->text"
+    tier: paid-cloud
+    speed: "very fast"
+    size_class: M
+    latency_class: interactive
+    reasoning: true
+    structured_outputs: false
+    notes: "Priority order 23. No priority service tier declared."
+
   # ──────────────────────── OUR ORNITH FLEET (local, sovereign) ───────────────
   # DeepReinforce Ornith 1.0, self-hosted on our own GPUs. Cloud-free, private.
   # Tool use PROVEN end-to-end through the gateway (Bash tool round-trip, after
@@ -568,3 +687,21 @@ providers:
     data_retention: trains
     verified: "2026-08-15"
     ref: "https://opencode.ai/docs/zen (free-tier models: 'collected data may be used to improve the model')"
+
+  # OpenAI Codex backend (ChatGPT subscription inference, backend key
+  # "codex", auth_type codex_oauth). Recorded `trains` as the fail-safe
+  # reading, NOT because training on this traffic was positively confirmed:
+  # the ChatGPT consumer terms condition any no-training posture on the
+  # account's data controls, which is a per-account setting this gateway
+  # cannot verify from the credentials file, and a paid subscription is not
+  # a zero-retention contract. Anything stricter than zone 2 would require
+  # dated evidence of contractual-zero retention that does not exist for
+  # consumer ChatGPT plans. Consequence: codex models derive trust zone 2 and
+  # are eligible only for `public` sensitivity buckets. Revisit ONLY with a
+  # dated verification of the account's data-controls posture and the exact
+  # terms revision; an undated claim here is worthless in six months, same
+  # rule as every other entry in this block.
+  codex:
+    data_retention: trains
+    verified: "2026-08-22"
+    ref: "https://help.openai.com/en/articles/5729567-how-your-data-is-used (ChatGPT consumer plans: training exclusion is conditional on per-account data controls, not contractual)"
