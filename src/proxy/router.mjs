@@ -20,9 +20,16 @@ import fs from "node:fs";
 import path from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
+import { statSync } from "node:fs";
 import { sendUpstream } from "./upstream.mjs";
 import { createEvent } from "../siem/events.mjs";
 import { isAnthropicBackend, toAnthropicRequest, toOpenAIResponse } from "./anthropic-adapter.mjs";
+import {
+  isCodexBackend,
+  toCodexRequest,
+  fromCodexResponse,
+  readCodexAuthHeaders,
+} from "./codex-adapter.mjs";
 import { getPool, PoolAdmissionError } from "./connection-pool.mjs";
 import { isRegistryRouted, resolve as resolveRegistry, getAutoConfig, getConfigEpoch, loadRegistry } from "./registry.mjs";
 import { getFailoverConfig, isLocalUrl, probeLocalHealth, recordLocalOutcome } from "./local-failover.mjs";
@@ -640,10 +647,24 @@ export class Backend {
       ? config.quarantine_cooldown_ms
       : DEFAULT_QUARANTINE_COOLDOWN_MS;
 
-    // Auth credentials
+    // Auth credentials. credentials_path (the key the YAML schema and
+    // config/skgateway.yaml.example document, and what the live config uses
+    // for anthropic-direct) is accepted here alongside credentials_file.
+    // Before this the Backend only read credentials_file, so a backend
+    // declared with credentials_path silently behaved like auth_type none
+    // with a warning. Found while adding the codex_oauth backend (which uses
+    // credentials_path); this also repairs that latent gap for OAuth
+    // backends declared with the path form.
     this._api_key = config.api_key || null;
     this._api_key_env = config.api_key_env || null;
-    this._credentials_file = config.credentials_file || null;
+    this._credentials_file = config.credentials_file || config.credentials_path || null;
+    // Codex auth (auth_type codex_oauth): read-only view of the Codex CLI
+    // credentials file, re-read when its mtime changes so a token file
+    // synced from the login host takes effect without a restart. NEVER
+    // refreshed (single-use refresh token; see codex-adapter.mjs).
+    this._codexAuth = null;
+    this._codexAuthMtime = -1;
+    this._codexAuthPath = this._credentials_file;
 
     // Agent-level restrictions — set of agent IDs allowed to use this backend.
     // Empty set = no restrictions.
@@ -942,6 +963,26 @@ export class Backend {
         return { authorization: `Bearer ${token}` };
       }
 
+      case "codex_oauth": {
+        // OpenAI Codex subscription auth (see codex-adapter.mjs): a bearer
+        // access token PLUS the chatgpt-account-id header, read from the
+        // Codex CLI auth.json. Read-only: the refresh token is single-use and
+        // owned by the Codex CLI login on its host, so this gateway never
+        // refreshes and never writes the file (a second refresher would
+        // invalidate the CLI's next refresh and kill the login). A stale
+        // token 401s, the router counts the failure, failover covers it.
+        const headers = this._getCodexAuthHeaders();
+        if (!headers) {
+          console.warn(
+            `[router] backend=${this.id} codex_oauth auth but no usable credentials at ` +
+              `${this._codexAuthPath || "(no credentials_path/file set)"}. ` +
+              `Sending UNAUTHENTICATED (expect 401). Sync a fresh Codex CLI auth.json there.`,
+          );
+          return {};
+        }
+        return headers;
+      }
+
       case "none":
       default:
         return {};
@@ -985,6 +1026,40 @@ export class Backend {
         );
         this._status = "up";
       }
+    }
+  }
+
+  /**
+   * Return the Codex subscription auth headers, re-reading the credentials
+   * file when its mtime changed (tokens are refreshed externally by the
+   * owning Codex CLI and synced here; see the codex_oauth case in
+   * buildAuthHeaders). Cached in memory between requests. Never throws,
+   * never writes, never refreshes.
+   *
+   * @returns {Record<string, string>|null}
+   */
+  _getCodexAuthHeaders() {
+    if (!this._codexAuthPath) return null;
+    try {
+      const filePath = this._codexAuthPath.replace(/^~/, process.env.HOME || "");
+      const mtime = statSync(filePath).mtimeMs;
+      if (!this._codexAuth || mtime !== this._codexAuthMtime) {
+        const headers = readCodexAuthHeaders(filePath);
+        if (!headers) {
+          console.warn(
+            `[router] backend=${this.id} codex credentials file has no access token: ${filePath}`,
+          );
+          return null;
+        }
+        this._codexAuth = headers;
+        this._codexAuthMtime = mtime;
+      }
+      return this._codexAuth;
+    } catch (err) {
+      console.error(
+        `[router] backend=${this.id} failed to load codex credentials ${this._codexAuthPath}: ${err.message}`,
+      );
+      return null;
     }
   }
 
@@ -2421,18 +2496,53 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           console.warn("[router] registry resolved to anthropic but no anthropic backend configured");
         }
       } else {
-        // External llama backend (ornith .100:8082 / qwen-vl chiap08:11436, …).
-        // Kept in an ISOLATED pool so it never joins normal model-name routing
-        // (would otherwise shadow concrete-model backends via wildcard match).
-        const b = getRegBackend("reg:" + reg.backend, reg.url);
-        const localCandidate = {
-          backendId: b.id,
-          backendUrl: b.url,
-          authHeaders: {},
-          backend: b,
-          localUrl: reg.url, // tag: record the health outcome of this attempt
-          model: reg.model, // tag: model-granular throttle cooldown keying (card 9e28de88)
-        };
+        // External backend (ornith .100:8082 / qwen38 chiap08:11439 / a
+        // remote provider). Kept in an ISOLATED pool so it never joins normal
+        // model-name routing (would otherwise shadow concrete-model backends
+        // via wildcard match).
+        //
+        // AUTH (codex support): this path used to hardcode `authHeaders: {}`
+        // because every registry target was a local unauthenticated llama.cpp
+        // box. A role can now point at an AUTHENTICATED remote backend (the
+        // codex subscription backend, auth_type codex_oauth): when the
+        // registry url matches a CONFIGURED backend, route through that
+        // backend so its buildAuthHeaders() applies and health/pooling state
+        // is shared (a reg: synthetic pool with empty auth would send the
+        // request unauthenticated and 401, measured live on chiap01). The
+        // synthetic isolated pool remains for urls the config does not
+        // declare, byte-identical to the old behavior.
+        const regUrl = String(reg.url || "").replace(/\/$/, "");
+        const configured = (typeof router.getBackends === "function"
+          ? [...router.getBackends().values()]
+          : []
+        ).find((b) => b && b.url === regUrl);
+        let localCandidate;
+        let regBackendInstance = null; // the attempt backend, for the failover timeout below
+        if (configured) {
+          regBackendInstance = configured;
+          localCandidate = {
+            backendId: configured.id,
+            backendUrl: configured.url,
+            authHeaders: await configured.buildAuthHeaders(),
+            backend: configured,
+            model: reg.model,
+            // Feed the local-health verdict map exactly like the synthetic
+            // branch below, but only when the target really is local (a
+            // remote configured backend must not poison the liveness map).
+            ...(isLocalUrl(reg.url) ? { localUrl: reg.url } : {}),
+          };
+        } else {
+          const b = getRegBackend("reg:" + reg.backend, reg.url);
+          regBackendInstance = b;
+          localCandidate = {
+            backendId: b.id,
+            backendUrl: b.url,
+            authHeaders: {},
+            backend: b,
+            localUrl: reg.url, // tag: record the health outcome of this attempt
+            model: reg.model, // tag: model-granular throttle cooldown keying (card 9e28de88)
+          };
+        }
         candidates = [localCandidate];
 
         // ── Health-aware, sovereign-first local failover ──
@@ -2479,8 +2589,9 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         if (fb) {
           // Bound the local completion so a wedged upstream (accepts the socket,
           // never replies) 504s and the candidate loop fails over, instead of
-          // hanging. Idempotent on the shared reg backend instance.
-          b.timeout_ms = fc.completionTimeoutMs;
+          // hanging. Idempotent on the shared backend instance (configured or
+          // synthetic reg: pool member).
+          regBackendInstance.timeout_ms = fc.completionTimeoutMs;
           const fallbackCandidate = {
             backendId: fb.id,
             backendUrl: fb.url,
@@ -2882,6 +2993,27 @@ export async function routeAndSend(router, request, upstreamPath, method, client
             }
             res = toOpenAIResponse(raw, request.model);
           }
+        } else {
+          res = await sendUpstream(upstreamPath, method, forwardHeaders, attemptBody, targetUrl, backend.timeout_ms, abortSignal);
+        }
+      } else if (isCodexBackend(backend)) {
+        // Translate OpenAI chat-completions -> Codex Responses API (OpenAI
+        // *subscription* inference; see codex-adapter.mjs). Same contract as
+        // the Anthropic branch above: a translatable body is converted and the
+        // buffered upstream SSE answer converted back (to SSE for the client
+        // when the client asked stream:true); anything else passes through.
+        const tr = toCodexRequest(attemptBody);
+        if (tr) {
+          if (tr.dropped.length) {
+            console.warn(
+              `[router] codex ${backendId}: dropped unsupported params [${tr.dropped.join(",")}] ` +
+                `for model=${candidateModel}`,
+            );
+          }
+          const cHeaders = { ...forwardHeaders, ...tr.headers };
+          delete cHeaders["content-length"];
+          const raw = await sendUpstream(tr.path, method, cHeaders, tr.body, targetUrl, backend.timeout_ms, abortSignal);
+          res = raw?.cancelled ? raw : fromCodexResponse(raw, candidateModel, tr.clientStream);
         } else {
           res = await sendUpstream(upstreamPath, method, forwardHeaders, attemptBody, targetUrl, backend.timeout_ms, abortSignal);
         }

@@ -15,7 +15,7 @@ import { createProxyServer, handleRequest, buildConfig } from "./proxy/core.mjs"
 import { createRouter, routeAndSend } from "./proxy/router.mjs";
 import { buildModelCatalog, reconcileModeFromConfig, tagLocalModels, mergeDiscoveredCatalog, isModelAvailable } from "./proxy/advertise.mjs";
 import { loadAllowlist, saveAllowlist, applyAllowlist } from "./advertise.mjs";
-import { discoverCatalog, loadCache, saveCache, fetchNvidia, fetchOpenRouter, fetchOpencode, fetchAnthropicWrapper, catalogStatus, loadCardOverrides, applyCardOverlays, buildServingCatalog } from "./discovery.mjs";
+import { discoverCatalog, loadCache, saveCache, fetchNvidia, fetchOpenRouter, fetchOpencode, fetchAnthropicWrapper, fetchCodex, catalogStatus, loadCardOverrides, applyCardOverlays, buildServingCatalog } from "./discovery.mjs";
 import { getPool, resetPool } from "./proxy/connection-pool.mjs";
 import { loadAgentRegistry, extractIdentity, normalizeAgentId, ANONYMOUS_AGENT_ID } from "./identity/capauth.mjs";
 import { createAuthzClient } from "./policy/authz_decide.mjs";
@@ -25,6 +25,7 @@ import { isInternalRemote } from "./policy/net_trust.mjs";
 import { classifyRequest, toSiemEvent } from "./classifiers/engine.mjs";
 import { handleModuleManifest } from "./operator/manifest.mjs";
 import { fromAnthropicRequest, toAnthropicMessage, modelRetrieveObject } from "./proxy/anthropic-frontend.mjs";
+import { readCodexAuthHeaders } from "./proxy/codex-adapter.mjs";
 import { SSEWriter, jsonToSSE } from "./proxy/stream.mjs";
 import { getLifecycle } from "./discovery/model_catalog_store.mjs";
 import { isRoutable, isEffectivelyRoutable, LIFECYCLE_STATES } from "./discovery/lifecycle.mjs";
@@ -568,6 +569,12 @@ export async function refreshCatalog(cfg, discoverCatalogFn = discoverCatalog) {
   // so the wiring lands with the feature even when the feature ships off.
   const ocEnabled = d.providers?.opencode?.enabled === true;
   const anthropicEnabled = d.providers?.anthropic?.enabled === true;
+  // Codex (OpenAI subscription backend): same opt-in rule as opencode above
+  // (=== true, not !== false). The fetch needs the codex backend's Codex CLI
+  // credentials (bearer + chatgpt-account-id), built from its credentials_path
+  // via readCodexAuthHeaders() (read-only, never refreshed).
+  const cxEnabled = d.providers?.codex?.enabled === true;
+  const codexCreds = cfg.backends?.codex?.credentials_path || cfg.backends?.codex?.credentials_file;
   const nvidiaKey = process.env[cfg.backends?.nvidia?.api_key_env || "NVIDIA_API_KEY"];
   const { models } = await discoverCatalogFn({
     localModels: localModels(cfg),
@@ -582,6 +589,9 @@ export async function refreshCatalog(cfg, discoverCatalogFn = discoverCatalog) {
           process.env[cfg.backends?.anthropic?.api_key_env || "CCAPI_TOKEN"],
         )
       : null,
+    codexFetch: cxEnabled
+      ? () => fetchCodex(readCodexAuthHeaders(codexCreds))
+      : async () => ({ models: [] }),
     cache: _discoveryCache,
     probeSeconds: d.probe_seconds || 0,
     probeBudget: d.probe_budget,

@@ -520,7 +520,7 @@ function applyElasticsearchEnv(cfg, e) {
 
 // ─── validation ───────────────────────────────────────────────────────────────
 
-const VALID_AUTH_TYPES = new Set(['api_key', 'oauth', 'bearer', 'none']);
+const VALID_AUTH_TYPES = new Set(['api_key', 'oauth', 'bearer', 'none', 'codex_oauth']);
 
 /**
  * Test whether a model id matches a backend `models` pattern. Patterns may use
@@ -546,6 +546,8 @@ function modelMatchesPattern(pattern, model) {
  *
  *   1. auth completeness: a backend whose route can never authenticate is dead.
  *        oauth            requires credentials_path / credentials_file
+ *        codex_oauth      requires credentials_path / credentials_file
+ *                         (a Codex CLI auth.json; read-only, never refreshed)
  *        api_key | bearer requires api_key or api_key_env
  *   2. pooling.per_backend: every per-backend concurrency limit must name a
  *      declared backend (a limit on a nonexistent provider is dead config).
@@ -583,6 +585,9 @@ export function assertProviderRoutes(cfg, errs = [], registryPath = undefined) {
     const auth = backend.auth_type;
     if (auth === 'oauth' && !backend.credentials_path && !backend.credentials_file) {
       errs.push(`backends.${name}.auth_type is "oauth" but no credentials_path/credentials_file is set`);
+    }
+    if (auth === 'codex_oauth' && !backend.credentials_path && !backend.credentials_file) {
+      errs.push(`backends.${name}.auth_type is "codex_oauth" but no credentials_path/credentials_file is set`);
     }
     if ((auth === 'api_key' || auth === 'bearer') && !backend.api_key && !backend.api_key_env) {
       errs.push(`backends.${name}.auth_type is "${auth}" but neither api_key nor api_key_env is set`);

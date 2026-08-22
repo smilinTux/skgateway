@@ -59,6 +59,7 @@ import * as nvidiaAdapter from './discovery/providers/nvidia.mjs';
 import * as openrouterAdapter from './discovery/providers/openrouter.mjs';
 import * as opencodeAdapter from './discovery/providers/opencode.mjs';
 import * as anthropicWrapperAdapter from './discovery/providers/anthropic-wrapper.mjs';
+import * as codexAdapter from './discovery/providers/codex.mjs';
 import {
   probeModels,
   DEFAULT_PROBE_BUDGET,
@@ -72,6 +73,7 @@ import { getConfig } from './config.mjs';
 // Reused rather than re-derived so servingConfigModels() and
 // advertise.mjs's tagLocalModels() can never disagree about which ids are paid.
 import { isAnthropicBackend, isAnthropicModelId } from './proxy/anthropic-adapter.mjs';
+import { isCodexBackend } from './proxy/codex-adapter.mjs';
 
 /**
  * The real, per-node discovery cache path, ignoring any env override. Kept
@@ -389,9 +391,9 @@ export function applyCardOverlays(models, overrides) {
   return models.map((m) => applyCardOverlay(m, overrides));
 }
 
-export function mergeCatalog(local, nvidia, openrouter, opencode, anthropic) {
+export function mergeCatalog(local, nvidia, openrouter, opencode, anthropic, codex) {
   const seen = new Map();
-  for (const group of [local || [], nvidia || [], openrouter || [], opencode || [], anthropic || []]) {
+  for (const group of [local || [], nvidia || [], openrouter || [], opencode || [], anthropic || [], codex || []]) {
     for (const m of group) {
       if (!seen.has(m.id)) seen.set(m.id, m);
     }
@@ -463,7 +465,7 @@ export function servingConfigModels(backends = {}) {
   const out = [];
   if (!backends || typeof backends !== 'object') return out;
   for (const [name, b] of Object.entries(backends)) {
-    const paidBackend = isAnthropicBackend(b);
+    const paidBackend = isAnthropicBackend(b) || isCodexBackend(b);
     for (const id of (b && b.models) || []) {
       if (typeof id !== 'string' || id.includes('*')) continue;
       const paid = paidBackend || isAnthropicModelId(id);
@@ -622,6 +624,15 @@ export async function fetchAnthropicWrapper(baseUrl, token) {
   return anthropicWrapperAdapter.fetch(baseUrl, token);
 }
 
+// Codex (OpenAI ChatGPT subscription backend): named export matching the
+// pattern above. refreshCatalog() in src/index.mjs passes this through when
+// `discovery.providers.codex.enabled === true` (opt-in, same rule as
+// opencode), building the auth headers from the codex backend's credentials
+// file via readCodexAuthHeaders().
+export async function fetchCodex(authHeaders) {
+  return codexAdapter.fetch(authHeaders);
+}
+
 /**
  * Record the outcome of one provider's fetch cycle onto the cache so the
  * freshness endpoint can report per-provider health (last success, last error,
@@ -710,6 +721,11 @@ export async function discoverCatalog(opts) {
     //      true on all of them.
     opencodeFetch = async () => ({ zen: { data: [] }, modelsDev: null }),
     anthropicFetch = null,
+    // Codex (OpenAI subscription): defaults like opencodeFetch above to a
+    // successful empty cycle, for the same two reasons (production sites that
+    // have not enabled the provider must see "not configured", not
+    // "outage"; pre-existing tests must not flip stale).
+    codexFetch = async () => ({ models: [] }),
     cache = {},
     now = Date.now,
     // Card P1.3: where the shared model lifecycle store (model_catalog_store.mjs)
@@ -785,10 +801,12 @@ export async function discoverCatalog(opts) {
   let openrouter = [];
   let opencode = [];
   let anthropic = [];
+  let codex = [];
   let nvidiaOk = false;
   let openrouterOk = false;
   let opencodeOk = false;
   let anthropicOk = false;
+  let codexOk = false;
   try {
     // Card P2.1: normalize() (not the legacy parseNvidia()) so the merged
     // catalog carries the full ModelCard, not just the id.
@@ -836,6 +854,18 @@ export async function discoverCatalog(opts) {
       anthropic = (cache.models || []).filter((m) => m.provider === 'anthropic');
       recordProvider(cache, 'anthropic', { ok: false, count: anthropic.length, at, error: String(e?.message || e) });
     }
+  }
+  try {
+    // Codex: a throw means the subscription backend or its credentials are
+    // unavailable this cycle (fail-soft to cache, never an outage of the
+    // other providers; see the opencode catch above for the same contract).
+    codex = codexAdapter.normalize(await codexFetch(), { now: () => at });
+    codexOk = true;
+    recordProvider(cache, 'codex', { ok: true, count: codex.length, at });
+  } catch (e) {
+    stale = true;
+    codex = (cache.models || []).filter((m) => m.provider === 'codex');
+    recordProvider(cache, 'codex', { ok: false, count: codex.length, at, error: String(e?.message || e) });
   }
 
   // Catalog-absence tracking (card P1.3): only a REAL live fetch is evidence
@@ -888,7 +918,17 @@ export async function discoverCatalog(opts) {
         );
         updated = { ...updated, ...reconciled };
       }
-      if (nvidiaOk || openrouterOk || opencodeOk || anthropicOk) saveLifecycleStore(updated, lifecycleStorePath);
+      if (codexOk) {
+        const reconciled = reconcilePresence(
+          sliceByProvider(fullStore, 'codex', declaredModels?.codex ?? declaredModelsFor('codex')),
+          codex.map((m) => m.id),
+          'codex',
+          at,
+          thresholds,
+        );
+        updated = { ...updated, ...reconciled };
+      }
+      if (nvidiaOk || openrouterOk || opencodeOk || anthropicOk || codexOk) saveLifecycleStore(updated, lifecycleStorePath);
     } catch {
       // fail-soft, see doc comment above.
     }
@@ -941,11 +981,13 @@ export async function discoverCatalog(opts) {
   // Static entries on the Anthropic backends are cold-start seeds only. Once
   // the authenticated wrapper answered successfully, exclude those seeds so
   // an absent/retired id cannot leak back into the cache through localModels.
+  // (Codex keeps the union: its serving-config declaration is the
+  // declared-but-undiscovered safety net, same as nvidia's nine declared ids.)
   const effectiveLocal = anthropicOk
     ? localModels.filter((m) => m.provider !== 'anthropic' && m.provider !== 'anthropic-direct')
     : localModels;
   const models = applyCardOverlays(
-    mergeCatalog(effectiveLocal, nvidia, openrouter, opencode, anthropic),
+    mergeCatalog(effectiveLocal, nvidia, openrouter, opencode, anthropic, codex),
     overrides,
   ).map((m) => ({ ...m, stale }));
   cache.models = models;

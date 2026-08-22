@@ -27,6 +27,7 @@
  */
 
 import { isAnthropicBackend, isAnthropicModelId } from "./anthropic-adapter.mjs";
+import { isCodexBackend } from "./codex-adapter.mjs";
 
 /** Valid reconcile modes. */
 export const RECONCILE_MODES = new Set(["flag", "hide", "off"]);
@@ -110,7 +111,8 @@ export function isModelAvailable(model, router) {
  *
  * `provider` is the OWNING backend name (never a blanket "local"). `free` is
  * decided per model, not by a blanket default:
- *   - a paid cloud backend (isAnthropicBackend: oauth or api.anthropic.com), OR
+ *   - a paid cloud backend (isAnthropicBackend: oauth or api.anthropic.com;
+ *     isCodexBackend: the ChatGPT-subscription Codex backend), OR
  *   - a paid model family by id (isAnthropicModelId: claude-*), even when the
  *     serving backend is the OpenAI-compatible local Claude wrapper that
  *     isAnthropicBackend() does not flag,
@@ -124,7 +126,7 @@ export function tagLocalModels(backends = {}) {
   const out = [];
   for (const [name, b] of Object.entries(backends || {})) {
     if (name === "nvidia" || name === "openrouter") continue;
-    const paidBackend = isAnthropicBackend(b);
+    const paidBackend = isAnthropicBackend(b) || isCodexBackend(b);
     for (const id of (b?.models || [])) {
       if (typeof id === "string" && !id.includes("*")) {
         const paid = paidBackend || isAnthropicModelId(id);
