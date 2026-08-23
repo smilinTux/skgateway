@@ -84,6 +84,32 @@ describe("SKLegal systemd credential-file source", () => {
     value.fill(0);
   });
 
+  test("accepts every visible 7-bit ASCII boundary byte before decoding", () => {
+    const visible = Buffer.from(Array.from({ length: 0x7e - 0x21 + 1 }, (_, index) => 0x21 + index));
+    const path = credential(visible);
+    const value = readSkLegalServiceCredential(path);
+    assert.deepEqual(value, visible);
+    value.fill(0);
+  });
+
+  test("rejects every control and high-bit byte before PDP transport", async () => {
+    const path = credential();
+    let calls = 0;
+    const strict = client(path, async () => { calls++; });
+    const invalidBytes = [
+      ...Array.from({ length: 0x21 }, (_, byte) => byte),
+      ...Array.from({ length: 0x100 - 0x7f }, (_, index) => 0x7f + index),
+    ];
+    for (const byte of invalidBytes) {
+      writeFileSync(path, Buffer.from([0x41, byte, 0x42]), { mode: 0o600 });
+      chmodSync(path, 0o600);
+      const decision = await strict.decideSkLegal(REQUEST);
+      assert.equal(decision.allow, false, `byte 0x${byte.toString(16).padStart(2, "0")} must deny`);
+      assert.equal(decision.reason, "authz_decide fail-closed: authorization backend unavailable");
+    }
+    assert.equal(calls, 0);
+  });
+
   test("sends the file credential only to the local PDP and keeps request CapAuth separate", async () => {
     const path = credential();
     const calls = [];

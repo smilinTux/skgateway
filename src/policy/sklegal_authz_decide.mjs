@@ -167,10 +167,7 @@ export function readSkLegalServiceCredential(file, opts = {}) {
       || after.size !== opened.size
       || after.mtimeNs !== opened.mtimeNs
       || credential.length !== Number(opened.size)
-      || credential.includes(0)
-      || credential.includes(10)
-      || credential.includes(13)
-      || !/^[\x21-\x7e]+$/.test(credential.toString("ascii"))
+      || credential.some((byte) => byte < 0x21 || byte > 0x7e)
     ) {
       credential.fill(0);
       throw credentialFileUnavailable();

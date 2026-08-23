@@ -322,6 +322,26 @@ describe("SKLegal governed qualification wire contract on the live server", () =
     assert.equal(denied.status, 403);
   });
 
+  test("every high-bit credential byte denies before PDP or provider dispatch", async () => {
+    mode = "allow";
+    const before = calls.length;
+    for (let byte = 0x80; byte <= 0xff; byte++) {
+      writeFileSync(serviceCredential, Buffer.from([0x41, byte, 0x42]), { mode: 0o600 });
+      chmodSync(serviceCredential, 0o600);
+      const denied = await httpResponse(
+        "POST",
+        SKLEGAL_PORT,
+        "/v1/chat/completions",
+        { model: "x", messages: [] },
+        { authorization: "Bearer synthetic-request-capauth" },
+      );
+      assert.equal(denied.status, 403, `byte 0x${byte.toString(16)} must deny`);
+      assert.equal(calls.length, before, "unsafe credential must not reach the PDP");
+    }
+    writeFileSync(serviceCredential, "synthetic-service-secret", { mode: 0o600 });
+    chmodSync(serviceCredential, 0o600);
+  });
+
   test("credential rotation is read through and removal denies before PDP transport", async () => {
     mode = "allow";
     writeFileSync(serviceCredential, "synthetic-service-rotated", { mode: 0o600 });
