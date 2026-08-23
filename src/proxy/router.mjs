@@ -39,6 +39,7 @@ import { marginalJoules, imputeJoules, resolveBasis, coeffsForModel, backendIsLo
 import { recordModelOutcome, getLifecycle } from "../discovery/model_catalog_store.mjs";
 import { isRoutable, isEffectivelyRoutable } from "../discovery/lifecycle.mjs";
 import { applyReasoningFloor } from "./core.mjs";
+import { enforceResponseContract } from "./response-contract.mjs";
 import { createDecisionCache, decisionKey } from "./decision-cache.mjs";
 // card P4.2 (@match routing): reuse the existing ranker + capability deriver
 // + discovery cache reader + allowlist/availability checks as-is, no
@@ -2350,6 +2351,7 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = (
 
 export async function routeAndSend(router, request, upstreamPath, method, clientHeaders, body, usePool = true, siem = null, abortSignal = null) {
   const pool = usePool ? getPool() : null;
+  const requestedModel = request?.model;
 
   // Read fresh off getConfig() every request (not cached at module scope) so
   // a SIGHUP config reload picks up a flipped energy.enabled or an updated
@@ -2764,6 +2766,32 @@ export async function routeAndSend(router, request, upstreamPath, method, client
   }
 
   if (!candidates) {
+    const configured = typeof router.getBackends === "function"
+      ? [...router.getBackends().values()]
+      : [];
+    const claimsRequested = configured.some((backend) => backend.supportsModel?.(request.model));
+    if (request.model && configured.length > 0 && !claimsRequested) {
+      const lifecycle = getLifecycle(request.model);
+      if (!isRoutable(lifecycle)) {
+        try {
+          await router.route(request);
+        } catch (err) {
+          if (err instanceof ModelEolError) return eolGatedResponse(err);
+          throw err;
+        }
+      }
+      const result = {
+        status: 404,
+        headers: { "content-type": "application/json" },
+        body: Buffer.from(JSON.stringify({
+          error: { message: `Unknown model: ${request.model}`, code: "unknown_model", type: "invalid_request_error" },
+          requested_model: requestedModel,
+        }), "utf8"),
+        requestedModel,
+      };
+      emitSiem("response", { status: 404, code: "unknown_model", requested_model: requestedModel }, {});
+      return result;
+    }
     try {
       candidates = await router.route(request);
     } catch (err) {
@@ -2964,6 +2992,16 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           retry_after_seconds: retryAfterSeconds,
           message: err.message,
         }, { backend: backendId });
+        const queueWaitMs = Date.now() - queueStart;
+        emitSiem("response", {
+          status: 503,
+          latency_ms: queueWaitMs,
+          queue_wait_ms: queueWaitMs,
+          failover: false,
+          admission_rejected: true,
+          code,
+          capacity_domain: capacityDomain,
+        }, { backend: backendId });
         return {
           status: 503,
           headers: {
@@ -3104,6 +3142,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       exitMeter(meterUrl);
     }
 
+    res = enforceResponseContract(res, requestedModel);
     const latencyMs = (Date.now() - queueStart) - meterBeforeMs;
 
     // A downstream disconnect is not evidence about the backend or model.
@@ -3258,7 +3297,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // Set from the attempt that is about to be returned, so on a failover it
     // names the SERVING attempt and never a blend across attempts, which is
     // the same ruling the energy headers already follow.
-    lastResult = { ...res, backendId, servedModel: candidateModel, failover: didFailover, queueWaitMs };
+    lastResult = { ...res, backendId, failover: didFailover, queueWaitMs };
     if (isBucketChain) {
       lastResult.bucket = bucketAddr.bucket;
       lastResult.bucketMember = candidateModel;
@@ -3302,6 +3341,8 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         latency_ms: latencyMs,
         queue_wait_ms: queueWaitMs,
         failover: didFailover,
+        requested_model: lastResult.requestedModel,
+        served_model: lastResult.servedModel,
         ...extractUsage(res.body),
       }, { backend: backendId });
       return lastResult;

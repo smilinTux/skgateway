@@ -2098,9 +2098,7 @@ export const server = http.createServer(async (req, res) => {
           // this is undefined on exactly those paths and the column stays NULL
           // meaning unobserved. That is by construction, not by a special
           // case, and it must never be widened to `|| parsedModel`.
-          modelServed: typeof parsedBody?.model === "string" && parsedBody.model
-            ? parsedBody.model
-            : undefined,
+          modelServed: result?.servedModel,
           energy: result?.energy,
           energyAttempts: result?.energyAttempts,
         });

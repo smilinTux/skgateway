@@ -152,11 +152,9 @@ describe("router @match routing branch (card P4.2)", () => {
     assert.equal(a.status, b.status);
     assert.equal(a.backendId, b.backendId);
     assert.equal(a.body.toString("utf-8"), b.body.toString("utf-8"));
-    // Neither the primary nor secondary backend (which only serve the ranked
-    // ids, not "probe-unmatched-model") should have been hit by either case:
-    // both fall through to "all available backends" and the FIRST one wins,
-    // so exactly 2 attempts total (one per case) landed on real servers.
-    assert.equal(primaryUp.requestCount + secondaryUp.requestCount, before_ + 2);
+    // Neither request may widen an unknown id to an unrelated backend.
+    assert.equal(a.status, 404);
+    assert.equal(primaryUp.requestCount + secondaryUp.requestCount, before_);
   });
 
   test("flag ON: ranked chain builds candidates + failover across the chain works", async () => {
