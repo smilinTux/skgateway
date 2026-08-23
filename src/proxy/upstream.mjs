@@ -61,7 +61,11 @@ export function buildUpstreamUrl(reqUrl, targetUrl) {
 
   const basePath = targetUrl.pathname.replace(/\/$/, ""); // strip trailing slash
   const versionMatch = req.pathname.match(LEADING_VERSION_SEGMENT);
-  const baseEndsWithVersion = versionMatch && basePath.endsWith(versionMatch[0]);
+  // Treat the client's /v1 as a logical API version. Providers may expose
+  // the same OpenAI-compatible surface under another version, such as z.ai's
+  // /api/coding/paas/v4. When the configured base already ends in /vN,
+  // replace the client's leading version rather than producing /v4/v1/....
+  const baseEndsWithVersion = versionMatch && /\/v\d+$/i.test(basePath);
 
   const reqPathToAppend = baseEndsWithVersion
     ? req.pathname.slice(versionMatch[0].length)

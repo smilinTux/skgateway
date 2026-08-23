@@ -148,6 +148,20 @@ test("config validation: codex_oauth requires a credentials file; unknown auth t
   }
 });
 
+test("config validation accepts zai_oauth with a credentials file", () => {
+  const errs = [];
+  assertProviderRoutes({
+    backends: {
+      zai: {
+        url: "https://api.z.ai/api/coding/paas/v4",
+        auth_type: "zai_oauth",
+        credentials_path: credsPath,
+      },
+    },
+  }, errs);
+  assert.deepEqual(errs, []);
+});
+
 // cleanup after the whole file (node:test runs tests in order)
 test("cleanup", () => {
   rmSync(dir, { recursive: true, force: true });

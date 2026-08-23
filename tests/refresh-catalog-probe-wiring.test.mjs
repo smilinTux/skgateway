@@ -151,6 +151,28 @@ describe("card C3: refreshCatalog wires discovery.probe_* into discoverCatalog",
     // checking that the disabled case below produces a different result.
   });
 
+  test("zai stays OFF unless explicitly enabled", async () => {
+    for (const discovery of [
+      { enabled: true, providers: {} },
+      { enabled: true, providers: { zai: { enabled: false } } },
+    ]) {
+      let captured = null;
+      const spy = async (opts) => { captured = opts; return { models: [] }; };
+      await mod.refreshCatalog({ backends: {}, discovery }, spy);
+      assert.deepEqual(await captured.zaiFetch(), { data: [] });
+    }
+  });
+
+  test("zai enabled forwards a real fetch function", async () => {
+    let captured = null;
+    const spy = async (opts) => { captured = opts; return { models: [] }; };
+    await mod.refreshCatalog({
+      backends: { zai: { credentials_path: "/tmp/does-not-exist" } },
+      discovery: { enabled: true, providers: { zai: { enabled: true } } },
+    }, spy);
+    assert.equal(typeof captured.zaiFetch, "function");
+  });
+
   test("opencode stays OFF when the config does not opt in, and OFF means an empty stub not a live call", async () => {
     for (const discovery of [
       { enabled: true, providers: {} },

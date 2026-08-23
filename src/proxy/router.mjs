@@ -30,6 +30,7 @@ import {
   fromCodexResponse,
   readCodexAuthHeaders,
 } from "./codex-adapter.mjs";
+import { isZaiBackend, readZaiAuthHeaders } from "./zai-adapter.mjs";
 import { getPool, PoolAdmissionError } from "./connection-pool.mjs";
 import { isRegistryRouted, resolve as resolveRegistry, getAutoConfig, getConfigEpoch, loadRegistry } from "./registry.mjs";
 import { getFailoverConfig, isLocalUrl, probeLocalHealth, recordLocalOutcome } from "./local-failover.mjs";
@@ -665,6 +666,11 @@ export class Backend {
     this._codexAuth = null;
     this._codexAuthMtime = -1;
     this._codexAuthPath = this._credentials_file;
+    // z.ai ZCode subscription auth follows the same read-only file contract
+    // as Codex, but has its own credential shape and provider-owned CLI.
+    this._zaiAuth = null;
+    this._zaiAuthMtime = -1;
+    this._zaiAuthPath = this._credentials_file;
 
     // Agent-level restrictions — set of agent IDs allowed to use this backend.
     // Empty set = no restrictions.
@@ -963,6 +969,21 @@ export class Backend {
         return { authorization: `Bearer ${token}` };
       }
 
+      case "zai_oauth": {
+        // ZCode owns OAuth refresh and writes ~/.zcode/v2/credentials.json.
+        // The gateway only reads oauth:zai:access_token and never mutates it.
+        const headers = this._getZaiAuthHeaders();
+        if (!headers) {
+          console.warn(
+            `[router] backend=${this.id} zai_oauth auth but no usable credentials at ` +
+              `${this._zaiAuthPath || "(no credentials_path/file set)"}. ` +
+              `Run the official ZCode login on this gateway host.`,
+          );
+          return {};
+        }
+        return headers;
+      }
+
       case "codex_oauth": {
         // OpenAI Codex subscription auth (see codex-adapter.mjs): a bearer
         // access token PLUS the chatgpt-account-id header, read from the
@@ -1058,6 +1079,32 @@ export class Backend {
     } catch (err) {
       console.error(
         `[router] backend=${this.id} failed to load codex credentials ${this._codexAuthPath}: ${err.message}`,
+      );
+      return null;
+    }
+  }
+
+  /**
+   * Return the z.ai subscription auth headers, re-reading the ZCode
+   * credentials file when its mtime changes. Never writes or refreshes.
+   *
+   * @returns {Record<string, string>|null}
+   */
+  _getZaiAuthHeaders() {
+    if (!this._zaiAuthPath) return null;
+    try {
+      const filePath = this._zaiAuthPath.replace(/^~/, process.env.HOME || "");
+      const mtime = statSync(filePath).mtimeMs;
+      if (!this._zaiAuth || mtime !== this._zaiAuthMtime) {
+        const headers = readZaiAuthHeaders(filePath);
+        if (!headers) return null;
+        this._zaiAuth = headers;
+        this._zaiAuthMtime = mtime;
+      }
+      return this._zaiAuth;
+    } catch (err) {
+      console.error(
+        `[router] backend=${this.id} failed to load z.ai credentials ${this._zaiAuthPath}: ${err.message}`,
       );
       return null;
     }
@@ -1991,6 +2038,12 @@ export function backendTrustZone(candidate) {
   // (verified 2026-08-15, card N2's provider posture block). The local
   // claude-code-api wrapper is loopback and already caught by isLocalUrl above.
   if (/^anthropic/.test(id)) return TRUST_ZONES.PAID_CONTRACTUAL;
+  // z.ai is paid subscription traffic, but its current retention posture is
+  // intentionally not assumed contractual-zero. Keep it in zone 2 until the
+  // provider terms are reviewed and a dated posture is recorded.
+  if (isZaiBackend(candidate?.backend) || /api\.z\.ai\//i.test(url) || /^zai/.test(id)) {
+    return TRUST_ZONES.FREE_REMOTE;
+  }
   return TRUST_ZONES.FREE_REMOTE;
 }
 

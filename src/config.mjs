@@ -520,7 +520,7 @@ function applyElasticsearchEnv(cfg, e) {
 
 // ─── validation ───────────────────────────────────────────────────────────────
 
-const VALID_AUTH_TYPES = new Set(['api_key', 'oauth', 'bearer', 'none', 'codex_oauth']);
+const VALID_AUTH_TYPES = new Set(['api_key', 'oauth', 'bearer', 'none', 'codex_oauth', 'zai_oauth']);
 
 /**
  * Test whether a model id matches a backend `models` pattern. Patterns may use
@@ -549,6 +549,7 @@ function modelMatchesPattern(pattern, model) {
  *        codex_oauth      requires credentials_path / credentials_file
  *                         (a Codex CLI auth.json; read-only, never refreshed)
  *        api_key | bearer requires api_key or api_key_env
+ *        zai_oauth requires a ZCode credentials_path / credentials_file
  *   2. pooling.per_backend: every per-backend concurrency limit must name a
  *      declared backend (a limit on a nonexistent provider is dead config).
  *   3. registry `agent:*` contexts (CR-5.1): the per-agent pin now lives in the
@@ -588,6 +589,9 @@ export function assertProviderRoutes(cfg, errs = [], registryPath = undefined) {
     }
     if (auth === 'codex_oauth' && !backend.credentials_path && !backend.credentials_file) {
       errs.push(`backends.${name}.auth_type is "codex_oauth" but no credentials_path/credentials_file is set`);
+    }
+    if (auth === 'zai_oauth' && !backend.credentials_path && !backend.credentials_file) {
+      errs.push(`backends.${name}.auth_type is "zai_oauth" but no credentials_path/credentials_file is set`);
     }
     if ((auth === 'api_key' || auth === 'bearer') && !backend.api_key && !backend.api_key_env) {
       errs.push(`backends.${name}.auth_type is "${auth}" but neither api_key nor api_key_env is set`);

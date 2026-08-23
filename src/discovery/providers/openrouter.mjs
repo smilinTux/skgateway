@@ -50,10 +50,12 @@ function isFree(m) {
  * pre-P2.1 `fetchOpenRouter()` contract in discovery.mjs (discoverCatalog's
  * fail-soft/cache-fallback handling relies on this shape).
  *
+ * @param {string} [apiKey] optional account key for authenticated discovery
  * @returns {Promise<object>}
  */
-export async function fetch() {
-  const r = await globalThis.fetch('https://openrouter.ai/api/v1/models');
+export async function fetch(apiKey) {
+  const headers = apiKey ? { authorization: `Bearer ${apiKey}` } : undefined;
+  const r = await globalThis.fetch('https://openrouter.ai/api/v1/models', headers ? { headers } : undefined);
   if (!r.ok) throw new Error(`openrouter ${r.status}`);
   return r.json();
 }
