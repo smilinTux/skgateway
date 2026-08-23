@@ -792,9 +792,27 @@ function validate(cfg) {
   if (!Number.isInteger(cfg.metrics.retention_days) || cfg.metrics.retention_days < 1)
     errs.push('metrics.retention_days must be a positive integer');
 
+  // SIEM
+  if (typeof cfg.siem.enabled !== 'boolean')
+    errs.push('siem.enabled must be a boolean');
+
   // dashboard
+  if (typeof cfg.dashboard.enabled !== 'boolean')
+    errs.push('dashboard.enabled must be a boolean');
   if (typeof cfg.dashboard.refresh_ms !== 'number' || cfg.dashboard.refresh_ms < 100)
     errs.push('dashboard.refresh_ms must be >= 100');
+
+  // discovery
+  if (typeof cfg.discovery.enabled !== 'boolean')
+    errs.push('discovery.enabled must be a boolean');
+
+  // authorization
+  if (typeof cfg.authz.enforce !== 'boolean')
+    errs.push('authz.enforce must be a boolean');
+  if (typeof cfg.authz.trust_internal !== 'boolean')
+    errs.push('authz.trust_internal must be a boolean');
+  if (!Number.isFinite(cfg.authz.cache_ttl_ms) || cfg.authz.cache_ttl_ms < 0)
+    errs.push('authz.cache_ttl_ms must be a non-negative number');
 
   // energy (joule-economy P0 metering)
   if (cfg.energy) {

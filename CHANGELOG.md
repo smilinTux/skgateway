@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Honor dashboard and metrics disablement during startup. Disabled qualification
+  configurations no longer create the dashboard listener, initialize the metrics
+  database, expose the dashboard redirect, permit a forced discovery refresh, or
+  forward events when SIEM is explicitly disabled.
+
 ### Documentation
 
 - Documented least-privilege GitHub authentication bootstrap for headless fleet

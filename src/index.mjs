@@ -675,14 +675,18 @@ const poolConfig = {
 };
 const pool = getPool(poolConfig);
 
-// Metrics collector (lazy — may not be installed yet)
+// Metrics collector (lazy, and not imported when disabled)
 let metrics = null;
-try {
-  const { createMetricsCollector } = await import("./metrics/collector.mjs");
-  metrics = createMetricsCollector(config.metrics || {});
-  console.log("[skgateway] metrics collector initialized");
-} catch (e) {
-  console.log("[skgateway] metrics collector not available (optional):", e.message);
+if (config.metrics?.enabled === true) {
+  try {
+    const { createMetricsCollector } = await import("./metrics/collector.mjs");
+    metrics = createMetricsCollector(config.metrics);
+    console.log("[skgateway] metrics collector initialized");
+  } catch (e) {
+    console.log("[skgateway] metrics collector not available (optional):", e.message);
+  }
+} else {
+  console.log("[skgateway] metrics collector disabled by configuration");
 }
 
 // ─── CapAuth agent-identity registry (P2.1) ───
@@ -810,30 +814,37 @@ async function enforceAuthz(req, res, identity) {
 // import of this module (see tests/advertise-lifecycle.test.mjs's
 // registerDiscoveredRoutes group); no production code depends on the export.
 export let dashboard = null;
-try {
-  const { createDashboardServer } = await import("./dashboard/server.mjs");
-  const dashPort = config.dashboard?.port || config.server?.dashboard_port || 18781;
-  dashboard = createDashboardServer({
-    port:    dashPort,
-    bind:    config.server?.bind || "0.0.0.0",
-    metrics,
-    router,
-    config,
-  });
-  console.log(`[skgateway] dashboard server started on port ${dashPort}`);
-} catch (e) {
-  console.log("[skgateway] dashboard server not available (optional):", e.message);
+if (config.dashboard?.enabled === true) {
+  try {
+    const { createDashboardServer } = await import("./dashboard/server.mjs");
+    const dashPort = config.dashboard?.port || config.server?.dashboard_port || 18781;
+    dashboard = createDashboardServer({
+      port:    dashPort,
+      bind:    config.server?.bind || "0.0.0.0",
+      metrics,
+      router,
+      config,
+    });
+    console.log(`[skgateway] dashboard server started on port ${dashPort}`);
+  } catch (e) {
+    console.log("[skgateway] dashboard server not available (optional):", e.message);
+  }
+} else {
+  console.log("[skgateway] dashboard server disabled by configuration");
 }
 
 // ─── SIEM hook — append gateway decisions to logs/audit.jsonl ───
 import fs from "node:fs";
 import path from "node:path";
+const siemEnabled = config.siem?.enabled === true;
 const siemPath = path.resolve(
   path.dirname(new URL(import.meta.url).pathname),
   "..",
   config.siem?.outputs?.[0]?.path || "./logs/audit.jsonl",
 );
-try { fs.mkdirSync(path.dirname(siemPath), { recursive: true }); } catch {}
+if (siemEnabled) {
+  try { fs.mkdirSync(path.dirname(siemPath), { recursive: true }); } catch {}
+}
 // Optional skcapstone bridge — shares warn+ SIEM events on the mesh-wide
 // sk-alert bus when ~/.skcapstone is present; no-op otherwise.
 import * as skcapstone from "./integration.mjs";
@@ -843,17 +854,19 @@ import * as skcapstone from "./integration.mjs";
 // no-op unless `enabled: true` (or SKGATEWAY_SYSLOG_* env is set). Shipping to
 // syslog never blocks or breaks the existing file/append + skcapstone path.
 let syslogOutputs = [];
-try {
-  const { createSyslogOutput } = await import("./siem/syslog.mjs");
-  syslogOutputs = (config.siem?.outputs || [])
-    .filter((o) => o && o.type === "syslog")
-    .map((o) => createSyslogOutput(o))
-    .filter((a) => a.enabled);
-  if (syslogOutputs.length) {
-    console.log(`[skgateway] syslog output(s) enabled: ${syslogOutputs.length}`);
+if (siemEnabled) {
+  try {
+    const { createSyslogOutput } = await import("./siem/syslog.mjs");
+    syslogOutputs = (config.siem?.outputs || [])
+      .filter((o) => o && o.type === "syslog")
+      .map((o) => createSyslogOutput(o))
+      .filter((a) => a.enabled);
+    if (syslogOutputs.length) {
+      console.log(`[skgateway] syslog output(s) enabled: ${syslogOutputs.length}`);
+    }
+  } catch (e) {
+    console.log("[skgateway] syslog output not available (optional):", e.message);
   }
-} catch (e) {
-  console.log("[skgateway] syslog output not available (optional):", e.message);
 }
 
 // ─── Elasticsearch / OpenSearch output (_bulk) - disabled by default ───
@@ -862,20 +875,23 @@ try {
 // is a no-op unless `enabled: true` with an endpoint (or SKGATEWAY_ES_* env is
 // set). Shipping to ES never blocks or breaks the file/append + syslog path.
 let esOutputs = [];
-try {
-  const { createElasticsearchOutput } = await import("./siem/elasticsearch.mjs");
-  esOutputs = (config.siem?.outputs || [])
-    .filter((o) => o && (o.type === "elasticsearch" || o.type === "opensearch"))
-    .map((o) => createElasticsearchOutput(o))
-    .filter((a) => a.enabled);
-  if (esOutputs.length) {
-    console.log(`[skgateway] elasticsearch/opensearch output(s) enabled: ${esOutputs.length}`);
+if (siemEnabled) {
+  try {
+    const { createElasticsearchOutput } = await import("./siem/elasticsearch.mjs");
+    esOutputs = (config.siem?.outputs || [])
+      .filter((o) => o && (o.type === "elasticsearch" || o.type === "opensearch"))
+      .map((o) => createElasticsearchOutput(o))
+      .filter((a) => a.enabled);
+    if (esOutputs.length) {
+      console.log(`[skgateway] elasticsearch/opensearch output(s) enabled: ${esOutputs.length}`);
+    }
+  } catch (e) {
+    console.log("[skgateway] elasticsearch output not available (optional):", e.message);
   }
-} catch (e) {
-  console.log("[skgateway] elasticsearch output not available (optional):", e.message);
 }
 
 function siemHook(evt) {
+  if (!siemEnabled) return;
   try {
     fs.appendFile(siemPath, JSON.stringify(evt) + "\n", () => {});
   } catch (e) {
@@ -1252,6 +1268,11 @@ export const server = http.createServer(async (req, res) => {
 
   // ── Dashboard redirect (future) ──
   if (req.url === "/" || req.url === "/dashboard") {
+    if (config.dashboard?.enabled !== true) {
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "Dashboard is disabled", code: 404 } }));
+      return;
+    }
     const dashboardPort = config.dashboard?.port || config.server?.dashboard_port || 18781;
     const host = req.headers.host?.split(":")[0] || "localhost";
     res.writeHead(302, { location: `http://${host}:${dashboardPort}/` });
@@ -1494,6 +1515,13 @@ export const server = http.createServer(async (req, res) => {
     if (!isLoopback(req)) {
       res.writeHead(403, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: { message: "Admin routes are loopback only", code: 403 } }));
+      return;
+    }
+    if (getConfig().discovery?.enabled === false) {
+      res.writeHead(409, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        error: { message: "Model discovery is disabled", code: 409 },
+      }));
       return;
     }
     try {
@@ -2121,8 +2149,12 @@ server.listen(port, bind, () => {
     const backendNames = Object.keys(config.backends || {});
     console.log("[skgateway] backends: " + (backendNames.join(", ") || "default"));
     console.log("[skgateway] metrics: " + (metrics ? "enabled" : "disabled"));
-    const dashPort = config.server?.dashboard_port || 18781;
-    console.log("[skgateway] dashboard: port " + dashPort + " (coming soon)");
+    if (dashboard) {
+      const dashPort = config.dashboard?.port || config.server?.dashboard_port || 18781;
+      console.log("[skgateway] dashboard: port " + dashPort);
+    } else {
+      console.log("[skgateway] dashboard: disabled");
+    }
     // Advertise to skcapstone service discovery when present (no-op otherwise).
     try {
       if (skcapstone.registerService({ healthUrl: `http://localhost:${port}/health` })) {
