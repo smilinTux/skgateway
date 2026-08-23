@@ -18,6 +18,7 @@
 import { test, describe, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createServer } from "node:http";
 import { writeFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname, resolve } from "node:path";
@@ -27,7 +28,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const INDEX = resolve(__dirname, "..", "src", "index.mjs");
 
 /** Boot the gateway with the given env; resolve once it logs "listening". */
-function bootGateway({ port, dashPort, env }) {
+function bootGateway({ port, dashPort, env, extraConfig = [] }) {
   const dir = mkdtempSync(join(tmpdir(), "skgw-authz-"));
   const cfgPath = join(dir, "gw.yaml");
   writeFileSync(
@@ -44,6 +45,7 @@ function bootGateway({ port, dashPort, env }) {
       "identity:",
       "  enabled: false",
       "backends: {}",
+      ...extraConfig,
       "",
     ].join("\n"),
   );
@@ -75,6 +77,14 @@ async function http(method, port, path, body) {
     body: body ? JSON.stringify(body) : undefined,
   });
   return res.status;
+}
+
+async function httpResponse(method, port, path, body, headers = {}) {
+  return fetch(`http://127.0.0.1:${port}${path}`, {
+    method,
+    headers: { ...(body ? { "content-type": "application/json" } : {}), ...headers },
+    body: body ? JSON.stringify(body) : undefined,
+  });
 }
 
 function stop(handle) {
@@ -165,5 +175,165 @@ describe("authz enforce ON — allow-internal default authorizes a loopback call
   });
   test("gated admin route from loopback is NOT 403ed (internal-allowed)", async () => {
     assert.notEqual(await http("GET", INT_PORT, "/admin/models"), 403);
+  });
+});
+
+const SKLEGAL_PDP_PORT = 18948, SKLEGAL_PORT = 18949, SKLEGAL_DASH = 18950;
+
+describe("SKLegal governed qualification wire contract on the live server", () => {
+  let handle;
+  let pdp;
+  let mode = "allow";
+  const calls = [];
+
+  before(async () => {
+    pdp = createServer(async (req, res) => {
+      let raw = "";
+      for await (const chunk of req) raw += chunk;
+      calls.push({ headers: req.headers, body: JSON.parse(raw) });
+      const base = {
+        allow: mode === "allow" || mode === "leak",
+        reason: mode === "allow" || mode === "leak" ? "allow" : "policy_denied",
+        decision_id: "synthetic-decision",
+        policy_revision: "synthetic-policy",
+        correlation_id: "synthetic-correlation",
+        obligations: [],
+      };
+      const body = mode === "malformed"
+        ? { ...base, allow: "true" }
+        : mode === "leak"
+          ? { ...base, prompt: "protected-synthetic-content" }
+          : base;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(body));
+    });
+    await new Promise((resolveListen) => pdp.listen(SKLEGAL_PDP_PORT, "127.0.0.1", resolveListen));
+    handle = await bootGateway({
+      port: SKLEGAL_PORT,
+      dashPort: SKLEGAL_DASH,
+      env: {
+        SKGATEWAY_AUTHZ_ENFORCE: "1",
+        SKLEGAL_CAPAUTH_AUTHZ_ENDPOINT: `http://127.0.0.1:${SKLEGAL_PDP_PORT}/v1/authz/decide`,
+        SKLEGAL_AUTHZ_SERVICE_TOKEN: "synthetic-service-secret",
+      },
+      extraConfig: [
+        "authz:",
+        "  enforce: true",
+        "  trust_internal: true",
+        "  sklegal_qualification:",
+        "    enabled: true",
+        "    routes:",
+        "      - method: POST",
+        "        path: /v1/chat/completions",
+        "        subject: synthetic-agent",
+        "        resource:",
+        "          tenant_id: synthetic-tenant",
+        "          matter_id: synthetic-matter",
+        "          material_id: synthetic-material",
+        "          material_version: '7'",
+        "          route_id: synthetic-route",
+        "        context:",
+        "          purpose: research",
+        "          classification: public",
+        "          privilege: none",
+        "          ethical_wall: clear",
+      ],
+    });
+  });
+
+  after(async () => {
+    stop(handle);
+    if (pdp?.listening) await new Promise((resolveClose) => pdp.close(resolveClose));
+  });
+
+  test("missing request-local CapAuth denies without contacting the PDP", async () => {
+    const before = calls.length;
+    const response = await httpResponse("POST", SKLEGAL_PORT, "/v1/chat/completions", { model: "x", messages: [] });
+    assert.equal(response.status, 403);
+    assert.equal(calls.length, before);
+  });
+
+  test("loopback cannot bypass and the PDP receives exact headers and body", async () => {
+    mode = "allow";
+    const response = await httpResponse(
+      "POST",
+      SKLEGAL_PORT,
+      "/v1/chat/completions",
+      { model: "x", messages: [] },
+      { authorization: "Bearer synthetic-request-capauth", "x-sklegal-tenant-id": "attacker-tenant" },
+    );
+    assert.notEqual(response.status, 403);
+    const call = calls.at(-1);
+    assert.equal(call.headers.authorization, "Bearer synthetic-request-capauth");
+    assert.equal(call.headers["x-sklegal-service-authorization"], "Bearer synthetic-service-secret");
+    assert.deepEqual(call.body, {
+      subject: "synthetic-agent",
+      capability: "skgateway.infer",
+      resource: {
+        tenant_id: "synthetic-tenant",
+        matter_id: "synthetic-matter",
+        material_id: "synthetic-material",
+        material_version: "7",
+        route_id: "synthetic-route",
+      },
+      context: {
+        purpose: "research",
+        classification: "public",
+        privilege: "none",
+        ethical_wall: "clear",
+      },
+    });
+  });
+
+  test("allows are not cached and a policy deny becomes 403", async () => {
+    mode = "allow";
+    const before = calls.length;
+    for (let index = 0; index < 2; index++) {
+      await httpResponse(
+        "POST",
+        SKLEGAL_PORT,
+        "/v1/chat/completions",
+        { model: "x", messages: [] },
+        { authorization: "Bearer synthetic-request-capauth" },
+      );
+    }
+    assert.equal(calls.length, before + 2);
+    mode = "deny";
+    const denied = await httpResponse(
+      "POST",
+      SKLEGAL_PORT,
+      "/v1/chat/completions",
+      { model: "x", messages: [] },
+      { authorization: "Bearer synthetic-request-capauth" },
+    );
+    assert.equal(denied.status, 403);
+  });
+
+  test("malformed or expanded responses deny without leakage", async () => {
+    for (const responseMode of ["malformed", "leak"]) {
+      mode = responseMode;
+      const response = await httpResponse(
+        "POST",
+        SKLEGAL_PORT,
+        "/v1/chat/completions",
+        { model: "x", messages: [] },
+        { authorization: "Bearer synthetic-request-capauth" },
+      );
+      assert.equal(response.status, 403);
+      const text = await response.text();
+      assert.doesNotMatch(text, /protected-synthetic-content|synthetic-service-secret|synthetic-request-capauth/);
+    }
+  });
+
+  test("an unavailable PDP fails closed", async () => {
+    await new Promise((resolveClose) => pdp.close(resolveClose));
+    const response = await httpResponse(
+      "POST",
+      SKLEGAL_PORT,
+      "/v1/chat/completions",
+      { model: "x", messages: [] },
+      { authorization: "Bearer synthetic-request-capauth" },
+    );
+    assert.equal(response.status, 403);
   });
 });

@@ -100,6 +100,24 @@ describe('C15: a caller credential never reaches an upstream provider', () => {
     }
   });
 
+  test('SKLegal service and caller scope headers never reach a provider', () => {
+    const client = {
+      'x-sklegal-service-authorization': 'Bearer service-secret',
+      'x-sklegal-tenant-id': 'caller-controlled-tenant',
+      'x-sklegal-matter-id': 'caller-controlled-matter',
+      'x-sklegal-material-id': 'caller-controlled-material',
+      'x-sklegal-material-version': '1',
+      'x-sklegal-route-id': 'caller-controlled-route',
+      'x-sklegal-purpose': 'caller-controlled-purpose',
+      'x-sklegal-classification': 'caller-controlled-classification',
+      'x-sklegal-privilege': 'caller-controlled-privilege',
+      'x-sklegal-ethical-wall': 'caller-controlled-wall',
+    };
+    const forward = composeForwardHeaders(client, {});
+    assert.deepEqual(forward, {});
+    assert.doesNotMatch(JSON.stringify(forward), /service-secret|caller-controlled/);
+  });
+
   test('NEGATIVE CONTROL: merge-without-strip reproduces the leak', () => {
     // The pre-fix composition, kept explicit so the difference is visible and
     // so a future refactor that reverts the order fails loudly here.

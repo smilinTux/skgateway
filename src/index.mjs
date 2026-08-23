@@ -19,8 +19,13 @@ import { discoverCatalog, loadCache, saveCache, fetchNvidia, fetchOpenRouter, fe
 import { getPool, resetPool } from "./proxy/connection-pool.mjs";
 import { loadAgentRegistry, extractIdentity, normalizeAgentId, ANONYMOUS_AGENT_ID } from "./identity/capauth.mjs";
 import { createAuthzClient } from "./policy/authz_decide.mjs";
+import { createSkLegalAuthzClient } from "./policy/sklegal_authz_decide.mjs";
 import { classifyRoute } from "./policy/authz_routes.mjs";
-import { authzEnforceEnabled, authorizeRequest } from "./policy/authz_gate.mjs";
+import {
+  authzEnforceEnabled,
+  authorizeRequest,
+  createSkLegalQualificationResolver,
+} from "./policy/authz_gate.mjs";
 import { isInternalRemote } from "./policy/net_trust.mjs";
 import { classifyRequest, toSiemEvent } from "./classifiers/engine.mjs";
 import { handleModuleManifest } from "./operator/manifest.mjs";
@@ -711,10 +716,8 @@ if (identityEnabled) {
 // flag flips, but it is only ever consulted inside the `if (authzEnforce)` guard.
 const authzCfg = config.authz || {};
 const authzEnforce = authzEnforceEnabled(process.env, config);
-// "Allow internal, gate external" posture: a request from a trusted internal peer
-// (loopback / Tailscale CGNAT / RFC1918) is allowed without a PDP call; only
-// external peers are delegated to the PDP. Default ON; set authz.trust_internal
-// or $SKGATEWAY_AUTHZ_TRUST_INTERNAL=0 to gate ALL callers (strict mode).
+// The legacy lane can retain its internal-peer posture. Explicit SKLegal
+// qualification routes never use this bypass and always call the strict client.
 const authzTrustInternal =
   (process.env.SKGATEWAY_AUTHZ_TRUST_INTERNAL ?? "").trim() === "0"
     ? false
@@ -724,10 +727,23 @@ const authzClient = createAuthzClient({
   cacheTtlMs: authzCfg.cache_ttl_ms,
   timeoutMs: authzCfg.timeout_ms,
 });
+const sklegalAuthzCfg = authzCfg.sklegal_qualification || {};
+// Exact governed wire: X-SKLegal-Service-Authorization carries the service
+// credential and request_capauth carries the request-local Authorization value.
+const sklegalQualification = createSkLegalQualificationResolver(
+  authzEnforce ? sklegalAuthzCfg : {},
+);
+const sklegalAuthzClient = createSkLegalAuthzClient({
+  url: sklegalAuthzCfg.url,
+  timeoutMs: sklegalAuthzCfg.timeout_ms ?? authzCfg.timeout_ms,
+});
 if (authzEnforce) {
   console.log(
-    `[skgateway] authz ENFORCE ON — delegating to capauth decide endpoint ` +
-    `(${authzClient.configured ? "configured" : "NOT configured → all gated routes DENY"})`,
+    `[skgateway] authz ENFORCE ON; generic PDP ` +
+    `${authzClient.configured ? "configured" : "not configured"}; ` +
+    `SKLegal qualification ${sklegalQualification.enabled
+      ? (sklegalAuthzClient.configured ? "configured" : "not configured, governed routes deny")
+      : "disabled"}`,
   );
 } else {
   console.log("[skgateway] authz enforce OFF (byte-identical passthrough; no decide call)");
@@ -743,17 +759,21 @@ if (authzEnforce) {
  * by construction (coverage-gap guard, standard §3).
  */
 async function enforceAuthz(req, res, identity) {
-  // Allow-internal, gate-external: a trusted internal TCP peer (loopback/tailnet/
-  // RFC1918) is authorized without a PDP call. remoteAddress is the real peer (no
-  // trusted proxy in front), so this is a network-layer boundary, not a spoofable
-  // header. The verdict still flows to the SIEM hook below for the audit trail.
-  const internal = authzTrustInternal && isInternalRemote(req.socket?.remoteAddress);
+  // Resolve trusted SKLegal scope before considering the legacy internal-peer
+  // behavior. A governed route always calls the PDP, including from loopback.
+  const qualification = sklegalQualification.resolve(req.method, req.url);
+  const internal = !qualification
+    && authzTrustInternal
+    && isInternalRemote(req.socket?.remoteAddress);
   const verdict = await authorizeRequest({
     method: req.method,
     url: req.url,
     identity,
     client: authzClient,
     internal,
+    sklegalQualification: qualification,
+    requestCapAuth: req.headers.authorization,
+    sklegalClient: sklegalAuthzClient,
   });
   if (verdict.kind === "public") return false;
 
@@ -765,6 +785,10 @@ async function enforceAuthz(req, res, identity) {
     capability: verdict.capability,
     decision: verdict.allowed ? "allow" : "deny",
     reason: verdict.reason,
+    governed: verdict.governed === true,
+    decision_id: verdict.decision_id ?? null,
+    policy_revision: verdict.policy_revision ?? null,
+    correlation_id: verdict.correlation_id ?? null,
     path: (req.url || "").split("?")[0],
     method: (req.method || "GET").toUpperCase(),
     remote: req.socket?.remoteAddress ?? null,

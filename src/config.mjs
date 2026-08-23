@@ -262,6 +262,14 @@ const DEFAULTS = {
     cache_ttl_ms: 5000,
     timeout_ms: 2000,
     trust_internal: true,
+    // The SKLegal lane is explicit and disabled by default. Each configured
+    // route carries operator-trusted synthetic qualification scope. The lane
+    // ignores caller scope headers, bypasses no internal peer, and never caches.
+    sklegal_qualification: {
+      enabled: false,
+      url: null,
+      routes: [],
+    },
   },
 
   // Dynamic provider model discovery (SKGateway dynamic-provider-model-discovery).
