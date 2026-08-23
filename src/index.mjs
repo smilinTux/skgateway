@@ -18,7 +18,7 @@ import { loadAllowlist, saveAllowlist, applyAllowlist } from "./advertise.mjs";
 import { discoverCatalog, loadCache, saveCache, fetchNvidia, fetchOpenRouter, fetchOpencode, fetchAnthropicWrapper, fetchCodex, fetchZai, catalogStatus, loadCardOverrides, applyCardOverlays, buildServingCatalog } from "./discovery.mjs";
 import { getPool, resetPool } from "./proxy/connection-pool.mjs";
 import { loadAgentRegistry, extractIdentity, normalizeAgentId, ANONYMOUS_AGENT_ID } from "./identity/capauth.mjs";
-import { ClientAuthenticator, stripCallerCredentials, stripCredentialQuery } from "./identity/client-auth.mjs";
+import { ClientAuthenticator, classifyAuthenticationRoute, stripCallerCredentials, stripCredentialQuery } from "./identity/client-auth.mjs";
 import { createAuthzClient } from "./policy/authz_decide.mjs";
 import { createSkLegalAuthzClient } from "./policy/sklegal_authz_decide.mjs";
 import { classifyRoute } from "./policy/authz_routes.mjs";
@@ -68,6 +68,7 @@ const config = _cfgEmitter.current();
 const port = portOverride || config.server?.port || 18780;
 const bind = config.server?.bind || "127.0.0.1";
 let clientAuthenticator = config.client_auth?.enabled ? new ClientAuthenticator(config.client_auth) : null;
+let operatorAuthenticator = config.operator_auth?.enabled ? new ClientAuthenticator(config.operator_auth) : null;
 
 // ─── Capability-aware routing master gate (design 7.2), DEFAULT OFF ───
 // Governs BOTH the `@match` role ranking branch (router.mjs, card P4.2) and
@@ -1163,29 +1164,65 @@ const proxyConfig = buildConfig({
 // (see tests/advertise-lifecycle.test.mjs); no production code depends on it.
 export const server = http.createServer(async (req, res) => {
   const startTime = Date.now();
-  if (process.env.SKGW_REQLOG) { console.log("[REQLOG]", req.method, req.url); }
-
-  // Estate-agent authentication protects inference routes only. It is disabled
-  // by default. When enabled, every denial happens before routing or body read.
-  if (clientAuthenticator && req.url?.startsWith('/v1/')) {
-    const contentLength = Number(req.headers['content-length'] ?? 0);
-    const tooLarge = !Number.isFinite(contentLength) || contentLength < 0 || contentLength > config.client_auth.max_request_body_bytes;
-    const result = tooLarge ? { ok: false, reason: 'request_too_large' } : clientAuthenticator.authenticate(req.headers);
-    if (!result.ok) {
-      const allowed = clientAuthenticator.denialAllowed();
-      const status = tooLarge ? 413 : (allowed ? 401 : 429);
-      const code = tooLarge ? 'request_too_large' : (allowed ? 'client_auth_denied' : 'client_auth_rate_limited');
-      siemHook({ ts: new Date().toISOString(), event: 'client_auth.denied', reason: result.reason, status, path: req.url.split('?')[0] });
-      res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' });
-      res.end(JSON.stringify({ error: { message: tooLarge ? 'Request body exceeds configured limit' : 'Client authentication failed', code, status } }));
+  if (clientAuthenticator || operatorAuthenticator) {
+    try {
+      req.url = stripCredentialQuery(req.url ?? '/');
+    } catch {
+      res.writeHead(400, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+      res.end(JSON.stringify({ error: { message: 'Invalid request path', code: 'invalid_path', status: 400 } }));
       return;
     }
-    req.identity = result.identity;
-    req.agent_id = result.identity.agent_id;
-    req.headers['x-agent-id'] = result.identity.agent_id;
-    stripCallerCredentials(req.headers);
-    req.url = stripCredentialQuery(req.url);
-    siemHook({ ts: new Date().toISOString(), event: 'client_auth.accepted', agent_id: result.identity.agent_id, credential_revision: result.identity.credential_revision, registry_revision: result.identity.registry_revision, path: req.url.split('?')[0] });
+  }
+  if (process.env.SKGW_REQLOG) { console.log("[REQLOG]", req.method, req.url); }
+
+  // Authentication is disabled by default. Once either boundary is enabled,
+  // only an explicit public allowlist can run without credentials. Admin uses
+  // a separate operator registry, so a forwarding proxy cannot confer trust by
+  // making a remote socket appear loopback-local.
+  if (clientAuthenticator || operatorAuthenticator) {
+    const routeAuth = classifyAuthenticationRoute(req.method, req.url);
+    if (routeAuth.kind === 'invalid') {
+      res.writeHead(400, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+      res.end(JSON.stringify({ error: { message: 'Invalid request path', code: 'invalid_path', status: 400 } }));
+      return;
+    }
+    if (routeAuth.kind !== 'public') {
+      const isAdmin = routeAuth.kind === 'admin';
+      const authenticator = isAdmin ? operatorAuthenticator : clientAuthenticator;
+      const authConfig = isAdmin ? config.operator_auth : config.client_auth;
+      if (!authenticator) {
+        siemHook({ ts: new Date().toISOString(), event: isAdmin ? 'operator_auth.denied' : 'client_auth.denied', reason: 'boundary_unavailable', status: 403, path: routeAuth.path });
+        res.writeHead(403, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+        res.end(JSON.stringify({ error: { message: 'Authentication boundary unavailable', code: 'authentication_unavailable', status: 403 } }));
+        return;
+      }
+      const contentLength = Number(req.headers['content-length'] ?? 0);
+      const tooLarge = !Number.isFinite(contentLength) || contentLength < 0 || contentLength > authConfig.max_request_body_bytes;
+      const checked = tooLarge ? { ok: false, reason: 'request_too_large' } : authenticator.authenticate(req.headers);
+      if (!checked.ok) {
+        const allowed = authenticator.denialAllowed();
+        const status = tooLarge ? 413 : (allowed ? 401 : 429);
+        const code = tooLarge ? 'request_too_large' : (allowed ? 'client_auth_denied' : 'client_auth_rate_limited');
+        siemHook({ ts: new Date().toISOString(), event: isAdmin ? 'operator_auth.denied' : 'client_auth.denied', reason: checked.reason, status, path: routeAuth.path });
+        res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+        res.end(JSON.stringify({ error: { message: tooLarge ? 'Request body exceeds configured limit' : 'Client authentication failed', code, status } }));
+        return;
+      }
+      if (isAdmin) {
+        req.operator_identity = checked.identity;
+        req.identity = { ...checked.identity, method: 'operator_auth' };
+        req.agent_id = checked.identity.agent_id;
+      }
+      else {
+        req.identity = checked.identity;
+        req.agent_id = checked.identity.agent_id;
+        req.headers['x-agent-id'] = checked.identity.agent_id;
+        req.headers['x-sk-client-id'] = checked.identity.client_id;
+        req.headers['x-sk-credential-revision'] = checked.identity.credential_revision;
+      }
+      stripCallerCredentials(req.headers);
+      siemHook({ ts: new Date().toISOString(), event: isAdmin ? 'operator_auth.accepted' : 'client_auth.accepted', agent_id: checked.identity.agent_id, client_id: checked.identity.client_id, credential_revision: checked.identity.credential_revision, registry_revision: checked.identity.registry_revision, path: routeAuth.path });
+    }
   }
 
   // ── SKWorld authorization gate (L1.8) — OFF BY DEFAULT ──
@@ -2171,9 +2208,11 @@ _cfgEmitter.on("config-changed", () => {
   try {
     Object.assign(config, _cfgEmitter.current());
     clientAuthenticator = config.client_auth?.enabled ? new ClientAuthenticator(config.client_auth) : null;
+    operatorAuthenticator = config.operator_auth?.enabled ? new ClientAuthenticator(config.operator_auth) : null;
     console.log("[skgateway] config reloaded");
   } catch (e) {
     if (clientAuthenticator) clientAuthenticator.available = false;
+    if (operatorAuthenticator) operatorAuthenticator.available = false;
     console.error("[skgateway] config reload failed:", e.message);
   }
 });
