@@ -126,6 +126,22 @@ const DEFAULTS = {
     strip_thinking: true,
   },
 
+  client_auth: {
+    enabled: false,
+    credentials_file: null,
+    agent_header: 'x-agent-id',
+    expected_owner_uid: null,
+    expected_group_gid: null,
+    max_authorization_bytes: 4096,
+    max_agent_id_bytes: 128,
+    max_token_bytes: 2048,
+    max_request_body_bytes: 120000,
+    max_credential_file_bytes: 1048576,
+    max_credentials: 4096,
+    denial_window_ms: 60000,
+    denial_max: 120,
+  },
+
   // Streaming → non-streaming auto-flip for upstream stability on large /
   // tool-heavy turns.  Independent of the tool-request path (which always
   // buffers upstream).  Used by shouldForceNonStream() in the classifier.
@@ -784,6 +800,19 @@ function validate(cfg) {
   if (typeof cfg.sanitizer.max_body_bytes !== 'number' || cfg.sanitizer.max_body_bytes < 1)
     errs.push('sanitizer.max_body_bytes must be a positive number');
 
+  // estate-agent client authentication
+  const ca = cfg.client_auth;
+  if (!ca || typeof ca.enabled !== 'boolean') errs.push('client_auth.enabled must be a boolean');
+  if (ca?.enabled) {
+    if (typeof ca.credentials_file !== 'string' || !ca.credentials_file) errs.push('client_auth.credentials_file must be set when enabled');
+    if (ca.agent_header !== 'x-agent-id') errs.push('client_auth.agent_header must be x-agent-id');
+    if (!Number.isInteger(ca.expected_owner_uid) || ca.expected_owner_uid < 0) errs.push('client_auth.expected_owner_uid must be a non-negative integer');
+    if (ca.expected_group_gid != null && (!Number.isInteger(ca.expected_group_gid) || ca.expected_group_gid < 0)) errs.push('client_auth.expected_group_gid must be null or a non-negative integer');
+  }
+  for (const key of ['max_authorization_bytes', 'max_agent_id_bytes', 'max_token_bytes', 'max_request_body_bytes', 'max_credential_file_bytes', 'max_credentials', 'denial_window_ms', 'denial_max']) {
+    if (!Number.isInteger(ca?.[key]) || ca[key] < 1) errs.push(`client_auth.${key} must be a positive integer`);
+  }
+
   // metrics
   if (typeof cfg.metrics.enabled !== 'boolean')
     errs.push('metrics.enabled must be a boolean');
@@ -860,6 +889,12 @@ function resolvePaths(cfg) {
     cfg.metrics.db_path = cfg.metrics.db_path.startsWith('~')
       ? expandHome(cfg.metrics.db_path)
       : resolve(REPO_ROOT, cfg.metrics.db_path);
+  }
+
+  if (cfg.client_auth?.credentials_file) {
+    cfg.client_auth.credentials_file = cfg.client_auth.credentials_file.startsWith('~')
+      ? expandHome(cfg.client_auth.credentials_file)
+      : resolve(REPO_ROOT, cfg.client_auth.credentials_file);
   }
 
   // siem output paths

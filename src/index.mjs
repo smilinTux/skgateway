@@ -18,6 +18,7 @@ import { loadAllowlist, saveAllowlist, applyAllowlist } from "./advertise.mjs";
 import { discoverCatalog, loadCache, saveCache, fetchNvidia, fetchOpenRouter, fetchOpencode, fetchAnthropicWrapper, fetchCodex, fetchZai, catalogStatus, loadCardOverrides, applyCardOverlays, buildServingCatalog } from "./discovery.mjs";
 import { getPool, resetPool } from "./proxy/connection-pool.mjs";
 import { loadAgentRegistry, extractIdentity, normalizeAgentId, ANONYMOUS_AGENT_ID } from "./identity/capauth.mjs";
+import { ClientAuthenticator, stripCallerCredentials, stripCredentialQuery } from "./identity/client-auth.mjs";
 import { createAuthzClient } from "./policy/authz_decide.mjs";
 import { createSkLegalAuthzClient } from "./policy/sklegal_authz_decide.mjs";
 import { classifyRoute } from "./policy/authz_routes.mjs";
@@ -66,6 +67,7 @@ const _cfgEmitter = await loadConfig({ configPath });
 const config = _cfgEmitter.current();
 const port = portOverride || config.server?.port || 18780;
 const bind = config.server?.bind || "127.0.0.1";
+let clientAuthenticator = config.client_auth?.enabled ? new ClientAuthenticator(config.client_auth) : null;
 
 // ─── Capability-aware routing master gate (design 7.2), DEFAULT OFF ───
 // Governs BOTH the `@match` role ranking branch (router.mjs, card P4.2) and
@@ -1163,6 +1165,29 @@ export const server = http.createServer(async (req, res) => {
   const startTime = Date.now();
   if (process.env.SKGW_REQLOG) { console.log("[REQLOG]", req.method, req.url); }
 
+  // Estate-agent authentication protects inference routes only. It is disabled
+  // by default. When enabled, every denial happens before routing or body read.
+  if (clientAuthenticator && req.url?.startsWith('/v1/')) {
+    const contentLength = Number(req.headers['content-length'] ?? 0);
+    const tooLarge = !Number.isFinite(contentLength) || contentLength < 0 || contentLength > config.client_auth.max_request_body_bytes;
+    const result = tooLarge ? { ok: false, reason: 'request_too_large' } : clientAuthenticator.authenticate(req.headers);
+    if (!result.ok) {
+      const allowed = clientAuthenticator.denialAllowed();
+      const status = tooLarge ? 413 : (allowed ? 401 : 429);
+      const code = tooLarge ? 'request_too_large' : (allowed ? 'client_auth_denied' : 'client_auth_rate_limited');
+      siemHook({ ts: new Date().toISOString(), event: 'client_auth.denied', reason: result.reason, status, path: req.url.split('?')[0] });
+      res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+      res.end(JSON.stringify({ error: { message: tooLarge ? 'Request body exceeds configured limit' : 'Client authentication failed', code, status } }));
+      return;
+    }
+    req.identity = result.identity;
+    req.agent_id = result.identity.agent_id;
+    req.headers['x-agent-id'] = result.identity.agent_id;
+    stripCallerCredentials(req.headers);
+    req.url = stripCredentialQuery(req.url);
+    siemHook({ ts: new Date().toISOString(), event: 'client_auth.accepted', agent_id: result.identity.agent_id, credential_revision: result.identity.credential_revision, registry_revision: result.identity.registry_revision, path: req.url.split('?')[0] });
+  }
+
   // ── SKWorld authorization gate (L1.8) — OFF BY DEFAULT ──
   // This ENTIRE block is skipped unless SKGATEWAY_AUTHZ_ENFORCE / config.authz.
   // enforce is on, so with the flag off the handler below runs exactly as it did
@@ -1172,12 +1197,12 @@ export const server = http.createServer(async (req, res) => {
   // the capauth PDP, and 403 a gated-route deny before any handler runs. Public
   // routes (health/status/discovery/model-listing) pass straight through.
   if (authzEnforce) {
-    let gateIdentity = {
+    let gateIdentity = req.identity ?? {
       agent_id: req.headers["x-agent-id"] || ANONYMOUS_AGENT_ID,
       method: req.headers["x-agent-id"] ? "header" : "anonymous",
       agent: null,
     };
-    if (identityRegistry) {
+    if (!req.identity && identityRegistry) {
       try {
         gateIdentity = await extractIdentity(req, identityRegistry);
       } catch {
@@ -1665,14 +1690,14 @@ export const server = http.createServer(async (req, res) => {
     // flag. Per-agent spend queries are exact matches, so that split one agent
     // into two keys nothing joins back together.
     const headerAgent = normalizeAgentId(req.headers["x-agent-id"]);
-    let identity = {
+    let identity = req.identity ?? {
       agent_id: headerAgent ?? ANONYMOUS_AGENT_ID,
       verified: false,
       method: headerAgent ? "header" : "anonymous",
       session_id: req.headers["x-session-id"] || null,
       fingerprint: null,
     };
-    if (identityRegistry) {
+    if (!req.identity && identityRegistry) {
       try {
         identity = await extractIdentity(req, identityRegistry);
       } catch (e) {
@@ -1711,7 +1736,17 @@ export const server = http.createServer(async (req, res) => {
 
     // Buffer the request body so we can read the model for routing.
     const chunks = [];
-    for await (const chunk of req) chunks.push(chunk);
+    let receivedBytes = 0;
+    for await (const chunk of req) {
+      receivedBytes += chunk.length;
+      if (clientAuthenticator && receivedBytes > config.client_auth.max_request_body_bytes) {
+        siemHook({ ts: new Date().toISOString(), event: 'client_auth.denied', reason: 'request_too_large', status: 413, agent_id: identity.agent_id, path: req.url });
+        res.writeHead(413, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+        res.end(JSON.stringify({ error: { message: 'Request body exceeds configured limit', code: 'request_too_large', status: 413 } }));
+        return;
+      }
+      chunks.push(chunk);
+    }
     const body = Buffer.concat(chunks);
 
     // ── Anthropic Messages FRONTEND (POST /v1/messages) ──
@@ -2135,8 +2170,10 @@ process.on("SIGINT", () => shutdown("SIGINT"));
 _cfgEmitter.on("config-changed", () => {
   try {
     Object.assign(config, _cfgEmitter.current());
+    clientAuthenticator = config.client_auth?.enabled ? new ClientAuthenticator(config.client_auth) : null;
     console.log("[skgateway] config reloaded");
   } catch (e) {
+    if (clientAuthenticator) clientAuthenticator.available = false;
     console.error("[skgateway] config reload failed:", e.message);
   }
 });
