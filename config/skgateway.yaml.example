@@ -275,6 +275,40 @@ identity:
   allow_anonymous: true
   require_agent_id: false
 
+## Authorization is disabled unless enforce is explicitly enabled. The SKLegal
+## qualification lane is separately explicit. Its exact synthetic scope comes
+## only from this trusted process configuration, never from request headers.
+## Service and request-local credentials are read from the environment and the
+## incoming Authorization header. Do not place either credential in this file.
+authz:
+  enforce: false
+  url: null
+  cache_ttl_ms: 5000
+  timeout_ms: 2000
+  trust_internal: true
+  sklegal_qualification:
+    enabled: false
+    ## URL may come from SKLEGAL_CAPAUTH_AUTHZ_ENDPOINT. The service credential
+    ## comes only from SKLEGAL_AUTHZ_SERVICE_TOKEN.
+    url: null
+    routes: []
+    ## Example synthetic route shape:
+    # routes:
+    #   - method: POST
+    #     path: /v1/chat/completions
+    #     subject: synthetic-agent
+    #     resource:
+    #       tenant_id: synthetic-tenant
+    #       matter_id: synthetic-matter
+    #       material_id: synthetic-material
+    #       material_version: "1"
+    #       route_id: synthetic-route
+    #     context:
+    #       purpose: research
+    #       classification: public
+    #       privilege: none
+    #       ethical_wall: clear
+
 ## Per-agent model routing rules (P4.3). Pin a resolved agent identity to a
 ## specific model or alias/role, overriding the model the caller asked for. The
 ## target is either a concrete model id served by a backend above, or an

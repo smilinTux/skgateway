@@ -99,6 +99,16 @@ export const INTERNAL_CONTROL_HEADERS = [
   "x-agent-id",
   "x-session-id",
   "x-model",
+  "x-sklegal-service-authorization",
+  "x-sklegal-tenant-id",
+  "x-sklegal-matter-id",
+  "x-sklegal-material-id",
+  "x-sklegal-material-version",
+  "x-sklegal-route-id",
+  "x-sklegal-purpose",
+  "x-sklegal-classification",
+  "x-sklegal-privilege",
+  "x-sklegal-ethical-wall",
 ];
 
 const HEALTH_WINDOW = 100;
