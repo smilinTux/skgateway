@@ -19,7 +19,7 @@ import { test, describe, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
-import { writeFileSync, mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -50,8 +50,12 @@ function bootGateway({ port, dashPort, env, extraConfig = [] }) {
     ].join("\n"),
   );
 
+  const childEnv = { ...process.env, ...env };
+  for (const [key, value] of Object.entries(childEnv)) {
+    if (value === undefined) delete childEnv[key];
+  }
   const child = spawn(process.execPath, [INDEX, "--config", cfgPath, "--port", String(port)], {
-    env: { ...process.env, ...env },
+    env: childEnv,
     stdio: ["ignore", "pipe", "pipe"],
   });
 
@@ -183,10 +187,16 @@ const SKLEGAL_PDP_PORT = 18948, SKLEGAL_PORT = 18949, SKLEGAL_DASH = 18950;
 describe("SKLegal governed qualification wire contract on the live server", () => {
   let handle;
   let pdp;
+  let credentialDir;
+  let serviceCredential;
   let mode = "allow";
   const calls = [];
 
   before(async () => {
+    credentialDir = mkdtempSync(join(tmpdir(), "skgw-authz-credential-"));
+    serviceCredential = join(credentialDir, "skgateway-authz-service-token");
+    writeFileSync(serviceCredential, "synthetic-service-secret", { mode: 0o600 });
+    chmodSync(serviceCredential, 0o600);
     pdp = createServer(async (req, res) => {
       let raw = "";
       for await (const chunk of req) raw += chunk;
@@ -214,7 +224,7 @@ describe("SKLegal governed qualification wire contract on the live server", () =
       env: {
         SKGATEWAY_AUTHZ_ENFORCE: "1",
         SKLEGAL_CAPAUTH_AUTHZ_ENDPOINT: `http://127.0.0.1:${SKLEGAL_PDP_PORT}/v1/authz/decide`,
-        SKLEGAL_AUTHZ_SERVICE_TOKEN: "synthetic-service-secret",
+        SKLEGAL_AUTHZ_SERVICE_TOKEN: undefined,
       },
       extraConfig: [
         "authz:",
@@ -222,6 +232,8 @@ describe("SKLegal governed qualification wire contract on the live server", () =
         "  trust_internal: true",
         "  sklegal_qualification:",
         "    enabled: true",
+        `    service_credential_file: ${serviceCredential}`,
+        "    service_credential_max_age_ms: 300000",
         "    routes:",
         "      - method: POST",
         "        path: /v1/chat/completions",
@@ -244,6 +256,7 @@ describe("SKLegal governed qualification wire contract on the live server", () =
   after(async () => {
     stop(handle);
     if (pdp?.listening) await new Promise((resolveClose) => pdp.close(resolveClose));
+    if (credentialDir) rmSync(credentialDir, { recursive: true, force: true });
   });
 
   test("missing request-local CapAuth denies without contacting the PDP", async () => {
@@ -307,6 +320,41 @@ describe("SKLegal governed qualification wire contract on the live server", () =
       { authorization: "Bearer synthetic-request-capauth" },
     );
     assert.equal(denied.status, 403);
+  });
+
+  test("credential rotation is read through and removal denies before PDP transport", async () => {
+    mode = "allow";
+    writeFileSync(serviceCredential, "synthetic-service-rotated", { mode: 0o600 });
+    chmodSync(serviceCredential, 0o600);
+    const rotated = await httpResponse(
+      "POST",
+      SKLEGAL_PORT,
+      "/v1/chat/completions",
+      { model: "x", messages: [] },
+      { authorization: "Bearer synthetic-request-capauth" },
+    );
+    assert.notEqual(rotated.status, 403);
+    assert.equal(
+      calls.at(-1).headers["x-sklegal-service-authorization"],
+      "Bearer synthetic-service-rotated",
+    );
+
+    rmSync(serviceCredential, { force: true });
+    const before = calls.length;
+    const denied = await httpResponse(
+      "POST",
+      SKLEGAL_PORT,
+      "/v1/chat/completions",
+      { model: "x", messages: [] },
+      { authorization: "Bearer synthetic-request-capauth" },
+    );
+    assert.equal(denied.status, 403);
+    assert.equal(calls.length, before);
+
+    writeFileSync(serviceCredential, "synthetic-service-restored", { mode: 0o600 });
+    chmodSync(serviceCredential, 0o600);
+    assert.doesNotMatch(handle.out, /synthetic-service-(secret|rotated|restored)/);
+    assert.doesNotMatch(handle.child.spawnargs.join(" "), /synthetic-service-(secret|rotated|restored)/);
   });
 
   test("malformed or expanded responses deny without leakage", async () => {

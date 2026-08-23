@@ -6,7 +6,19 @@
  * response, and never caches a decision.
  */
 
+import {
+  closeSync,
+  constants as fsConstants,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+} from "node:fs";
+import { isAbsolute } from "node:path";
+
 const DEFAULT_TIMEOUT_MS = 2000;
+const DEFAULT_CREDENTIAL_MAX_AGE_MS = 5 * 60 * 1000;
+const MAX_CREDENTIAL_BYTES = 8 * 1024;
 const MAX_TEXT = 256;
 const MAX_OBLIGATIONS = 16;
 
@@ -101,13 +113,102 @@ export function resolveSkLegalAuthzUrl(explicit, env = process.env) {
   return raw.replace(/\/$/, "") + "/v1/authz/decide";
 }
 
+function credentialFileUnavailable() {
+  return new Error("SKLegal service credential file is unavailable");
+}
+
+/**
+ * Read one systemd-compatible service credential without following links or
+ * retaining a cross-request value. The optional hooks are test seams only.
+ */
+export function readSkLegalServiceCredential(file, opts = {}) {
+  const now = opts.now ?? Date.now;
+  const currentUid = opts.currentUid
+    ?? (typeof process.geteuid === "function" ? process.geteuid() : 0);
+  const maxAgeMs = opts.maxAgeMs ?? DEFAULT_CREDENTIAL_MAX_AGE_MS;
+  let descriptor;
+  let credential;
+  try {
+    if (typeof file !== "string" || !isAbsolute(file)) throw credentialFileUnavailable();
+    if (!Number.isSafeInteger(maxAgeMs) || maxAgeMs < 1 || maxAgeMs > DEFAULT_CREDENTIAL_MAX_AGE_MS) {
+      throw credentialFileUnavailable();
+    }
+    const before = lstatSync(file, { bigint: true });
+    if (!before.isFile() || before.isSymbolicLink()) throw credentialFileUnavailable();
+    opts.afterLstat?.();
+    descriptor = openSync(
+      file,
+      fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_CLOEXEC,
+    );
+    const opened = fstatSync(descriptor, { bigint: true });
+    const mode = Number(opened.mode & 0o777n);
+    const owner = Number(opened.uid);
+    const age = now() - Number(opened.mtimeMs);
+    if (
+      !opened.isFile()
+      || opened.dev !== before.dev
+      || opened.ino !== before.ino
+      || opened.nlink !== 1n
+      || !new Set([0, currentUid]).has(owner)
+      || !new Set([0o400, 0o600]).has(mode)
+      || opened.size < 1n
+      || opened.size > BigInt(MAX_CREDENTIAL_BYTES)
+      || !Number.isFinite(age)
+      || age < 0
+      || age > maxAgeMs
+    ) {
+      throw credentialFileUnavailable();
+    }
+    credential = readFileSync(descriptor);
+    const after = fstatSync(descriptor, { bigint: true });
+    if (
+      after.dev !== opened.dev
+      || after.ino !== opened.ino
+      || after.size !== opened.size
+      || after.mtimeNs !== opened.mtimeNs
+      || credential.length !== Number(opened.size)
+      || credential.includes(0)
+      || credential.includes(10)
+      || credential.includes(13)
+      || !/^[\x21-\x7e]+$/.test(credential.toString("ascii"))
+    ) {
+      credential.fill(0);
+      throw credentialFileUnavailable();
+    }
+    return credential;
+  } catch {
+    credential?.fill(0);
+    throw credentialFileUnavailable();
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
+}
+
 export function createSkLegalAuthzClient(opts = {}) {
   const env = opts.env || process.env;
   const url = resolveSkLegalAuthzUrl(opts.url, env);
-  const serviceToken = (opts.serviceToken ?? env.SKLEGAL_AUTHZ_SERVICE_TOKEN ?? "").trim();
+  const qualificationEnabled = opts.qualificationEnabled === true;
+  const inlineCredentialConfigured = Object.hasOwn(opts, "serviceToken")
+    || Object.hasOwn(env, "SKLEGAL_AUTHZ_SERVICE_TOKEN");
+  if (qualificationEnabled && inlineCredentialConfigured) {
+    throw new Error("SKLegal qualification forbids environment or inline service credentials");
+  }
+  const serviceCredentialFile = opts.serviceCredentialFile;
+  const serviceCredentialMaxAgeMs = opts.serviceCredentialMaxAgeMs
+    ?? DEFAULT_CREDENTIAL_MAX_AGE_MS;
+  const legacyServiceToken = qualificationEnabled
+    ? ""
+    : (opts.serviceToken ?? env.SKLEGAL_AUTHZ_SERVICE_TOKEN ?? "").trim();
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const fetchImpl = opts.fetchImpl || globalThis.fetch;
-  const configured = Boolean(url && serviceToken && serviceToken.length <= 8192);
+  const fileConfigured = typeof serviceCredentialFile === "string"
+    && isAbsolute(serviceCredentialFile)
+    && Number.isSafeInteger(serviceCredentialMaxAgeMs)
+    && serviceCredentialMaxAgeMs >= 1
+    && serviceCredentialMaxAgeMs <= DEFAULT_CREDENTIAL_MAX_AGE_MS;
+  const configured = Boolean(url && (
+    qualificationEnabled ? fileConfigured : legacyServiceToken && legacyServiceToken.length <= MAX_CREDENTIAL_BYTES
+  ));
   let calls = 0;
 
   async function decideSkLegal({ subject, capability, resource, context, requestCapAuth } = {}) {
@@ -127,6 +228,21 @@ export function createSkLegalAuthzClient(opts = {}) {
       return deny("authorization backend unavailable");
     }
 
+    let credential;
+    let serviceAuthorization;
+    try {
+      if (qualificationEnabled) {
+        credential = readSkLegalServiceCredential(serviceCredentialFile, {
+          maxAgeMs: serviceCredentialMaxAgeMs,
+        });
+        serviceAuthorization = `Bearer ${credential.toString("ascii")}`;
+      } else {
+        serviceAuthorization = `Bearer ${legacyServiceToken}`;
+      }
+    } catch {
+      return deny("authorization backend unavailable");
+    }
+
     calls++;
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), timeoutMs);
@@ -136,7 +252,7 @@ export function createSkLegalAuthzClient(opts = {}) {
         method: "POST",
         headers: {
           "content-type": "application/json",
-          [SKLEGAL_SERVICE_AUTHORIZATION_HEADER]: `Bearer ${serviceToken}`,
+          [SKLEGAL_SERVICE_AUTHORIZATION_HEADER]: serviceAuthorization,
           authorization: requestCapAuth,
         },
         body: JSON.stringify({ subject, capability, resource, context }),
@@ -146,6 +262,8 @@ export function createSkLegalAuthzClient(opts = {}) {
       return deny("authorization backend unavailable");
     } finally {
       clearTimeout(timer);
+      if (credential) credential.fill(0);
+      serviceAuthorization = null;
     }
 
     if (!response || response.status !== 200) {
