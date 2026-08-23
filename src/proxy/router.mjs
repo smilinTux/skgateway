@@ -59,6 +59,7 @@ import {
   TRUST_ZONES,
 } from "../policy/sensitivity.mjs";
 import { parseBucketId, resolveBucket, selectMember, looksLikeBucketAttempt, allBuckets } from "../policy/buckets.mjs";
+import { codexPurityProblems } from "../policy/codex-purity.mjs";
 
 // sk-auto routing decision cache (TTL+LRU); keyed by request fingerprint + config epoch.
 const _autoDecisionCache = createDecisionCache({ ttlMs: 60_000, maxEntries: 500 });
@@ -2357,6 +2358,7 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = (
 export async function routeAndSend(router, request, upstreamPath, method, clientHeaders, body, usePool = true, siem = null, abortSignal = null) {
   const pool = usePool ? getPool() : null;
   const requestedModel = request?.model;
+  const codexIntent = [requestedModel, request?.role, request?.context, request?.service];
 
   // Read fresh off getConfig() every request (not cached at module scope) so
   // a SIGHUP config reload picks up a flipped energy.enabled or an updated
@@ -2803,6 +2805,29 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       if (err instanceof ModelEolError) return eolGatedResponse(err);
       throw err;
     }
+  }
+
+  // Re-evaluate the complete candidate chain immediately before dispatch.
+  // This covers registry reloads, health recovery, buckets and failover lists.
+  // A single foreign-provider candidate poisons the chain rather than becoming
+  // an outage fallback for a Codex-labelled request.
+  codexIntent.push(request?.model, ...(candidates || []).map((candidate) => candidate?.model));
+  const purityProblems = codexPurityProblems(
+    codexIntent,
+    (candidates || []).map((candidate) => ({ ...candidate, model: candidate?.model || request?.model })),
+  );
+  if (purityProblems.length) {
+    const result = {
+      status: 503,
+      headers: { "content-type": "application/json" },
+      body: Buffer.from(JSON.stringify({
+        error: { message: 'Codex provider route unavailable', code: 'codex_provider_unavailable', type: 'service_unavailable' },
+        requested_model: requestedModel,
+      }), 'utf8'),
+      requestedModel,
+    };
+    emitSiem('error', { status: 503, code: 'codex_provider_unavailable', requested_model: requestedModel }, {});
+    return result;
   }
 
   // ── SIEM: auth decision + route/model selected (live request path) ──
