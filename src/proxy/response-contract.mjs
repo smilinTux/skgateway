@@ -17,7 +17,7 @@ function hasVisibleContent(output) {
     : Array.isArray(content) && content.some((part) => typeof part?.text === "string" && part.text.trim().length > 0);
 }
 
-function collectChoiceEvidence(chunk, states, ids) {
+function collectChoiceEvidence(chunk, states, ids, stream) {
   for (const [choicePosition, choice] of (chunk?.choices || []).entries()) {
     const output = choice?.delta || choice?.message || {};
     const choiceIndex = Number.isSafeInteger(choice?.index) && choice.index >= 0
@@ -29,14 +29,23 @@ function collectChoiceEvidence(chunk, states, ids) {
       validToolEvidence: true,
       calls: new Map(),
       terminalReasons: [],
+      terminated: false,
     };
-    state.visibleContent ||= hasVisibleContent(output);
+    const visibleContent = hasVisibleContent(output);
+    const hasContentEvent = Object.hasOwn(output, "content");
+    const hasToolEvent = Object.hasOwn(output, "tool_calls");
+    const hasTerminalEvent = Object.hasOwn(choice, "finish_reason");
+    if (stream.done || (state.terminated && (hasContentEvent || hasToolEvent || hasTerminalEvent))) {
+      stream.invalidCompletion = true;
+    }
+    state.visibleContent ||= visibleContent;
     if (Object.hasOwn(choice, "finish_reason") && choice.finish_reason !== null) {
       state.terminalReasons.push(choice.finish_reason);
+      state.terminated = true;
     }
     states.set(choiceIndex, state);
 
-    if (!Object.hasOwn(output, "tool_calls")) continue;
+    if (!hasToolEvent) continue;
     state.sawToolEvidence = true;
     if (!Array.isArray(output.tool_calls) || output.tool_calls.length === 0) {
       state.validToolEvidence = false;
@@ -101,6 +110,15 @@ function hasCompletedToolCalls(calls) {
   });
 }
 
+function hasValidCompletion(state) {
+  if (state.terminalReasons.length !== 1) return false;
+  const reason = state.terminalReasons[0];
+  if (state.sawToolEvidence) {
+    return state.validToolEvidence && hasCompletedToolCalls(state.calls) && reason === "tool_calls";
+  }
+  return state.visibleContent && (reason === "stop" || reason === "length");
+}
+
 /** Preserve requested alias separately while exposing the upstream model exactly. */
 export function enforceResponseContract(response, requestedModel) {
   if (!response?.body) return { ...response, requestedModel, servedModel: null };
@@ -111,15 +129,24 @@ export function enforceResponseContract(response, requestedModel) {
   if (contentType.includes("text/event-stream") || body.toString("utf8").includes("data:")) {
     const choiceStates = new Map();
     const toolIds = new Map();
+    const stream = { done: false, doneCount: 0, invalidCompletion: false };
     const lines = body.toString("utf8").split("\n").map((line) => {
       if (!line.startsWith("data:")) return line;
       const payload = line.slice(5).trim();
-      if (!payload || payload === "[DONE]") return line;
+      if (!payload) return line;
+      if (payload === "[DONE]") {
+        stream.doneCount++;
+        if (stream.done || [...choiceStates.values()].some((state) => !hasValidCompletion(state))) {
+          stream.invalidCompletion = true;
+        }
+        stream.done = true;
+        return line;
+      }
       try {
         const parsed = JSON.parse(payload);
         if (!servedModel && typeof parsed.model === "string" && parsed.model) servedModel = parsed.model;
         const clean = stripReasoning(parsed);
-        collectChoiceEvidence(clean, choiceStates, toolIds);
+        collectChoiceEvidence(clean, choiceStates, toolIds, stream);
         if (requestedModel) clean.requested_model = requestedModel;
         return `data: ${JSON.stringify(clean)}`;
       } catch {
@@ -138,7 +165,10 @@ export function enforceResponseContract(response, requestedModel) {
     });
     const emptyChoice = states.length === 0 || states.some((state) =>
       !state.visibleContent && !hasCompletedToolCalls(state.calls));
-    if (response.status >= 200 && response.status < 300 && (invalidToolCalls || emptyChoice)) {
+    const invalidCompletion = stream.invalidCompletion
+      || stream.doneCount !== 1
+      || states.some((state) => state.visibleContent && !state.sawToolEvidence && !hasValidCompletion(state));
+    if (response.status >= 200 && response.status < 300 && (invalidToolCalls || invalidCompletion || emptyChoice)) {
       const headers = { ...response.headers, "content-type": "application/json", "cache-control": "no-store" };
       delete headers["content-length"];
       delete headers["Content-Length"];
@@ -146,8 +176,14 @@ export function enforceResponseContract(response, requestedModel) {
         error: {
           message: invalidToolCalls
             ? "Upstream returned invalid tool-call evidence"
-            : "Upstream returned no visible content or tool calls",
-          code: invalidToolCalls ? "invalid_upstream_tool_calls" : "empty_upstream_response",
+            : emptyChoice
+              ? "Upstream returned no visible content or tool calls"
+              : "Upstream returned invalid completion evidence",
+          code: invalidToolCalls
+            ? "invalid_upstream_tool_calls"
+            : emptyChoice
+              ? "empty_upstream_response"
+              : "invalid_upstream_completion",
           type: "upstream_error",
         },
         ...(requestedModel ? { requested_model: requestedModel } : {}),

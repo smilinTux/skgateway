@@ -43,7 +43,105 @@ function assertRejected(deltas) {
   assert.equal(result.body.includes(Buffer.from("private chain")), false);
 }
 
+function assertCompletionRejected(result) {
+  assert.equal(result.status, 502);
+  assert.equal(result.headers["content-type"], "application/json");
+  assert.equal(result.headers["content-length"], undefined);
+  assert.equal(JSON.parse(result.body).error.code, "invalid_upstream_completion");
+  assert.equal(result.body.includes(Buffer.from("[DONE]")), false);
+  assert.equal(result.body.includes(Buffer.from("private chain")), false);
+}
+
+function assertBoundedRejected(result) {
+  assert.equal(result.status, 502);
+  assert.equal(result.headers["content-type"], "application/json");
+  assert.equal(result.headers["content-length"], undefined);
+  assert.match(JSON.parse(result.body).error.code, /^invalid_upstream_(completion|tool_calls)$/);
+  assert.equal(result.body.includes(Buffer.from("[DONE]")), false);
+  assert.equal(result.body.includes(Buffer.from("private chain")), false);
+}
+
+function rawResponse(lines) {
+  return enforceResponseContract({
+    status: 200,
+    headers: { "content-type": "text/event-stream", "content-length": "999" },
+    body: Buffer.from([...lines, ""].join("\n\n")),
+  }, REQUESTED);
+}
+
+function contentFrame(finishReason, content = "PUBLIC_SYNTHETIC_OK", index = 0) {
+  const choice = { index, delta: content === null ? {} : { content } };
+  if (finishReason !== undefined) choice.finish_reason = finishReason;
+  return `data: ${JSON.stringify({ model: MODEL, choices: [choice] })}`;
+}
+
 describe("completed SSE tool-call structure", () => {
+  test("parent blocker rejects visible content with no terminal reason", () => {
+    assertCompletionRejected(rawResponse([contentFrame(undefined), "data: [DONE]"]));
+  });
+
+  test("parent blocker rejects duplicate visible-content terminal reasons", () => {
+    assertCompletionRejected(rawResponse([contentFrame("stop"), contentFrame("stop", null), "data: [DONE]"]));
+  });
+
+  test("parent blocker rejects conflicting visible-content terminal reasons", () => {
+    assertCompletionRejected(rawResponse([contentFrame("stop"), contentFrame("length", null), "data: [DONE]"]));
+  });
+
+  test("parent blocker rejects unsupported visible-content terminal reason", () => {
+    assertCompletionRejected(rawResponse([contentFrame("unsupported"), "data: [DONE]"]));
+  });
+
+  test("parent blocker rejects filtered visible-content success", () => {
+    assertCompletionRejected(rawResponse([contentFrame("content_filter"), "data: [DONE]"]));
+  });
+
+  test("rejects semantic events after a choice terminal", () => {
+    const tool = { index: 0, id: "call_1", type: "function", function: { name: "lookup", arguments: "{}" } };
+    for (const frame of [
+      contentFrame(null, "LATE"),
+      `data: ${JSON.stringify({ model: MODEL, choices: [{ index: 0, delta: { content: "" }, finish_reason: null }] })}`,
+      `data: ${JSON.stringify({ model: MODEL, choices: [{ index: 0, delta: { content: null }, finish_reason: null }] })}`,
+      contentFrame(null, null),
+      contentFrame("length", null),
+      `data: ${JSON.stringify({ model: MODEL, choices: [{ index: 0, delta: { tool_calls: [tool] }, finish_reason: null }] })}`,
+    ]) {
+      assertBoundedRejected(rawResponse([contentFrame("stop"), frame, "data: [DONE]"]));
+    }
+  });
+
+  test("rejects DONE before every choice completes and any choice after DONE", () => {
+    assertCompletionRejected(rawResponse([
+      contentFrame(null),
+      "data: [DONE]",
+      contentFrame("stop", null),
+    ]));
+    assertCompletionRejected(rawResponse([
+      contentFrame("stop"),
+      "data: [DONE]",
+      contentFrame(null, "LATE"),
+    ]));
+  });
+
+  test("rejects missing and duplicate DONE markers", () => {
+    assertCompletionRejected(rawResponse([contentFrame("stop")]));
+    assertCompletionRejected(rawResponse([contentFrame("stop"), "data: [DONE]", "data: [DONE]"]));
+  });
+
+  test("keeps terminal state independent across interleaved choices", () => {
+    const result = choicesResponse([
+      [
+        { index: 0, delta: { content: "CHOICE_ZERO" }, finish_reason: null },
+        { index: 1, delta: { content: "CHOICE_ONE" }, finish_reason: null },
+      ],
+      [{ index: 1, delta: {}, finish_reason: "length" }],
+      [{ index: 0, delta: {}, finish_reason: "stop" }],
+    ]);
+    assert.equal(result.status, 200);
+    assert.match(result.body.toString(), /CHOICE_ZERO/);
+    assert.match(result.body.toString(), /CHOICE_ONE/);
+  });
+
   test("rejects tool completion without same-choice call evidence", () => {
     assertRejected([{ delta: { content: "PUBLIC_SYNTHETIC_OK" }, finishReason: "tool_calls" }]);
   });
@@ -194,11 +292,9 @@ describe("completed SSE tool-call structure", () => {
     assert.equal(result.servedModel, MODEL);
   });
 
-  test("preserves ordinary visible content without tool evidence", () => {
+  test("rejects ordinary visible content without a terminal reason", () => {
     const result = response([{ delta: { content: "PUBLIC_SYNTHETIC_OK", reasoning_content: "private chain" } }]);
-    assert.equal(result.status, 200);
-    assert.match(result.body.toString(), /PUBLIC_SYNTHETIC_OK/);
-    assert.equal(result.body.includes(Buffer.from("private chain")), false);
+    assertCompletionRejected(result);
   });
 
   test("shared route returns bounded failure and sanitized audit", async () => {
