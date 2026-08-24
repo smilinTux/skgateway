@@ -1,5 +1,7 @@
 import { sanitizeResponse } from "./sanitizer.mjs";
 
+const MAX_USAGE_TOKENS = 1_000_000_000;
+
 function stripReasoning(value) {
   if (!value || typeof value !== "object") return value;
   const out = Array.isArray(value) ? value.map(stripReasoning) : { ...value };
@@ -32,12 +34,8 @@ function collectChoiceEvidence(chunk, states, ids, stream) {
       terminated: false,
     };
     const visibleContent = hasVisibleContent(output);
-    const hasContentEvent = Object.hasOwn(output, "content");
     const hasToolEvent = Object.hasOwn(output, "tool_calls");
-    const hasTerminalEvent = Object.hasOwn(choice, "finish_reason");
-    if (stream.done || (state.terminated && (hasContentEvent || hasToolEvent || hasTerminalEvent))) {
-      stream.invalidCompletion = true;
-    }
+    if (state.terminated) stream.invalidCompletion = true;
     state.visibleContent ||= visibleContent;
     if (Object.hasOwn(choice, "finish_reason") && choice.finish_reason !== null) {
       state.terminalReasons.push(choice.finish_reason);
@@ -97,6 +95,18 @@ function collectChoiceEvidence(chunk, states, ids, stream) {
   }
 }
 
+function hasValidUsage(usage) {
+  if (!usage || typeof usage !== "object" || Array.isArray(usage)) return false;
+  const keys = Object.keys(usage);
+  if (!keys.includes("prompt_tokens") || !keys.includes("completion_tokens")
+      || keys.some((key) => !["prompt_tokens", "completion_tokens", "total_tokens"].includes(key))) return false;
+  const values = keys.map((key) => usage[key]);
+  if (values.some((value) => !Number.isSafeInteger(value) || value < 0 || value > MAX_USAGE_TOKENS)) return false;
+  if (usage.prompt_tokens + usage.completion_tokens > MAX_USAGE_TOKENS) return false;
+  return !Object.hasOwn(usage, "total_tokens")
+    || usage.total_tokens === usage.prompt_tokens + usage.completion_tokens;
+}
+
 function hasCompletedToolCalls(calls) {
   if (calls.size === 0) return false;
   return [...calls.values()].every((call) => {
@@ -129,10 +139,11 @@ export function enforceResponseContract(response, requestedModel) {
   if (contentType.includes("text/event-stream") || body.toString("utf8").includes("data:")) {
     const choiceStates = new Map();
     const toolIds = new Map();
-    const stream = { done: false, doneCount: 0, invalidCompletion: false };
+    const stream = { done: false, doneCount: 0, invalidCompletion: false, usageSeen: false };
     const lines = body.toString("utf8").split("\n").map((line) => {
       if (!line.startsWith("data:")) return line;
       const payload = line.slice(5).trim();
+      if (stream.done) stream.invalidCompletion = true;
       if (!payload) return line;
       if (payload === "[DONE]") {
         stream.doneCount++;
@@ -145,6 +156,10 @@ export function enforceResponseContract(response, requestedModel) {
       try {
         const parsed = JSON.parse(payload);
         if (!servedModel && typeof parsed.model === "string" && parsed.model) servedModel = parsed.model;
+        if (Object.hasOwn(parsed, "usage")) {
+          if (stream.usageSeen || !hasValidUsage(parsed.usage)) stream.invalidCompletion = true;
+          stream.usageSeen = true;
+        }
         const clean = stripReasoning(parsed);
         collectChoiceEvidence(clean, choiceStates, toolIds, stream);
         if (requestedModel) clean.requested_model = requestedModel;

@@ -105,9 +105,43 @@ describe("completed SSE tool-call structure", () => {
       contentFrame(null, null),
       contentFrame("length", null),
       `data: ${JSON.stringify({ model: MODEL, choices: [{ index: 0, delta: { tool_calls: [tool] }, finish_reason: null }] })}`,
+      `data: ${JSON.stringify({ model: MODEL, choices: [{ index: 0, delta: { reasoning_content: "private chain" } }] })}`,
+      `data: ${JSON.stringify({ model: MODEL, choices: [{ index: 0, delta: { role: "assistant" } }] })}`,
+      `data: ${JSON.stringify({ model: MODEL, choices: [{ index: 0, delta: {} }] })}`,
     ]) {
       assertBoundedRejected(rawResponse([contentFrame("stop"), frame, "data: [DONE]"]));
     }
+  });
+
+  test("rejects semantic data after DONE while preserving transport lines", () => {
+    const usage = `data: ${JSON.stringify({ model: MODEL, choices: [], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } })}`;
+    assertCompletionRejected(rawResponse([contentFrame("stop"), "data: [DONE]", usage]));
+    assertCompletionRejected(rawResponse([contentFrame("stop"), "data: [DONE]", "data: {not-json}"]));
+    assertCompletionRejected(rawResponse([contentFrame("stop"), "data: [DONE]", "data:"]));
+    const result = rawResponse([contentFrame("stop"), "data: [DONE]", "", ": transport keepalive"]);
+    assert.equal(result.status, 200);
+    assert.match(result.body.toString(), /transport keepalive/);
+  });
+
+  test("accepts one bounded usage frame and rejects invalid usage", () => {
+    const usageFrame = (usage, choices = []) => `data: ${JSON.stringify({ model: MODEL, choices, usage })}`;
+    const valid = usageFrame({ prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 });
+    const result = rawResponse([contentFrame("stop"), valid, "data: [DONE]"]);
+    assert.equal(result.status, 200);
+    assert.match(result.body.toString(), /"total_tokens":5/);
+
+    for (const usage of [
+      null,
+      [],
+      { prompt_tokens: 1 },
+      { prompt_tokens: 1, completion_tokens: "1", total_tokens: 2 },
+      { prompt_tokens: 1, completion_tokens: 1, total_tokens: 3 },
+      { prompt_tokens: 1, input_tokens: 1, completion_tokens: 1 },
+      { prompt_tokens: 1_000_000_001, completion_tokens: 0 },
+      { prompt_tokens: 600_000_000, completion_tokens: 600_000_000 },
+    ]) assertCompletionRejected(rawResponse([contentFrame("stop"), usageFrame(usage), "data: [DONE]"]));
+
+    assertCompletionRejected(rawResponse([contentFrame("stop"), valid, valid, "data: [DONE]"]));
   });
 
   test("rejects DONE before every choice completes and any choice after DONE", () => {
