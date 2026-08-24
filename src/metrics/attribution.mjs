@@ -55,6 +55,9 @@ export function attributionHeaders(reqId, result) {
   if (typeof result?.servedModel === "string" && result.servedModel) {
     out["x-sk-model-served"] = result.servedModel;
   }
+  if (typeof result?.requestedModel === "string" && result.requestedModel) {
+    out["x-sk-model-requested"] = result.requestedModel;
+  }
   if (typeof result?.bucket === "string" && result.bucket) {
     out["x-sk-bucket"] = result.bucket;
   }

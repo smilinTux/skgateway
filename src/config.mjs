@@ -27,6 +27,7 @@ import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import { load as yamlLoad } from 'js-yaml';
 import { isRegistryRouted, loadRegistry } from './proxy/registry.mjs';
+import { assertCodexRegistryPurity } from './policy/codex-purity.mjs';
 
 // ─── paths ────────────────────────────────────────────────────────────────────
 
@@ -124,6 +125,46 @@ const DEFAULTS = {
     keep_start: 2,
     keep_end: 12,
     strip_thinking: true,
+  },
+
+  client_auth: {
+    enabled: false,
+    credentials_file: null,
+    agent_header: 'x-agent-id',
+    client_header: 'x-sk-client-id',
+    revision_header: 'x-sk-credential-revision',
+    expected_owner_uid: null,
+    expected_group_gid: null,
+    max_authorization_bytes: 4096,
+    max_agent_id_bytes: 128,
+    max_client_id_bytes: 128,
+    max_revision_bytes: 128,
+    max_token_bytes: 2048,
+    max_request_body_bytes: 120000,
+    max_credential_file_bytes: 1048576,
+    max_credentials: 4096,
+    denial_window_ms: 60000,
+    denial_max: 120,
+  },
+
+  operator_auth: {
+    enabled: false,
+    credentials_file: null,
+    agent_header: 'x-sk-operator-id',
+    client_header: 'x-sk-operator-client-id',
+    revision_header: 'x-sk-operator-credential-revision',
+    expected_owner_uid: null,
+    expected_group_gid: null,
+    max_authorization_bytes: 4096,
+    max_agent_id_bytes: 128,
+    max_client_id_bytes: 128,
+    max_revision_bytes: 128,
+    max_token_bytes: 2048,
+    max_request_body_bytes: 65536,
+    max_credential_file_bytes: 1048576,
+    max_credentials: 256,
+    denial_window_ms: 60000,
+    denial_max: 30,
   },
 
   // Streaming → non-streaming auto-flip for upstream stability on large /
@@ -721,6 +762,15 @@ export function assertProviderRoutes(cfg, errs = [], registryPath = undefined) {
     }
   }
 
+  // Codex is a provider boundary, not a capability hint. Validate the live
+  // registry at boot and reload so a Codex-labelled role cannot point at a
+  // local Qwen or a third-party aggregator even transiently.
+  try {
+    assertCodexRegistryPurity(loadRegistry(registryPath), errs);
+  } catch {
+    errs.push('Codex provider-purity registry validation failed closed');
+  }
+
   return errs;
 }
 
@@ -785,6 +835,25 @@ function validate(cfg) {
     errs.push('sanitizer.max_system_bytes must be a positive number');
   if (typeof cfg.sanitizer.max_body_bytes !== 'number' || cfg.sanitizer.max_body_bytes < 1)
     errs.push('sanitizer.max_body_bytes must be a positive number');
+
+  // estate-agent client authentication
+  for (const [name, ca] of [['client_auth', cfg.client_auth], ['operator_auth', cfg.operator_auth]]) {
+    if (!ca || typeof ca.enabled !== 'boolean') errs.push(`${name}.enabled must be a boolean`);
+    if (ca?.enabled) {
+      if (typeof ca.credentials_file !== 'string' || !ca.credentials_file) errs.push(`${name}.credentials_file must be set when enabled`);
+      const expectedHeaders = name === 'client_auth'
+        ? { agent_header: 'x-agent-id', client_header: 'x-sk-client-id', revision_header: 'x-sk-credential-revision' }
+        : { agent_header: 'x-sk-operator-id', client_header: 'x-sk-operator-client-id', revision_header: 'x-sk-operator-credential-revision' };
+      for (const [key, expected] of Object.entries(expectedHeaders)) {
+        if (ca[key] !== expected) errs.push(`${name}.${key} must be ${expected}`);
+      }
+      if (!Number.isInteger(ca.expected_owner_uid) || ca.expected_owner_uid < 0) errs.push(`${name}.expected_owner_uid must be a non-negative integer`);
+      if (ca.expected_group_gid != null && (!Number.isInteger(ca.expected_group_gid) || ca.expected_group_gid < 0)) errs.push(`${name}.expected_group_gid must be null or a non-negative integer`);
+    }
+    for (const key of ['max_authorization_bytes', 'max_agent_id_bytes', 'max_client_id_bytes', 'max_revision_bytes', 'max_token_bytes', 'max_request_body_bytes', 'max_credential_file_bytes', 'max_credentials', 'denial_window_ms', 'denial_max']) {
+      if (!Number.isInteger(ca?.[key]) || ca[key] < 1) errs.push(`${name}.${key} must be a positive integer`);
+    }
+  }
 
   // metrics
   if (typeof cfg.metrics.enabled !== 'boolean')
@@ -862,6 +931,17 @@ function resolvePaths(cfg) {
     cfg.metrics.db_path = cfg.metrics.db_path.startsWith('~')
       ? expandHome(cfg.metrics.db_path)
       : resolve(REPO_ROOT, cfg.metrics.db_path);
+  }
+
+  if (cfg.client_auth?.credentials_file) {
+    cfg.client_auth.credentials_file = cfg.client_auth.credentials_file.startsWith('~')
+      ? expandHome(cfg.client_auth.credentials_file)
+      : resolve(REPO_ROOT, cfg.client_auth.credentials_file);
+  }
+  if (cfg.operator_auth?.credentials_file) {
+    cfg.operator_auth.credentials_file = cfg.operator_auth.credentials_file.startsWith('~')
+      ? expandHome(cfg.operator_auth.credentials_file)
+      : resolve(REPO_ROOT, cfg.operator_auth.credentials_file);
   }
 
   // siem output paths

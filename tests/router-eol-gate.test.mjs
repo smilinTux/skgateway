@@ -204,7 +204,7 @@ describe("router gates known-eol/dead concrete model ids (card P1.6)", () => {
     );
   });
 
-  test("an unknown id keeps the fall-through unchanged (backend still attempted)", async () => {
+  test("an unknown id fails fast without a backend attempt", async () => {
     _resetCacheForTests();
     const modelId = `nvidia/never-seen-${Date.now()}`;
     const lc = getLifecycle(modelId);
@@ -221,8 +221,9 @@ describe("router gates known-eol/dead concrete model ids (card P1.6)", () => {
       router, { model: modelId, agentId: "test" }, "/chat/completions", "POST", HEADERS, bodyFor(modelId), false
     );
 
-    assert.equal(r.status, 200, "unknown id falls through to the only available backend, which serves it");
-    assert.equal(up.requestCount, before_ + 1, "the backend WAS attempted (fall-through unchanged)");
+    assert.equal(r.status, 404);
+    assert.equal(JSON.parse(r.body).error.code, "unknown_model");
+    assert.equal(up.requestCount, before_, "unknown ids never widen to an unrelated backend");
   });
 
   test("an active id explicitly claimed by a backend is unaffected", async () => {
