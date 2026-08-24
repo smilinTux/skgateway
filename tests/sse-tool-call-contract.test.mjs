@@ -24,6 +24,15 @@ function response(deltas) {
   }, REQUESTED);
 }
 
+function choicesResponse(chunks) {
+  const frames = chunks.map((choices) => `data: ${JSON.stringify({ model: MODEL, choices })}`);
+  return enforceResponseContract({
+    status: 200,
+    headers: { "content-type": "text/event-stream", "content-length": "999" },
+    body: Buffer.from([...frames, "data: [DONE]", ""].join("\n\n")),
+  }, REQUESTED);
+}
+
 function assertRejected(deltas) {
   const result = response(deltas);
   assert.equal(result.status, 502);
@@ -35,6 +44,79 @@ function assertRejected(deltas) {
 }
 
 describe("completed SSE tool-call structure", () => {
+  test("rejects tool completion without same-choice call evidence", () => {
+    assertRejected([{ delta: { content: "PUBLIC_SYNTHETIC_OK" }, finishReason: "tool_calls" }]);
+  });
+
+  test("rejects a completed call with stop", () => {
+    const call = { index: 0, id: "call_1", type: "function", function: { name: "lookup", arguments: "{}" } };
+    assertRejected([{ delta: { tool_calls: [call] }, finishReason: "stop" }]);
+  });
+
+  test("rejects a completed call with length", () => {
+    const call = { index: 0, id: "call_1", type: "function", function: { name: "lookup", arguments: "{}" } };
+    assertRejected([{ delta: { tool_calls: [call] }, finishReason: "length" }]);
+  });
+
+  test("rejects missing, duplicate, conflicting, and unsupported tool terminal reasons", () => {
+    const call = { index: 0, id: "call_1", type: "function", function: { name: "lookup", arguments: "{}" } };
+    assertRejected([{ delta: { tool_calls: [call] } }]);
+    assertRejected([
+      { delta: { tool_calls: [call] }, finishReason: "tool_calls" },
+      { delta: {}, finishReason: "tool_calls" },
+    ]);
+    assertRejected([
+      { delta: { tool_calls: [call] }, finishReason: "tool_calls" },
+      { delta: {}, finishReason: "stop" },
+    ]);
+    assertRejected([{ delta: { tool_calls: [call] }, finishReason: "content_filter" }]);
+    assertRejected([{ delta: { tool_calls: [call] }, finishReason: "unsupported" }]);
+  });
+
+  test("rejects cross-choice output and terminal borrowing", () => {
+    const result = choicesResponse([
+      [
+        { index: 0, delta: { tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "lookup", arguments: "{}" } }] }, finish_reason: null },
+        { index: 1, delta: { content: "PUBLIC_SYNTHETIC_OK" }, finish_reason: "tool_calls" },
+      ],
+    ]);
+    assert.equal(result.status, 502);
+    assert.equal(JSON.parse(result.body).error.code, "invalid_upstream_tool_calls");
+  });
+
+  test("rejects cross-choice visible-output borrowing", () => {
+    const result = choicesResponse([[
+      { index: 0, delta: { content: "PUBLIC_SYNTHETIC_OK" }, finish_reason: "stop" },
+      { index: 1, delta: {}, finish_reason: "stop" },
+    ]]);
+    assert.equal(result.status, 502);
+    assert.equal(JSON.parse(result.body).error.code, "empty_upstream_response");
+  });
+
+  test("preserves independent content and interleaved tool choices", () => {
+    const result = choicesResponse([
+      [
+        { index: 0, delta: { tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "lookup", arguments: "{" } }] }, finish_reason: null },
+        { index: 1, delta: { content: "PUBLIC_SYNTHETIC_OK" }, finish_reason: null },
+      ],
+      [
+        { index: 1, delta: {}, finish_reason: "stop" },
+        { index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: "}" } }] }, finish_reason: "tool_calls" },
+      ],
+    ]);
+    assert.equal(result.status, 200);
+    assert.match(result.body.toString(), /PUBLIC_SYNTHETIC_OK/);
+    assert.match(result.body.toString(), /call_1/);
+  });
+
+  test("preserves ordinary content-only stop and length", () => {
+    for (const finishReason of ["stop", "length"]) {
+      const result = response([{ delta: { content: "PUBLIC_SYNTHETIC_OK" }, finishReason }]);
+      assert.equal(result.status, 200);
+      assert.match(result.body.toString(), /PUBLIC_SYNTHETIC_OK/);
+    }
+  });
+
   test("reproduces and rejects an empty tool-call entry", () => {
     assertRejected([{ delta: { tool_calls: [{}] } }]);
   });

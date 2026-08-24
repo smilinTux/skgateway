@@ -81,7 +81,7 @@ describe("response attribution and sanitizer contract", () => {
       choices: [{ delta: {
         reasoning_content: "private chain",
         tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "lookup", arguments: "{}" } }],
-      } }],
+      }, finish_reason: "tool_calls" }],
     };
     const result = enforceResponseContract({
       status: 200,
