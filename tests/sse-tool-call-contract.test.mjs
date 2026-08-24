@@ -7,6 +7,7 @@ import { enforceResponseContract } from "../src/proxy/response-contract.mjs";
 
 const MODEL = "Qwen/Qwen3-30B-A3B";
 const REQUESTED = "sk-qwen";
+const LIVE_QWEN_MODEL = "qwen3.8-27b-huihui-abliterated-q4_k_m";
 
 function sseBody(deltas) {
   const frames = deltas.map((entry) => `data: ${JSON.stringify({
@@ -75,7 +76,71 @@ function contentFrame(finishReason, content = "PUBLIC_SYNTHETIC_OK", index = 0) 
   return `data: ${JSON.stringify({ model: MODEL, choices: [choice] })}`;
 }
 
+function sanitizedLiveQwenSse() {
+  const chunk = (delta, finishReason = null) => `data: ${JSON.stringify({
+    choices: [{ finish_reason: finishReason, index: 0, delta }],
+    created: 0,
+    id: "sanitized-live-qwen",
+    model: LIVE_QWEN_MODEL,
+    system_fingerprint: "sanitized",
+    object: "chat.completion.chunk",
+  })}`;
+  const reasoning = Array.from({ length: 31 }, (_, index) =>
+    chunk({ reasoning_content: `PRIVATE_REASONING_MUST_NOT_LEAK_${index}` }));
+  const content = ["PUBLIC", "_SYN", "TH", "ET", "IC", "_OK"].map((part) => chunk({ content: part }));
+  const usage = `data: ${JSON.stringify({
+    choices: [],
+    created: 0,
+    id: "sanitized-live-qwen",
+    model: LIVE_QWEN_MODEL,
+    system_fingerprint: "sanitized",
+    object: "chat.completion.chunk",
+    usage: {
+      completion_tokens: 40,
+      prompt_tokens: 65,
+      total_tokens: 105,
+      prompt_tokens_details: { cached_tokens: 0 },
+    },
+    timings: {
+      cache_n: 0,
+      prompt_n: 0,
+      prompt_ms: 0,
+      prompt_per_token_ms: 0,
+      prompt_per_second: 0,
+      predicted_n: 0,
+      predicted_ms: 0,
+      predicted_per_token_ms: 0,
+      predicted_per_second: 0,
+    },
+  })}`;
+  return Buffer.from([
+    chunk({ role: "assistant", content: null }),
+    ...reasoning,
+    ...content,
+    chunk({}, "stop"),
+    usage,
+    "data: [DONE]",
+    "",
+  ].join("\n\n"));
+}
+
 describe("completed SSE tool-call structure", () => {
+  test("accepts sanitized concrete-Qwen live SSE framing", () => {
+    const result = enforceResponseContract({
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+      body: sanitizedLiveQwenSse(),
+    }, REQUESTED);
+    assert.equal(result.status, 200);
+    assert.equal(result.servedModel, LIVE_QWEN_MODEL);
+    const visible = result.body.toString().split("\n")
+      .filter((line) => line.startsWith("data:") && !line.includes("[DONE]"))
+      .map((line) => JSON.parse(line.slice(5)).choices?.[0]?.delta?.content || "")
+      .join("");
+    assert.equal(visible, "PUBLIC_SYNTHETIC_OK");
+    assert.equal(result.body.includes(Buffer.from("PRIVATE_REASONING_MUST_NOT_LEAK")), false);
+  });
+
   test("parent blocker rejects visible content with no terminal reason", () => {
     assertCompletionRejected(rawResponse([contentFrame(undefined), "data: [DONE]"]));
   });
@@ -142,6 +207,28 @@ describe("completed SSE tool-call structure", () => {
     ]) assertCompletionRejected(rawResponse([contentFrame("stop"), usageFrame(usage), "data: [DONE]"]));
 
     assertCompletionRejected(rawResponse([contentFrame("stop"), valid, valid, "data: [DONE]"]));
+  });
+
+  test("rejects malformed concrete-Qwen prompt token details", () => {
+    const usageFrame = (promptTokensDetails) => `data: ${JSON.stringify({
+      model: MODEL,
+      choices: [],
+      usage: {
+        prompt_tokens: 3,
+        completion_tokens: 2,
+        total_tokens: 5,
+        prompt_tokens_details: promptTokensDetails,
+      },
+    })}`;
+    for (const details of [
+      null,
+      [],
+      {},
+      { cached_tokens: -1 },
+      { cached_tokens: 4 },
+      { cached_tokens: "0" },
+      { cached_tokens: 0, extra: 0 },
+    ]) assertCompletionRejected(rawResponse([contentFrame("stop"), usageFrame(details), "data: [DONE]"]));
   });
 
   test("rejects every usage frame with nonempty choices", () => {
