@@ -51,7 +51,7 @@ import { buildServingCatalog } from "../discovery.mjs";
 import { rankModels } from "../ranking/rank.mjs";
 import { buildCapabilityCatalog } from "../ranking/catalog.mjs";
 import { loadAllowlist } from "../advertise.mjs";
-import { isModelAvailable } from "./advertise.mjs";
+import { isCatalogDisabledBackend, isModelAvailable } from "./advertise.mjs";
 import {
   resolveZoneCeiling,
   isZoneAllowed,
@@ -413,6 +413,8 @@ export function _throttleStateForTests(backendId, model) {
  * @property {string}   [credentials_file]  Path to JSON credentials (oauth flow)
  * @property {number}   [cooldown_ms]       Cooldown after DOWN before re-probe
  * @property {number}   [timeout_ms]        Socket idle timeout (fail fast on a wedged upstream; 0 = off)
+ * @property {boolean}  [enabled]           False removes the backend from every route candidate
+ * @property {boolean}  [advertise]         False removes the backend from catalog and routing
  *
  * @typedef {Object} HealthSnapshot
  * @property {'up'|'degraded'|'down'|'unknown'} status  `unknown` = never observed
@@ -1323,6 +1325,7 @@ export function createRouter(config = {}) {
   // Populate initial registry from config
   if (config.backends && typeof config.backends === "object") {
     for (const [id, cfg] of Object.entries(config.backends)) {
+      if (isCatalogDisabledBackend(cfg)) continue;
       backends.set(id, new Backend({ id, ...qDefaults, ...cfg }));
     }
   }
@@ -1573,6 +1576,11 @@ export function createRouter(config = {}) {
    */
   function addBackend(cfg) {
     if (!cfg.id) throw new Error("[router] addBackend: cfg.id is required");
+    if (isCatalogDisabledBackend(cfg)) {
+      backends.delete(cfg.id);
+      console.log(`[router] backend=${cfg.id} disabled and removed from routing`);
+      return;
+    }
     backends.set(cfg.id, new Backend({ ...qDefaults, ...cfg }));
     console.log(
       `[router] registered backend=${cfg.id} url=${cfg.url} ` +
