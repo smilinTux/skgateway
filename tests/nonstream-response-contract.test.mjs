@@ -43,6 +43,101 @@ function assertRejected(result) {
 }
 
 describe("non-stream public output contract", () => {
+  test("never promotes private reasoning aliases into public content", () => {
+    for (const privateField of ["reasoning", "reasoning_content", "analysis"]) {
+      const marker = `PRIVATE_${privateField.toUpperCase()}_${"x".repeat(480)}`;
+      const result = response([{
+        index: 0,
+        finish_reason: "length",
+        message: { role: "assistant", content: "", [privateField]: marker },
+      }]);
+      assertRejected(result);
+      assert.equal(result.body.includes(Buffer.from(marker)), false);
+    }
+  });
+
+  test("rejects lossy-repairable tool arguments exactly as received", () => {
+    for (const argumentsText of [
+      "{",
+      "[",
+      '{"key":"value",}',
+      '{"key":"value"',
+      '"scalar"',
+      "null",
+      "[]",
+      '{"key":1,"\\u006bey":2}',
+      '{"key":"\\q"}',
+      '{"key":"\\uD800"}',
+    ]) {
+      const result = response([{
+        index: 0,
+        finish_reason: "tool_calls",
+        message: {
+          role: "assistant",
+          content: null,
+          tool_calls: [{
+            id: "call_1",
+            type: "function",
+            function: { name: "lookup", arguments: argumentsText },
+          }],
+        },
+      }]);
+      assertRejected(result);
+    }
+  });
+
+  test("preserves every byte of visible public content", () => {
+    const content = " \t\nPUBLIC_SYNTHETIC_OK\n\t ";
+    const result = response([{
+      index: 0,
+      finish_reason: "stop",
+      message: { role: "assistant", content },
+    }]);
+    assert.equal(result.status, 200);
+    assert.equal(JSON.parse(result.body).choices[0].message.content, content);
+  });
+
+  test("preserves valid tool arguments byte-exactly", () => {
+    const argumentsText = ' \n\t { "key" : "value", "items" : [1, 2] } \t ';
+    const result = response([{
+      index: 0,
+      finish_reason: "tool_calls",
+      message: {
+        role: "assistant",
+        content: null,
+        tool_calls: [{
+          id: "call_1",
+          type: "function",
+          function: { name: "lookup", arguments: argumentsText },
+        }],
+      },
+    }]);
+    assert.equal(result.status, 200);
+    assert.equal(JSON.parse(result.body).choices[0].message.tool_calls[0].function.arguments, argumentsText);
+  });
+
+  test("strips nested reasoning aliases without changing public fields", () => {
+    const content = " PUBLIC_SYNTHETIC_OK ";
+    const result = response([{
+      index: 0,
+      finish_reason: "stop",
+      message: {
+        role: "assistant",
+        content,
+        metadata: {
+          reasoning: "PRIVATE_REASONING",
+          reasoning_content: "PRIVATE_REASONING_CONTENT",
+          analysis: "PRIVATE_ANALYSIS",
+          public_label: "PUBLIC_LABEL",
+        },
+      },
+    }]);
+    assert.equal(result.status, 200);
+    const parsed = JSON.parse(result.body);
+    assert.deepEqual(parsed.choices[0].message.metadata, { public_label: "PUBLIC_LABEL" });
+    assert.equal(parsed.choices[0].message.content, content);
+  });
+
   test("rejects the exact sanitized live Qwen reasoning-only length response", () => {
     const result = response([{
       finish_reason: "length",
