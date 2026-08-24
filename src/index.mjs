@@ -762,6 +762,9 @@ const sklegalQualification = createSkLegalQualificationResolver(
 const sklegalAuthzClient = createSkLegalAuthzClient({
   url: sklegalAuthzCfg.url,
   timeoutMs: sklegalAuthzCfg.timeout_ms ?? authzCfg.timeout_ms,
+  qualificationEnabled: sklegalQualification.enabled,
+  serviceCredentialFile: sklegalAuthzCfg.service_credential_file,
+  serviceCredentialMaxAgeMs: sklegalAuthzCfg.service_credential_max_age_ms,
 });
 if (authzEnforce) {
   console.log(

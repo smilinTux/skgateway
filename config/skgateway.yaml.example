@@ -367,8 +367,9 @@ identity:
 ## Authorization is disabled unless enforce is explicitly enabled. The SKLegal
 ## qualification lane is separately explicit. Its exact synthetic scope comes
 ## only from this trusted process configuration, never from request headers.
-## Service and request-local credentials are read from the environment and the
-## incoming Authorization header. Do not place either credential in this file.
+## Qualification service credentials are read from a systemd credential file.
+## Request-local credentials come from the incoming Authorization header. Do
+## not place either credential value in this file or the process environment.
 authz:
   enforce: false
   url: null
@@ -377,9 +378,12 @@ authz:
   trust_internal: true
   sklegal_qualification:
     enabled: false
-    ## URL may come from SKLEGAL_CAPAUTH_AUTHZ_ENDPOINT. The service credential
-    ## comes only from SKLEGAL_AUTHZ_SERVICE_TOKEN.
+    ## URL may come from SKLEGAL_CAPAUTH_AUTHZ_ENDPOINT. When enabled, the
+    ## service credential must come from this absolute systemd credential path.
+    ## SKLEGAL_AUTHZ_SERVICE_TOKEN is rejected in qualification mode.
     url: null
+    service_credential_file: null
+    service_credential_max_age_ms: 300000
     routes: []
     ## Example synthetic route shape:
     # routes:

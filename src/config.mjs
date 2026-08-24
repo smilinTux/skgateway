@@ -268,6 +268,8 @@ const DEFAULTS = {
     sklegal_qualification: {
       enabled: false,
       url: null,
+      service_credential_file: null,
+      service_credential_max_age_ms: 300000,
       routes: [],
     },
   },
