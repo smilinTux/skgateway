@@ -80,7 +80,7 @@ describe("response attribution and sanitizer contract", () => {
       model: "Qwen/Qwen3-30B-A3B",
       choices: [{ delta: {
         reasoning_content: "private chain",
-        tool_calls: [{ index: 0, function: { name: "lookup", arguments: "{}" } }],
+        tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "lookup", arguments: "{}" } }],
       } }],
     };
     const result = enforceResponseContract({

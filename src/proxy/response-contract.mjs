@@ -10,15 +10,85 @@ function stripReasoning(value) {
   return out;
 }
 
-function hasVisibleOutput(chunk) {
+function hasVisibleContent(chunk) {
   return chunk?.choices?.some((choice) => {
     const output = choice?.delta || choice?.message || {};
     const content = output.content;
-    const hasContent = typeof content === "string"
+    return typeof content === "string"
       ? content.trim().length > 0
       : Array.isArray(content) && content.some((part) => typeof part?.text === "string" && part.text.trim().length > 0);
-    return hasContent || (Array.isArray(output.tool_calls) && output.tool_calls.length > 0);
   }) === true;
+}
+
+function collectToolCallFragments(chunk, calls, ids) {
+  let valid = true;
+  for (const [choicePosition, choice] of (chunk?.choices || []).entries()) {
+    const output = choice?.delta || choice?.message || {};
+    if (!Object.hasOwn(output, "tool_calls")) continue;
+    if (!Array.isArray(output.tool_calls) || output.tool_calls.length === 0) {
+      valid = false;
+      continue;
+    }
+    const choiceIndex = Number.isSafeInteger(choice?.index) && choice.index >= 0
+      ? choice.index
+      : choicePosition;
+    for (const fragment of output.tool_calls) {
+      if (!fragment || typeof fragment !== "object" || Array.isArray(fragment)
+          || !Number.isSafeInteger(fragment.index) || fragment.index < 0) {
+        valid = false;
+        continue;
+      }
+      const key = `${choiceIndex}:${fragment.index}`;
+      const call = calls.get(key) || { id: null, type: null, name: null, arguments: "", sawArguments: false };
+
+      if (Object.hasOwn(fragment, "id")) {
+        if (typeof fragment.id !== "string" || !fragment.id.trim()
+            || (call.id !== null && call.id !== fragment.id)
+            || (ids.has(fragment.id) && ids.get(fragment.id) !== key)) valid = false;
+        else {
+          call.id = fragment.id;
+          ids.set(fragment.id, key);
+        }
+      }
+      if (Object.hasOwn(fragment, "type")) {
+        if (fragment.type !== "function" || (call.type !== null && call.type !== fragment.type)) valid = false;
+        else call.type = fragment.type;
+      }
+      if (Object.hasOwn(fragment, "function")) {
+        if (!fragment.function || typeof fragment.function !== "object" || Array.isArray(fragment.function)) {
+          valid = false;
+        } else {
+          if (Object.hasOwn(fragment.function, "name")) {
+            const name = fragment.function.name;
+            if (typeof name !== "string" || !name.trim() || (call.name !== null && call.name !== name)) valid = false;
+            else call.name = name;
+          }
+          if (Object.hasOwn(fragment.function, "arguments")) {
+            if (typeof fragment.function.arguments !== "string") valid = false;
+            else {
+              call.arguments += fragment.function.arguments;
+              call.sawArguments = true;
+            }
+          }
+        }
+      }
+      calls.set(key, call);
+    }
+  }
+  return valid;
+}
+
+function hasCompletedToolCalls(calls) {
+  if (calls.size === 0) return false;
+  return [...calls.values()].every((call) => {
+    if (!call.id || call.type !== "function" || !call.name || !call.sawArguments) return false;
+    try {
+      JSON.parse(call.arguments);
+      return true;
+    } catch {
+      return false;
+    }
+  });
 }
 
 /** Preserve requested alias separately while exposing the upstream model exactly. */
@@ -29,7 +99,10 @@ export function enforceResponseContract(response, requestedModel) {
   let body = response.body;
 
   if (contentType.includes("text/event-stream") || body.toString("utf8").includes("data:")) {
-    let visibleOutput = false;
+    let visibleContent = false;
+    let validToolEvidence = true;
+    const toolCalls = new Map();
+    const toolIds = new Map();
     const lines = body.toString("utf8").split("\n").map((line) => {
       if (!line.startsWith("data:")) return line;
       const payload = line.slice(5).trim();
@@ -38,7 +111,8 @@ export function enforceResponseContract(response, requestedModel) {
         const parsed = JSON.parse(payload);
         if (!servedModel && typeof parsed.model === "string" && parsed.model) servedModel = parsed.model;
         const clean = stripReasoning(parsed);
-        visibleOutput ||= hasVisibleOutput(clean);
+        visibleContent ||= hasVisibleContent(clean);
+        validToolEvidence = collectToolCallFragments(clean, toolCalls, toolIds) && validToolEvidence;
         if (requestedModel) clean.requested_model = requestedModel;
         return `data: ${JSON.stringify(clean)}`;
       } catch {
@@ -46,14 +120,18 @@ export function enforceResponseContract(response, requestedModel) {
       }
     });
     body = Buffer.from(lines.join("\n"), "utf8");
-    if (response.status >= 200 && response.status < 300 && !visibleOutput) {
+    const completedToolCalls = hasCompletedToolCalls(toolCalls);
+    const invalidToolCalls = !validToolEvidence || (toolCalls.size > 0 && !completedToolCalls);
+    if (response.status >= 200 && response.status < 300 && (invalidToolCalls || (!visibleContent && !completedToolCalls))) {
       const headers = { ...response.headers, "content-type": "application/json", "cache-control": "no-store" };
       delete headers["content-length"];
       delete headers["Content-Length"];
       body = Buffer.from(JSON.stringify({
         error: {
-          message: "Upstream returned no visible content or tool calls",
-          code: "empty_upstream_response",
+          message: invalidToolCalls
+            ? "Upstream returned invalid tool-call evidence"
+            : "Upstream returned no visible content or tool calls",
+          code: invalidToolCalls ? "invalid_upstream_tool_calls" : "empty_upstream_response",
           type: "upstream_error",
         },
         ...(requestedModel ? { requested_model: requestedModel } : {}),

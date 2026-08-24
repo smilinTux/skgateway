@@ -1,0 +1,145 @@
+import assert from "node:assert/strict";
+import http from "node:http";
+import { describe, test } from "node:test";
+
+import { createRouter, routeAndSend } from "../src/proxy/router.mjs";
+import { enforceResponseContract } from "../src/proxy/response-contract.mjs";
+
+const MODEL = "Qwen/Qwen3-30B-A3B";
+const REQUESTED = "sk-qwen";
+
+function sseBody(deltas) {
+  const frames = deltas.map((entry) => `data: ${JSON.stringify({
+    model: MODEL,
+    choices: [{ index: 0, delta: entry.delta, finish_reason: entry.finishReason ?? null }],
+  })}`);
+  return Buffer.from([...frames, "data: [DONE]", ""].join("\n\n"));
+}
+
+function response(deltas) {
+  return enforceResponseContract({
+    status: 200,
+    headers: { "content-type": "text/event-stream", "content-length": "999" },
+    body: sseBody(deltas),
+  }, REQUESTED);
+}
+
+function assertRejected(deltas) {
+  const result = response(deltas);
+  assert.equal(result.status, 502);
+  assert.equal(result.headers["content-type"], "application/json");
+  assert.equal(result.headers["content-length"], undefined);
+  assert.equal(JSON.parse(result.body).error.code, "invalid_upstream_tool_calls");
+  assert.equal(result.body.includes(Buffer.from("[DONE]")), false);
+  assert.equal(result.body.includes(Buffer.from("private chain")), false);
+}
+
+describe("completed SSE tool-call structure", () => {
+  test("reproduces and rejects an empty tool-call entry", () => {
+    assertRejected([{ delta: { tool_calls: [{}] } }]);
+  });
+
+  test("rejects empty and non-array tool-call collections", () => {
+    assertRejected([{ delta: { tool_calls: [] } }]);
+    assertRejected([{ delta: { tool_calls: {} } }]);
+  });
+
+  test("rejects missing or unsupported identity and type", () => {
+    assertRejected([{ delta: { tool_calls: [{ index: 0, type: "function", function: { name: "lookup", arguments: "{}" } }] } }]);
+    assertRejected([{ delta: { tool_calls: [{ id: "call_1", type: "function", function: { name: "lookup", arguments: "{}" } }] } }]);
+    assertRejected([{ delta: { tool_calls: [{ index: -1, id: "call_1", type: "function", function: { name: "lookup", arguments: "{}" } }] } }]);
+    assertRejected([{ delta: { tool_calls: [{ index: 0, id: "call_1", type: "computer", function: { name: "lookup", arguments: "{}" } }] } }]);
+  });
+
+  test("rejects missing function, name, and arguments", () => {
+    assertRejected([{ delta: { tool_calls: [{ index: 0, id: "call_1", type: "function" }] } }]);
+    assertRejected([{ delta: { tool_calls: [{ index: 0, id: "call_1", type: "function", function: { arguments: "{}" } }] } }]);
+    assertRejected([{ delta: { tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "lookup" } }] } }]);
+  });
+
+  test("rejects incomplete and invalid JSON arguments", () => {
+    assertRejected([{ delta: { tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "lookup", arguments: "{\"term\":" } }] } }]);
+    assertRejected([{ delta: { tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "lookup", arguments: "not json" } }] } }]);
+  });
+
+  test("rejects conflicting fragments and duplicate identities", () => {
+    assertRejected([
+      { delta: { tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "lookup", arguments: "{" } }] } },
+      { delta: { tool_calls: [{ index: 0, id: "call_2", type: "function", function: { arguments: "}" } }] } },
+    ]);
+    assertRejected([
+      { delta: { tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "lookup", arguments: "{}" } }] } },
+      { delta: { tool_calls: [{ index: 1, id: "call_1", type: "function", function: { name: "search", arguments: "{}" } }] } },
+    ]);
+    assertRejected([
+      { delta: { tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "lookup", arguments: "" } }] } },
+      { delta: { tool_calls: [{ index: 0, type: "computer", function: { name: "search", arguments: {} } }] } },
+    ]);
+  });
+
+  test("rejects mixed visible content and malformed tool evidence", () => {
+    assertRejected([{ delta: { content: "PUBLIC_SYNTHETIC_OK", reasoning_content: "private chain", tool_calls: [{}] } }]);
+  });
+
+  test("preserves a valid fragmented call", () => {
+    const result = response([
+      { delta: { reasoning_content: "private chain", tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "lookup", arguments: "{\"term\":" } }] } },
+      { delta: { tool_calls: [{ index: 0, function: { arguments: "\"public\"}" } }] } },
+      { delta: {}, finishReason: "tool_calls" },
+    ]);
+    assert.equal(result.status, 200);
+    assert.match(result.body.toString(), /call_1/);
+    assert.match(result.body.toString(), /PUBLIC|public/);
+    assert.equal(result.body.includes(Buffer.from("private chain")), false);
+    assert.equal(result.servedModel, MODEL);
+  });
+
+  test("preserves valid fragmented parallel calls", () => {
+    const result = response([
+      { delta: { tool_calls: [
+        { index: 0, id: "call_1", type: "function", function: { name: "lookup", arguments: "{" } },
+        { index: 1, id: "call_2", type: "function", function: { name: "search", arguments: "{\"q\":" } },
+      ] } },
+      { delta: { tool_calls: [
+        { index: 1, function: { arguments: "\"public\"}" } },
+        { index: 0, function: { arguments: "}" } },
+      ] } },
+      { delta: {}, finishReason: "tool_calls" },
+    ]);
+    assert.equal(result.status, 200);
+    assert.match(result.body.toString(), /call_1/);
+    assert.match(result.body.toString(), /call_2/);
+    assert.equal(result.servedModel, MODEL);
+  });
+
+  test("preserves ordinary visible content without tool evidence", () => {
+    const result = response([{ delta: { content: "PUBLIC_SYNTHETIC_OK", reasoning_content: "private chain" } }]);
+    assert.equal(result.status, 200);
+    assert.match(result.body.toString(), /PUBLIC_SYNTHETIC_OK/);
+    assert.equal(result.body.includes(Buffer.from("private chain")), false);
+  });
+
+  test("shared route returns bounded failure and sanitized audit", async () => {
+    const upstream = http.createServer((request, serverResponse) => {
+      request.resume();
+      serverResponse.writeHead(200, { "content-type": "text/event-stream" });
+      serverResponse.end(sseBody([{ delta: { reasoning_content: "private chain", tool_calls: [{}] } }]));
+    });
+    await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+    try {
+      const url = `http://127.0.0.1:${upstream.address().port}/v1`;
+      const router = createRouter({ backends: { qwen: { url, auth_type: "none", models: [REQUESTED] } } });
+      const events = [];
+      const result = await routeAndSend(router, { model: REQUESTED, agentId: "repair" },
+        "/chat/completions", "POST", { "content-type": "application/json" },
+        Buffer.from(JSON.stringify({ model: REQUESTED, stream: true, messages: [] })), false,
+        (event) => events.push(event));
+      assert.equal(result.status, 502);
+      assert.equal(JSON.parse(result.body).error.code, "invalid_upstream_tool_calls");
+      assert.equal(events.findLast((event) => event.event_type === "response").details.status, 502);
+      assert.equal(JSON.stringify(events).includes("private chain"), false);
+    } finally {
+      await new Promise((resolve) => upstream.close(resolve));
+    }
+  });
+});
