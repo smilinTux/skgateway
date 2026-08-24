@@ -144,6 +144,47 @@ describe("completed SSE tool-call structure", () => {
     assertCompletionRejected(rawResponse([contentFrame("stop"), valid, valid, "data: [DONE]"]));
   });
 
+  test("rejects every usage frame with nonempty choices", () => {
+    const usage = { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 };
+    const usageFrame = (choices) => `data: ${JSON.stringify({ model: MODEL, choices, usage })}`;
+    const tool = { index: 0, id: "call_1", type: "function", function: { name: "lookup", arguments: "{}" } };
+    const cases = [
+      [usageFrame([{ index: 0, delta: { content: "PUBLIC_SYNTHETIC_OK" }, finish_reason: "stop" }])],
+      [usageFrame([{ index: 0, delta: { reasoning_content: "private chain" }, finish_reason: null }]), contentFrame("stop")],
+      [usageFrame([{ index: 0, delta: { role: "assistant" }, finish_reason: null }]), contentFrame("stop")],
+      [usageFrame([{ index: 0, delta: { tool_calls: [tool] }, finish_reason: "tool_calls" }])],
+      [usageFrame([{ index: 0, delta: { content: "PUBLIC_SYNTHETIC_OK" }, finish_reason: null }]), contentFrame("stop", null)],
+      [usageFrame([
+        { index: 0, delta: { content: "CHOICE_ZERO" }, finish_reason: "stop" },
+        { index: 1, delta: { content: "CHOICE_ONE" }, finish_reason: "length" },
+      ])],
+    ];
+    for (const frames of cases) {
+      const result = rawResponse([...frames, "data: [DONE]"]);
+      assert.equal(result.status, 502);
+      assert.equal(result.headers["content-type"], "application/json");
+      assert.equal(result.headers["content-length"], undefined);
+      assert.equal(result.body.includes(Buffer.from("[DONE]")), false);
+      assert.equal(result.body.includes(Buffer.from("PUBLIC_SYNTHETIC_OK")), false);
+      assert.equal(result.body.includes(Buffer.from("private chain")), false);
+      assert.equal(result.body.includes(Buffer.from("total_tokens")), false);
+    }
+  });
+
+  test("requires usage-only choices after every choice completes", () => {
+    const usage = { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 };
+    const frame = (choices) => `data: ${JSON.stringify({ model: MODEL, ...(choices === undefined ? {} : { choices }), usage })}`;
+    for (const choices of [undefined, null, {}, [null]]) {
+      const result = rawResponse([contentFrame("stop"), frame(choices), "data: [DONE]"]);
+      assert.equal(result.status, 502);
+      assert.equal(result.headers["content-type"], "application/json");
+      assert.equal(result.body.includes(Buffer.from("[DONE]")), false);
+      assert.equal(result.body.includes(Buffer.from("total_tokens")), false);
+    }
+    assertCompletionRejected(rawResponse([frame([]), contentFrame("stop"), "data: [DONE]"]));
+    assertCompletionRejected(rawResponse([contentFrame(null), frame([]), contentFrame("stop", null), "data: [DONE]"]));
+  });
+
   test("rejects DONE before every choice completes and any choice after DONE", () => {
     assertCompletionRejected(rawResponse([
       contentFrame(null),

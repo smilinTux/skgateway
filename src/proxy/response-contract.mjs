@@ -157,7 +157,10 @@ export function enforceResponseContract(response, requestedModel) {
         const parsed = JSON.parse(payload);
         if (!servedModel && typeof parsed.model === "string" && parsed.model) servedModel = parsed.model;
         if (Object.hasOwn(parsed, "usage")) {
-          if (stream.usageSeen || !hasValidUsage(parsed.usage)) stream.invalidCompletion = true;
+          if (stream.usageSeen || !hasValidUsage(parsed.usage)
+              || !Array.isArray(parsed.choices) || parsed.choices.length !== 0
+              || choiceStates.size === 0
+              || [...choiceStates.values()].some((state) => !hasValidCompletion(state))) stream.invalidCompletion = true;
           stream.usageSeen = true;
         }
         const clean = stripReasoning(parsed);

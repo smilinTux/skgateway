@@ -148,7 +148,8 @@ function startUpstream() {
         if (wantStream) {
           r.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
           r.write('data: {"id":"c1","model":"attrib-model","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}\n\n');
-          r.write('data: {"id":"c1","model":"attrib-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}\n\n');
+          r.write('data: {"id":"c1","model":"attrib-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n');
+          r.write('data: {"id":"c1","model":"attrib-model","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2}}\n\n');
           r.write("data: [DONE]\n\n");
           r.end();
         } else {
