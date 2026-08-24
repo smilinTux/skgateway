@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- SKGateway now serves its own operator facet on the daemon's existing port:
+  `GET /operator/v1/{healthz,readyz,explain,observe}` and a reserved
+  `POST /operator/v1/act` that always returns 501. This fixes the dead-`spec.cli`
+  problem (the `skgateway` binary is not on the control-plane node's PATH) without
+  waiting for the node move, and makes that later move a one-field endpoint update.
+  Conditions come from in-process state, never a self-HTTP probe: `UpstreamServing`
+  from the live per-backend health table, `PoolHealthy` from quarantine flags plus
+  real queue/capacity numbers, and `CatalogFresh` from the discovery cache. Every
+  condition renders only True/False/Unknown with a specific reason code; a
+  cold-start backend yields `Unknown (NoObservedTraffic)` rather than a fabricated
+  healthy, and one failing data source degrades only its own condition.
+
 ### Fixed
 
 - Honor dashboard and metrics disablement during startup. Disabled qualification
