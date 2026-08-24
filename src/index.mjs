@@ -18,6 +18,7 @@ import { loadAllowlist, saveAllowlist, applyAllowlist } from "./advertise.mjs";
 import { discoverCatalog, loadCache, saveCache, fetchNvidia, fetchOpenRouter, fetchOpencode, fetchAnthropicWrapper, fetchCodex, fetchZai, catalogStatus, loadCardOverrides, applyCardOverlays, buildServingCatalog } from "./discovery.mjs";
 import { getPool, resetPool } from "./proxy/connection-pool.mjs";
 import { loadAgentRegistry, extractIdentity, normalizeAgentId, ANONYMOUS_AGENT_ID } from "./identity/capauth.mjs";
+import { ClientAuthenticator, classifyAuthenticationRoute, stripCallerCredentials, stripCredentialQuery } from "./identity/client-auth.mjs";
 import { createAuthzClient } from "./policy/authz_decide.mjs";
 import { createSkLegalAuthzClient } from "./policy/sklegal_authz_decide.mjs";
 import { classifyRoute } from "./policy/authz_routes.mjs";
@@ -66,6 +67,8 @@ const _cfgEmitter = await loadConfig({ configPath });
 const config = _cfgEmitter.current();
 const port = portOverride || config.server?.port || 18780;
 const bind = config.server?.bind || "127.0.0.1";
+let clientAuthenticator = config.client_auth?.enabled ? new ClientAuthenticator(config.client_auth) : null;
+let operatorAuthenticator = config.operator_auth?.enabled ? new ClientAuthenticator(config.operator_auth) : null;
 
 // ─── Capability-aware routing master gate (design 7.2), DEFAULT OFF ───
 // Governs BOTH the `@match` role ranking branch (router.mjs, card P4.2) and
@@ -1161,7 +1164,66 @@ const proxyConfig = buildConfig({
 // (see tests/advertise-lifecycle.test.mjs); no production code depends on it.
 export const server = http.createServer(async (req, res) => {
   const startTime = Date.now();
+  if (clientAuthenticator || operatorAuthenticator) {
+    try {
+      req.url = stripCredentialQuery(req.url ?? '/');
+    } catch {
+      res.writeHead(400, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+      res.end(JSON.stringify({ error: { message: 'Invalid request path', code: 'invalid_path', status: 400 } }));
+      return;
+    }
+  }
   if (process.env.SKGW_REQLOG) { console.log("[REQLOG]", req.method, req.url); }
+
+  // Authentication is disabled by default. Once either boundary is enabled,
+  // only an explicit public allowlist can run without credentials. Admin uses
+  // a separate operator registry, so a forwarding proxy cannot confer trust by
+  // making a remote socket appear loopback-local.
+  if (clientAuthenticator || operatorAuthenticator) {
+    const routeAuth = classifyAuthenticationRoute(req.method, req.url);
+    if (routeAuth.kind === 'invalid') {
+      res.writeHead(400, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+      res.end(JSON.stringify({ error: { message: 'Invalid request path', code: 'invalid_path', status: 400 } }));
+      return;
+    }
+    if (routeAuth.kind !== 'public') {
+      const isAdmin = routeAuth.kind === 'admin';
+      const authenticator = isAdmin ? operatorAuthenticator : clientAuthenticator;
+      const authConfig = isAdmin ? config.operator_auth : config.client_auth;
+      if (!authenticator) {
+        siemHook({ ts: new Date().toISOString(), event: isAdmin ? 'operator_auth.denied' : 'client_auth.denied', reason: 'boundary_unavailable', status: 403, path: routeAuth.path });
+        res.writeHead(403, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+        res.end(JSON.stringify({ error: { message: 'Authentication boundary unavailable', code: 'authentication_unavailable', status: 403 } }));
+        return;
+      }
+      const contentLength = Number(req.headers['content-length'] ?? 0);
+      const tooLarge = !Number.isFinite(contentLength) || contentLength < 0 || contentLength > authConfig.max_request_body_bytes;
+      const checked = tooLarge ? { ok: false, reason: 'request_too_large' } : authenticator.authenticate(req.headers);
+      if (!checked.ok) {
+        const allowed = authenticator.denialAllowed();
+        const status = tooLarge ? 413 : (allowed ? 401 : 429);
+        const code = tooLarge ? 'request_too_large' : (allowed ? 'client_auth_denied' : 'client_auth_rate_limited');
+        siemHook({ ts: new Date().toISOString(), event: isAdmin ? 'operator_auth.denied' : 'client_auth.denied', reason: checked.reason, status, path: routeAuth.path });
+        res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+        res.end(JSON.stringify({ error: { message: tooLarge ? 'Request body exceeds configured limit' : 'Client authentication failed', code, status } }));
+        return;
+      }
+      if (isAdmin) {
+        req.operator_identity = checked.identity;
+        req.identity = { ...checked.identity, method: 'operator_auth' };
+        req.agent_id = checked.identity.agent_id;
+      }
+      else {
+        req.identity = checked.identity;
+        req.agent_id = checked.identity.agent_id;
+        req.headers['x-agent-id'] = checked.identity.agent_id;
+        req.headers['x-sk-client-id'] = checked.identity.client_id;
+        req.headers['x-sk-credential-revision'] = checked.identity.credential_revision;
+      }
+      stripCallerCredentials(req.headers);
+      siemHook({ ts: new Date().toISOString(), event: isAdmin ? 'operator_auth.accepted' : 'client_auth.accepted', agent_id: checked.identity.agent_id, client_id: checked.identity.client_id, credential_revision: checked.identity.credential_revision, registry_revision: checked.identity.registry_revision, path: routeAuth.path });
+    }
+  }
 
   // ── SKWorld authorization gate (L1.8) — OFF BY DEFAULT ──
   // This ENTIRE block is skipped unless SKGATEWAY_AUTHZ_ENFORCE / config.authz.
@@ -1172,12 +1234,12 @@ export const server = http.createServer(async (req, res) => {
   // the capauth PDP, and 403 a gated-route deny before any handler runs. Public
   // routes (health/status/discovery/model-listing) pass straight through.
   if (authzEnforce) {
-    let gateIdentity = {
+    let gateIdentity = req.identity ?? {
       agent_id: req.headers["x-agent-id"] || ANONYMOUS_AGENT_ID,
       method: req.headers["x-agent-id"] ? "header" : "anonymous",
       agent: null,
     };
-    if (identityRegistry) {
+    if (!req.identity && identityRegistry) {
       try {
         gateIdentity = await extractIdentity(req, identityRegistry);
       } catch {
@@ -1665,14 +1727,14 @@ export const server = http.createServer(async (req, res) => {
     // flag. Per-agent spend queries are exact matches, so that split one agent
     // into two keys nothing joins back together.
     const headerAgent = normalizeAgentId(req.headers["x-agent-id"]);
-    let identity = {
+    let identity = req.identity ?? {
       agent_id: headerAgent ?? ANONYMOUS_AGENT_ID,
       verified: false,
       method: headerAgent ? "header" : "anonymous",
       session_id: req.headers["x-session-id"] || null,
       fingerprint: null,
     };
-    if (identityRegistry) {
+    if (!req.identity && identityRegistry) {
       try {
         identity = await extractIdentity(req, identityRegistry);
       } catch (e) {
@@ -1711,7 +1773,17 @@ export const server = http.createServer(async (req, res) => {
 
     // Buffer the request body so we can read the model for routing.
     const chunks = [];
-    for await (const chunk of req) chunks.push(chunk);
+    let receivedBytes = 0;
+    for await (const chunk of req) {
+      receivedBytes += chunk.length;
+      if (clientAuthenticator && receivedBytes > config.client_auth.max_request_body_bytes) {
+        siemHook({ ts: new Date().toISOString(), event: 'client_auth.denied', reason: 'request_too_large', status: 413, agent_id: identity.agent_id, path: req.url });
+        res.writeHead(413, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+        res.end(JSON.stringify({ error: { message: 'Request body exceeds configured limit', code: 'request_too_large', status: 413 } }));
+        return;
+      }
+      chunks.push(chunk);
+    }
     const body = Buffer.concat(chunks);
 
     // ── Anthropic Messages FRONTEND (POST /v1/messages) ──
@@ -2098,9 +2170,7 @@ export const server = http.createServer(async (req, res) => {
           // this is undefined on exactly those paths and the column stays NULL
           // meaning unobserved. That is by construction, not by a special
           // case, and it must never be widened to `|| parsedModel`.
-          modelServed: typeof parsedBody?.model === "string" && parsedBody.model
-            ? parsedBody.model
-            : undefined,
+          modelServed: result?.servedModel,
           energy: result?.energy,
           energyAttempts: result?.energyAttempts,
         });
@@ -2137,8 +2207,12 @@ process.on("SIGINT", () => shutdown("SIGINT"));
 _cfgEmitter.on("config-changed", () => {
   try {
     Object.assign(config, _cfgEmitter.current());
+    clientAuthenticator = config.client_auth?.enabled ? new ClientAuthenticator(config.client_auth) : null;
+    operatorAuthenticator = config.operator_auth?.enabled ? new ClientAuthenticator(config.operator_auth) : null;
     console.log("[skgateway] config reloaded");
   } catch (e) {
+    if (clientAuthenticator) clientAuthenticator.available = false;
+    if (operatorAuthenticator) operatorAuthenticator.available = false;
     console.error("[skgateway] config reload failed:", e.message);
   }
 });

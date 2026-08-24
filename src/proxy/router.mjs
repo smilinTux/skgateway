@@ -39,6 +39,7 @@ import { marginalJoules, imputeJoules, resolveBasis, coeffsForModel, backendIsLo
 import { recordModelOutcome, getLifecycle } from "../discovery/model_catalog_store.mjs";
 import { isRoutable, isEffectivelyRoutable } from "../discovery/lifecycle.mjs";
 import { applyReasoningFloor } from "./core.mjs";
+import { enforceResponseContract } from "./response-contract.mjs";
 import { createDecisionCache, decisionKey } from "./decision-cache.mjs";
 // card P4.2 (@match routing): reuse the existing ranker + capability deriver
 // + discovery cache reader + allowlist/availability checks as-is, no
@@ -50,7 +51,7 @@ import { buildServingCatalog } from "../discovery.mjs";
 import { rankModels } from "../ranking/rank.mjs";
 import { buildCapabilityCatalog } from "../ranking/catalog.mjs";
 import { loadAllowlist } from "../advertise.mjs";
-import { isModelAvailable } from "./advertise.mjs";
+import { isCatalogDisabledBackend, isModelAvailable } from "./advertise.mjs";
 import {
   resolveZoneCeiling,
   isZoneAllowed,
@@ -58,6 +59,7 @@ import {
   TRUST_ZONES,
 } from "../policy/sensitivity.mjs";
 import { parseBucketId, resolveBucket, selectMember, looksLikeBucketAttempt, allBuckets } from "../policy/buckets.mjs";
+import { codexPurityProblems } from "../policy/codex-purity.mjs";
 
 // sk-auto routing decision cache (TTL+LRU); keyed by request fingerprint + config epoch.
 const _autoDecisionCache = createDecisionCache({ ttlMs: 60_000, maxEntries: 500 });
@@ -105,6 +107,11 @@ export const INTERNAL_CONTROL_HEADERS = [
   "x-sk-role",
   "x-sk-service",
   "x-agent-id",
+  "x-sk-client-id",
+  "x-sk-credential-revision",
+  "x-sk-operator-id",
+  "x-sk-operator-client-id",
+  "x-sk-operator-credential-revision",
   "x-session-id",
   "x-model",
   "x-sklegal-service-authorization",
@@ -406,6 +413,8 @@ export function _throttleStateForTests(backendId, model) {
  * @property {string}   [credentials_file]  Path to JSON credentials (oauth flow)
  * @property {number}   [cooldown_ms]       Cooldown after DOWN before re-probe
  * @property {number}   [timeout_ms]        Socket idle timeout (fail fast on a wedged upstream; 0 = off)
+ * @property {boolean}  [enabled]           False removes the backend from every route candidate
+ * @property {boolean}  [advertise]         False removes the backend from catalog and routing
  *
  * @typedef {Object} HealthSnapshot
  * @property {'up'|'degraded'|'down'|'unknown'} status  `unknown` = never observed
@@ -1316,6 +1325,7 @@ export function createRouter(config = {}) {
   // Populate initial registry from config
   if (config.backends && typeof config.backends === "object") {
     for (const [id, cfg] of Object.entries(config.backends)) {
+      if (isCatalogDisabledBackend(cfg)) continue;
       backends.set(id, new Backend({ id, ...qDefaults, ...cfg }));
     }
   }
@@ -1566,6 +1576,11 @@ export function createRouter(config = {}) {
    */
   function addBackend(cfg) {
     if (!cfg.id) throw new Error("[router] addBackend: cfg.id is required");
+    if (isCatalogDisabledBackend(cfg)) {
+      backends.delete(cfg.id);
+      console.log(`[router] backend=${cfg.id} disabled and removed from routing`);
+      return;
+    }
     backends.set(cfg.id, new Backend({ ...qDefaults, ...cfg }));
     console.log(
       `[router] registered backend=${cfg.id} url=${cfg.url} ` +
@@ -2350,6 +2365,8 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = (
 
 export async function routeAndSend(router, request, upstreamPath, method, clientHeaders, body, usePool = true, siem = null, abortSignal = null) {
   const pool = usePool ? getPool() : null;
+  const requestedModel = request?.model;
+  const codexIntent = [requestedModel, request?.role, request?.context, request?.service];
 
   // Read fresh off getConfig() every request (not cached at module scope) so
   // a SIGHUP config reload picks up a flipped energy.enabled or an updated
@@ -2764,12 +2781,61 @@ export async function routeAndSend(router, request, upstreamPath, method, client
   }
 
   if (!candidates) {
+    const configured = typeof router.getBackends === "function"
+      ? [...router.getBackends().values()]
+      : [];
+    const claimsRequested = configured.some((backend) => backend.supportsModel?.(request.model));
+    if (request.model && configured.length > 0 && !claimsRequested) {
+      const lifecycle = getLifecycle(request.model);
+      if (!isRoutable(lifecycle)) {
+        try {
+          await router.route(request);
+        } catch (err) {
+          if (err instanceof ModelEolError) return eolGatedResponse(err);
+          throw err;
+        }
+      }
+      const result = {
+        status: 404,
+        headers: { "content-type": "application/json" },
+        body: Buffer.from(JSON.stringify({
+          error: { message: `Unknown model: ${request.model}`, code: "unknown_model", type: "invalid_request_error" },
+          requested_model: requestedModel,
+        }), "utf8"),
+        requestedModel,
+      };
+      emitSiem("response", { status: 404, code: "unknown_model", requested_model: requestedModel }, {});
+      return result;
+    }
     try {
       candidates = await router.route(request);
     } catch (err) {
       if (err instanceof ModelEolError) return eolGatedResponse(err);
       throw err;
     }
+  }
+
+  // Re-evaluate the complete candidate chain immediately before dispatch.
+  // This covers registry reloads, health recovery, buckets and failover lists.
+  // A single foreign-provider candidate poisons the chain rather than becoming
+  // an outage fallback for a Codex-labelled request.
+  codexIntent.push(request?.model, ...(candidates || []).map((candidate) => candidate?.model));
+  const purityProblems = codexPurityProblems(
+    codexIntent,
+    (candidates || []).map((candidate) => ({ ...candidate, model: candidate?.model || request?.model })),
+  );
+  if (purityProblems.length) {
+    const result = {
+      status: 503,
+      headers: { "content-type": "application/json" },
+      body: Buffer.from(JSON.stringify({
+        error: { message: 'Codex provider route unavailable', code: 'codex_provider_unavailable', type: 'service_unavailable' },
+        requested_model: requestedModel,
+      }), 'utf8'),
+      requestedModel,
+    };
+    emitSiem('error', { status: 503, code: 'codex_provider_unavailable', requested_model: requestedModel }, {});
+    return result;
   }
 
   // ── SIEM: auth decision + route/model selected (live request path) ──
@@ -2964,6 +3030,16 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           retry_after_seconds: retryAfterSeconds,
           message: err.message,
         }, { backend: backendId });
+        const queueWaitMs = Date.now() - queueStart;
+        emitSiem("response", {
+          status: 503,
+          latency_ms: queueWaitMs,
+          queue_wait_ms: queueWaitMs,
+          failover: false,
+          admission_rejected: true,
+          code,
+          capacity_domain: capacityDomain,
+        }, { backend: backendId });
         return {
           status: 503,
           headers: {
@@ -3104,6 +3180,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       exitMeter(meterUrl);
     }
 
+    res = enforceResponseContract(res, requestedModel);
     const latencyMs = (Date.now() - queueStart) - meterBeforeMs;
 
     // A downstream disconnect is not evidence about the backend or model.
@@ -3258,7 +3335,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // Set from the attempt that is about to be returned, so on a failover it
     // names the SERVING attempt and never a blend across attempts, which is
     // the same ruling the energy headers already follow.
-    lastResult = { ...res, backendId, servedModel: candidateModel, failover: didFailover, queueWaitMs };
+    lastResult = { ...res, backendId, failover: didFailover, queueWaitMs };
     if (isBucketChain) {
       lastResult.bucket = bucketAddr.bucket;
       lastResult.bucketMember = candidateModel;
@@ -3302,6 +3379,8 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         latency_ms: latencyMs,
         queue_wait_ms: queueWaitMs,
         failover: didFailover,
+        requested_model: lastResult.requestedModel,
+        served_model: lastResult.servedModel,
         ...extractUsage(res.body),
       }, { backend: backendId });
       return lastResult;
