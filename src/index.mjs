@@ -29,6 +29,13 @@ import {
 import { isInternalRemote } from "./policy/net_trust.mjs";
 import { classifyRequest, toSiemEvent } from "./classifiers/engine.mjs";
 import { handleModuleManifest } from "./operator/manifest.mjs";
+import {
+  handleHealthz as handleOperatorHealthz,
+  handleReadyz as handleOperatorReadyz,
+  handleExplain as handleOperatorExplain,
+  handleObserve as handleOperatorObserve,
+  handleAct as handleOperatorAct,
+} from "./operator/http.mjs";
 import { fromAnthropicRequest, toAnthropicMessage, modelRetrieveObject } from "./proxy/anthropic-frontend.mjs";
 import { readCodexAuthHeaders } from "./proxy/codex-adapter.mjs";
 import { readZaiAuthHeaders, ZAI_CREDENTIALS_PATH } from "./proxy/zai-adapter.mjs";
@@ -675,6 +682,21 @@ const poolConfig = {
 };
 const pool = getPool(poolConfig);
 
+// ─── Operator-plane self-served facet data sources (epic c880017b, Phase 3.4) ───
+// The live objects the /operator/v1/* routes (below, near /health) read from.
+// Defined once, right after router/pool exist, so it can never observe them
+// as undefined. Each source is a zero-arg accessor — operator/http.mjs treats
+// a throw from any one of them as that condition's evidence, never a crash
+// into a 500 (see buildObservation() there). getConfig() (not the module-load
+// `config` local) so a hot-reloaded discovery.enabled flag is honored live,
+// same convention getDiscoveredStatus() below already follows.
+const operatorHttpDeps = {
+  getHealth: () => router.getHealth(),
+  getPoolStats: () => pool.getTotalStats(),
+  getCatalogStatus: () => getDiscoveredStatus(),
+  discoveryEnabled: () => getConfig().discovery?.enabled !== false,
+};
+
 // Metrics collector (lazy, and not imported when disabled)
 let metrics = null;
 if (config.metrics?.enabled === true) {
@@ -1208,6 +1230,36 @@ export const server = http.createServer(async (req, res) => {
   // health URL resolves against wherever the caller reached the gateway.
   if (req.url === "/.well-known/skworld-module.json" && req.method === "GET") {
     handleModuleManifest(req, res);
+    return;
+  }
+
+  // ── Operator-plane self-served facet (epic c880017b, Phase 3.4) ──
+  // /operator/v1/{healthz,readyz,explain,observe} mirror
+  // docs/OPERATOR_PLANE_REMOTE_STANDARD.md's wire contract directly off this
+  // daemon's existing port, replacing the dead-cli / advisory-only path ATLAS
+  // has had to rely on. Read-only, unauthenticated (see operator/http.mjs's
+  // module docstring for why that is safe today) GETs; act is a reserved POST
+  // stub that always 501s — see handleOperatorAct. Routing is a flat path
+  // switch (no sub-router) to match this file's existing style for every
+  // other single-purpose route above/below.
+  if (req.url === "/operator/v1/healthz" && req.method === "GET") {
+    handleOperatorHealthz(req, res);
+    return;
+  }
+  if (req.url === "/operator/v1/readyz" && req.method === "GET") {
+    handleOperatorReadyz(req, res, operatorHttpDeps);
+    return;
+  }
+  if (req.url === "/operator/v1/explain" && req.method === "GET") {
+    handleOperatorExplain(req, res);
+    return;
+  }
+  if (req.url === "/operator/v1/observe" && req.method === "GET") {
+    await handleOperatorObserve(req, res, operatorHttpDeps);
+    return;
+  }
+  if (req.url === "/operator/v1/act" && req.method === "POST") {
+    handleOperatorAct(req, res);
     return;
   }
 

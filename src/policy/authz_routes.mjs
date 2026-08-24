@@ -39,6 +39,17 @@ export const PUBLIC_ROUTES = [
   { methods: ["GET"], match: (p) => p === "/queue", why: "connection-pool depth" },
   { methods: ["GET"], match: (p) => p === "/" || p === "/dashboard", why: "dashboard redirect" },
   { methods: ["GET"], match: (p) => p === "/.well-known/skworld-module.json", why: "module manifest discovery" },
+  {
+    methods: ["GET"],
+    match: (p) => p === "/operator/v1/healthz" || p === "/operator/v1/readyz"
+      || p === "/operator/v1/explain" || p === "/operator/v1/observe",
+    why: "operator-plane self-served facet (epic c880017b): read-only health/observe, no secrets, same posture as /health and /status",
+  },
+  {
+    methods: ["POST"],
+    match: (p) => p === "/operator/v1/act",
+    why: "operator-plane act is a reserved stub that always 501s; it can never actuate, so there is no privilege boundary to gate yet",
+  },
   { methods: ["GET"], match: (p) => p === "/v1/models", why: "read-only model catalog (feeds the picker)" },
   { methods: ["GET"], match: (p) => p.startsWith("/v1/models/"), why: "read-only per-model retrieve" },
 ];
