@@ -1,6 +1,103 @@
 import { sanitizeResponse } from "./sanitizer.mjs";
 
 const MAX_USAGE_TOKENS = 1_000_000_000;
+const MAX_SSE_JSON_DEPTH = 64;
+const MAX_SSE_JSON_MEMBERS = 4_096;
+const MAX_SSE_JSON_KEY_UNITS = 1_024;
+
+function readJsonString(input, start) {
+  let decoded = "";
+  let decodedUnits = 0;
+  const append = (value) => {
+    decodedUnits += value.length;
+    if (decodedUnits <= MAX_SSE_JSON_KEY_UNITS) decoded += value;
+  };
+  for (let index = start + 1; index < input.length;) {
+    const character = input[index++];
+    if (character === '"') return {
+      decoded: decodedUnits <= MAX_SSE_JSON_KEY_UNITS ? decoded : null,
+      end: index,
+    };
+    if (character === "\\") {
+      if (index >= input.length) return null;
+      const escape = input[index++];
+      if ('"\\/bfnrt'.includes(escape)) {
+        append(escape === "b" ? "\b"
+          : escape === "f" ? "\f"
+            : escape === "n" ? "\n"
+              : escape === "r" ? "\r"
+                : escape === "t" ? "\t"
+                  : escape);
+        continue;
+      }
+      if (escape !== "u" || index + 4 > input.length) return null;
+      const hex = input.slice(index, index + 4);
+      if (!/^[0-9a-fA-F]{4}$/.test(hex)) return null;
+      index += 4;
+      const unit = Number.parseInt(hex, 16);
+      if (unit >= 0xd800 && unit <= 0xdbff) {
+        if (input.slice(index, index + 2) !== "\\u") return null;
+        const lowHex = input.slice(index + 2, index + 6);
+        if (!/^[0-9a-fA-F]{4}$/.test(lowHex)) return null;
+        const low = Number.parseInt(lowHex, 16);
+        if (low < 0xdc00 || low > 0xdfff) return null;
+        append(String.fromCodePoint(0x10000 + ((unit - 0xd800) << 10) + low - 0xdc00));
+        index += 6;
+      } else {
+        if (unit >= 0xdc00 && unit <= 0xdfff) return null;
+        append(String.fromCharCode(unit));
+      }
+      continue;
+    }
+    const unit = character.charCodeAt(0);
+    if (unit <= 0x1f) return null;
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      if (index >= input.length) return null;
+      const low = input.charCodeAt(index);
+      if (low < 0xdc00 || low > 0xdfff) return null;
+      append(character + input[index++]);
+    } else {
+      if (unit >= 0xdc00 && unit <= 0xdfff) return null;
+      append(character);
+    }
+  }
+  return null;
+}
+
+// This is only a bounded string and object-scope guard. JSON.parse remains the value parser.
+function hasUniqueJsonMembers(input) {
+  const stack = [];
+  let memberCount = 0;
+  for (let index = 0; index < input.length;) {
+    const character = input[index];
+    if (character === '"') {
+      const string = readJsonString(input, index);
+      if (!string) return false;
+      let next = string.end;
+      while (/\s/.test(input[next] || "")) next++;
+      if (input[next] === ":") {
+        const object = stack.at(-1);
+        if (object?.type !== "object" || string.decoded === null
+            || ++memberCount > MAX_SSE_JSON_MEMBERS
+            || object.keys.has(string.decoded)) return false;
+        object.keys.add(string.decoded);
+      }
+      index = string.end;
+      continue;
+    }
+    if (character === "{" || character === "[") {
+      if (stack.length >= MAX_SSE_JSON_DEPTH) return false;
+      stack.push(character === "{" ? { type: "object", keys: new Set() } : { type: "array" });
+    } else if (character === "}" || character === "]") {
+      const expected = character === "}" ? "object" : "array";
+      if (stack.pop()?.type !== expected) return false;
+    } else if (character.charCodeAt(0) <= 0x1f && !"\t\n\r".includes(character)) {
+      return false;
+    }
+    index++;
+  }
+  return stack.length === 0;
+}
 
 function stripReasoning(value) {
   if (!value || typeof value !== "object") return value;
@@ -162,6 +259,10 @@ export function enforceResponseContract(response, requestedModel) {
         stream.done = true;
         return line;
       }
+      if (!hasUniqueJsonMembers(payload)) {
+        stream.invalidCompletion = true;
+        return line;
+      }
       try {
         const parsed = JSON.parse(payload);
         if (!servedModel && typeof parsed.model === "string" && parsed.model) servedModel = parsed.model;
@@ -177,6 +278,7 @@ export function enforceResponseContract(response, requestedModel) {
         if (requestedModel) clean.requested_model = requestedModel;
         return `data: ${JSON.stringify(clean)}`;
       } catch {
+        stream.invalidCompletion = true;
         return line;
       }
     });

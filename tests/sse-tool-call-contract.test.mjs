@@ -57,7 +57,7 @@ function assertBoundedRejected(result) {
   assert.equal(result.status, 502);
   assert.equal(result.headers["content-type"], "application/json");
   assert.equal(result.headers["content-length"], undefined);
-  assert.match(JSON.parse(result.body).error.code, /^invalid_upstream_(completion|tool_calls)$/);
+  assert.match(JSON.parse(result.body).error.code, /^(?:invalid_upstream_(?:completion|tool_calls)|empty_upstream_response)$/);
   assert.equal(result.body.includes(Buffer.from("[DONE]")), false);
   assert.equal(result.body.includes(Buffer.from("private chain")), false);
 }
@@ -229,6 +229,75 @@ describe("completed SSE tool-call structure", () => {
       { cached_tokens: "0" },
       { cached_tokens: 0, extra: 0 },
     ]) assertCompletionRejected(rawResponse([contentFrame("stop"), usageFrame(details), "data: [DONE]"]));
+  });
+
+  test("rejects duplicate semantic JSON members before parsing", () => {
+    const usage = 'data: {"model":"Qwen/Qwen3-30B-A3B","choices":[],"usage":'
+      + '{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5,'
+      + '"prompt_tokens_details":{"cached_tokens":0,"cached_tokens":1}}}';
+    assertCompletionRejected(rawResponse([contentFrame("stop"), usage, "data: [DONE]"]));
+  });
+
+  test("rejects duplicate decoded keys in every SSE contract object", () => {
+    const validChoice = '"choices":[{"index":0,"delta":{"content":"PUBLIC_SYNTHETIC_OK"},"finish_reason":"stop"}]';
+    const duplicateFrames = [
+      `data: {"model":"${MODEL}","model":"${MODEL}",${validChoice}}`,
+      `data: {"model":"${MODEL}","choices":[{"index":0,"index":0,"delta":{"content":"PUBLIC_SYNTHETIC_OK"},"finish_reason":"stop"}]}`,
+      `data: {"model":"${MODEL}","choices":[{"index":0,"delta":{"content":"PUBLIC_SYNTHETIC_OK","content":"PUBLIC_SYNTHETIC_OK"},"finish_reason":"stop"}]}`,
+      `data: {"model":"${MODEL}","attribution":{"agent":"public","agent":"public"},${validChoice}}`,
+      `data: {"model":"${MODEL}","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`,
+    ];
+    for (const frame of duplicateFrames) assertBoundedRejected(rawResponse([frame, "data: [DONE]"]));
+
+    const duplicateUsage = 'data: {"model":"Qwen/Qwen3-30B-A3B","choices":[],"usage":'
+      + '{"prompt_tokens":3,"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}';
+    assertCompletionRejected(rawResponse([contentFrame("stop"), duplicateUsage, "data: [DONE]"]));
+  });
+
+  test("rejects literal and escape-equivalent duplicate member names", () => {
+    const frame = `data: {"model":"${MODEL}","choices":[{"index":0,"delta":`
+      + '{"content":"PUBLIC_SYNTHETIC_OK","cont\\u0065nt":"PUBLIC_SYNTHETIC_OK"},"finish_reason":"stop"}]}';
+    assertBoundedRejected(rawResponse([frame, "data: [DONE]"]));
+
+    const astral = `data: {"model":"${MODEL}","meta":{"😀":1,"\\uD83D\\uDE00":2},`
+      + '"choices":[{"index":0,"delta":{"content":"PUBLIC_SYNTHETIC_OK"},"finish_reason":"stop"}]}';
+    assertBoundedRejected(rawResponse([astral, "data: [DONE]"]));
+  });
+
+  test("keeps member-name scopes separate from strings and arrays", () => {
+    const frame = `data: {"model":"${MODEL}",`
+      + '"meta":{"left":{"same":1},"right":{"same":2},'
+      + '"items":[{"same":3},{"same":4}],'
+      + '"text":"key-looking: \\"same\\":1 and \\uD83D\\uDE00"},'
+      + '"choices":[{"index":0,"delta":{"content":"PUBLIC_SYNTHETIC_OK"},"finish_reason":"stop"}]}';
+    const result = rawResponse([frame, "data: [DONE]"]);
+    assert.equal(result.status, 200);
+
+    const longValue = `data: {"meta":{"text":"${"x".repeat(4_097)}"},`
+      + '"choices":[{"index":0,"delta":{"content":"PUBLIC_SYNTHETIC_OK"},"finish_reason":"stop"}]}';
+    assert.equal(rawResponse([longValue, "data: [DONE]"]).status, 200);
+  });
+
+  test("fails closed on malformed strings, structure, depth, and member count", () => {
+    const validChoice = `,"choices":[{"index":0,"delta":{"content":"PUBLIC_SYNTHETIC_OK"},"finish_reason":"stop"}]}`;
+    for (const malformed of [
+      `data: {"model":"${MODEL}","bad":"\\q"${validChoice}`,
+      `data: {"model":"${MODEL}","bad":"\\u12xz"${validChoice}`,
+      `data: {"model":"${MODEL}","bad":"\\uD800"${validChoice}`,
+      `data: {"model":"${MODEL}","bad":"\\uDC00"${validChoice}`,
+      `data: {"model":"${MODEL}","bad":"\\uD800\\u0041"${validChoice}`,
+      `data: {"model":"${MODEL}","bad":{"truncated":true`,
+    ]) assertBoundedRejected(rawResponse([malformed, "data: [DONE]"]));
+
+    const tooDeep = `data: {"meta":${"[".repeat(65)}0${"]".repeat(65)}${validChoice}`;
+    assertBoundedRejected(rawResponse([tooDeep, "data: [DONE]"]));
+
+    const members = Array.from({ length: 4_097 }, (_, index) => `"k${index}":0`).join(",");
+    const tooMany = `data: {"meta":{${members}}${validChoice}`;
+    assertBoundedRejected(rawResponse([tooMany, "data: [DONE]"]));
+
+    const tooLongKey = `data: {"${"k".repeat(1_025)}":0${validChoice}`;
+    assertBoundedRejected(rawResponse([tooLongKey, "data: [DONE]"]));
   });
 
   test("rejects every usage frame with nonempty choices", () => {
