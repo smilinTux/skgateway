@@ -104,6 +104,7 @@ function stripReasoning(value) {
   const out = Array.isArray(value) ? value.map(stripReasoning) : { ...value };
   if (!Array.isArray(out)) {
     delete out.reasoning_content;
+    delete out._hadReasoning;
     for (const [key, child] of Object.entries(out)) out[key] = stripReasoning(child);
   }
   return out;
@@ -226,6 +227,50 @@ function hasCompletedToolCalls(calls) {
   });
 }
 
+function hasValidNonStreamToolCalls(toolCalls) {
+  if (!Array.isArray(toolCalls) || toolCalls.length === 0) return false;
+  const ids = new Set();
+  return toolCalls.every((call) => {
+    if (!call || typeof call !== "object" || Array.isArray(call)
+        || typeof call.id !== "string" || !call.id.trim() || ids.has(call.id)
+        || call.type !== "function"
+        || !call.function || typeof call.function !== "object" || Array.isArray(call.function)
+        || typeof call.function.name !== "string" || !call.function.name.trim()
+        || typeof call.function.arguments !== "string") return false;
+    ids.add(call.id);
+    try {
+      JSON.parse(call.function.arguments);
+      return true;
+    } catch {
+      return false;
+    }
+  });
+}
+
+function rejectNonStream(response, requestedModel, servedModel, code) {
+  const headers = { ...response.headers, "content-type": "application/json", "cache-control": "no-store" };
+  delete headers["content-length"];
+  delete headers["Content-Length"];
+  return {
+    ...response,
+    status: 502,
+    headers,
+    body: Buffer.from(JSON.stringify({
+      error: {
+        message: code === "invalid_upstream_tool_calls"
+          ? "Upstream returned invalid tool-call evidence"
+          : code === "empty_upstream_response"
+            ? "Upstream returned no visible content or tool calls"
+            : "Upstream returned invalid completion evidence",
+        code,
+        type: "upstream_error",
+      },
+      ...(requestedModel ? { requested_model: requestedModel } : {}),
+      ...(servedModel ? { served_model: servedModel } : {}),
+    }), "utf8"),
+  };
+}
+
 function hasValidCompletion(state) {
   if (state.terminalReasons.length !== 1) return false;
   const reason = state.terminalReasons[0];
@@ -325,8 +370,29 @@ export function enforceResponseContract(response, requestedModel) {
       const parsed = JSON.parse(body.toString("utf8"));
       if (typeof parsed.model === "string" && parsed.model) servedModel = parsed.model;
       const clean = stripReasoning(sanitizeResponse(parsed, { thinkMode: "strip", label: "response-contract" }));
-      if (requestedModel) clean.requested_model = requestedModel;
-      body = Buffer.from(JSON.stringify(clean), "utf8");
+      if (response.status >= 200 && response.status < 300 && Object.hasOwn(clean, "choices")) {
+        const choices = Array.isArray(clean.choices) ? clean.choices : [];
+        const malformedTools = choices.some((choice) => {
+          const message = choice?.message;
+          return message && Object.hasOwn(message, "tool_calls")
+            && !hasValidNonStreamToolCalls(message.tool_calls);
+        });
+        const emptyChoice = choices.length === 0 || choices.some((choice) => {
+          const message = choice?.message;
+          return !message || (!hasVisibleContent(message) && !hasValidNonStreamToolCalls(message.tool_calls));
+        });
+        if (malformedTools || emptyChoice) {
+          response = rejectNonStream(response, requestedModel, servedModel,
+            malformedTools ? "invalid_upstream_tool_calls" : "empty_upstream_response");
+          body = response.body;
+        } else {
+          if (requestedModel) clean.requested_model = requestedModel;
+          body = Buffer.from(JSON.stringify(clean), "utf8");
+        }
+      } else {
+        if (requestedModel) clean.requested_model = requestedModel;
+        body = Buffer.from(JSON.stringify(clean), "utf8");
+      }
     } catch {
       // Non-JSON error bodies remain byte-identical.
     }

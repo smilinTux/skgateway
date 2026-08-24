@@ -91,7 +91,10 @@ function startHoldingServer() {
       state.pending.push(() => {
         if (res.destroyed || res.writableEnded) return;
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ model: "served-qwen38", choices: [] }));
+        res.end(JSON.stringify({
+          model: "served-qwen38",
+          choices: [{ finish_reason: "stop", message: { content: "ok" } }],
+        }));
       });
     });
     server.listen(0, "127.0.0.1", () => {
