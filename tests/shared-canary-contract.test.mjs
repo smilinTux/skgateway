@@ -94,9 +94,68 @@ describe("response attribution and sanitizer contract", () => {
     assert.equal(parsed.choices[0].delta.tool_calls[0].function.name, "lookup");
     assert.equal(result.servedModel, "Qwen/Qwen3-30B-A3B");
   });
+
+  test("stream fails closed when reasoning stripping leaves no visible output", () => {
+    const chunk = {
+      model: "Qwen/Qwen3-30B-A3B",
+      choices: [{ delta: { reasoning_content: "private chain" }, finish_reason: "stop" }],
+    };
+    const result = enforceResponseContract({
+      status: 200,
+      headers: { "content-type": "text/event-stream", "content-length": "999" },
+      body: Buffer.from(`data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`),
+    }, "sk-qwen");
+    const parsed = JSON.parse(result.body);
+    assert.equal(result.status, 502);
+    assert.equal(result.headers["content-type"], "application/json");
+    assert.equal(result.headers["content-length"], undefined);
+    assert.equal(parsed.error.code, "empty_upstream_response");
+    assert.equal(parsed.requested_model, "sk-qwen");
+    assert.equal(result.servedModel, "Qwen/Qwen3-30B-A3B");
+    assert.equal(result.body.includes(Buffer.from("private chain")), false);
+    assert.equal(result.body.includes(Buffer.from("[DONE]")), false);
+  });
 });
 
 describe("router qualification repairs", () => {
+  test("shared route preserves visible SSE and rejects empty-visible SSE", async () => {
+    const sse = (delta) => Buffer.from([
+      `data: ${JSON.stringify({ model: "Qwen/Qwen3-30B-A3B", choices: [{ delta, finish_reason: null }] })}`,
+      `data: ${JSON.stringify({ model: "Qwen/Qwen3-30B-A3B", choices: [{ delta: {}, finish_reason: "stop" }] })}`,
+      "data: [DONE]",
+      "",
+    ].join("\n\n"));
+    let upstreamBody = sse({ content: "PUBLIC_SYNTHETIC_OK" });
+    const upstream = await startServer((req, res) => {
+      req.resume();
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.end(upstreamBody);
+    });
+    try {
+      const router = createRouter({ backends: { qwen: { url: upstream.url, auth_type: "none", models: ["sk-qwen"] } } });
+      const events = [];
+      const visible = await routeAndSend(router, { model: "sk-qwen", agentId: "canary" },
+        "/chat/completions", "POST", HEADERS, body("sk-qwen", true), false, (event) => events.push(event));
+      assert.equal(visible.status, 200);
+      assert.match(visible.body.toString(), /PUBLIC_SYNTHETIC_OK/);
+      assert.equal(visible.servedModel, "Qwen/Qwen3-30B-A3B");
+
+      events.length = 0;
+      upstreamBody = sse({ reasoning_content: "private chain" });
+      const empty = await routeAndSend(router, { model: "sk-qwen", agentId: "canary" },
+        "/chat/completions", "POST", HEADERS, body("sk-qwen", true), false, (event) => events.push(event));
+      assert.equal(empty.status, 502);
+      assert.equal(JSON.parse(empty.body).error.code, "empty_upstream_response");
+      assert.equal(empty.servedModel, "Qwen/Qwen3-30B-A3B");
+      assert.equal(empty.body.includes(Buffer.from("private chain")), false);
+      assert.equal(empty.body.includes(Buffer.from("[DONE]")), false);
+      assert.equal(events.findLast((event) => event.event_type === "response").details.status, 502);
+      assert.equal(JSON.stringify(events).includes("private chain"), false);
+    } finally {
+      await upstream.close();
+    }
+  });
+
   test("requested alias and exact upstream served model cross body and audit", async () => {
     const upstream = await startServer((req, res) => {
       req.resume();
