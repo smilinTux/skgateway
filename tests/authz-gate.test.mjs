@@ -33,7 +33,12 @@ function spyClient(verdict = { allow: true, reason: "ok", obligations: [] }) {
   };
 }
 
-const LUMINA = { agent_id: "lumina", agent: { capauth_uri: "capauth:lumina@skworld.io" } };
+// verified:true because these fixtures stand in for an already-authenticated
+// caller (SKW-AUTONOMY-E1 / card 1911481e): subjectFromIdentity() now requires
+// a cryptographically verified identity before it will resolve a subject, so an
+// unverified LUMINA would silently collapse to "" here same as ANON.
+const LUMINA = { agent_id: "lumina", agent: { capauth_uri: "capauth:lumina@skworld.io" }, verified: true };
+const LUMINA_UNVERIFIED = { agent_id: "lumina", agent: { capauth_uri: "capauth:lumina@skworld.io" }, verified: false };
 const ANON = { agent_id: "anonymous", agent: null };
 
 // ─── the master flag ───────────────────────────────────────────────────────────
@@ -108,5 +113,16 @@ describe("authorizeRequest (what runs only when the flag is ON)", () => {
     const v = await authorizeRequest({ method: "POST", url: "/v1/chat/completions", identity: ANON, client: c });
     assert.equal(v.subject, "");
     assert.equal(v.allowed, false);
+  });
+
+  // SKW-AUTONOMY-E1 / card 1911481e: the actual vulnerability this card closes.
+  // A fully-resolved agent identity (real fqid, real registry entry) that was
+  // never cryptographically verified must still resolve to no subject, exactly
+  // like the anonymous case above, not the agent's real fqid.
+  test("resolved but unverified caller on a gated route → subject '' (PDP denies unknown subject)", async () => {
+    const c = spyClient({ allow: true, reason: "granted", obligations: [] });
+    const v = await authorizeRequest({ method: "POST", url: "/v1/chat/completions", identity: LUMINA_UNVERIFIED, client: c });
+    assert.equal(c.calls.length, 1);
+    assert.equal(c.calls[0].subject, "");
   });
 });
