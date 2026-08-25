@@ -234,22 +234,37 @@ describe("disabled qualification startup", () => {
     assert.equal((await request(port, "/dashboard", { redirect: "manual" })).status, 404);
   });
 
+  // SKW-AUTONOMY-E1 / card 1911481e: identity is disabled in this fixture
+  // (no identityRegistry, so extractIdentity()'s cryptographic capauth path
+  // never runs), which means the caller can never be verified here no matter
+  // what X-Agent-Id claims. Under strict authz that now denies with 403
+  // instead of the pre-fix 200, which used to trust the bare header as the
+  // policy-decision subject. The metrics/audit assertions below are the
+  // actual point of this test and hold regardless: a fail-closed 403 creates
+  // no database and no audit line either.
   test("metrics create no database and expose no request correlation data", async () => {
     const response = await request(port, "/v1/chat/completions", {
       method: "POST",
       headers: { "content-type": "application/json", "x-agent-id": "qualification-agent" },
       body: JSON.stringify({ model: "synthetic-model", messages: [{ role: "user", content: "synthetic input" }] }),
     });
-    assert.equal(response.status, 200);
+    assert.equal(response.status, 403);
+    assert.match(await response.text(), /Forbidden by authorization policy/);
     assert.equal(response.headers.has("x-sk-req-id"), false);
-    assert.match(await response.text(), new RegExp(PROTECTED_MARKER));
     assert.equal(existsSync(dbPath), false);
     assert.equal(existsSync(join(dir, "audit.jsonl")), false);
     const status = await (await request(port, "/status")).json();
     assert.equal(status.metrics, null);
   });
 
-  test("strict authz uses the PDP for loopback and zero TTL prevents allow caching", async () => {
+  // SKW-AUTONOMY-E1 / card 1911481e: with identity disabled the caller is
+  // never verified, so authz_decide.decide() now fails closed on an empty
+  // subject before it ever reaches the network (authz_decide.mjs's own
+  // "empty subject or capability" guard), so the PDP fixture is not hit at
+  // all. That is a stronger property than the pre-fix behavior this test used
+  // to assert (PDP hit twice, no caching): now there is nothing to cache
+  // because there is no real subject to ask about.
+  test("strict authz fails closed on an unverified caller without ever reaching the PDP", async () => {
     const beforeCount = pdpRequests;
     for (let i = 0; i < 2; i++) {
       const response = await request(port, "/v1/chat/completions", {
@@ -257,19 +272,24 @@ describe("disabled qualification startup", () => {
         headers: { "content-type": "application/json", "x-agent-id": "qualification-agent" },
         body: JSON.stringify({ model: "synthetic-model", messages: [] }),
       });
-      assert.equal(response.status, 200);
+      assert.equal(response.status, 403);
       await response.arrayBuffer();
     }
-    assert.equal(pdpRequests - beforeCount, 2);
+    assert.equal(pdpRequests - beforeCount, 0);
   });
 
+  // SKW-AUTONOMY-E1 / card 1911481e: /admin/* is CAP_ADMIN-gated, so it goes
+  // through the same unverified-caller fail-closed path as /v1/* above; 403
+  // (authz denial) now arrives before the route ever reaches the
+  // discovery-disabled 409 it used to return. discoveryRequests staying at 0
+  // is still the right assertion either way.
   test("disabled discovery neither polls at startup nor permits forced refresh", async () => {
     assert.equal(discoveryRequests, 0);
     const response = await request(port, "/admin/models/refresh", {
       method: "POST",
       headers: { "x-agent-id": "qualification-agent" },
     });
-    assert.equal(response.status, 409);
+    assert.equal(response.status, 403);
     assert.equal(discoveryRequests, 0);
   });
 });
