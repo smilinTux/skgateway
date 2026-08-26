@@ -364,30 +364,71 @@ export function resolveBucket({ bucket, catalog = [], sensitivityPolicy, isRouta
       });
       continue;
     }
-    members.push({ id: entry.id, class_basis: floor.basis, model_class: floor.modelClass, trust_zone: zone ?? null });
+    members.push({
+      id: entry.id,
+      class_basis: floor.basis,
+      model_class: floor.modelClass,
+      trust_zone: zone ?? null,
+      // COST metadata is copied only after the independent trust ceiling has
+      // admitted the model. It can order this resolved set, never expand it.
+      cost_tier: entry?.capabilities?.sovereignty || entry?.card?.tier || null,
+    });
   }
 
   return { members, rejected, ceiling };
 }
 
+/** Cost preference, deliberately independent from trust-zone order. */
+export const COST_TIER_ORDER = Object.freeze(['local', 'free-remote', 'paid-cloud']);
+
+/**
+ * Return the complete eligible failover chain in cost order.
+ *
+ * `resolveBucket()` has already applied the capability floor and trust ceiling.
+ * This function therefore accepts ONLY that resolved member array and never
+ * consults sensitivity or admits another model. The cost ladder remains the
+ * deliberate inverse of trust for `free-remote`: free is cheaper than paid,
+ * even though it is less trusted. Unknown cost metadata sorts last.
+ *
+ * Catalog order is the deterministic tie break. The counter rotates each
+ * equal-cost tier so one local model is not hammered while its equally cheap
+ * peer idles. A request exhausts that cheapest tier before trying the next.
+ *
+ * @param {Array<object>} members members already admitted by resolveBucket
+ * @param {number} counter monotonically increasing per bucket
+ * @returns {Array<object>}
+ */
+export function orderMembersByCost(members, counter = 0) {
+  if (!Array.isArray(members) || members.length === 0) return [];
+  const groups = new Map();
+  for (const member of members) {
+    const rank = COST_TIER_ORDER.indexOf(member?.cost_tier);
+    const key = rank === -1 ? COST_TIER_ORDER.length : rank;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(member);
+  }
+
+  const n = Math.abs(Math.trunc(counter));
+  const ordered = [];
+  for (const key of [...groups.keys()].sort((a, b) => a - b)) {
+    const group = groups.get(key);
+    const start = n % group.length;
+    ordered.push(...group.slice(start), ...group.slice(0, start));
+  }
+  return ordered;
+}
+
 /**
  * Pick which member serves THIS request.
  *
- * Ranking decides who is ELIGIBLE. Rotation decides who SERVES. Always taking
- * the top-ranked member hammers one model into a rate limit while the rest of
- * the pool idles, and on a free fleet throttling is the normal operating
- * condition rather than an edge case (card 9e28de88). Spreading load is how a
- * free pool stays usable, not a nicety.
+ * Selection rotates only within the cheapest available cost tier. Costlier
+ * tiers remain failover candidates through `orderMembersByCost()`, but are not
+ * selected while an equally eligible cheaper tier exists.
  *
- * Deterministic round-robin over a caller-supplied counter, so it is testable
- * and so two gateway processes do not need to agree on anything.
- *
- * @param {Array<object>} members
+ * @param {Array<object>} members members already admitted by resolveBucket
  * @param {number} counter monotonically increasing per bucket
  * @returns {object|null}
  */
 export function selectMember(members, counter = 0) {
-  if (!Array.isArray(members) || members.length === 0) return null;
-  const i = Math.abs(Math.trunc(counter)) % members.length;
-  return members[i];
+  return orderMembersByCost(members, counter)[0] || null;
 }

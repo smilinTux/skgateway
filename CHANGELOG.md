@@ -23,6 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Cost-rank bucket members only after capability and trust eligibility, rotate
+  equal-cost peers, and bound bucket completion liveness so a listed but hung
+  backend fails over instead of holding the route. The fleet has no declared
+  S-class model, so `sk-s-*` remains explicitly a capability floor pool.
+
 - Honor dashboard and metrics disablement during startup. Disabled qualification
   configurations no longer create the dashboard listener, initialize the metrics
   database, expose the dashboard redirect, permit a forced discovery refresh, or

@@ -58,7 +58,7 @@ import {
   policyFromRegistry,
   TRUST_ZONES,
 } from "../policy/sensitivity.mjs";
-import { parseBucketId, resolveBucket, selectMember, looksLikeBucketAttempt, allBuckets } from "../policy/buckets.mjs";
+import { parseBucketId, resolveBucket, orderMembersByCost, looksLikeBucketAttempt, allBuckets } from "../policy/buckets.mjs";
 import { codexPurityProblems } from "../policy/codex-purity.mjs";
 
 // sk-auto routing decision cache (TTL+LRU); keyed by request fingerprint + config epoch.
@@ -2108,6 +2108,31 @@ function isBucketsEnabled() {
   }
 }
 
+/**
+ * A catalog listing is not completion liveness. Bound bucket attempts even
+ * when a backend has no general timeout, so a socket-accepting black hole
+ * becomes a retryable 504 instead of holding the selected route forever.
+ *
+ * This is intentionally bucket-only. Named-model and registry-role traffic
+ * retain each backend's existing timeout contract. An explicit shorter backend
+ * timeout stays shorter. Tests may lower the boundary through the environment;
+ * zero and malformed values cannot disable it.
+ */
+export const DEFAULT_BUCKET_LIVENESS_TIMEOUT_MS = 60_000;
+
+export function bucketLivenessTimeoutMs(
+  backendTimeoutMs = 0,
+  raw = process.env.SKGATEWAY_BUCKET_LIVENESS_TIMEOUT_MS,
+) {
+  const configured = Number(raw);
+  const boundary = Number.isFinite(configured) && configured > 0
+    ? Math.trunc(configured)
+    : DEFAULT_BUCKET_LIVENESS_TIMEOUT_MS;
+  return Number.isFinite(backendTimeoutMs) && backendTimeoutMs > 0
+    ? Math.min(Math.trunc(backendTimeoutMs), boundary)
+    : boundary;
+}
+
 /** Per-bucket rotation counters. Ranking decides eligibility, this decides who serves. */
 const _bucketCounters = new Map();
 
@@ -2271,9 +2296,8 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = (
 
   const n = (_bucketCounters.get(addr.bucket) || 0) + 1;
   _bucketCounters.set(addr.bucket, n);
-  const picked = selectMember(members, n);
-  const start = members.indexOf(picked);
-  const orderedMembers = [...members.slice(start), ...members.slice(0, start)];
+  const orderedMembers = orderMembersByCost(members, n);
+  const picked = orderedMembers[0];
 
   console.log(
     `[router] bucket ${addr.bucket} -> ${picked.id} ` +
@@ -2882,6 +2906,9 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // in the list (candidatesFor() only ever matches on model id), so
     // request.model is the correct default.
     const candidateModel = candidates[i].model || request.model;
+    const attemptTimeoutMs = isBucketChain
+      ? bucketLivenessTimeoutMs(backend.timeout_ms)
+      : backend.timeout_ms;
 
     if (i > 0) {
       didFailover = true;
@@ -3120,7 +3147,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         if (tr) {
           const aHeaders = { ...forwardHeaders, ...tr.headers };
           delete aHeaders["content-length"];
-          const raw = await sendUpstream(tr.path, method, aHeaders, tr.body, targetUrl, backend.timeout_ms, abortSignal);
+          const raw = await sendUpstream(tr.path, method, aHeaders, tr.body, targetUrl, attemptTimeoutMs, abortSignal);
           if (raw?.cancelled) {
             res = raw;
           } else {
@@ -3133,7 +3160,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
             res = toOpenAIResponse(raw, request.model);
           }
         } else {
-          res = await sendUpstream(upstreamPath, method, forwardHeaders, attemptBody, targetUrl, backend.timeout_ms, abortSignal);
+          res = await sendUpstream(upstreamPath, method, forwardHeaders, attemptBody, targetUrl, attemptTimeoutMs, abortSignal);
         }
       } else if (isCodexBackend(backend)) {
         // Translate OpenAI chat-completions -> Codex Responses API (OpenAI
@@ -3151,13 +3178,13 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           }
           const cHeaders = { ...forwardHeaders, ...tr.headers };
           delete cHeaders["content-length"];
-          const raw = await sendUpstream(tr.path, method, cHeaders, tr.body, targetUrl, backend.timeout_ms, abortSignal);
+          const raw = await sendUpstream(tr.path, method, cHeaders, tr.body, targetUrl, attemptTimeoutMs, abortSignal);
           res = raw?.cancelled ? raw : fromCodexResponse(raw, candidateModel, tr.clientStream);
         } else {
-          res = await sendUpstream(upstreamPath, method, forwardHeaders, attemptBody, targetUrl, backend.timeout_ms, abortSignal);
+          res = await sendUpstream(upstreamPath, method, forwardHeaders, attemptBody, targetUrl, attemptTimeoutMs, abortSignal);
         }
       } else {
-        res = await sendUpstream(upstreamPath, method, forwardHeaders, attemptBody, targetUrl, backend.timeout_ms, abortSignal);
+        res = await sendUpstream(upstreamPath, method, forwardHeaders, attemptBody, targetUrl, attemptTimeoutMs, abortSignal);
       }
       attemptConcurrency = meterUrl ? inFlightOnMeter(meterUrl) : 1;
     } catch (err) {

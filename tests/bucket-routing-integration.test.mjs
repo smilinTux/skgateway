@@ -50,7 +50,13 @@ process.env.SKMODELS_REGISTRY = REGISTRY_PATH;
 process.env.SKGATEWAY_MODEL_CATALOG_STORE_PATH = STORE_PATH;
 process.env.SKGATEWAY_MODEL_CATALOG_CACHE_PATH = CATALOG_CACHE_PATH;
 
-const { createRouter, routeAndSend, requestZoneCeiling } = await import('../src/proxy/router.mjs');
+const {
+  createRouter,
+  routeAndSend,
+  requestZoneCeiling,
+  bucketLivenessTimeoutMs,
+  DEFAULT_BUCKET_LIVENESS_TIMEOUT_MS,
+} = await import('../src/proxy/router.mjs');
 const { loadConfig } = await import('../src/config.mjs');
 const { _resetCacheForTests } = await import('../src/discovery/model_catalog_store.mjs');
 const { resetLocalHealth } = await import('../src/proxy/local-failover.mjs');
@@ -79,7 +85,7 @@ const applyConfig = (flags) => loadConfig({ configPath: writeConfig(flags), sile
 
 /** A fake upstream that answers 200 and records what model it was asked for. */
 function startUpstream(name) {
-  const state = { count: 0, lastModel: null, modelsStatus: 200 };
+  const state = { count: 0, lastModel: null, modelsStatus: 200, hangCompletions: false };
   return new Promise((resolve) => {
     const server = http.createServer((req, res) => {
       if (req.url.endsWith('/models') && req.method === 'GET') {
@@ -93,6 +99,7 @@ function startUpstream(name) {
         state.count++;
         try { state.lastModel = JSON.parse(Buffer.concat(chunks).toString('utf-8')).model ?? null; }
         catch { state.lastModel = null; }
+        if (state.hangCompletions) return;
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ served: name, model: state.lastModel }));
       });
@@ -168,6 +175,7 @@ describe('a bucket-shaped id is recognized as an ATTEMPT, not just "unknown"', (
 
 describe('buckets_enabled: bucket addressing, end to end through routeAndSend', () => {
   let pool;
+  let hanging;
   let router;
 
   const REGISTRY = (extraRoles = '') => `backends:
@@ -192,13 +200,18 @@ ${extraRoles}defaults:
 
   before(async () => {
     pool = await startUpstream('pool');
+    hanging = await startUpstream('hanging');
+    hanging.state.hangCompletions = true;
     writeFileSync(REGISTRY_PATH, REGISTRY(), 'utf8');
     router = createRouter({
       backends: { poolbackend: { url: pool.base, auth_type: 'none', models: ['pool-l-local', 'pool-l-free'], priority: 1 } },
     });
   });
 
-  after(async () => { await pool.close(); });
+  after(async () => {
+    await hanging.close();
+    await pool.close();
+  });
 
   beforeEach(() => {
     _resetCacheForTests();
@@ -223,6 +236,108 @@ ${extraRoles}defaults:
       pool.state.lastModel, 'pool-l-local',
       'secret admits only the sovereign member, and the body was rewritten to it',
     );
+  });
+
+  test('flag ON: an S-graded public request prefers sovereign local over a costlier coin flip', async () => {
+    await applyConfig({ buckets_enabled: true });
+    const r = await routeAndSend(
+      router, { model: 'sk-s-public', agentId: 't' }, '/chat/completions', 'POST', HEADERS, bodyFor('sk-s-public'), false,
+    );
+    assert.equal(r.status, 200);
+    assert.equal(pool.state.lastModel, 'pool-l-local', 'the default starts with the cheapest sovereign tier');
+  });
+
+  test('the liveness boundary cannot be disabled and preserves a shorter backend timeout', () => {
+    assert.equal(bucketLivenessTimeoutMs(0, undefined), DEFAULT_BUCKET_LIVENESS_TIMEOUT_MS);
+    assert.equal(bucketLivenessTimeoutMs(0, '0'), DEFAULT_BUCKET_LIVENESS_TIMEOUT_MS);
+    assert.equal(bucketLivenessTimeoutMs(0, 'not-a-number'), DEFAULT_BUCKET_LIVENESS_TIMEOUT_MS);
+    assert.equal(bucketLivenessTimeoutMs(250, '500'), 250);
+    assert.equal(bucketLivenessTimeoutMs(750, '500'), 500);
+  });
+
+  test('flag ON: a listed backend that never completes is bounded and the next live member serves', async () => {
+    const previousTimeout = process.env.SKGATEWAY_BUCKET_LIVENESS_TIMEOUT_MS;
+    process.env.SKGATEWAY_BUCKET_LIVENESS_TIMEOUT_MS = '40';
+    const abort = new AbortController();
+    const guard = setTimeout(() => abort.abort(), 500);
+    try {
+      writeFileSync(CATALOG_CACHE_PATH, JSON.stringify({ models: [
+        { id: 'hung-local', provider: 'local', free: true, card: { tier: 'local', size_class: 'L' } },
+        { id: 'healthy-local', provider: 'local', free: true, card: { tier: 'local', size_class: 'L' } },
+      ] }), 'utf8');
+      _resetCacheForTests();
+      const livenessRouter = createRouter({
+        backends: {
+          hung: { url: hanging.base, auth_type: 'none', models: ['hung-local'], priority: 1 },
+          healthy: { url: pool.base, auth_type: 'none', models: ['healthy-local'], priority: 1 },
+        },
+      });
+      await applyConfig({ buckets_enabled: true });
+
+      const r = await routeAndSend(
+        livenessRouter,
+        { model: 'sk-s-public', agentId: 't' },
+        '/chat/completions', 'POST', HEADERS, bodyFor('sk-s-public'), false, null, abort.signal,
+      );
+
+      assert.equal(r.status, 200, 'the hung listed member must not hold the bucket request');
+      assert.equal(r.backendId, 'healthy');
+      assert.equal(r.bucketMember, 'healthy-local');
+      assert.equal(hanging.state.count > 0, true, 'the first member accepted the completion and then hung');
+
+      const hungAttempts = hanging.state.count;
+      const r2 = await routeAndSend(
+        livenessRouter,
+        { model: 'sk-s-public', agentId: 't' },
+        '/chat/completions', 'POST', HEADERS, bodyFor('sk-s-public'), false,
+      );
+      assert.equal(r2.status, 200);
+      assert.equal(r2.bucketMember, 'healthy-local');
+      assert.equal(
+        hanging.state.count,
+        hungAttempts,
+        'the failed completion probe marks the black hole down, so it cannot win the next selection',
+      );
+
+      const r3 = await routeAndSend(
+        livenessRouter,
+        { model: 'sk-s-public', agentId: 't' },
+        '/chat/completions', 'POST', HEADERS, bodyFor('sk-s-public'), false,
+      );
+      assert.equal(r3.status, 200);
+      assert.equal(r3.bucketMember, 'hung-local', 'request three rotates selection back toward the failed member');
+      assert.equal(r3.backendId, 'healthy', 'the preserved local URL lets health-aware expansion serve healthy');
+      assert.equal(
+        hanging.state.count,
+        hungAttempts,
+        'rotation back toward the black hole skips its down local URL and serves the healthy member',
+      );
+    } finally {
+      clearTimeout(guard);
+      if (previousTimeout === undefined) delete process.env.SKGATEWAY_BUCKET_LIVENESS_TIMEOUT_MS;
+      else process.env.SKGATEWAY_BUCKET_LIVENESS_TIMEOUT_MS = previousTimeout;
+    }
+  });
+
+  test('NEGATIVE CONTROL: ordinary named-model routing keeps its existing timeout contract', async () => {
+    const namedRouter = createRouter({
+      backends: {
+        hung: { url: hanging.base, auth_type: 'none', models: ['named-hung'], priority: 1 },
+      },
+    });
+    const abort = new AbortController();
+    const guard = setTimeout(() => abort.abort(), 60);
+    try {
+      await applyConfig({ buckets_enabled: true });
+      const r = await routeAndSend(
+        namedRouter,
+        { model: 'named-hung', agentId: 't' },
+        '/chat/completions', 'POST', HEADERS, bodyFor('named-hung'), false, null, abort.signal,
+      );
+      assert.equal(r.status, 499, 'bucket liveness must not alter explicit named-model traffic');
+    } finally {
+      clearTimeout(guard);
+    }
   });
 
   test('flag ON: an empty pool returns the exact bucket_no_eligible_member 503 contract', async () => {
