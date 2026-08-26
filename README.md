@@ -641,8 +641,6 @@ graph LR
     SYNC -->|"config/policies.yaml sync"| GW
 ```
 
-**OpenClaw** - Set `baseUrl: http://localhost:18780` on any model provider in `openclaw.json`. SKGateway becomes transparent to OpenClaw while gaining full observability over every call.
-
 **SKVoice** - The voice pipeline (`192.168.0.100:18800`) routes all LLM inference through SKGateway, giving the same rate limiting and cost accounting as interactive sessions.
 
 **CapAuth** - PGP-signed agent identities flow through SKGateway's identity module. Every request carries a verified `agent_id` that policies and metrics key off.
@@ -753,7 +751,6 @@ Outputs are pluggable modules in `src/siem/`. To add a new destination (e.g. Spl
 
 ### Phase 6 - Hardening and Integration
 
-- [ ] OpenClaw plugin (`openclaw-plugin/`) - native plugin so OpenClaw auto-routes through gateway with zero config change on the client side
 - [ ] SKVoice integration - dedicated auth path and latency-optimized stream handling for voice inference
 - [ ] Traefik integration - run SKGateway behind Traefik for TLS termination, let's encrypt, and multi-node load balancing
 - [ ] Syncthing auto-reload - file watcher on `config/` triggers hot-reload when Syncthing delivers a new config version
