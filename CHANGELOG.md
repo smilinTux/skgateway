@@ -23,6 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Made a declared `backends` mapping authoritative instead of deep-merging
+  omitted built-in backends back into service. Operators can also use the
+  schema-valid `enabled: false` tombstone. Removed backends are excluded from
+  discovery, advertisement, and bucket inputs, while orphan direct or
+  `reg:<backend>` pooling references now fail startup validation.
+
 - Cost-rank bucket members only after capability and trust eligibility, rotate
   equal-cost peers, and bound bucket completion liveness so a listed but hung
   backend fails over instead of holding the route. The fleet has no declared
