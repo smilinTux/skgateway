@@ -65,7 +65,7 @@ flowchart LR
     CARD["coord card"] -->|"complete work_grade"| HARNESS["skharness"]
     HARNESS -->|"model = sk-&lt;class&gt;-&lt;sensitivity&gt;"| GW2["skgateway"]
     GW2 -->|"class floor + trust-zone ceiling"| POOL["eligible bucket pool"]
-    POOL -->|"rotate; retry eligible members"| MODEL["concrete serving model"]
+    POOL -->|"cost-rank; rotate ties; retry eligible members"| MODEL["concrete serving model"]
     MODEL -->|"x-sk-bucket + x-sk-bucket-member"| HARNESS
 ```
 
@@ -74,12 +74,22 @@ There are exactly 12 addresses: the cross-product of `S`, `M`, `L`, `XL` and
 all 12 visible in `/v1/models`; `/admin/buckets` explains current membership and
 rejections. A class is a hard capability floor; sensitivity resolves to a hard maximum
 trust zone. A larger capable model may serve, but a smaller model or a model outside the
-zone may not.
+zone may not. The curated fleet currently declares no `size_class: S`, so `sk-s-*` is a
+capability floor pool, not a small-model pool. Unknown-class models also clear only this
+lowest floor; no unverified S-class declaration is invented to make the name look exact.
 
 The pool is derived from the same serving-config/discovery union, provider posture,
-lifecycle state, and claimer-aware routing rule used by requests. Rotation selects a
-starting member, then `402`, `429`, `5xx`, and bucket-scoped `404`/`410` advance through
-the remaining eligible members. An empty pool fails closed with
+lifecycle state, and claimer-aware routing rule used by requests. After those independent
+eligibility gates resolve the pool, the cost ladder orders `local`, `free-remote`, then
+`paid-cloud`; catalog order breaks ties and the per-bucket counter rotates equal-cost
+members. Failover exhausts an equal-cost tier before advancing on `402`, `429`, `5xx`, or
+bucket-scoped `404`/`410`. Every bucket attempt also has a completion-liveness idle boundary
+(default 60 seconds, test/incident override `SKGATEWAY_BUCKET_LIVENESS_TIMEOUT_MS`): a backend
+that lists a model but never completes becomes a retryable `504` and the next eligible member
+is tried. A shorter explicit backend timeout remains authoritative. This boundary is bucket-only
+and cannot be disabled with zero or malformed input. Unknown cost metadata sorts last. Cost
+never admits a model the trust ceiling excluded: the two ladders remain independent, including
+the intentional fact that free remote is cheaper than paid cloud but less trusted. An empty pool fails closed with
 `503 bucket_no_eligible_member`; a near-miss such as `sk-xl-secrets` fails with
 `400 invalid_bucket_id` and never falls through to `sk-auto`.
 
