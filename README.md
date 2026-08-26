@@ -398,8 +398,8 @@ dedicated card unifies the two entrypoints:
 | Policy engine (allow/deny/transform/rate_limit) | not invoked | **descoped** — planned, not on live path |
 | Prompt classifiers (jailbreak/PII/intent) | difficulty classifier only (sk-auto routing) | **partial** — risk/PII classifiers descoped on live path |
 
-Only the SIEM wiring is addressed by this change; the descoped layers are
-tracked separately. See `docs/deploy-plan/skgateway-bulletproof-deploy.md`.
+Only the SIEM wiring is addressed here; the descoped layers require separate
+implementation and qualification before they can be described as live-path controls.
 
 ---
 
