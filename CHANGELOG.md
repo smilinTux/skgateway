@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Purge four dead Ornith model ids from configured, discovered, advertised, and
+  bucket projections. Repeated fast 404, 502, and connection-refused outcomes
+  now quarantine only the exact backend-model claim, while slow 504 completion
+  hangs remain under the separate timeout guard. Bucket inspection also groups
+  aliases by physical service so one llama-server is not reported as multiple
+  independent servers.
+
 - A metrics collector that is explicitly enabled in config and then fails to load
   is now reported as a degradation instead of being logged as `(optional)` at info
   level. On 2026-08-27 an `npm ci` rebuilt `better-sqlite3` against a different
