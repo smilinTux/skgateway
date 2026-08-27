@@ -648,7 +648,14 @@ export class Backend {
     // at runtime by registerDiscoveredRoutes() once a discovery fetch
     // succeeds. See supportsModel(): an empty list on a discovery backend must
     // NOT wildcard-match, unlike an ordinary statically-configured backend.
-    this.discovery = config.discovery || null;
+    // Discovery-managed backends claim only models registered by an
+    // authoritative catalog. Z.ai predates the explicit `discovery:` key, so
+    // infer its source rather than treating `models: []` as accept-everything.
+    this.discovery = config.discovery || (isZaiBackend(config) ? "zai" : null);
+    this.discoveryStatus = this.discovery ? "pending" : "static";
+    this.discoveryRevision = 0;
+    this.readinessRevision = 0;
+    this.discoveryAt = null;
     this.priority = typeof config.priority === "number" ? config.priority : 99;
     this.cooldown_ms = config.cooldown_ms || DEFAULT_COOLDOWN_MS;
     // Optional per-backend idle timeout (ms). 0 = no timeout (default). Used to
@@ -753,6 +760,25 @@ export class Backend {
     if (!model) return true;
     if (this.models.length === 0) return !this.discovery;
     return this.models.some((pattern) => modelMatches(pattern, model));
+  }
+
+  /** Whether an unclaimed id belongs to this provider's discovery namespace. */
+  mayDiscoverModel(model) {
+    return Boolean(this.discovery && model &&
+      (this.discovery === "zai" ? /^glm-/i.test(model) : false));
+  }
+
+  /** Replace one provider snapshot and advance observable process revisions. */
+  replaceDiscoveredModels(models, { ok = true, stale = false, at = Date.now() } = {}) {
+    const next = [...new Set((models || []).filter((id) => typeof id === "string"))];
+    const status = ok ? (stale ? "stale" : "ready") : (next.length ? "stale" : "failed");
+    this.discoveryRevision += 1;
+    if (status !== this.discoveryStatus || JSON.stringify(next) !== JSON.stringify(this.models)) {
+      this.readinessRevision += 1;
+    }
+    this.models = next;
+    this.discoveryStatus = status;
+    this.discoveryAt = at;
   }
 
   // -------------------------------------------------------------------------
@@ -1641,7 +1667,14 @@ export function createRouter(config = {}) {
   // Return router interface
   // -------------------------------------------------------------------------
 
-  return { route, getHealth, addBackend, removeBackend, getBackend, getBackends, resolveAgentTarget };
+  function registerDiscoveredModels(id, models, outcome) {
+    const backend = backends.get(id);
+    if (!backend?.discovery) return false;
+    backend.replaceDiscoveredModels(models, outcome);
+    return true;
+  }
+
+  return { route, getHealth, addBackend, removeBackend, getBackend, getBackends, registerDiscoveredModels, resolveAgentTarget };
 }
 
 // ---------------------------------------------------------------------------
@@ -2810,6 +2843,42 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       : [];
     const claimsRequested = configured.some((backend) => backend.supportsModel?.(request.model));
     if (request.model && configured.length > 0 && !claimsRequested) {
+      const awaiting = configured.find((backend) =>
+        backend.mayDiscoverModel?.(request.model) &&
+        (backend.discoveryStatus === "pending" || backend.discoveryStatus === "failed")
+      );
+      if (awaiting) {
+        const result = {
+          status: 503,
+          headers: { "content-type": "application/json", "retry-after": "1" },
+          body: Buffer.from(JSON.stringify({
+            error: {
+              message: `Model capability discovery is not ready: ${awaiting.id}/${request.model}`,
+              code: "model_discovery_not_ready",
+              type: "service_unavailable",
+            },
+            requested_model: requestedModel,
+            backend: awaiting.id,
+            readiness_revision: awaiting.readinessRevision,
+            discovery_revision: awaiting.discoveryRevision,
+            discovery_status: awaiting.discoveryStatus,
+          }), "utf8"),
+          backendId: null,
+          requestedModel,
+          readinessRevision: awaiting.readinessRevision,
+          discoveryRevision: awaiting.discoveryRevision,
+        };
+        emitSiem("error", {
+          status: 503,
+          code: "model_discovery_not_ready",
+          requested_model: requestedModel,
+          candidate_backend: awaiting.id,
+          readiness_revision: awaiting.readinessRevision,
+          discovery_revision: awaiting.discoveryRevision,
+          discovery_status: awaiting.discoveryStatus,
+        }, {});
+        return result;
+      }
       const lifecycle = getLifecycle(request.model);
       if (!isRoutable(lifecycle)) {
         try {
@@ -3362,7 +3431,14 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // Set from the attempt that is about to be returned, so on a failover it
     // names the SERVING attempt and never a blend across attempts, which is
     // the same ruling the energy headers already follow.
-    lastResult = { ...res, backendId, failover: didFailover, queueWaitMs };
+    lastResult = {
+      ...res,
+      backendId,
+      readinessRevision: backend.readinessRevision,
+      discoveryRevision: backend.discoveryRevision,
+      failover: didFailover,
+      queueWaitMs,
+    };
     if (isBucketChain) {
       lastResult.bucket = bucketAddr.bucket;
       lastResult.bucketMember = candidateModel;
@@ -3407,7 +3483,10 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         queue_wait_ms: queueWaitMs,
         failover: didFailover,
         requested_model: lastResult.requestedModel,
+        chosen_backend: backendId,
         served_model: lastResult.servedModel,
+        readiness_revision: lastResult.readinessRevision,
+        discovery_revision: lastResult.discoveryRevision,
         ...extractUsage(res.body),
       }, { backend: backendId });
       return lastResult;
