@@ -580,11 +580,11 @@ function exitMeter(url) {
  * Round-robin counters keyed by (priority, model) tuples.
  * Each counter rotates through backends in that group to ensure balanced
  * selection across equal-priority doors serving the same model.
- * 
+ *
  * The key format is "<priority>:<model>" so chiap08-qwen38 and chiap01-qwen38
  * (both priority 1, both serving qwen3.8-27b-huihui-abliterated-q4_k_m)
  * share counter "1:qwen3.8-27b-huihui-abliterated-q4_k_m" and alternate.
- * 
+ *
  * @type {Map<string, number>}
  */
 const _replicaBalancers = new Map();
@@ -593,7 +593,7 @@ const _replicaBalancers = new Map();
  * Get the next backend index for a (priority, model) group using round-robin.
  * This is deterministic and ensures equal distribution across all backends
  * in the group over time.
- * 
+ *
  * @param {number} priority
  * @param {string} model
  * @param {number} count  Number of backends in the group
