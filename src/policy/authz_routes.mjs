@@ -39,6 +39,17 @@ export const PUBLIC_ROUTES = [
   { methods: ["GET"], match: (p) => p === "/queue", why: "connection-pool depth" },
   { methods: ["GET"], match: (p) => p === "/" || p === "/dashboard", why: "dashboard redirect" },
   { methods: ["GET"], match: (p) => p === "/.well-known/skworld-module.json", why: "module manifest discovery" },
+  {
+    methods: ["GET"],
+    match: (p) => p === "/operator/v1/healthz" || p === "/operator/v1/readyz"
+      || p === "/operator/v1/explain" || p === "/operator/v1/observe",
+    why: "operator-plane self-served facet (epic c880017b): read-only health/observe, no secrets, same posture as /health and /status",
+  },
+  {
+    methods: ["POST"],
+    match: (p) => p === "/operator/v1/act",
+    why: "operator-plane act is a reserved stub that always 501s; it can never actuate, so there is no privilege boundary to gate yet",
+  },
   { methods: ["GET"], match: (p) => p === "/v1/models", why: "read-only model catalog (feeds the picker)" },
   { methods: ["GET"], match: (p) => p.startsWith("/v1/models/"), why: "read-only per-model retrieve" },
 ];
@@ -90,17 +101,26 @@ export function classifyRoute(method, url) {
 
 /**
  * Resolve the PDP subject from the resolved identity, from the credential-backed
- * registry entry only (never from raw request input). Preference:
+ * registry entry only (never from raw request input), and only when the identity
+ * was cryptographically verified. Preference, once verified:
  *   1. agent.fqid                       — the sovereign <agent>@<operator>.<realm>
  *   2. agent.capauth_uri (strip scheme) — capauth:lumina@skworld.io → lumina@skworld.io
  *   3. agent_id                          — bare name, last resort
- * Anonymous / unresolved → "" so the PDP denies on an unknown subject (fail closed).
  *
- * @param {{ agent_id?: string, agent?: object }} identity
+ * An identity with verified !== true yields "" (SKW-AUTONOMY-E1, card 1911481e,
+ * incident inc-37456f9f): an X-Agent-Id header or bearer token resolves an
+ * agent_id and even a registry entry, but extractIdentity() only ever sets
+ * verified true on the capauth method after a successful cryptographic PGP
+ * check, so before this fix an unauthenticated header claim produced the same
+ * policy-decision subject as a signed one. Anonymous, unresolved, and unverified
+ * all collapse to "" so the PDP denies on an unknown subject (fail closed).
+ *
+ * @param {{ agent_id?: string, agent?: object, verified?: boolean }} identity
  * @returns {string}
  */
 export function subjectFromIdentity(identity) {
   if (!identity) return "";
+  if (identity.verified !== true) return "";
   const agent = identity.agent || null;
   if (agent && typeof agent.fqid === "string" && agent.fqid.trim()) return agent.fqid.trim();
   if (agent && typeof agent.capauth_uri === "string" && agent.capauth_uri.trim()) {

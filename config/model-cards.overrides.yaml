@@ -331,6 +331,22 @@ overrides:
     structured_outputs: false
     notes: "Priority order 23. No priority service tier declared."
 
+  # ───────────────────────── Z.AI CODING PLAN (paid cloud) ────────────────────
+  # Model ids are discovered from ZCode's current /models entitlement list.
+  # Only the paid-cloud tier is asserted here. ZCode's entitlement response
+  # does not publish context, parameter count, or tool capability facts, so
+  # those fields remain absent until independently verified. This prevents an
+  # attractive but unsupported size claim from placing a model in an XL bucket.
+  glm-4.5:       { display_name: "GLM-4.5",       org: Z.ai, tier: paid-cloud }
+  glm-4.5-air:   { display_name: "GLM-4.5 Air",   org: Z.ai, tier: paid-cloud }
+  glm-4.6:       { display_name: "GLM-4.6",       org: Z.ai, tier: paid-cloud }
+  glm-4.7:       { display_name: "GLM-4.7",       org: Z.ai, tier: paid-cloud }
+  glm-5:         { display_name: "GLM-5",         org: Z.ai, tier: paid-cloud }
+  glm-5-turbo:   { display_name: "GLM-5 Turbo",   org: Z.ai, tier: paid-cloud }
+  glm-5.1:       { display_name: "GLM-5.1",       org: Z.ai, tier: paid-cloud }
+  glm-5.2:       { display_name: "GLM-5.2",       org: Z.ai, tier: paid-cloud }
+  glm-5.3:       { display_name: "GLM-5.3",       org: Z.ai, tier: paid-cloud }
+
   # ──────────────────────── OUR ORNITH FLEET (local, sovereign) ───────────────
   # DeepReinforce Ornith 1.0, self-hosted on our own GPUs. Cloud-free, private.
   # Tool use PROVEN end-to-end through the gateway (Bash tool round-trip, after
@@ -705,3 +721,11 @@ providers:
     data_retention: trains
     verified: "2026-08-22"
     ref: "https://help.openai.com/en/articles/5729567-how-your-data-is-used (ChatGPT consumer plans: training exclusion is conditional on per-account data controls, not contractual)"
+
+  # ZCode confirms a subscription OAuth token and plan entitlement, but the
+  # provider retention/training posture was not verified in this task. Keep the
+  # fail-safe zone-2 boundary until the current terms are reviewed.
+  zai:
+    data_retention: unknown
+    verified: "2026-08-22"
+    ref: "ZCode subscription entitlement observed locally; provider retention terms still require human review"

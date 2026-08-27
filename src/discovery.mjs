@@ -60,6 +60,7 @@ import * as openrouterAdapter from './discovery/providers/openrouter.mjs';
 import * as opencodeAdapter from './discovery/providers/opencode.mjs';
 import * as anthropicWrapperAdapter from './discovery/providers/anthropic-wrapper.mjs';
 import * as codexAdapter from './discovery/providers/codex.mjs';
+import * as zaiAdapter from './discovery/providers/zai.mjs';
 import {
   probeModels,
   DEFAULT_PROBE_BUDGET,
@@ -74,6 +75,7 @@ import { getConfig } from './config.mjs';
 // advertise.mjs's tagLocalModels() can never disagree about which ids are paid.
 import { isAnthropicBackend, isAnthropicModelId } from './proxy/anthropic-adapter.mjs';
 import { isCodexBackend } from './proxy/codex-adapter.mjs';
+import { isZaiBackend } from './proxy/zai-adapter.mjs';
 
 /**
  * The real, per-node discovery cache path, ignoring any env override. Kept
@@ -391,9 +393,9 @@ export function applyCardOverlays(models, overrides) {
   return models.map((m) => applyCardOverlay(m, overrides));
 }
 
-export function mergeCatalog(local, nvidia, openrouter, opencode, anthropic, codex) {
+export function mergeCatalog(local, nvidia, openrouter, opencode, anthropic, codex, zai) {
   const seen = new Map();
-  for (const group of [local || [], nvidia || [], openrouter || [], opencode || [], anthropic || [], codex || []]) {
+  for (const group of [local || [], nvidia || [], openrouter || [], opencode || [], anthropic || [], codex || [], zai || []]) {
     for (const m of group) {
       if (!seen.has(m.id)) seen.set(m.id, m);
     }
@@ -465,7 +467,7 @@ export function servingConfigModels(backends = {}) {
   const out = [];
   if (!backends || typeof backends !== 'object') return out;
   for (const [name, b] of Object.entries(backends)) {
-    const paidBackend = isAnthropicBackend(b) || isCodexBackend(b);
+    const paidBackend = isAnthropicBackend(b) || isCodexBackend(b) || isZaiBackend(b);
     for (const id of (b && b.models) || []) {
       if (typeof id !== 'string' || id.includes('*')) continue;
       const paid = paidBackend || isAnthropicModelId(id);
@@ -605,8 +607,8 @@ export async function fetchNvidia(apiKey) {
   return nvidiaAdapter.fetch(apiKey);
 }
 
-export async function fetchOpenRouter() {
-  return openrouterAdapter.fetch();
+export async function fetchOpenRouter(apiKey) {
+  return openrouterAdapter.fetch(apiKey);
 }
 
 // Card C8: named export like fetchNvidia/fetchOpenRouter above.
@@ -631,6 +633,10 @@ export async function fetchAnthropicWrapper(baseUrl, token) {
 // file via readCodexAuthHeaders().
 export async function fetchCodex(authHeaders) {
   return codexAdapter.fetch(authHeaders);
+}
+
+export async function fetchZai(authHeaders) {
+  return zaiAdapter.fetch(authHeaders);
 }
 
 /**
@@ -726,6 +732,7 @@ export async function discoverCatalog(opts) {
     // have not enabled the provider must see "not configured", not
     // "outage"; pre-existing tests must not flip stale).
     codexFetch = async () => ({ models: [] }),
+    zaiFetch = async () => ({ data: [] }),
     cache = {},
     now = Date.now,
     // Card P1.3: where the shared model lifecycle store (model_catalog_store.mjs)
@@ -802,11 +809,13 @@ export async function discoverCatalog(opts) {
   let opencode = [];
   let anthropic = [];
   let codex = [];
+  let zai = [];
   let nvidiaOk = false;
   let openrouterOk = false;
   let opencodeOk = false;
   let anthropicOk = false;
   let codexOk = false;
+  let zaiOk = false;
   try {
     // Card P2.1: normalize() (not the legacy parseNvidia()) so the merged
     // catalog carries the full ModelCard, not just the id.
@@ -866,6 +875,16 @@ export async function discoverCatalog(opts) {
     stale = true;
     codex = (cache.models || []).filter((m) => m.provider === 'codex');
     recordProvider(cache, 'codex', { ok: false, count: codex.length, at, error: String(e?.message || e) });
+  }
+
+  try {
+    zai = zaiAdapter.normalize(await zaiFetch(), { now: () => at });
+    zaiOk = true;
+    recordProvider(cache, 'zai', { ok: true, count: zai.length, at });
+  } catch (e) {
+    stale = true;
+    zai = (cache.models || []).filter((m) => m.provider === 'zai');
+    recordProvider(cache, 'zai', { ok: false, count: zai.length, at, error: String(e?.message || e) });
   }
 
   // Catalog-absence tracking (card P1.3): only a REAL live fetch is evidence
@@ -928,7 +947,17 @@ export async function discoverCatalog(opts) {
         );
         updated = { ...updated, ...reconciled };
       }
-      if (nvidiaOk || openrouterOk || opencodeOk || anthropicOk || codexOk) saveLifecycleStore(updated, lifecycleStorePath);
+      if (zaiOk) {
+        const reconciled = reconcilePresence(
+          sliceByProvider(fullStore, 'zai', declaredModels?.zai ?? declaredModelsFor('zai')),
+          zai.map((m) => m.id),
+          'zai',
+          at,
+          thresholds,
+        );
+        updated = { ...updated, ...reconciled };
+      }
+      if (nvidiaOk || openrouterOk || opencodeOk || anthropicOk || codexOk || zaiOk) saveLifecycleStore(updated, lifecycleStorePath);
     } catch {
       // fail-soft, see doc comment above.
     }
@@ -987,7 +1016,7 @@ export async function discoverCatalog(opts) {
     ? localModels.filter((m) => m.provider !== 'anthropic' && m.provider !== 'anthropic-direct')
     : localModels;
   const models = applyCardOverlays(
-    mergeCatalog(effectiveLocal, nvidia, openrouter, opencode, anthropic, codex),
+    mergeCatalog(effectiveLocal, nvidia, openrouter, opencode, anthropic, codex, zai),
     overrides,
   ).map((m) => ({ ...m, stale }));
   cache.models = models;

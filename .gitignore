@@ -11,3 +11,10 @@ __pycache__/
 .ruff_cache/
 *.egg-info/
 node_modules
+
+# Never commit live credentials. secrets/codex-auth.json is a synced copy of the
+# Codex CLI auth and was NOT ignored before, so a blind "git add -A" would have
+# committed it.
+secrets/
+*.bak-*
+*.pre-*

@@ -94,9 +94,14 @@ None are secrets:
 
 ### 2. Clone and install
 
+Choose a checkout directory with `SKGATEWAY_DIR`; the default below is portable
+across user accounts and can be overridden before running the commands.
+
 ```bash
-git clone https://github.com/smilinTux/skgateway.git ~/clawd/skcapstone-repos/skgateway
-cd ~/clawd/skcapstone-repos/skgateway
+export SKGATEWAY_DIR="${SKGATEWAY_DIR:-$HOME/src/skgateway}"
+mkdir -p "$(dirname "$SKGATEWAY_DIR")"
+git clone https://github.com/smilinTux/skgateway.git "$SKGATEWAY_DIR"
+cd "$SKGATEWAY_DIR"
 npm ci                       # reproducible install from package-lock.json
 node --check src/index.mjs   # exits 0 if the entrypoint parses
 ```
@@ -152,9 +157,9 @@ it exists and is `0600` if you keep that backend.
 ```bash
 mkdir -p ~/.config/systemd/user
 cp scripts/skgateway.service ~/.config/systemd/user/skgateway.service
-# If your checkout is NOT at /home/cbrd21/clawd/skcapstone-repos/skgateway,
-# edit ExecStart + WorkingDirectory in the copied unit. The EnvironmentFile
-# line uses %h and needs no edit.
+# Set ExecStart + WorkingDirectory in the copied unit to $SKGATEWAY_DIR.
+# The EnvironmentFile line uses %h and needs no edit.
+${EDITOR:-nano} ~/.config/systemd/user/skgateway.service
 loginctl enable-linger "$USER"
 systemctl --user daemon-reload
 systemctl --user enable --now skgateway.service

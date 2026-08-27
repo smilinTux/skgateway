@@ -27,6 +27,7 @@
  */
 
 import { isAnthropicBackend, isAnthropicModelId } from "./anthropic-adapter.mjs";
+import { isZaiBackend } from "./zai-adapter.mjs";
 import { isCodexBackend } from "./codex-adapter.mjs";
 
 /** Valid reconcile modes. */
@@ -126,7 +127,7 @@ export function tagLocalModels(backends = {}) {
   const out = [];
   for (const [name, b] of Object.entries(backends || {})) {
     if (name === "nvidia" || name === "openrouter") continue;
-    const paidBackend = isAnthropicBackend(b) || isCodexBackend(b);
+    const paidBackend = isAnthropicBackend(b) || isCodexBackend(b) || isZaiBackend(b);
     for (const id of (b?.models || [])) {
       if (typeof id === "string" && !id.includes("*")) {
         const paid = paidBackend || isAnthropicModelId(id);

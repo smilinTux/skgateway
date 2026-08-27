@@ -51,9 +51,14 @@ sudo apt-get install -y nodejs
 
 ## Clone and Install
 
+Choose a checkout directory with `SKGATEWAY_DIR`; the default below is portable
+across user accounts and can be overridden before running the commands.
+
 ```bash
-git clone https://github.com/smilinTux/skgateway.git ~/clawd/skcapstone-repos/skgateway
-cd ~/clawd/skcapstone-repos/skgateway
+export SKGATEWAY_DIR="${SKGATEWAY_DIR:-$HOME/src/skgateway}"
+mkdir -p "$(dirname "$SKGATEWAY_DIR")"
+git clone https://github.com/smilinTux/skgateway.git "$SKGATEWAY_DIR"
+cd "$SKGATEWAY_DIR"
 npm ci
 ```
 
@@ -201,10 +206,14 @@ mkdir -p ~/.config/systemd/user
 cp scripts/skgateway.service ~/.config/systemd/user/skgateway.service
 ```
 
-If your checkout is not at `/home/cbrd21/clawd/skcapstone-repos/skgateway`, edit
-the `ExecStart` and `WorkingDirectory` paths in the copied unit to match your
-home and checkout location. The `EnvironmentFile=` line uses `%h`, so it already
-resolves to your home directory and needs no edit.
+Set the `ExecStart` and `WorkingDirectory` paths in the copied unit to
+`$SKGATEWAY_DIR` (expand the variable to its current value when editing). The
+`EnvironmentFile=` line uses `%h`, so it already resolves to your home directory
+and needs no edit.
+
+```bash
+${EDITOR:-nano} ~/.config/systemd/user/skgateway.service
+```
 
 **Step 2: Enable lingering** so the service runs without an active login
 session (the unit is `WantedBy=default.target`, a user target that only comes up
@@ -377,10 +386,16 @@ The metrics SQLite store could not open. `data/` must be writable (it is created
 under the repo root by default, `metrics.db_path: ./data/metrics.db`). Set an
 absolute, writable path if needed:
 
-```yaml
-metrics:
-  db_path: /home/YOUR_USER/.skgateway/metrics.db
+Set a variable to an absolute writable location, then use its expanded value in
+YAML (YAML does not expand shell variables):
+
+```bash
+export SKGATEWAY_METRICS_DB="${SKGATEWAY_METRICS_DB:-$HOME/.local/state/skgateway/metrics.db}"
+mkdir -p "$(dirname "$SKGATEWAY_METRICS_DB")"
+printf 'metrics:\n  db_path: %s\n' "$SKGATEWAY_METRICS_DB"
 ```
+
+Copy the printed `db_path` into `config/skgateway.yaml`.
 
 ### Config file not found
 
@@ -389,7 +404,7 @@ The loader resolves `config/skgateway.yaml` relative to the repo root, or from
 absolute path:
 
 ```bash
-node /abs/path/skgateway/src/index.mjs --config /abs/path/skgateway/config/skgateway.yaml
+node "$SKGATEWAY_DIR/src/index.mjs" --config "$SKGATEWAY_DIR/config/skgateway.yaml"
 ```
 
 ---
@@ -397,7 +412,7 @@ node /abs/path/skgateway/src/index.mjs --config /abs/path/skgateway/config/skgat
 ## Upgrading
 
 ```bash
-cd ~/clawd/skcapstone-repos/skgateway
+cd "$SKGATEWAY_DIR"
 git pull
 npm ci
 systemctl --user restart skgateway.service

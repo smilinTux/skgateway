@@ -178,6 +178,32 @@ backends:
   #   priority: 2
   #   timeout_ms: 300000                       # reasoning models can think a while; stream resets the idle timer
 
+  ## z.ai ZCode Coding Plan subscription. The official ZCode CLI owns the
+  ## OAuth lifecycle in ~/.zcode/v2/credentials.json or the active plan key
+  ## in ~/.zcode/v2/config.json. SKGateway reads only the provider credential
+  ## and never refreshes or writes the file. A human
+  ## must run the official ZCode login on this gateway host first. Discovery
+  ## polls the provider's current entitlement list and prunes retired ids.
+  ## If this provider later offers a different credential file shape, add a
+  ## provider-specific adapter rather than making the gateway guess.
+  # zai:
+  #   url: https://api.z.ai/api/coding/paas/v4
+  #   auth_type: zai_oauth
+  #   credentials_path: ~/.zcode/v2/credentials.json
+  #   models: []
+  #   priority: 2
+  #   timeout_ms: 300000
+
+  ## Standard API-key providers use the same discovery/routing lifecycle when
+  ## their catalog adapter is enabled. Keep the key in a 0600 EnvironmentFile;
+  ## never place the value in YAML, prompts, logs, or commits.
+  ## openrouter:
+  ##   url: https://openrouter.ai/api/v1
+  ##   auth_type: api_key
+  ##   api_key_env: OPENROUTER_API_KEY
+  ##   discovery: free
+  ##   max_concurrent: 10
+
   ## Claude models via the LOCAL claude-code-api wrapper (claude --print on
   ## 127.0.0.1:18782). auth_type none: the wrapper IS Claude Code and bills as
   ## first-party subscription. Do NOT point this at api.anthropic.com.
@@ -384,13 +410,14 @@ discovery:
     ## tier is confirmed recovered on this host. See the `backends.opencode`
     ## comment block above for the full reasoning.
     ## codex: { enabled: true }
+    ## zai: { enabled: true }
     ## Opt-in like opencode (=== true, not !== false): a brand-new provider
     ## must not start making network calls the moment the code lands. When
-    ## enabled, the refresh builds auth headers from
-    ## backends.codex.credentials_path (read-only; no refresh ever) and polls
-    ## GET chatgpt.com/backend-api/codex/models, folding the subscription's
-    ## live model list into the catalog (hidden and CLI-only slugs excluded).
-    ## The static `models:` list above remains the declaration fallback.
+    ## enabled, Codex reads backends.codex.credentials_path read-only and
+    ## polls GET chatgpt.com/backend-api/codex/models. ZCode reads
+    ## backends.zai.credentials_path read-only and polls
+    ## GET api.z.ai/api/coding/paas/v4/models. Both live lists replace stale
+    ## discovery entries; static model declarations remain cold-start only.
 
   ## EOL probe sweep (card P2.3, design doc 2026-08-08 §5.2). A budgeted,
   ## off-request-path warm probe against candidate models (chosen from the

@@ -61,7 +61,7 @@ providers:
   test('the real committed overlay carries local/anthropic/nvidia/openrouter/opencode, all dated except local', () => {
     const providers = loadProviderPostures(PROVIDER_POSTURE_PATH);
     assert.equal(providers.local.data_retention, 'local-only');
-    for (const name of ['anthropic', 'nvidia', 'openrouter', 'opencode']) {
+    for (const name of ['anthropic', 'nvidia', 'openrouter', 'opencode', 'codex', 'zai']) {
       assert.ok(providers[name], `providers.${name} present`);
       assert.ok(providers[name].data_retention, `providers.${name}.data_retention set`);
       assert.ok(providers[name].verified, `providers.${name}.verified set (dated)`);

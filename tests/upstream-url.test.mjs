@@ -37,6 +37,11 @@ test("anthropic base with /v1", () => {
   assert.equal(result.toString(), "https://api.anthropic.com/v1/messages");
 });
 
+test("z.ai v4 base replaces the client's logical /v1 prefix", () => {
+  const result = buildUpstreamUrl("/v1/chat/completions", new URL("https://api.z.ai/api/coding/paas/v4"));
+  assert.equal(result.toString(), "https://api.z.ai/api/coding/paas/v4/chat/completions");
+});
+
 test("query string is preserved", () => {
   const result = buildUpstreamUrl("/v1/models?foo=bar", new URL("https://openrouter.ai/api/v1"));
   assert.equal(result.toString(), "https://openrouter.ai/api/v1/models?foo=bar");

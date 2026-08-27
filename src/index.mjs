@@ -15,7 +15,7 @@ import { createProxyServer, handleRequest, buildConfig } from "./proxy/core.mjs"
 import { createRouter, routeAndSend } from "./proxy/router.mjs";
 import { buildModelCatalog, reconcileModeFromConfig, tagLocalModels, mergeDiscoveredCatalog, isModelAvailable } from "./proxy/advertise.mjs";
 import { loadAllowlist, saveAllowlist, applyAllowlist } from "./advertise.mjs";
-import { discoverCatalog, loadCache, saveCache, fetchNvidia, fetchOpenRouter, fetchOpencode, fetchAnthropicWrapper, fetchCodex, catalogStatus, loadCardOverrides, applyCardOverlays, buildServingCatalog } from "./discovery.mjs";
+import { discoverCatalog, loadCache, saveCache, fetchNvidia, fetchOpenRouter, fetchOpencode, fetchAnthropicWrapper, fetchCodex, fetchZai, catalogStatus, loadCardOverrides, applyCardOverlays, buildServingCatalog } from "./discovery.mjs";
 import { getPool, resetPool } from "./proxy/connection-pool.mjs";
 import { loadAgentRegistry, extractIdentity, normalizeAgentId, ANONYMOUS_AGENT_ID } from "./identity/capauth.mjs";
 import { createAuthzClient } from "./policy/authz_decide.mjs";
@@ -26,6 +26,7 @@ import { classifyRequest, toSiemEvent } from "./classifiers/engine.mjs";
 import { handleModuleManifest } from "./operator/manifest.mjs";
 import { fromAnthropicRequest, toAnthropicMessage, modelRetrieveObject } from "./proxy/anthropic-frontend.mjs";
 import { readCodexAuthHeaders } from "./proxy/codex-adapter.mjs";
+import { readZaiAuthHeaders, ZAI_CREDENTIALS_PATH } from "./proxy/zai-adapter.mjs";
 import { SSEWriter, jsonToSSE } from "./proxy/stream.mjs";
 import { getLifecycle } from "./discovery/model_catalog_store.mjs";
 import { isRoutable, isEffectivelyRoutable, LIFECYCLE_STATES } from "./discovery/lifecycle.mjs";
@@ -575,11 +576,14 @@ export async function refreshCatalog(cfg, discoverCatalogFn = discoverCatalog) {
   // via readCodexAuthHeaders() (read-only, never refreshed).
   const cxEnabled = d.providers?.codex?.enabled === true;
   const codexCreds = cfg.backends?.codex?.credentials_path || cfg.backends?.codex?.credentials_file;
+  const zaiEnabled = d.providers?.zai?.enabled === true && Boolean(cfg.backends?.zai);
+  const zaiCreds = cfg.backends?.zai?.credentials_path || cfg.backends?.zai?.credentials_file || ZAI_CREDENTIALS_PATH;
   const nvidiaKey = process.env[cfg.backends?.nvidia?.api_key_env || "NVIDIA_API_KEY"];
+  const openrouterKey = process.env[cfg.backends?.openrouter?.api_key_env || "OPENROUTER_API_KEY"];
   const { models } = await discoverCatalogFn({
     localModels: localModels(cfg),
     nvidiaFetch: nvEnabled ? () => fetchNvidia(nvidiaKey) : async () => ({ data: [] }),
-    openrouterFetch: orEnabled ? () => fetchOpenRouter() : async () => ({ data: [] }),
+    openrouterFetch: orEnabled ? () => fetchOpenRouter(openrouterKey) : async () => ({ data: [] }),
     opencodeFetch: ocEnabled
       ? () => fetchOpencode(process.env[cfg.backends?.opencode?.api_key_env || "OPENCODE_API_KEY"])
       : async () => ({ zen: { data: [] }, modelsDev: null }),
@@ -592,6 +596,9 @@ export async function refreshCatalog(cfg, discoverCatalogFn = discoverCatalog) {
     codexFetch: cxEnabled
       ? () => fetchCodex(readCodexAuthHeaders(codexCreds))
       : async () => ({ models: [] }),
+    zaiFetch: zaiEnabled
+      ? () => fetchZai(readZaiAuthHeaders(zaiCreds))
+      : async () => ({ data: [] }),
     cache: _discoveryCache,
     probeSeconds: d.probe_seconds || 0,
     probeBudget: d.probe_budget,
