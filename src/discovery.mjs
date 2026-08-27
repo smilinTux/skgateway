@@ -17,6 +17,7 @@
 // and because parseNvidia/parseOpenRouterFree below are the pre-adapter
 // functions whose output shape those tests pin.
 import { isChatModelId } from './discovery/classify.mjs';
+import { attachFamilyAndCost } from './discovery/model-metadata.mjs';
 
 /** Kept as a named export: tests/discovery.test.mjs pins this exact behavior. */
 export const isChatModel = isChatModelId;
@@ -390,7 +391,9 @@ export function applyCardOverlay(model, overrides) {
 
 /** Apply the manual overlay across a whole merged catalog (card P2.2). */
 export function applyCardOverlays(models, overrides) {
-  return models.map((m) => applyCardOverlay(m, overrides));
+  // Family and cost coverage applies even to fresh provider cards, whose
+  // capability fields remain protected from the manual overlay above.
+  return models.map((m) => attachFamilyAndCost(applyCardOverlay(m, overrides)));
 }
 
 export function mergeCatalog(local, nvidia, openrouter, opencode, anthropic, codex, zai) {

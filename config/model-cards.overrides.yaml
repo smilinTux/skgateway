@@ -73,6 +73,16 @@
 # this file) carries per-PROVIDER data_retention posture, each with a dated
 # verification. Per-model `data_retention` overrides belong on the model's
 # own override entry (design 4.3) and win over the provider default.
+#
+# Family and cost answer separate questions from trust. Every catalog entry is
+# completed at read time by discovery/model-metadata.mjs: canonical fleet
+# families include codex, claude, kimi, glm, ornith, and qwen, with a stable
+# id-prefix fallback or an explicit unfamilied_reason. Economic cost_tier uses
+# FREE, LOCAL, SUBSCRIPTION, PAID, or UNKNOWN. It is never an input to
+# deriveTrustZone(), which remains authoritative on WHERE content may go.
+# FREE is not merely "cheap": the remote FREE providers below are recorded as
+# trains-on-content from provider records verified 2026-08-15. LOCAL is a
+# separate tier because no third-party content exchange occurs.
 
 overrides:
 

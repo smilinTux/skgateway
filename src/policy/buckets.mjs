@@ -369,9 +369,11 @@ export function resolveBucket({ bucket, catalog = [], sensitivityPolicy, isRouta
       class_basis: floor.basis,
       model_class: floor.modelClass,
       trust_zone: zone ?? null,
+      family: entry?.card?.family || null,
+      unfamilied_reason: entry?.card?.unfamilied_reason || null,
       // COST metadata is copied only after the independent trust ceiling has
       // admitted the model. It can order this resolved set, never expand it.
-      cost_tier: entry?.capabilities?.sovereignty || entry?.card?.tier || null,
+      cost_tier: entry?.capabilities?.cost_tier || entry?.card?.cost_tier || null,
     });
   }
 
@@ -379,7 +381,15 @@ export function resolveBucket({ bucket, catalog = [], sensitivityPolicy, isRouta
 }
 
 /** Cost preference, deliberately independent from trust-zone order. */
-export const COST_TIER_ORDER = Object.freeze(['local', 'free-remote', 'paid-cloud']);
+export const COST_TIER_ORDER = Object.freeze(['LOCAL', 'FREE', 'SUBSCRIPTION', 'PAID', 'UNKNOWN']);
+
+function costTierRank(tier) {
+  if (tier === 'LOCAL' || tier === 'local') return 0;
+  if (tier === 'FREE' || tier === 'free-remote') return 1;
+  if (tier === 'SUBSCRIPTION') return 2;
+  if (tier === 'PAID' || tier === 'paid-cloud') return 3;
+  return 4;
+}
 
 /**
  * Return the complete eligible failover chain in cost order.
@@ -402,8 +412,7 @@ export function orderMembersByCost(members, counter = 0) {
   if (!Array.isArray(members) || members.length === 0) return [];
   const groups = new Map();
   for (const member of members) {
-    const rank = COST_TIER_ORDER.indexOf(member?.cost_tier);
-    const key = rank === -1 ? COST_TIER_ORDER.length : rank;
+    const key = costTierRank(member?.cost_tier);
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(member);
   }

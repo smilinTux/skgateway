@@ -324,6 +324,9 @@ export function deriveCapabilities(modelCard, opts = {}) {
     coding: deriveQualityDim(modelCard, 'code', ['coder'], ratingsOpts),
     sovereignty,
     size_class: deriveSizeClass(card),
+    // Economic metadata is surfaced, never consulted by deriveTrustZone().
+    // WHERE content may go remains solely sovereignty + provider retention.
+    cost_tier: typeof card.cost_tier === 'string' ? card.cost_tier : null,
     trust_zone: deriveTrustZone(sovereignty, posture),
     throughput_tps: typeof metrics.throughput_tps === 'number' ? metrics.throughput_tps : null,
   };
