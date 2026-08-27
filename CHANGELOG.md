@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A metrics collector that is explicitly enabled in config and then fails to load
+  is now reported as a degradation instead of being logged as `(optional)` at info
+  level. On 2026-08-27 an `npm ci` rebuilt `better-sqlite3` against a different
+  Node than the systemd unit runs, the collector threw, and the gateway came up
+  serving traffic with metrics off. Every `request_log`, energy and cost row
+  stopped being written and nothing alerted, because from the outside the gateway
+  was healthy: it routed, returned 200s, and `/queue` looked normal. The message
+  now names exactly what stops being written, detects the native-module ABI
+  mismatch specifically and gives the actionable remedy (rebuild against the same
+  Node the service executes), and `SKGATEWAY_REQUIRE_METRICS=1` makes the process
+  refuse to start rather than degrade.
+
+### Added
+
+- `.nvmrc` pinning Node 20, matching the CI matrix floor and the version the
+  deployed unit actually executes. Three different Node versions were resolvable
+  on the deployment host (unit v20, shell v22, npm v26), which is what produced
+  the ABI mismatch above.
+
 ### Added
 
 - SKGateway now serves its own operator facet on the daemon's existing port:
