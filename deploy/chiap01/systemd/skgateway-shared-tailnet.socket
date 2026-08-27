@@ -1,0 +1,21 @@
+[Unit]
+Description=SKGateway shared shadow tailnet-only ingress socket
+Documentation=https://github.com/sk-oss/skgateway
+DefaultDependencies=no
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Socket]
+## TAILNET-ONLY BINDING: Accepts connections ONLY on the Tailscale interface
+## IPv4: 100.80.180.78 (chiap01 Tailscale address)
+## IPv6: fd7a:115c:a1e0::9001:b4b9 (Tailscale prefix)
+## No wildcard, no LAN, no public, no dashboard, no metrics
+ListenStream=100.80.180.78:28880
+ListenStream=[fd7a:115c:a1e0::9001:b4b9]:28880
+Accept=yes
+MaxConnections=50
+KeepAlive=true
+NoDelay=true
+
+[Install]
+WantedBy=sockets.target
