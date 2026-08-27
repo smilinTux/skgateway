@@ -35,6 +35,7 @@
 
 import { deriveCapabilities } from "./capabilities.mjs";
 import { loadProviderPostures } from "../discovery/provider-posture.mjs";
+import { declareRoutingMetadata } from "../discovery/routing-metadata.mjs";
 
 /**
  * PROVIDER POSTURE IS PART OF THE MAPPING, not an optional extra.
@@ -91,9 +92,12 @@ export function buildCapabilityCatalog(entries, opts = {}) {
   const deriveCapabilitiesFn = opts.deriveCapabilitiesFn || deriveCapabilities;
   const metricsFn = opts.metricsFn || (() => ({}));
   const providers = opts.providers !== undefined ? opts.providers : loadProviderPostures();
-  return entries.map((entry) => ({
-    ...entry,
-    lifecycle: getLifecycleFn(entry.id),
-    capabilities: deriveCapabilitiesFn(entry, { metrics: metricsFn(entry.id), providers }),
-  }));
+  return entries.map((entry) => {
+    const declared = declareRoutingMetadata(entry, providers);
+    return {
+      ...declared,
+      lifecycle: getLifecycleFn(declared.id),
+      capabilities: deriveCapabilitiesFn(declared, { metrics: metricsFn(declared.id), providers }),
+    };
+  });
 }
