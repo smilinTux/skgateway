@@ -150,6 +150,25 @@ describe('C9: eligibility composes the floor with the sovereignty ceiling', () =
     assert.match(rejected.find((r) => r.id === 'mystery').reason, /unknown/);
   });
 
+  test('members expose family and declared cost separately from trust', () => {
+    const decorated = {
+      ...entry('claude-opus', { zone: TRUST_ZONES.PAID_CONTRACTUAL, declared: 'XL' }),
+      card: { family: 'claude', cost_tier: 'paid-cloud' },
+    };
+    const { members } = resolveBucket({
+      bucket: { model_class: 'XL', sensitivity: 'internal' },
+      catalog: [decorated],
+    });
+    assert.deepEqual(members, [{
+      id: 'claude-opus',
+      class_basis: 'declared-size-prior',
+      model_class: 'XL',
+      trust_zone: TRUST_ZONES.PAID_CONTRACTUAL,
+      family: 'claude',
+      cost_tier: 'paid-cloud',
+    }]);
+  });
+
   test('lifecycle exclusion still applies', () => {
     const { members } = resolveBucket({
       bucket: { model_class: 'L', sensitivity: 'public' },

@@ -369,9 +369,13 @@ export function resolveBucket({ bucket, catalog = [], sensitivityPolicy, isRouta
       class_basis: floor.basis,
       model_class: floor.modelClass,
       trust_zone: zone ?? null,
-      // COST metadata is copied only after the independent trust ceiling has
-      // admitted the model. It can order this resolved set, never expand it.
-      cost_tier: entry?.capabilities?.sovereignty || entry?.card?.tier || null,
+      // Preference metadata is copied only after the independent trust ceiling
+      // has admitted the model. Neither field can expand this resolved set.
+      family: entry?.card?.family ?? null,
+      ...(entry?.card?.family == null && entry?.card?.unfamilied_reason
+        ? { unfamilied_reason: entry.card.unfamilied_reason }
+        : {}),
+      cost_tier: entry?.card?.cost_tier ?? null,
     });
   }
 
