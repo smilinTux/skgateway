@@ -217,6 +217,7 @@ backends:
     priority: 3
 
   openrouter:
+    enabled: false
     url: https://openrouter.ai/api/v1
     auth_type: api_key
     api_key_env: OPENROUTER_API_KEY
@@ -388,4 +389,4 @@ discovery:
   providers:
     anthropic:  { enabled: true, free_only: false, chat_only: true }
     nvidia:     { enabled: true, free_only: true, chat_only: true }
-    openrouter: { enabled: true, free_only: true, chat_only: true }
+    openrouter: { enabled: false, free_only: true, chat_only: true }

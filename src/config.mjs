@@ -27,7 +27,7 @@ import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import { load as yamlLoad } from 'js-yaml';
 import { isRegistryRouted, loadRegistry } from './proxy/registry.mjs';
-import { assertCodexRegistryPurity } from './policy/codex-purity.mjs';
+import { assertCodexConfigPurity, assertCodexRegistryPurity } from './policy/codex-purity.mjs';
 
 // ─── paths ────────────────────────────────────────────────────────────────────
 
@@ -762,9 +762,11 @@ export function assertProviderRoutes(cfg, errs = [], registryPath = undefined) {
     }
   }
 
-  // Codex is a provider boundary, not a capability hint. Validate the live
-  // registry at boot and reload so a Codex-labelled role cannot point at a
-  // local Qwen or a third-party aggregator even transiently.
+  // Codex is a provider boundary, not a capability hint. Validate both the
+  // configured backends and live registry at boot and reload so a Codex-named
+  // direct target, alias or bucket cannot point at another provider even
+  // transiently.
+  assertCodexConfigPurity(cfg, errs);
   try {
     assertCodexRegistryPurity(loadRegistry(registryPath), errs);
   } catch {

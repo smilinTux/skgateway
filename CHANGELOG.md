@@ -18,6 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Codex-named direct targets, roles, aliases, buckets, contexts, fallback chains,
+  and runtime candidate chains now fail closed unless every member is an official
+  OpenAI GPT route. Missing Codex dispatch credentials and foreign-provider
+  candidates are rejected before transport, while Qwen remains separate and the
+  checked-in OpenRouter backend and discovery source remain disabled.
+
 - A metrics collector that is explicitly enabled in config and then fails to load
   is now reported as a degradation instead of being logged as `(optional)` at info
   level. On 2026-08-27 an `npm ci` rebuilt `better-sqlite3` against a different
