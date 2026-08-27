@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Added the chiap01 B70 Qwen3.8 server as an independent replica of the canonical
+  chiap08 logical model, with separate admission limits of two and three. The
+  same-model router now uses an eligible replica with free capacity before
+  queueing, without changing trust-zone or sensitivity ceilings.
+
 - A metrics collector that is explicitly enabled in config and then fails to load
   is now reported as a degradation instead of being logged as `(optional)` at info
   level. On 2026-08-27 an `npm ci` rebuilt `better-sqlite3` against a different
