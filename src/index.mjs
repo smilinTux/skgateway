@@ -708,7 +708,30 @@ if (config.metrics?.enabled === true) {
     metrics = createMetricsCollector(config.metrics);
     console.log("[skgateway] metrics collector initialized");
   } catch (e) {
-    console.log("[skgateway] metrics collector not available (optional):", e.message);
+    // Metrics was explicitly ENABLED in config and still failed to load. That is a
+    // degradation, not an option, and it must not be logged as though it were fine.
+    // Observed 2026-08-27: an npm ci rebuilt better-sqlite3 against a different
+    // Node than the service runs, the collector failed here, and the gateway came
+    // up cheerfully with metrics off. Every request_log row stopped being written
+    // and nothing noticed, because this line said "(optional)" at info level while
+    // the whole fleet's telemetry was gone.
+    const abi = /NODE_MODULE_VERSION|was compiled against a different Node\.js version/i.test(
+      String(e && e.message),
+    );
+    console.error(
+      "[skgateway] METRICS DEGRADED: collector is enabled in config but failed to load.",
+      "\n  request_log, energy and cost telemetry will NOT be written.",
+      "\n  cause:", e && e.message,
+      abi
+        ? "\n  remedy: the native binding was built for a different Node than this process." +
+          "\n          run:  npm rebuild better-sqlite3 --build-from-source" +
+          "\n          using the SAME node that runs the service (check the unit's ExecStart)."
+        : "\n  remedy: check config.metrics and that ./metrics/collector.mjs loads.",
+    );
+    if (process.env.SKGATEWAY_REQUIRE_METRICS === "1") {
+      console.error("[skgateway] SKGATEWAY_REQUIRE_METRICS=1 is set, refusing to start without metrics.");
+      process.exit(1);
+    }
   }
 } else {
   console.log("[skgateway] metrics collector disabled by configuration");
