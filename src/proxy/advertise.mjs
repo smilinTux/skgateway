@@ -36,6 +36,12 @@ export const RECONCILE_MODES = new Set(["flag", "hide", "off"]);
 /** Default mode: non-breaking (nothing silently disappears). */
 export const DEFAULT_RECONCILE_MODE = "flag";
 
+/** Remove explicitly retired ids from every catalog projection, including stale discovery cache rows. */
+export function filterExcludedCatalog(catalog = [], excluded = []) {
+  const deny = new Set(Array.isArray(excluded) ? excluded : []);
+  return catalog.filter((entry) => !deny.has(entry?.id));
+}
+
 /** A backend disabled for routing must never become a catalog promise. */
 export function isCatalogDisabledBackend(backend = {}) {
   if (backend?.enabled === false || backend?.advertise === false) return true;
@@ -168,9 +174,11 @@ export function tagLocalModels(backends = {}) {
  * @param {Array<object>} [discovered]
  * @returns {Array<object>}
  */
-export function mergeDiscoveredCatalog(reconciled = [], discovered = []) {
-  const byId = new Map(reconciled.map((m) => [m.id, { ...m }]));
+export function mergeDiscoveredCatalog(reconciled = [], discovered = [], excluded = []) {
+  const deny = new Set(Array.isArray(excluded) ? excluded : []);
+  const byId = new Map(reconciled.filter((m) => !deny.has(m.id)).map((m) => [m.id, { ...m }]));
   for (const { id, ...tags } of discovered) {
+    if (deny.has(id)) continue;
     if (typeof id === "string" && /^(?:disabled|placeholder)(?:-|$)/i.test(id)) continue;
     const base = byId.get(id) || { id, object: "model", created: 0, owned_by: tags.provider || "discovery" };
     byId.set(id, { ...base, ...tags, id });

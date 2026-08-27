@@ -30,6 +30,13 @@ server:
 ## 12 NVIDIA ids answer 410 Gone or 404 while the nvidia backend is fine).
 advertise:
   reconcile: hide
+  # Purged 2026-08-25: every exact Ornith claim failed qualification.
+  # This denylist also filters stale discovery cache and bucket projections.
+  excluded_models:
+    - ornith-1.5-9b
+    - ornith-1.0-35b
+    - ornith-big
+    - ornith-1.0-9b
 
 ## Connection Pooling — enforces per-backend concurrency limits
 ## NVIDIA NIM allows 20 concurrent requests max. We enforce this here
@@ -59,37 +66,9 @@ pooling:
       maxQueue: 200
 
 backends:
-  local:
-    url: http://192.168.0.100:8082/v1
-    auth_type: none
-    models:
-      - ornith-1.5-9b            # exact llama-server alias on .100:8082
-    priority: 1
+  ## Ornith backends removed from routing after exact-id qualification failed.
+  ## Restore only after model-list plus completion qualification for every id.
 
-  ## ornith-1.0-35b (Q4_K_M) — llama.cpp (llama-server :11436, sm120) on chiap08,
-  ## 256K ctx, reasoning model. High priority NUMBER keeps this OUT of the
-  ## unmatched-model fallback pool (fronted by priority 1); it remains the SOLE
-  ## match for the exact id `ornith-1.0-35b`, so it never shadows other routing.
-  ##
-  ## 2026-07-21: chiap08 added as PRIMARY. chiap08:11436 serves
-  ## deepreinforce-ai_Ornith-1.0-35B-Q4_K_M.gguf at n_ctx=262144, so the existing
-  ## model_limits (800000/320000) apply unchanged.
-  ##
-  ## 2026-08-05: REMOVED the two Tyler failover backends (tyler-ornith .150:8087,
-  ## tyler-ornith-b .153:8087). Both have been EHOSTUNREACH since 2026-07-21 and
-  ## were the ONLY failover targets, so a transient chiap08 5xx failed over to two
-  ## dead boxes -> a hard request failure, and the router marked chiap08 DEGRADED
-  ## on the resulting error-rate blip (the observed "flakiness"). chiap08 is
-  ## verified healthy (plain + concurrent + 39KB tool-laden payloads all 200), so
-  ## it is now the SOLE ornith-1.0-35b backend and a blip retries it instead of
-  ## cascading to nothing. Re-add the Tyler boxes (priority 5/6) if they return.
-  chiap08-ornith:
-    url: http://TAILNET_HOST:11436/v1
-    auth_type: none
-    models:
-      - ornith-1.0-35b
-      - ornith-big            # short alias -> same backend (llama.cpp serves name-agnostically)
-    priority: 4
   ## Qwen3.8 27B Huihui abliterated Q4_K_M — llama.cpp (llama-server :11439)
   ## on chiap08, 262144 ctx, reasoning model, VISION-capable (mmproj is loaded
   ## by ~skuser01/bin/launch-chiap08-llama-qwen38.sh, unit
@@ -266,12 +245,6 @@ sanitizer:
 # Per-model context limits.  Formula: max_body_bytes = context_tokens * 4 bytes * 0.80
 # max_system_bytes = max_body_bytes * 0.40.  Values from NVIDIA NIM model cards (2026-05-12).
 model_limits:
-  ## 64K qualified live context (Ornith 1.5 Q6_K on .100:8082). Do not
-  ## advertise the model's larger 262K training window.
-  ornith-1.5-9b:                              { max_body_bytes: 209715,   max_system_bytes: 83886   }
-  ## 256K context (ornith-1.0-35b on Tyler's .150/.153:8087 — verified n_ctx=256000)
-  ornith-1.0-35b:                             { max_body_bytes: 800000,   max_system_bytes: 320000  }
-  ornith-big:                                 { max_body_bytes: 800000,   max_system_bytes: 320000  }  # alias of ornith-1.0-35b
   ## 256K context (Huihui Qwen3.8 27B on chiap08 :11439, CTX_SIZE=262144) —
   ## the exact served id and all compatibility aliases carry the same limits.
   qwen3.8-27b-huihui-abliterated-q4_k_m:      { max_body_bytes: 800000,   max_system_bytes: 320000  }

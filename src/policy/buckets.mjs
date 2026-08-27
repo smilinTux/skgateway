@@ -372,10 +372,23 @@ export function resolveBucket({ bucket, catalog = [], sensitivityPolicy, isRouta
       // COST metadata is copied only after the independent trust ceiling has
       // admitted the model. It can order this resolved set, never expand it.
       cost_tier: entry?.capabilities?.sovereignty || entry?.card?.tier || null,
+      backend: entry?.provider || null,
+      physical_service: entry?.url || entry?.provider || entry.id,
     });
   }
 
   return { members, rejected, ceiling };
+}
+
+/** Honest physical capacity view: aliases on one service count once. */
+export function physicalCapacity(members = []) {
+  const services = new Map();
+  for (const member of members) {
+    const service = member?.physical_service || member?.backend || member?.id;
+    if (!services.has(service)) services.set(service, { service, backend: member?.backend || null, models: [] });
+    services.get(service).models.push(member.id);
+  }
+  return [...services.values()];
 }
 
 /** Cost preference, deliberately independent from trust-zone order. */

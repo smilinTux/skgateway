@@ -461,15 +461,17 @@ export function mergeCatalog(local, nvidia, openrouter, opencode, anthropic, cod
  * Pure: the caller passes `backends` (config.backends). No I/O here.
  *
  * @param {Record<string, {models?: string[], url?: string, auth_type?: string}>} [backends]
+ * @param {string[]} [excludedModels]
  * @returns {Array<{id:string, provider:string, free:boolean, url?:string}>}
  */
-export function servingConfigModels(backends = {}) {
+export function servingConfigModels(backends = {}, excludedModels = []) {
   const out = [];
+  const excluded = new Set(Array.isArray(excludedModels) ? excludedModels : []);
   if (!backends || typeof backends !== 'object') return out;
   for (const [name, b] of Object.entries(backends)) {
     const paidBackend = isAnthropicBackend(b) || isCodexBackend(b) || isZaiBackend(b);
     for (const id of (b && b.models) || []) {
-      if (typeof id !== 'string' || id.includes('*')) continue;
+      if (typeof id !== 'string' || id.includes('*') || excluded.has(id)) continue;
       const paid = paidBackend || isAnthropicModelId(id);
       const entry = { id, provider: name, free: !paid };
       if (typeof b.url === 'string' && b.url) entry.url = b.url;
@@ -569,11 +571,14 @@ export function buildServingCatalog(opts = {}) {
   }
 
   let serving = [];
+  let excludedModels = opts.excludedModels;
   if (opts.backends !== undefined) {
-    serving = servingConfigModels(opts.backends);
+    serving = servingConfigModels(opts.backends, excludedModels);
   } else {
     try {
-      serving = servingConfigModels(getConfig().backends || {});
+      const config = getConfig();
+      excludedModels = excludedModels || config?.advertise?.excluded_models;
+      serving = servingConfigModels(config.backends || {}, excludedModels);
     } catch (err) {
       // getConfig() throws when no config has been loaded (every unit test
       // that never boots the gateway) and _readAndBuild throws on an invalid
@@ -585,12 +590,13 @@ export function buildServingCatalog(opts = {}) {
     }
   }
 
+  const excluded = new Set(Array.isArray(excludedModels) ? excludedModels : []);
   const byId = new Map();
   for (const m of serving) {
     if (m && typeof m.id === 'string' && !byId.has(m.id)) byId.set(m.id, m);
   }
   for (const m of cached) {
-    if (!m || typeof m.id !== 'string') continue;
+    if (!m || typeof m.id !== 'string' || excluded.has(m.id)) continue;
     const existing = byId.get(m.id);
     byId.set(m.id, existing ? unionEntry(existing, m) : m);
   }

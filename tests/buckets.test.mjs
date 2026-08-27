@@ -25,6 +25,7 @@ import {
   gradeVocabulary,
   measuredClassCeiling,
   effectiveClass,
+  physicalCapacity,
 } from '../src/policy/buckets.mjs';
 import { TRUST_ZONES } from '../src/policy/sensitivity.mjs';
 
@@ -222,6 +223,19 @@ describe('C9: cost-ranked selection rotates only among equal-cost members', () =
     for (const c of [-1, -7, 1e9, 0.5]) {
       assert.ok(members.includes(selectMember(members, c)));
     }
+  });
+
+  test('four aliases on one llama server report one physical service', () => {
+    const members = ['qwen-a', 'qwen-b', 'qwen-c', 'qwen-d'].map((id) => ({
+      id,
+      backend: 'chiap08-qwen38',
+      physical_service: 'http://chiap08:11439/v1',
+    }));
+    assert.deepEqual(physicalCapacity(members), [{
+      service: 'http://chiap08:11439/v1',
+      backend: 'chiap08-qwen38',
+      models: ['qwen-a', 'qwen-b', 'qwen-c', 'qwen-d'],
+    }]);
   });
 
   test('NEGATIVE CONTROL: ranking cannot admit a member rejected by the trust ceiling', () => {

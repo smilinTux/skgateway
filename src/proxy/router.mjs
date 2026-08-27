@@ -203,6 +203,12 @@ const DEFAULT_QUARANTINE_THRESHOLD = 5;
 /** Cooldown (ms) a quarantined alias stays out of rotation before a re-probe. */
 const DEFAULT_QUARANTINE_COOLDOWN_MS = 30_000;
 
+/** Fast wrong-answer failures before one backend-model claim is quarantined. */
+const DEFAULT_MODEL_QUARANTINE_THRESHOLD = 3;
+
+/** Fast failures are distinct from completion hangs (504). */
+const FAST_MODEL_FAILURE_STATUSES = new Set([404, 502]);
+
 // ---------------------------------------------------------------------------
 // Rate-limit failover (card 9e28de88): 429 (and, deliberately, 402) are
 // failover-worthy, MODEL-granular cooldowns, not the backend-granular
@@ -719,6 +725,9 @@ export class Backend {
     this._quarantined = false;
     /** @type {number} epoch ms (when quarantine started / cooldown last re-armed) */
     this._quarantinedSince = 0;
+    /** Exact model claims quarantined after repeated fast wrong answers. */
+    this._modelFailures = new Map();
+    this._modelQuarantined = new Set();
 
     this._totalRequests = 0;
     this._totalErrors = 0;
@@ -753,6 +762,39 @@ export class Backend {
     if (!model) return true;
     if (this.models.length === 0) return !this.discovery;
     return this.models.some((pattern) => modelMatches(pattern, model));
+  }
+
+  /** Whether this exact backend-model claim remains eligible. */
+  isModelAvailable(model) {
+    return this.isAvailable() && !this._modelQuarantined.has(model);
+  }
+
+  /**
+   * Quarantine only the exact claim after repeated fast wrong answers.
+   * A 504 is deliberately absent: slow completion hangs use their own timeout
+   * guard and are not evidence that a model alias is wrong.
+   */
+  recordModelStatus(model, status) {
+    if (!model) return null;
+    if (status >= 200 && status < 300) {
+      this._modelFailures.delete(model);
+      if (this._modelQuarantined.delete(model)) return { transition: "readmitted", model };
+      return null;
+    }
+    if (!FAST_MODEL_FAILURE_STATUSES.has(status)) return null;
+    const failures = (this._modelFailures.get(model) || 0) + 1;
+    this._modelFailures.set(model, failures);
+    if (failures >= DEFAULT_MODEL_QUARANTINE_THRESHOLD && !this._modelQuarantined.has(model)) {
+      this._modelQuarantined.add(model);
+      return {
+        transition: "quarantined",
+        model,
+        status,
+        consecutiveFailures: failures,
+        threshold: DEFAULT_MODEL_QUARANTINE_THRESHOLD,
+      };
+    }
+    return null;
   }
 
   // -------------------------------------------------------------------------
@@ -809,6 +851,7 @@ export class Backend {
       totalRequests: this._totalRequests,
       totalErrors: this._totalErrors,
       quarantined: this._quarantined,
+      quarantinedModels: [...this._modelQuarantined],
       consecutiveFailures: this._consecutiveFailures,
     };
   }
@@ -1360,7 +1403,7 @@ export function createRouter(config = {}) {
     if (!model) return available;
 
     // Exact or glob match first
-    const matched = available.filter((b) => b.supportsModel(model));
+    const matched = available.filter((b) => b.supportsModel(model) && b.isModelAvailable(model));
 
     // The gate has to be checked here too, not only in the fallback branch
     // below. `Backend.models` is a snapshot written by
@@ -3286,8 +3329,12 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // response or try the next door; splitting the two is the whole point
     // of this card, so a throttled model can fail over WITHOUT damaging
     // backend health or lifecycle state.
-    const healthy = res.status < 500;
+    // Fast wrong answers are claim-granular. Do not let a 502 for one alias
+    // remove every other model on the backend through the backend-wide health
+    // machine. Slow hangs and other 5xx retain the existing backend signal.
+    const healthy = res.status < 500 || FAST_MODEL_FAILURE_STATUSES.has(res.status);
     const qTransition = backend.recordOutcome(healthy, latencyMs);
+    const modelTransition = backend.recordModelStatus(candidateModel, res.status);
 
     // Model-granular lifecycle bookkeeping (card P1.2, section 4.2 of the
     // model-ranking design doc): record this concrete model's completion
@@ -3315,12 +3362,18 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     const claimsHere = candidateModel && typeof backend.supportsModel === "function"
       ? backend.supportsModel(candidateModel)
       : false;
-    const anyClaimer = typeof router.getBackends === "function" && candidateModel
-      ? router.getBackends().some(
+    const claimers = typeof router.getBackends === "function" && candidateModel
+      ? router.getBackends().filter(
           (b) => typeof b.supportsModel === "function" && b.supportsModel(candidateModel)
         )
-      : false;
-    recordModelOutcome(candidateModel, { status: res.status, now: Date.now(), claiming: claimsHere || !anyClaimer });
+      : [];
+    const anyClaimer = claimers.length > 0;
+    const anotherClaimer = claimers.some((b) => b !== backend);
+    recordModelOutcome(candidateModel, {
+      status: res.status,
+      now: Date.now(),
+      claiming: (claimsHere && !anotherClaimer) || !anyClaimer,
+    });
 
     // Feed the real completion outcome back into the local-health verdict so a
     // wedged local backend that got past the probe but then hung/errored is
@@ -3332,6 +3385,16 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // failover pattern: a stdout JSON line (always) plus a structured SIEM
     // event via the shared emitter (best-effort). Quarantine removes the alias
     // from rotation; re-admit returns it once a probe succeeds.
+    if (modelTransition) {
+      emitSiem("anomaly", {
+        type: `backend_model_${modelTransition.transition}`,
+        backend: backendId,
+        model: candidateModel,
+        status_code: res.status,
+        consecutive_failures: modelTransition.consecutiveFailures || 0,
+      }, { backend: backendId });
+    }
+
     if (qTransition) {
       const isQ = qTransition.transition === "quarantined";
       process.stdout.write(JSON.stringify({
@@ -3377,6 +3440,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // caller. `healthy` above already kept backend health/lifecycle out of
     // this decision entirely.
     const retryElsewhere = isFailoverStatus(res.status) ||
+      (claimsHere && res.status === 404) ||
       (isBucketChain && (res.status === 404 || res.status === 410));
     const throttled = isThrottleStatus(res.status);
 

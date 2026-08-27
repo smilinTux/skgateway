@@ -49,7 +49,7 @@ import { buildCapabilityCatalog } from "./ranking/catalog.mjs";
 import { REGISTRY_PATH } from "./proxy/registry.mjs";
 import { energyRowsFrom, energyHeaders } from "./metrics/energy.mjs";
 import { attributionHeaders } from "./metrics/attribution.mjs";
-import { allBuckets, resolveBucket } from "./policy/buckets.mjs";
+import { allBuckets, physicalCapacity, resolveBucket } from "./policy/buckets.mjs";
 import { loadRegistry, REGISTRY_PATH as _REGISTRY_PATH } from "./proxy/registry.mjs";
 import { policyFromRegistry } from "./policy/sensitivity.mjs";
 import { readFileSync } from "node:fs";
@@ -1450,7 +1450,7 @@ export const server = http.createServer(async (req, res) => {
       // onto the reconciled health/status entries and GUARANTEES every model
       // carries a non-empty provider (see src/proxy/advertise.mjs). The
       // allowlist is applied last, exactly as on /admin/models.
-      const merged = mergeDiscoveredCatalog(reconciled, discovered);
+      const merged = mergeDiscoveredCatalog(reconciled, discovered, config?.advertise?.excluded_models);
       const allowlist = loadAllowlist();
       const allowed = applyAllowlist(merged, allowlist);
       // Aliases (buckets + registry roles): additive, allowlist-aware,
@@ -1509,7 +1509,7 @@ export const server = http.createServer(async (req, res) => {
     try {
       const discovered = await getDiscoveredCatalog();
       const reconciled = buildModelCatalog(effectiveAdvertiseBackends(config.backends || {}, router), router, advertiseReconcileMode);
-      const merged = mergeDiscoveredCatalog(reconciled, discovered);
+      const merged = mergeDiscoveredCatalog(reconciled, discovered, config?.advertise?.excluded_models);
       const data = applyAllowlist(merged, loadAllowlist());
       const entry = data.find((m) => m.id === id);
       // Registry role (sk-default/sk-auto/sk-creative/...): a valid routing
@@ -1725,6 +1725,7 @@ export const server = http.createServer(async (req, res) => {
             sensitivity: b.sensitivity,
             ceiling,
             members,
+            physical_capacity: physicalCapacity(members),
             rejected,
           });
         } catch (e) {
