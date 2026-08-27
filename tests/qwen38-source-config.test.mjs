@@ -30,7 +30,7 @@ const cards = loadYaml(
 
 test('chiap08-qwen38 claims the exact served id before its compatibility aliases', () => {
   const backend = config.backends['chiap08-qwen38'];
-  assert.equal(backend.url, 'http://100.81.238.58:11439/v1');
+  assert.equal(backend.url, 'http://TAILNET_HOST:11439/v1');
   assert.equal(backend.auth_type, 'none');
   assert.equal(backend.priority, 3);
   assert.deepEqual(backend.models, MODEL_IDS);

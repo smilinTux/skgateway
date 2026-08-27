@@ -84,7 +84,7 @@ backends:
   ## it is now the SOLE ornith-1.0-35b backend and a blip retries it instead of
   ## cascading to nothing. Re-add the Tyler boxes (priority 5/6) if they return.
   chiap08-ornith:
-    url: http://100.81.238.58:11436/v1
+    url: http://TAILNET_HOST:11436/v1
     auth_type: none
     models:
       - ornith-1.0-35b
@@ -108,7 +108,7 @@ backends:
   ## finish_reason=stop. Observed: 121 completion tokens to answer "say alive".
   ## The registry entry carries min_output_tokens: 8192 for exactly this reason.
   chiap08-qwen38:
-    url: http://100.81.238.58:11439/v1
+    url: http://TAILNET_HOST:11439/v1
     auth_type: none
     models:
       - qwen3.8-27b-huihui-abliterated-q4_k_m   # exact llama-server --alias / served id

@@ -287,7 +287,7 @@ drop-in strips it back off:
 |---|---|
 | Base unit `~/.config/systemd/user/skgateway.service` | `/usr/bin/node ~/clawd/skcapstone-repos/skgateway/src/index.mjs --port 18780 --config ~/clawd/skcapstone-repos/skgateway/config/skgateway.yaml` |
 | Drop-in `skgateway.service.d/config-path.conf` | clears `ExecStart=` (the empty assignment resets the list-typed setting) and re-declares it **without** `--config` |
-| **Effective, both nodes** | `/usr/bin/node /home/cbrd21/clawd/skcapstone-repos/skgateway/src/index.mjs --port 18780` |
+| **Effective, both nodes** | `/usr/bin/node /home/OPERATOR/clawd/skcapstone-repos/skgateway/src/index.mjs --port 18780` |
 
 That is not cosmetic. Dropping `--config` moves the service from precedence step 1 to
 step 3 in §6, so it loads the **Syncthing-synced** `~/.skcapstone/gateway/skgateway.yaml`
@@ -478,7 +478,7 @@ canonical check that metrics are recording (non-null object once enabled).
 | Buckets absent from `/v1/models` | Confirm the **serving** config has `routing.buckets_enabled: true`; then compare `GET /admin/buckets`. Remember the live unit normally reads `~/.skcapstone/gateway/skgateway.yaml`, not the repo fallback. |
 | A bucket is visible but has no members | Inspect `/admin/buckets` rejection reasons. Membership requires the class floor, trust-zone ceiling, provider posture, an available serving backend, and effective lifecycle routability. Do not add a hardcoded member to conceal the rejected condition. |
 | Valid bucket returns 503 | `bucket_no_eligible_member` is fail-closed. Restore an eligible backend or correct its model card/lifecycle claim; do not fall back to `sk-default`. |
-| `qwen38-abliterated` reports EOL despite a local declaration | Run the claim-aware tests and inspect the lifecycle record's provider attribution. A non-claiming NVIDIA 404/410 must neither accumulate EOL nor preempt `chiap08-qwen38`; separately verify `100.81.238.58:11439` is reachable. |
+| `qwen38-abliterated` reports EOL despite a local declaration | Run the claim-aware tests and inspect the lifecycle record's provider attribution. A non-claiming NVIDIA 404/410 must neither accumulate EOL nor preempt `chiap08-qwen38`; separately verify `TAILNET_HOST:11439` is reachable. |
 | Mixed Qwen traffic stalls or returns `capacity_exceeded` / `queue_timeout` | Inspect `GET /queue` at key `chiap08-qwen38`. `active` and `queued` must never exceed four. A full queue returns retryable `503 capacity_exceeded`; a waiter older than 30 seconds returns retryable `503 queue_timeout`; both include `Retry-After`. Do not raise the four-slot ceiling without separately qualifying the llama.cpp service. |
 | Restart succeeds but code/config appears stale | Compare the listener PID (`ss -ltnp`) with `systemctl --user show skgateway -p MainPID`. A second unmanaged Node process can own `:18780` while the managed unit crash-loops. Stop the duplicate, then restart and probe the unit. |
 | `better-sqlite3` fails to load (`Could not locate the bindings file`) | The native addon was not built. Most often the install ran with `--ignore-scripts`, which skips it and fails 19 metrics/energy/SIEM tests. Re-run plain `npm ci` or `npm install` (needs a `node-gyp` toolchain). |

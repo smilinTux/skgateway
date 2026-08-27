@@ -70,7 +70,7 @@ const SERVING_BACKENDS = {
     models: ['ornith-tiny', 'ornith-1.0-9b', 'qwen3.6-27b-abliterated'],
   },
   'chiap08-qwen38': {
-    url: 'http://100.81.238.58:11439/v1',
+    url: 'http://TAILNET_HOST:11439/v1',
     auth_type: 'none',
     models: [
       'qwen3.8-27b-huihui-abliterated-q4_k_m',
