@@ -40,7 +40,7 @@ writeFileSync(
   fixture,
   `backends:
   qwen-vl:
-    url: http://100.81.238.58:11436/v1
+    url: http://TAILNET_HOST:11436/v1
     model: Qwen3.6-27b-abliterated-Q4_K_M
     ctx: 32768
     kind: chat
