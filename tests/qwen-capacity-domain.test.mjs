@@ -270,13 +270,19 @@ describe("chiap08 Qwen shared capacity domain", () => {
 });
 
 
-test("source config pins the exact four-slot Qwen capacity domain", async () => {
+test("source config pins two independent Qwen replica capacity domains", async () => {
   const { load: yamlLoad } = await import("js-yaml");
   const { readFileSync } = await import("node:fs");
   const config = yamlLoad(readFileSync(new URL("../config/skgateway.yaml", import.meta.url), "utf8"));
   assert.deepEqual(config.pooling.capacity_domains["chiap08-qwen38"], {
     members: ["chiap08-qwen38", "reg:qwen38"],
-    max: 4,
+    max: 3,
+    maxQueue: 8,
+    queueTimeoutMs: 30_000,
+  });
+  assert.deepEqual(config.pooling.capacity_domains["chiap01-qwen38"], {
+    members: ["chiap01-qwen38"],
+    max: 2,
     maxQueue: 4,
     queueTimeoutMs: 30_000,
   });
