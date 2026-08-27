@@ -410,6 +410,88 @@ function deepClone(obj) {
   return JSON.parse(JSON.stringify(obj));
 }
 
+/** True only for a YAML mapping, never null or an array. */
+function isMapping(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
+ * Merge one parsed config document over the defaults.
+ *
+ * `backends` is deliberately different from ordinary nested settings: when a
+ * file declares the key, that mapping is the complete backend registry. This
+ * makes omission an actual removal instead of allowing deepMerge() to restore
+ * a same-named built-in backend. `enabled: false` is the explicit equivalent;
+ * a disabled entry needs no url, auth, models, or priority because it is
+ * removed before backend validation and before any consumer sees the config.
+ *
+ * @param {object} base mutable clone of DEFAULTS
+ * @param {object} fromFile parsed YAML document
+ * @returns {Set<string>} backend ids explicitly disabled or removed from defaults
+ */
+function mergeConfigDocument(base, fromFile) {
+  if (!isMapping(fromFile)) {
+    throw new ConfigError(['configuration document must be a YAML mapping']);
+  }
+
+  const hasBackends = Object.prototype.hasOwnProperty.call(fromFile, 'backends');
+  const rest = { ...fromFile };
+  delete rest.backends;
+  deepMerge(base, rest);
+
+  if (!hasBackends) return new Set();
+  if (!isMapping(fromFile.backends)) {
+    throw new ConfigError(['backends must be a mapping when declared']);
+  }
+
+  const problems = [];
+  const configured = {};
+  const removed = new Set(
+    Object.keys(DEFAULTS.backends).filter(
+      (id) => !Object.prototype.hasOwnProperty.call(fromFile.backends, id),
+    ),
+  );
+
+  for (const [id, backend] of Object.entries(fromFile.backends)) {
+    if (!isMapping(backend)) {
+      problems.push(`backends.${id} must be an object or { enabled: false }`);
+      continue;
+    }
+    if (Object.prototype.hasOwnProperty.call(backend, 'enabled') && typeof backend.enabled !== 'boolean') {
+      problems.push(`backends.${id}.enabled must be a boolean`);
+      continue;
+    }
+    if (backend.enabled === false) {
+      removed.add(id);
+      continue;
+    }
+    const inherited = Object.prototype.hasOwnProperty.call(DEFAULTS.backends, id)
+      ? deepClone(DEFAULTS.backends[id])
+      : {};
+    configured[id] = deepMerge(inherited, backend);
+  }
+
+  if (problems.length) throw new ConfigError(problems);
+  base.backends = configured;
+  return removed;
+}
+
+/**
+ * A discovery provider without a same-named serving backend cannot produce a
+ * routable catalog entry. Turn those inherited defaults off in the effective
+ * config so removing a backend cannot leave provider polling or cached catalog
+ * advertisement enabled behind it.
+ */
+function disableOrphanDiscoveryProviders(cfg) {
+  const providers = cfg.discovery?.providers;
+  if (!isMapping(providers)) return;
+  for (const [id, provider] of Object.entries(providers)) {
+    if (!Object.prototype.hasOwnProperty.call(cfg.backends || {}, id) && isMapping(provider)) {
+      provider.enabled = false;
+    }
+  }
+}
+
 // ─── env overrides ────────────────────────────────────────────────────────────
 
 /**
@@ -449,8 +531,15 @@ export function applyEnvOverrides(cfg) {
   if (e.SKGATEWAY_PORT)           cfg.server.port            = Number(e.SKGATEWAY_PORT);
   if (e.SKGATEWAY_DASHBOARD_PORT) cfg.server.dashboard_port  = Number(e.SKGATEWAY_DASHBOARD_PORT);
   if (e.SKGATEWAY_BIND)           cfg.server.bind            = e.SKGATEWAY_BIND;
-  if (e.SKGATEWAY_TARGET)         cfg.backends.nvidia.url    = e.SKGATEWAY_TARGET;
-  if (e.SKGATEWAY_NVIDIA_KEY_ENV) cfg.backends.nvidia.api_key_env = e.SKGATEWAY_NVIDIA_KEY_ENV;
+  if (e.SKGATEWAY_TARGET || e.SKGATEWAY_NVIDIA_KEY_ENV) {
+    if (!cfg.backends?.nvidia) {
+      throw new ConfigError([
+        'SKGATEWAY_TARGET/SKGATEWAY_NVIDIA_KEY_ENV cannot target removed backend "nvidia"',
+      ]);
+    }
+    if (e.SKGATEWAY_TARGET) cfg.backends.nvidia.url = e.SKGATEWAY_TARGET;
+    if (e.SKGATEWAY_NVIDIA_KEY_ENV) cfg.backends.nvidia.api_key_env = e.SKGATEWAY_NVIDIA_KEY_ENV;
+  }
   if (e.SKGATEWAY_METRICS_DB)     cfg.metrics.db_path        = e.SKGATEWAY_METRICS_DB;
   if (e.SKGATEWAY_RETENTION_DAYS) cfg.metrics.retention_days = Number(e.SKGATEWAY_RETENTION_DAYS);
 
@@ -626,7 +715,12 @@ function modelMatchesPattern(pattern, model) {
  *   used at boot/reload.
  * @returns {string[]} The accumulated problems (empty when the routes are valid).
  */
-export function assertProviderRoutes(cfg, errs = [], registryPath = undefined) {
+export function assertProviderRoutes(
+  cfg,
+  errs = [],
+  registryPath = undefined,
+  removedBackendIds = new Set(),
+) {
   const backends = (cfg.backends && typeof cfg.backends === 'object') ? cfg.backends : {};
   const backendIds = new Set(Object.keys(backends));
 
@@ -702,6 +796,10 @@ export function assertProviderRoutes(cfg, errs = [], registryPath = undefined) {
           if (typeof member !== 'string' || member.length === 0) {
             errs.push(`${prefix}.members entries must be non-empty strings`);
             continue;
+          }
+          const configuredId = member.startsWith('reg:') ? member.slice(4) : member;
+          if (removedBackendIds.has(configuredId)) {
+            errs.push(`${prefix}.members references disabled or removed backend ${configuredId}`);
           }
           if (!backendIds.has(member) && !/^reg:[A-Za-z0-9._-]+$/.test(member)) {
             errs.push(
@@ -782,7 +880,7 @@ export function assertProviderRoutes(cfg, errs = [], registryPath = undefined) {
  * @param {object} cfg
  * @throws {ConfigError}
  */
-function validate(cfg) {
+function validate(cfg, removedBackendIds = new Set()) {
   const errs = [];
 
   // server
@@ -901,7 +999,7 @@ function validate(cfg) {
   // Provider-route consistency (card 7ec1d18a): assert routes map to known
   // backends / resolvable aliases at boot AND reload, so a mis-wired route fails
   // fast here rather than silently mis-routing at first request.
-  assertProviderRoutes(cfg, errs);
+  assertProviderRoutes(cfg, errs, undefined, removedBackendIds);
 
   if (errs.length) throw new ConfigError(errs);
 }
@@ -1033,24 +1131,25 @@ export function getConfig() {
 function _readAndBuild(filePath, silent) {
   const base = deepClone(DEFAULTS);
 
+  let removedBackendIds = new Set();
   if (existsSync(filePath)) {
+    let fromFile;
     try {
       const raw = readFileSync(filePath, 'utf8');
-      const fromFile = yamlLoad(raw) ?? {};
-      deepMerge(base, fromFile);
-      if (!silent) process.stderr.write(`[skgateway:config] Loaded ${filePath}\n`);
+      fromFile = yamlLoad(raw) ?? {};
     } catch (err) {
-      // Parse error — fall back to defaults and warn
-      process.stderr.write(`[skgateway:config] WARN: could not parse ${filePath}: ${err.message}\n`);
-      process.stderr.write('[skgateway:config] Falling back to built-in defaults.\n');
+      throw new ConfigError([`could not parse ${filePath}: ${err.message}`]);
     }
+    removedBackendIds = mergeConfigDocument(base, fromFile);
+    if (!silent) process.stderr.write(`[skgateway:config] Loaded ${filePath}\n`);
   } else {
     if (!silent) process.stderr.write(`[skgateway:config] ${filePath} not found — using defaults.\n`);
   }
 
+  disableOrphanDiscoveryProviders(base);
   applyEnvOverrides(base);
   resolvePaths(base);
-  validate(base);   // throws ConfigError on bad values
+  validate(base, removedBackendIds);   // throws ConfigError on bad values
 
   return base;
 }
