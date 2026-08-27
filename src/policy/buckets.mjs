@@ -369,6 +369,12 @@ export function resolveBucket({ bucket, catalog = [], sensitivityPolicy, isRouta
       class_basis: floor.basis,
       model_class: floor.modelClass,
       trust_zone: zone ?? null,
+      // Alias count is not physical capacity. Models declared by the same
+      // backend URL share one resource id, so four request aliases for one
+      // llama-server remain four addressable members but one physical server.
+      physical_resource_id: entry?.url
+        ? `${entry.provider || 'backend'}@${entry.url}`
+        : (entry?.provider || `model:${entry.id}`),
       // COST metadata is copied only after the independent trust ceiling has
       // admitted the model. It can order this resolved set, never expand it.
       cost_tier: entry?.capabilities?.sovereignty || entry?.card?.tier || null,

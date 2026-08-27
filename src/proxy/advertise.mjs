@@ -181,14 +181,26 @@ export function mergeDiscoveredCatalog(reconciled = [], discovered = []) {
   }));
 }
 
-export function buildModelCatalog(backends = {}, router = null, mode = DEFAULT_RECONCILE_MODE) {
+export function excludedModelIds(config = {}) {
+  return new Set(
+    Array.isArray(config?.advertise?.excluded_models)
+      ? config.advertise.excluded_models.filter((id) => typeof id === "string" && id)
+      : [],
+  );
+}
+
+export function withoutExcludedModels(models = [], excluded = new Set()) {
+  return models.filter((entry) => !excluded.has(typeof entry === "string" ? entry : entry?.id));
+}
+
+export function buildModelCatalog(backends = {}, router = null, mode = DEFAULT_RECONCILE_MODE, excluded = new Set()) {
   const m = normalizeReconcileMode(mode);
   const seen = new Set();
   const data = [];
   for (const [id, b] of Object.entries(backends || {})) {
     if (isCatalogDisabledBackend(b)) continue;
     for (const model of (b?.models || [])) {
-      if (typeof model !== "string" || model.includes("*") || seen.has(model)) continue;
+      if (typeof model !== "string" || model.includes("*") || seen.has(model) || excluded.has(model)) continue;
       seen.add(model);
       const entry = { id: model, object: "model", created: 0, owned_by: id };
       if (m !== "off") {

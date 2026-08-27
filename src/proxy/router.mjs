@@ -51,7 +51,7 @@ import { buildServingCatalog } from "../discovery.mjs";
 import { rankModels } from "../ranking/rank.mjs";
 import { buildCapabilityCatalog } from "../ranking/catalog.mjs";
 import { loadAllowlist } from "../advertise.mjs";
-import { isCatalogDisabledBackend, isModelAvailable } from "./advertise.mjs";
+import { isCatalogDisabledBackend, isModelAvailable, excludedModelIds, withoutExcludedModels } from "./advertise.mjs";
 import {
   resolveZoneCeiling,
   isZoneAllowed,
@@ -185,6 +185,21 @@ export class ModelEolError extends Error {
 }
 
 /**
+ * Every backend which explicitly declares this model is temporarily
+ * quarantined for this exact claim. This is intentionally distinct from a
+ * global lifecycle EOL verdict: another backend declaring the same model can
+ * remain selectable and advertised.
+ */
+export class ModelClaimQuarantinedError extends Error {
+  constructor(model) {
+    super(`all backend claims for model "${model}" are quarantined`);
+    this.name = "ModelClaimQuarantinedError";
+    this.model = model;
+    this.status = 503;
+  }
+}
+
+/**
  * Dead-alias auto-quarantine (card 2d1f3a2c).
  *
  * The error-rate health machine (DEGRADED/DOWN above) reacts to the fraction of
@@ -202,6 +217,21 @@ const DEFAULT_QUARANTINE_THRESHOLD = 5;
 
 /** Cooldown (ms) a quarantined alias stays out of rotation before a re-probe. */
 const DEFAULT_QUARANTINE_COOLDOWN_MS = 30_000;
+
+/** Repeated fast wrong-answer failures before one backend-model claim is removed. */
+const DEFAULT_MODEL_CLAIM_QUARANTINE_THRESHOLD = 3;
+const DEFAULT_MODEL_CLAIM_QUARANTINE_COOLDOWN_MS = 30_000;
+
+/**
+ * Fast wrong answers are classified synchronously from the completed attempt.
+ * 404/410 mean this door rejected the exact model id. 502 includes a refused
+ * connection or absent listener as normalized by sendUpstream(). A slow 504
+ * completion timeout is deliberately excluded and remains the separate
+ * completion-liveness path.
+ */
+export function isFastModelClaimFailure(status) {
+  return status === 404 || status === 410 || status === 502;
+}
 
 // ---------------------------------------------------------------------------
 // Rate-limit failover (card 9e28de88): 429 (and, deliberately, 402) are
@@ -666,6 +696,14 @@ export class Backend {
     this.quarantine_cooldown_ms = typeof config.quarantine_cooldown_ms === "number"
       ? config.quarantine_cooldown_ms
       : DEFAULT_QUARANTINE_COOLDOWN_MS;
+    this.model_claim_quarantine_threshold = Number.isInteger(config.model_claim_quarantine_threshold)
+      ? config.model_claim_quarantine_threshold
+      : DEFAULT_MODEL_CLAIM_QUARANTINE_THRESHOLD;
+    this.model_claim_quarantine_cooldown_ms = typeof config.model_claim_quarantine_cooldown_ms === "number"
+      ? config.model_claim_quarantine_cooldown_ms
+      : DEFAULT_MODEL_CLAIM_QUARANTINE_COOLDOWN_MS;
+    /** @type {Map<string,{failures:number,quarantinedAt:number,lastStatus:number}>} */
+    this._modelClaimFailures = new Map();
 
     // Auth credentials. credentials_path (the key the YAML schema and
     // config/skgateway.yaml.example document, and what the live config uses
@@ -753,6 +791,37 @@ export class Backend {
     if (!model) return true;
     if (this.models.length === 0) return !this.discovery;
     return this.models.some((pattern) => modelMatches(pattern, model));
+  }
+
+  /** Whether this exact declared backend-model claim is currently selectable. */
+  isModelClaimAvailable(model) {
+    const state = this._modelClaimFailures.get(model);
+    if (!state?.quarantinedAt) return true;
+    return Date.now() - state.quarantinedAt >= this.model_claim_quarantine_cooldown_ms;
+  }
+
+  /**
+   * Fold one completed attempt into exact-claim health. Only repeated fast
+   * wrong answers quarantine. Success clears the exact claim. 504 and other
+   * slow/ambiguous outcomes do not participate.
+   */
+  recordModelClaimOutcome(model, status) {
+    if (!model || !this.supportsModel(model) || this.model_claim_quarantine_threshold <= 0) return null;
+    if (status >= 200 && status < 300) {
+      const prior = this._modelClaimFailures.get(model);
+      this._modelClaimFailures.delete(model);
+      return prior?.quarantinedAt ? { transition: "readmitted", model, failures: 0 } : null;
+    }
+    if (!isFastModelClaimFailure(status)) return null;
+
+    const prior = this._modelClaimFailures.get(model) || { failures: 0, quarantinedAt: 0, lastStatus: 0 };
+    const failures = prior.failures + 1;
+    const quarantinedAt = failures >= this.model_claim_quarantine_threshold ? Date.now() : prior.quarantinedAt;
+    this._modelClaimFailures.set(model, { failures, quarantinedAt, lastStatus: status });
+    if (!prior.quarantinedAt && quarantinedAt) {
+      return { transition: "quarantined", model, failures, status };
+    }
+    return null;
   }
 
   // -------------------------------------------------------------------------
@@ -1359,8 +1428,13 @@ export function createRouter(config = {}) {
 
     if (!model) return available;
 
-    // Exact or glob match first
-    const matched = available.filter((b) => b.supportsModel(model));
+    // Keep declaration separate from current exact-claim availability. A
+    // quarantined claim must not turn into an unmatched-model spray, and one
+    // bad claimer must not condemn another claimer or the global model id.
+    const declared = [...backends.values()].filter((b) => b.supportsModel(model));
+    const matched = available.filter(
+      (b) => b.supportsModel(model) && b.isModelClaimAvailable(model),
+    );
 
     // The gate has to be checked here too, not only in the fallback branch
     // below. `Backend.models` is a snapshot written by
@@ -1392,6 +1466,12 @@ export function createRouter(config = {}) {
         return gated;
       }
       return matched;
+    }
+
+    if (declared.length > 0 && declared.every((b) => !b.isModelClaimAvailable(model))) {
+      const claimQuarantined = [];
+      claimQuarantined.claimQuarantined = true;
+      return claimQuarantined;
     }
 
     // No backend explicitly claims this model. A KNOWN eol|dead id (per the
@@ -1479,6 +1559,10 @@ export function createRouter(config = {}) {
     if (candidates.eolGated) {
       siemEvent("model_eol_gated", { model, agentId, eol_reason: candidates.eolReason });
       throw new ModelEolError(model, candidates.eolReason);
+    }
+    if (candidates.claimQuarantined) {
+      siemEvent("model_claims_quarantined", { model, agentId });
+      throw new ModelClaimQuarantinedError(model);
     }
 
     if (candidates.length === 0) {
@@ -1849,7 +1933,11 @@ function matchConfigEpoch() {
 function buildMatchCatalog() {
   let models;
   try {
-    models = buildServingCatalog({ cachePath: MATCH_CATALOG_CACHE_PATH });
+    const cfg = getConfig();
+    models = withoutExcludedModels(
+      buildServingCatalog({ cachePath: MATCH_CATALOG_CACHE_PATH }),
+      excludedModelIds(cfg),
+    );
   } catch {
     models = [];
   }
@@ -1987,6 +2075,24 @@ function eolGatedResponse(err) {
     status: 404,
     headers: { "content-type": "application/json" },
     body: Buffer.from(payload, "utf-8"),
+    backendId: null,
+    failover: false,
+  };
+}
+
+function claimQuarantinedResponse(err) {
+  return {
+    status: 503,
+    headers: { "content-type": "application/json", "retry-after": "30" },
+    body: Buffer.from(JSON.stringify({
+      error: {
+        message: err.message,
+        code: 503,
+        type: "model_claim_quarantined",
+        model: err.model,
+        retryable: true,
+      },
+    }), "utf-8"),
     backendId: null,
     failover: false,
   };
@@ -2594,6 +2700,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           candidates = await router.route({ ...request, model: reg.model, agentId: request.agentId });
         } catch (err) {
           if (err instanceof ModelEolError) return eolGatedResponse(err);
+          if (err instanceof ModelClaimQuarantinedError) return claimQuarantinedResponse(err);
           throw err;
         }
         if (!candidates || candidates.length === 0) {
@@ -2816,6 +2923,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           await router.route(request);
         } catch (err) {
           if (err instanceof ModelEolError) return eolGatedResponse(err);
+          if (err instanceof ModelClaimQuarantinedError) return claimQuarantinedResponse(err);
           throw err;
         }
       }
@@ -2835,6 +2943,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       candidates = await router.route(request);
     } catch (err) {
       if (err instanceof ModelEolError) return eolGatedResponse(err);
+      if (err instanceof ModelClaimQuarantinedError) return claimQuarantinedResponse(err);
       throw err;
     }
   }
@@ -3288,6 +3397,19 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // backend health or lifecycle state.
     const healthy = res.status < 500;
     const qTransition = backend.recordOutcome(healthy, latencyMs);
+    const claimTransition = backend.recordModelClaimOutcome(candidateModel, res.status);
+    if (claimTransition) {
+      const quarantined = claimTransition.transition === "quarantined";
+      process.stdout.write(JSON.stringify({
+        ts: new Date().toISOString(),
+        event: quarantined ? "model_claim_quarantined" : "model_claim_readmitted",
+        source: "router",
+        backend: backendId,
+        model: candidateModel,
+        status: res.status,
+        consecutive_failures: claimTransition.failures,
+      }) + "\n");
+    }
 
     // Model-granular lifecycle bookkeeping (card P1.2, section 4.2 of the
     // model-ranking design doc): record this concrete model's completion
