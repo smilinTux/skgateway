@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Requires Node 22. Node 20 left security support in April 2026, and the repo
+  still declared , pinned  to 20, and tested a 20/22
+  matrix while the deployment unit executed 20. Three runtimes were reachable on
+  the gateway host at once (unit v20, shell v22, npm v26), which is how
+   was built against one and run under another, silently
+  disabling all request telemetry. CI now tests 22 only.
+
 ### Fixed
 
 - A metrics collector that is explicitly enabled in config and then fails to load

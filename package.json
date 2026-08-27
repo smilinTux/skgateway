@@ -1,7 +1,7 @@
 {
   "name": "skgateway",
   "version": "0.1.0",
-  "description": "Enterprise AI inference proxy — routes, throttles, audits and observes AI API traffic",
+  "description": "Enterprise AI inference proxy \u2014 routes, throttles, audits and observes AI API traffic",
   "type": "module",
   "main": "src/index.mjs",
   "bin": {
@@ -19,7 +19,7 @@
     "openpgp": "6.3.1"
   },
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=22.0.0"
   },
   "license": "MIT"
 }
