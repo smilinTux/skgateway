@@ -11,7 +11,11 @@
 
 import http from "node:http";
 import { loadConfig, getConfig } from "./config.mjs";
-import { createProxyServer, handleRequest, buildConfig } from "./proxy/core.mjs";
+import {
+  buildConfig,
+  applyModelLimits,
+  sanitizeSuccessfulResponseBody,
+} from "./proxy/core.mjs";
 import { createRouter, routeAndSend } from "./proxy/router.mjs";
 import { buildModelCatalog, reconcileModeFromConfig, tagLocalModels, mergeDiscoveredCatalog, isModelAvailable } from "./proxy/advertise.mjs";
 import { loadAllowlist, saveAllowlist, applyAllowlist } from "./advertise.mjs";
@@ -1892,13 +1896,48 @@ export const server = http.createServer(async (req, res) => {
 
     let parsedModel = req.headers["x-model"] || undefined;
     let parsedMessages = undefined;
+    let parsedRouteBody = null;
     if (anthropicWant || (req.headers["content-type"]?.includes("application/json") && routeBody.length)) {
       try {
-        const parsed = JSON.parse(routeBody.toString("utf-8"));
-        parsedModel = parsed.model || parsedModel;
+        parsedRouteBody = JSON.parse(routeBody.toString("utf-8"));
+        parsedModel = parsedRouteBody.model || parsedModel;
         // Carry messages for sk-auto difficulty classification (registry.mjs).
-        if (Array.isArray(parsed.messages)) parsedMessages = parsed.messages;
+        if (Array.isArray(parsedRouteBody.messages)) parsedMessages = parsedRouteBody.messages;
       } catch {}
+    }
+
+    // Apply the same model-limit stages used by the standalone proxy core.
+    // A body that cannot be brought within policy is rejected before routing,
+    // so no backend or provider can observe it.
+    if (
+      req.method === "POST" &&
+      routePath.split("?")[0] === "/v1/chat/completions" &&
+      parsedRouteBody
+    ) {
+      const limitResult = applyModelLimits(parsedRouteBody, proxyConfig);
+      if (!limitResult.ok) {
+        siemHook({
+          ts: new Date().toISOString(),
+          event: "model_limit_rejected",
+          model: parsedModel || null,
+          body_bytes: limitResult.bodyBytes,
+          system_bytes: limitResult.systemBytes,
+          path: req.url,
+        });
+        res.writeHead(413, { "content-type": "application/json", "cache-control": "no-store" });
+        res.end(JSON.stringify({
+          error: {
+            message: "Request still exceeds configured model limits after trimming",
+            code: "model_limit_exceeded",
+            status: 413,
+          },
+        }));
+        return;
+      }
+      if (limitResult.applied) {
+        routeBody = limitResult.body;
+        parsedMessages = parsedRouteBody.messages;
+      }
     }
 
     // ── Prompt classification (P3.5) — PASSIVE observability into SIEM ──
@@ -2090,6 +2129,38 @@ export const server = http.createServer(async (req, res) => {
         router, routeRequest, routePath, req.method, req.headers, routeBody, true, siemHook,
         upstreamAbort.signal,
       );
+
+      // The live composed entrypoint owns response writing, so it must run the
+      // core sanitizer before any successful chat response reaches the client.
+      if (
+        result?.status === 200 &&
+        routePath.split("?")[0] === "/v1/chat/completions" &&
+        String(result.headers?.["content-type"] || "").includes("application/json")
+      ) {
+        try {
+          result = { ...result, body: sanitizeSuccessfulResponseBody(result.body, proxyConfig) };
+        } catch (err) {
+          siemHook({
+            ts: new Date().toISOString(),
+            event: "response_sanitizer_rejected",
+            model: parsedModel || null,
+            path: req.url,
+            reason: err.message,
+          });
+          result = {
+            ...result,
+            status: 502,
+            headers: { "content-type": "application/json", "cache-control": "no-store" },
+            body: Buffer.from(JSON.stringify({
+              error: {
+                message: "Upstream response failed sanitizer processing",
+                code: "response_sanitizer_failed",
+                status: 502,
+              },
+            })),
+          };
+        }
+      }
 
       // The socket is already gone. routeAndSend has released the upstream
       // request and pool slot; do not attempt to write a synthetic 499 to a
