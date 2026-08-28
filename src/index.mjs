@@ -11,8 +11,9 @@
 
 import http from "node:http";
 import { loadConfig, getConfig } from "./config.mjs";
-import { createProxyServer, handleRequest, buildConfig } from "./proxy/core.mjs";
+import { createProxyServer, handleRequest, buildConfig, trimSystemMessages, trimConversationHistory } from "./proxy/core.mjs";
 import { createRouter, routeAndSend } from "./proxy/router.mjs";
+import { sanitizeResponse } from "./proxy/sanitizer.mjs";
 import { buildModelCatalog, reconcileModeFromConfig, tagLocalModels, mergeDiscoveredCatalog, isModelAvailable } from "./proxy/advertise.mjs";
 import { loadAllowlist, saveAllowlist, applyAllowlist } from "./advertise.mjs";
 import { discoverCatalog, loadCache, saveCache, fetchNvidia, fetchOpenRouter, fetchOpencode, fetchAnthropicWrapper, fetchCodex, fetchZai, catalogStatus, loadCardOverrides, applyCardOverlays, buildServingCatalog } from "./discovery.mjs";
@@ -2043,9 +2044,57 @@ export const server = http.createServer(async (req, res) => {
       }
     }
 
+    // ── Apply model limits to request body (card 080e032e) ──
+    // Fail-closed: reject before any provider dispatch if limits are exceeded.
+    // Uses the same model_limits config section as core.mjs, with the same
+    // per-model overrides for maxBodyBytes and maxSystemBytes.
+    let transformedBody = routeBody;
+    let transformedMessages = parsedMessages;
+    try {
+      if (parsedModel && parsedMessages && Array.isArray(parsedMessages)) {
+        // Build a minimal parsed body object for the trim functions
+        const parsedBody = { model: parsedModel, messages: [...parsedMessages] };
+
+        // Resolve per-model limits (overrides global defaults)
+        const modelLimits = buildModelLimits(config.model_limits || {});
+        const perModel = modelLimits[parsedModel] || {};
+        const maxBodyBytes = perModel.maxBodyBytes || 120000;
+        const maxSystemBytes = perModel.maxSystemBytes || 40000;
+
+        const cfg = { maxBodyBytes, maxSystemBytes };
+
+        // Trim system messages first (to free budget for history)
+        trimSystemMessages(parsedBody, cfg);
+
+        // Trim conversation history
+        trimConversationHistory(parsedBody, cfg);
+
+        // Update the transformed messages for dispatch
+        transformedMessages = parsedBody.messages;
+
+        // Re-serialize the body with transformed messages
+        // This replaces routeBody before it goes to routeAndSend
+        if (anthropicWant || (req.headers["content-type"]?.includes("application/json"))) {
+          const requestObj = JSON.parse(routeBody.toString("utf-8"));
+          requestObj.messages = transformedMessages;
+          transformedBody = Buffer.from(JSON.stringify(requestObj), "utf-8");
+        }
+      }
+    } catch (e) {
+      // Fail-closed: any error during limit application rejects the request
+      // before provider dispatch
+      console.error("[skgateway] model limits processing failed (fail-closed):", e.message);
+      closeMetrics({ statusCode: 500, errorMsg: "Request processing failed" });
+      if (!res.headersSent) {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "Request processing failed", code: 500 } }));
+      }
+      return;
+    }
+
     const routeRequest = {
       model:   parsedModel,
-      messages: parsedMessages,
+      messages: transformedMessages,
       // Verified CapAuth identity (falls back to X-Agent-Id / anonymous).
       agentId: metricsAgentId,
       // skmodels registry role/context routing (single source of truth).
@@ -2086,9 +2135,52 @@ export const server = http.createServer(async (req, res) => {
     if (res.destroyed) onClientClose();
     try {
       result = await routeAndSend(
-        router, routeRequest, routePath, req.method, req.headers, routeBody, true, siemHook,
+        router, routeRequest, routePath, req.method, req.headers, transformedBody, true, siemHook,
         upstreamAbort.signal,
       );
+
+      // ── Response sanitization (card 080e032e) ──
+      // Apply sanitizer.mjs response sanitization before the client receives bytes.
+      // This strips leaked markup, handles <think> blocks, and repairs malformed content.
+      // Fail-closed: sanitization errors reject before sending to client.
+      if (result && result.body && result.status === 200) {
+        try {
+          let responseBody = result.body;
+          let needsReencoding = false;
+
+          // Parse response body for sanitization
+          if (!result.headers["content-type"]?.includes("text/event-stream")) {
+            // Non-streaming response: parse and sanitize JSON
+            try {
+              const parsedResponse = JSON.parse(responseBody.toString("utf-8"));
+              const sanitized = sanitizeResponse(parsedResponse, {
+                label: "skgateway",
+                thinkMode: config.sanitizer?.thinkMode || "strip"
+              });
+
+              // Check if sanitization changed anything
+              if (JSON.stringify(parsedResponse) !== JSON.stringify(sanitized)) {
+                result.body = Buffer.from(JSON.stringify(sanitized), "utf-8");
+                console.log(`[skgateway] response sanitized for model=${parsedModel}`);
+              }
+            } catch (parseError) {
+              // Not parseable as JSON - pass through unchanged
+              console.warn(`[skgateway] response not JSON, skipping sanitization: ${parseError.message}`);
+            }
+          }
+          // Streaming responses are buffered by routeAndSend and arrive here as
+          // complete bodies, so the same sanitization applies.
+        } catch (e) {
+          // Fail-closed: sanitization error rejects before sending to client
+          console.error("[skgateway] response sanitization failed (fail-closed):", e.message);
+          closeMetrics({ statusCode: 500, errorMsg: "Response sanitization failed" });
+          if (!res.headersSent) {
+            res.writeHead(500, { "content-type": "application/json" });
+            res.end(JSON.stringify({ error: { message: "Response sanitization failed", code: 500 } }));
+          }
+          return;
+        }
+      }
 
       // The socket is already gone. routeAndSend has released the upstream
       // request and pool slot; do not attempt to write a synthetic 499 to a
