@@ -21,6 +21,8 @@ import {
   meetsClassFloor,
   resolveBucket,
   orderMembersByCost,
+  parseBucketPreference,
+  applyCostPrimaryPreference,
   selectMember,
   gradeVocabulary,
   measuredClassCeiling,
@@ -282,6 +284,71 @@ describe('C9: cost-ranked selection rotates only among equal-cost members', () =
       ['free-zone-2', 'paid-zone-1'],
       'free-remote is cheaper even though it is less trusted; cost must not impersonate trust',
     );
+  });
+});
+
+describe('routing preference: strict input and cost-primary family order', () => {
+  const resolvedMembers = () => resolveBucket({
+    bucket: { model_class: 'S', sensitivity: 'public' },
+    catalog: [
+      {
+        ...entry('local-codex', { zone: TRUST_ZONES.SOVEREIGN_LOCAL, declared: 'L' }),
+        card: { family: 'codex', cost_tier: 'local', size_class: 'L' },
+      },
+      {
+        ...entry('local-claude', { zone: TRUST_ZONES.SOVEREIGN_LOCAL, declared: 'L' }),
+        card: { family: 'claude', cost_tier: 'local', size_class: 'L' },
+      },
+      {
+        ...entry('free-qwen', { zone: TRUST_ZONES.FREE_REMOTE, declared: 'L' }),
+        card: { family: 'qwen3.5', cost_tier: 'free-remote', size_class: 'L' },
+      },
+      {
+        ...entry('paid-claude', { zone: TRUST_ZONES.PAID_CONTRACTUAL, declared: 'L' }),
+        card: { family: 'claude', cost_tier: 'paid-cloud', size_class: 'L' },
+      },
+    ],
+  }).members;
+
+  test('the comma-separated wire accepts broad families and removes duplicates', () => {
+    assert.deepEqual(
+      parseBucketPreference(' Claude, qwen3.5,claude ', 'public'),
+      { preferences: ['claude', 'qwen3.5'], error: null },
+    );
+  });
+
+  test('raw model ids and non-public free preference fail validation', () => {
+    for (const value of ['gpt-5.6-sol', 'openai/gpt-5.6', 'claude_opus', 'family:model']) {
+      assert.match(parseBucketPreference(value, 'public').error, /broad family names/);
+    }
+    assert.match(parseBucketPreference('free', 'internal').error, /only for public/);
+    assert.match(parseBucketPreference('free', 'secret').error, /only for public/);
+    assert.equal(parseBucketPreference('free', 'public').error, null);
+  });
+
+  test('preference reads the top-level family emitted by resolveBucket', () => {
+    const members = resolvedMembers();
+    assert.equal(members.every((member) => Object.hasOwn(member, 'family')), true);
+    assert.equal(members.every((member) => !Object.hasOwn(member, 'card')), true);
+
+    const ordered = orderMembersByCost(members, 0);
+    const applied = applyCostPrimaryPreference(ordered, ['claude']);
+    assert.equal(applied.matched, 'claude');
+    assert.equal(applied.members[0].id, 'local-claude');
+    assert.deepEqual(
+      new Set(applied.members.map((member) => member.id)),
+      new Set(ordered.map((member) => member.id)),
+      'preference may reorder but never widen or narrow the admitted set',
+    );
+  });
+
+  test('a family in a costlier tier cannot displace the cheapest tier', () => {
+    const members = resolvedMembers().filter((member) => member.id !== 'local-claude');
+    const ordered = orderMembersByCost(members, 0);
+    const applied = applyCostPrimaryPreference(ordered, ['claude']);
+    assert.equal(applied.matched, null);
+    assert.equal(applied.members[0].id, 'local-codex');
+    assert.equal(applied.members.at(-1).id, 'paid-claude');
   });
 });
 

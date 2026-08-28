@@ -385,6 +385,92 @@ export function resolveBucket({ bucket, catalog = [], sensitivityPolicy, isRouta
 /** Cost preference, deliberately independent from trust-zone order. */
 export const COST_TIER_ORDER = Object.freeze(['local', 'free-remote', 'paid-cloud']);
 
+/** Broad-family preference grammar. Concrete model separators are excluded. */
+const PREFERENCE_TOKEN_RE = /^[a-z][a-z0-9]*(?:\.[a-z0-9]+)*$/;
+const PREFERENCE_MAX_TOKENS = 8;
+
+/** Parse the strict comma-separated x-sk-prefer wire value. */
+export function parseBucketPreference(value, sensitivity) {
+  if (value == null || value === '') return { preferences: [], error: null };
+  if (typeof value !== 'string') {
+    return { preferences: [], error: 'x-sk-prefer must be a comma-separated string' };
+  }
+  if (value.length > 256) {
+    return { preferences: [], error: 'x-sk-prefer exceeds 256 characters' };
+  }
+
+  const raw = value.split(',').map((token) => token.trim().toLowerCase());
+  if (raw.length > PREFERENCE_MAX_TOKENS) {
+    return {
+      preferences: [],
+      error: `x-sk-prefer allows at most ${PREFERENCE_MAX_TOKENS} ordered tokens`,
+    };
+  }
+  if (raw.some((token) => token.length > 32 || !PREFERENCE_TOKEN_RE.test(token))) {
+    return {
+      preferences: [],
+      error: 'x-sk-prefer accepts broad family names, never raw model ids',
+    };
+  }
+
+  const preferences = [...new Set(raw)];
+  if (preferences.includes('free') && sensitivity !== 'public') {
+    return {
+      preferences: [],
+      error: `free preference is allowed only for public work, not ${sensitivity || 'unknown'}`,
+    };
+  }
+  return { preferences, error: null };
+}
+
+function costTierRank(member) {
+  const rank = COST_TIER_ORDER.indexOf(member?.cost_tier);
+  return rank === -1 ? COST_TIER_ORDER.length : rank;
+}
+
+function preferenceMatches(member, preference) {
+  if (preference === 'sovereign') {
+    return member?.cost_tier === 'local'
+      && member?.trust_zone === TRUST_ZONES.SOVEREIGN_LOCAL;
+  }
+  if (preference === 'free') return member?.cost_tier === 'free-remote';
+  return member?.family?.toLowerCase() === preference;
+}
+
+/** Reorder only the cheapest eligible tier using the first preference with a hit. */
+export function applyCostPrimaryPreference(orderedMembers, preferences = []) {
+  if (!Array.isArray(orderedMembers) || orderedMembers.length === 0) {
+    return { members: [], matched: null };
+  }
+  if (!Array.isArray(preferences) || preferences.length === 0) {
+    return { members: [...orderedMembers], matched: null };
+  }
+
+  const cheapestRank = costTierRank(orderedMembers[0]);
+  const splitAt = orderedMembers.findIndex(
+    (member) => costTierRank(member) !== cheapestRank,
+  );
+  const tierEnd = splitAt === -1 ? orderedMembers.length : splitAt;
+  const cheapest = orderedMembers.slice(0, tierEnd);
+  const rest = orderedMembers.slice(tierEnd);
+
+  for (const preference of preferences) {
+    const matched = cheapest.filter((member) => preferenceMatches(member, preference));
+    if (matched.length === 0) continue;
+    const matchedIds = new Set(matched.map((member) => member.id));
+    return {
+      members: [
+        ...matched,
+        ...cheapest.filter((member) => !matchedIds.has(member.id)),
+        ...rest,
+      ],
+      matched: preference,
+    };
+  }
+
+  return { members: [...orderedMembers], matched: null };
+}
+
 /**
  * Return the complete eligible failover chain in cost order.
  *
@@ -406,8 +492,7 @@ export function orderMembersByCost(members, counter = 0) {
   if (!Array.isArray(members) || members.length === 0) return [];
   const groups = new Map();
   for (const member of members) {
-    const rank = COST_TIER_ORDER.indexOf(member?.cost_tier);
-    const key = rank === -1 ? COST_TIER_ORDER.length : rank;
+    const key = costTierRank(member);
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(member);
   }

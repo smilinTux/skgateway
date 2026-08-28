@@ -247,6 +247,98 @@ ${extraRoles}defaults:
     assert.equal(pool.state.lastModel, 'pool-l-local', 'the default starts with the cheapest sovereign tier');
   });
 
+  test('x-sk-prefer keeps an explicit ordered member chain and selects a matching family', async () => {
+    writeFileSync(CATALOG_CACHE_PATH, JSON.stringify({ models: [
+      {
+        id: 'local-a', provider: 'local', free: true,
+        card: { family: 'codex', cost_tier: 'local', size_class: 'L' },
+      },
+      {
+        id: 'local-b', provider: 'local', free: true,
+        card: { family: 'claude', cost_tier: 'local', size_class: 'L' },
+      },
+      {
+        id: 'paid-c', provider: 'anthropic', free: false,
+        card: { family: 'claude', cost_tier: 'paid-cloud', size_class: 'L' },
+      },
+    ] }), 'utf8');
+    _resetCacheForTests();
+    const preferenceRouter = createRouter({
+      backends: {
+        poolbackend: {
+          url: pool.base,
+          auth_type: 'none',
+          models: ['local-a', 'local-b', 'paid-c'],
+          priority: 1,
+        },
+      },
+    });
+    await applyConfig({ buckets_enabled: true });
+
+    const r = await routeAndSend(
+      preferenceRouter,
+      { model: 'sk-s-public', agentId: 't', preference: 'claude' },
+      '/chat/completions', 'POST', HEADERS, bodyFor('sk-s-public'), false,
+    );
+
+    assert.equal(r.status, 200, r.body.toString('utf8'));
+    assert.equal(pool.state.lastModel, 'local-b');
+    assert.equal(r.bucketMember, 'local-b');
+  });
+
+  test('x-sk-prefer cannot promote a family from a costlier tier', async () => {
+    writeFileSync(CATALOG_CACHE_PATH, JSON.stringify({ models: [
+      {
+        id: 'local-a', provider: 'local', free: true,
+        card: { family: 'codex', cost_tier: 'local', size_class: 'L' },
+      },
+      {
+        id: 'paid-c', provider: 'anthropic', free: false,
+        card: { family: 'claude', cost_tier: 'paid-cloud', size_class: 'L' },
+      },
+    ] }), 'utf8');
+    _resetCacheForTests();
+    const costRouter = createRouter({
+      backends: {
+        poolbackend: {
+          url: pool.base,
+          auth_type: 'none',
+          models: ['local-a', 'paid-c'],
+          priority: 1,
+        },
+      },
+    });
+    await applyConfig({ buckets_enabled: true });
+
+    const r = await routeAndSend(
+      costRouter,
+      { model: 'sk-s-public', agentId: 't', preference: 'claude' },
+      '/chat/completions', 'POST', HEADERS, bodyFor('sk-s-public'), false,
+    );
+
+    assert.equal(r.status, 200, r.body.toString('utf8'));
+    assert.equal(pool.state.lastModel, 'local-a');
+    assert.equal(r.bucketMember, 'local-a');
+  });
+
+  test('invalid preference fails before any upstream launch', async () => {
+    await applyConfig({ buckets_enabled: true });
+    for (const [model, preference] of [
+      ['sk-s-public', 'gpt-5.6-sol'],
+      ['sk-s-internal', 'free'],
+    ]) {
+      const before = pool.state.count;
+      const r = await routeAndSend(
+        router,
+        { model, agentId: 't', preference },
+        '/chat/completions', 'POST', HEADERS, bodyFor(model), false,
+      );
+      assert.equal(r.status, 400);
+      assert.equal(parseBody(r).error.type, 'invalid_bucket_preference');
+      assert.equal(pool.state.count, before, 'validation failure must dispatch nothing');
+    }
+  });
+
   test('the liveness boundary cannot be disabled and preserves a shorter backend timeout', () => {
     assert.equal(bucketLivenessTimeoutMs(0, undefined), DEFAULT_BUCKET_LIVENESS_TIMEOUT_MS);
     assert.equal(bucketLivenessTimeoutMs(0, '0'), DEFAULT_BUCKET_LIVENESS_TIMEOUT_MS);

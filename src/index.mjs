@@ -2054,6 +2054,9 @@ export const server = http.createServer(async (req, res) => {
       context: req.headers["x-sk-context"] || undefined,
       service: req.headers["x-sk-service"] || undefined,
       role:    req.headers["x-sk-role"]    || undefined,
+      // Strict broad-family preference for bucket members. The bucket route
+      // validates it against sensitivity before any upstream launch.
+      preference: req.headers["x-sk-prefer"] || undefined,
       // Internal card id for energy/cost attribution (joule-economy P0).
       // Stripped before forwarding upstream in router.mjs; never leaves the
       // gateway.

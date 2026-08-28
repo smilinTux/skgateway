@@ -58,7 +58,15 @@ import {
   policyFromRegistry,
   TRUST_ZONES,
 } from "../policy/sensitivity.mjs";
-import { parseBucketId, resolveBucket, orderMembersByCost, looksLikeBucketAttempt, allBuckets } from "../policy/buckets.mjs";
+import {
+  parseBucketId,
+  resolveBucket,
+  orderMembersByCost,
+  parseBucketPreference,
+  applyCostPrimaryPreference,
+  looksLikeBucketAttempt,
+  allBuckets,
+} from "../policy/buckets.mjs";
 import { codexPurityProblems } from "../policy/codex-purity.mjs";
 
 // sk-auto routing decision cache (TTL+LRU); keyed by request fingerprint + config epoch.
@@ -103,6 +111,7 @@ export const CLIENT_CREDENTIAL_HEADERS = [
 export const INTERNAL_CONTROL_HEADERS = [
   "x-sk-card-id",
   "x-sk-context",
+  "x-sk-prefer",
   "x-sk-require",
   "x-sk-role",
   "x-sk-service",
@@ -2227,6 +2236,28 @@ function invalidBucketIdResponse(id, reason) {
  * @param {(type:string, details?:object, ctx?:object)=>void} [emitSiem]
  */
 async function resolveBucketCandidates(router, addr, request, body, emitSiem = () => {}) {
+  const parsedPreference = parseBucketPreference(request.preference, addr.sensitivity);
+  if (parsedPreference.error) {
+    emitSiem("bucket_preference_refused", {
+      bucket: addr.bucket,
+      reason: parsedPreference.error,
+    }, {});
+    return {
+      failClosed: {
+        status: 400,
+        headers: { "content-type": "application/json" },
+        body: Buffer.from(JSON.stringify({
+          error: {
+            message: parsedPreference.error,
+            code: 400,
+            type: "invalid_bucket_preference",
+            bucket: addr.bucket,
+          },
+        }), "utf-8"),
+      },
+    };
+  }
+
   let catalog = [];
   try {
     catalog = buildMatchCatalog();
@@ -2296,12 +2327,18 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = (
 
   const n = (_bucketCounters.get(addr.bucket) || 0) + 1;
   _bucketCounters.set(addr.bucket, n);
-  const orderedMembers = orderMembersByCost(members, n);
+  const costOrderedMembers = orderMembersByCost(members, n);
+  const appliedPreference = applyCostPrimaryPreference(
+    costOrderedMembers,
+    parsedPreference.preferences,
+  );
+  const orderedMembers = appliedPreference.members;
   const picked = orderedMembers[0];
 
   console.log(
     `[router] bucket ${addr.bucket} -> ${picked.id} ` +
       `(class ${picked.model_class || "?"} via ${picked.class_basis}, zone ${picked.trust_zone ?? "?"}, ` +
+      `family ${picked.family || "none"}, preference ${appliedPreference.matched || "none"}, ` +
       `${members.length} eligible)`,
   );
 
