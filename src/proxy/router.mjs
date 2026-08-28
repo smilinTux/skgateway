@@ -58,7 +58,7 @@ import {
   policyFromRegistry,
   TRUST_ZONES,
 } from "../policy/sensitivity.mjs";
-import { parseBucketId, resolveBucket, orderMembersByCost, looksLikeBucketAttempt, allBuckets } from "../policy/buckets.mjs";
+import { parseBucketId, resolveBucket, orderMembersByCost, validateFamilyPreference, applyFamilyPreference, selectMember, looksLikeBucketAttempt, allBuckets } from "../policy/buckets.mjs";
 import { codexPurityProblems } from "../policy/codex-purity.mjs";
 
 // sk-auto routing decision cache (TTL+LRU); keyed by request fingerprint + config epoch.
@@ -103,6 +103,7 @@ export const CLIENT_CREDENTIAL_HEADERS = [
 export const INTERNAL_CONTROL_HEADERS = [
   "x-sk-card-id",
   "x-sk-context",
+  "x-sk-prefer",
   "x-sk-require",
   "x-sk-role",
   "x-sk-service",
@@ -2296,13 +2297,68 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = (
 
   const n = (_bucketCounters.get(addr.bucket) || 0) + 1;
   _bucketCounters.set(addr.bucket, n);
-  const orderedMembers = orderMembersByCost(members, n);
-  const picked = orderedMembers[0];
+  
+  // Read and validate family preference from x-sk-prefer header (card 1e26943e)
+  const prefHeader = request.headers?.['x-sk-prefer'];
+  let familyPreference = null;
+  let prefError = null;
+
+  if (prefHeader !== undefined) {
+    const validation = validateFamilyPreference(prefHeader, addr.sensitivity);
+    if (validation.valid) {
+      familyPreference = validation.preference;
+      if (familyPreference && familyPreference.length > 0) {
+        console.log(
+          `[router] bucket ${addr.bucket} applying family preference: ${familyPreference.join(',')}`,
+        );
+      }
+    } else {
+      prefError = validation.reason;
+      console.warn(
+        `[router] bucket ${addr.bucket} invalid family preference: ${prefError}`,
+      );
+      return {
+        failClosed: {
+          status: 400,
+          headers: { "content-type": "application/json" },
+          body: Buffer.from(JSON.stringify({
+            error: {
+              message: `Invalid family preference: ${prefError}`,
+              code: 400,
+              type: "invalid_family_preference",
+            },
+          }), "utf-8"),
+        },
+      };
+    }
+  }
+
+  // Apply family preference within cheapest cost tier
+  const picked = selectMember(members, n, familyPreference);
+  
+  if (!picked) {
+    console.warn(`[router] bucket ${addr.bucket} no member selected after preference`);
+    return {
+      failClosed: {
+        status: 503,
+        headers: { "content-type": "application/json" },
+        body: Buffer.from(JSON.stringify({
+          error: {
+            message: `No model available for bucket ${addr.bucket}`,
+            code: 503,
+            type: "bucket_no_member",
+          },
+        }), "utf-8"),
+      },
+    };
+  }
 
   console.log(
     `[router] bucket ${addr.bucket} -> ${picked.id} ` +
       `(class ${picked.model_class || "?"} via ${picked.class_basis}, zone ${picked.trust_zone ?? "?"}, ` +
-      `${members.length} eligible)`,
+      `family ${picked.family || "?"}, ` +
+      `${members.length} eligible)` +
+      (familyPreference ? ` [preference: ${familyPreference.join(',')}]` : ''),
   );
 
   // Resolve the chosen id through the router's own model matching, so
