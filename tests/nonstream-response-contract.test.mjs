@@ -146,6 +146,49 @@ describe("non-stream public output contract", () => {
     assert.equal(JSON.parse(text).choices[0].message.content, "PUBLIC_SYNTHETIC_OK");
   });
 
+  test("rejects private reasoning-only output without exposing it as public content", () => {
+    const privateReasoning = "PRIVATE_REASONING_MUST_NOT_BECOME_PUBLIC ".repeat(10);
+    const result = response([{
+      index: 0,
+      finish_reason: "length",
+      message: { role: "assistant", content: "", reasoning: privateReasoning },
+    }]);
+
+    assertRejected(result);
+    assert.equal(result.body.includes(Buffer.from(privateReasoning)), false);
+  });
+
+  test("rejects malformed tool argument bytes before sanitization can repair them", () => {
+    const result = response([{
+      index: 0,
+      finish_reason: "tool_calls",
+      message: {
+        role: "assistant",
+        content: null,
+        tool_calls: [{
+          id: "call_1",
+          type: "function",
+          function: { name: "lookup", arguments: "{" },
+        }],
+      },
+    }]);
+
+    assertRejected(result);
+    assert.equal(result.body.includes(Buffer.from('"arguments":"{}"')), false);
+  });
+
+  test("preserves valid leading and trailing public-content whitespace byte-for-byte", () => {
+    const content = "  BYTE FAITHFUL  ";
+    const result = response([{
+      index: 0,
+      finish_reason: "stop",
+      message: { role: "assistant", content },
+    }]);
+
+    assert.equal(result.status, 200);
+    assert.equal(JSON.parse(result.body).choices[0].message.content, content);
+  });
+
   test("routes the bounded failure through sanitized response audit", async () => {
     const upstream = http.createServer((request, serverResponse) => {
       request.resume();

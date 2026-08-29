@@ -103,11 +103,20 @@ function stripReasoning(value) {
   if (!value || typeof value !== "object") return value;
   const out = Array.isArray(value) ? value.map(stripReasoning) : { ...value };
   if (!Array.isArray(out)) {
+    delete out.reasoning;
     delete out.reasoning_content;
+    delete out.reasoning_details;
     delete out._hadReasoning;
     for (const [key, child] of Object.entries(out)) out[key] = stripReasoning(child);
   }
   return out;
+}
+
+function preserveUnchangedOuterWhitespace(original, sanitized) {
+  return typeof original === "string" && typeof sanitized === "string"
+      && original.trim() === sanitized
+    ? original
+    : sanitized;
 }
 
 function hasVisibleContent(output) {
@@ -369,10 +378,31 @@ export function enforceResponseContract(response, requestedModel) {
     try {
       const parsed = JSON.parse(body.toString("utf8"));
       if (typeof parsed.model === "string" && parsed.model) servedModel = parsed.model;
-      const clean = stripReasoning(sanitizeResponse(parsed, { thinkMode: "strip", label: "response-contract" }));
+      const rawChoices = Array.isArray(parsed.choices) ? parsed.choices : [];
+      const rawMalformedTools = rawChoices.some((choice) => {
+        const message = choice?.message;
+        return message && Object.hasOwn(message, "tool_calls")
+          && !hasValidNonStreamToolCalls(message.tool_calls);
+      });
+      const rejectRawTools = response.status >= 200 && response.status < 300 && rawMalformedTools;
+      const clean = rejectRawTools
+        ? stripReasoning(parsed)
+        : stripReasoning(sanitizeResponse(stripReasoning(parsed), {
+          thinkMode: "strip",
+          label: "response-contract",
+        }));
+      if (Array.isArray(clean.choices)) {
+        for (const [index, choice] of clean.choices.entries()) {
+          if (!choice?.message) continue;
+          choice.message.content = preserveUnchangedOuterWhitespace(
+            rawChoices[index]?.message?.content,
+            choice.message.content,
+          );
+        }
+      }
       if (response.status >= 200 && response.status < 300 && Object.hasOwn(clean, "choices")) {
         const choices = Array.isArray(clean.choices) ? clean.choices : [];
-        const malformedTools = choices.some((choice) => {
+        const malformedTools = rawMalformedTools || choices.some((choice) => {
           const message = choice?.message;
           return message && Object.hasOwn(message, "tool_calls")
             && !hasValidNonStreamToolCalls(message.tool_calls);
