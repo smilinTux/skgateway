@@ -2048,6 +2048,9 @@ export const server = http.createServer(async (req, res) => {
       messages: parsedMessages,
       // Verified CapAuth identity (falls back to X-Agent-Id / anonymous).
       agentId: metricsAgentId,
+      // Preserve the resolved request/session identity on every typed router
+      // audit event, alongside agent and per-request correlation ids.
+      sessionId: identity.session_id || req.headers["x-session-id"] || undefined,
       // skmodels registry role/context routing (single source of truth).
       // Present => routeAndSend resolves via ~/.skcapstone/models/registry.yaml
       // (precedence context > service > role > default) before backend select.
