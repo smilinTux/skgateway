@@ -2419,7 +2419,10 @@ export const server = http.createServer(async (req, res) => {
         try {
           parsedBody = result?.body ? JSON.parse(result.body.toString("utf8")) : null;
         } catch {
-          parsedBody = null;           // SSE or non-JSON; usage extraction skipped
+          // The collector accepts buffered SSE and extracts only its usage frame.
+          // Keeping the bytes here preserves streamed accounting without logging
+          // request content or credentials.
+          parsedBody = result?.body ?? null;
         }
         closeMetrics({
           statusCode: result?.status ?? res.statusCode,
