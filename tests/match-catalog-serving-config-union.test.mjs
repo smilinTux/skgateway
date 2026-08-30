@@ -48,6 +48,7 @@ const CATALOG_CACHE_PATH = join(FIX_DIR, 'model_catalog_cache.json');
 process.env.SKGATEWAY_MODEL_CATALOG_CACHE_PATH = CATALOG_CACHE_PATH;
 
 const { buildServingCatalog, servingConfigModels } = await import('../src/discovery.mjs');
+const { buildModelCatalog, mergeDiscoveredCatalog } = await import('../src/proxy/advertise.mjs');
 const { buildCapabilityCatalog } = await import('../src/ranking/catalog.mjs');
 const { resolveBucket, meetsClassFloor } = await import('../src/policy/buckets.mjs');
 const { TRUST_ZONES } = await import('../src/policy/sensitivity.mjs');
@@ -70,7 +71,7 @@ const SERVING_BACKENDS = {
     models: ['ornith-tiny', 'ornith-1.0-9b', 'qwen3.6-27b-abliterated'],
   },
   'chiap08-qwen38': {
-    url: 'http://100.81.238.58:11439/v1',
+    url: 'http://TAILNET_HOST:11439/v1',
     auth_type: 'none',
     models: [
       'qwen3.8-27b-huihui-abliterated-q4_k_m',
@@ -284,6 +285,51 @@ describe('the match catalog contains what the gateway is configured to serve', (
     // it would put a literal asterisk in a routing decision.
     const ids = realCatalog().map((e) => e.id);
     assert.ok(!ids.some((i) => i.includes('*')), 'no pattern may enter the catalog');
+  });
+});
+
+describe('disabled and removed backend cache rows stay excluded', () => {
+  test('cached rows cannot re-enter serving, advertised, or bucket catalogs', () => {
+    const cachePath = join(FIX_DIR, 'disabled-backend-cache.json');
+    const cacheModels = [
+      {
+        id: 'retired-model',
+        provider: 'retired',
+        free: true,
+        lifecycle: { state: 'active' },
+        card: { source: 'provider', size_class: 'L' },
+      },
+      {
+        id: 'enabled-model',
+        provider: 'enabled',
+        free: true,
+        lifecycle: { state: 'active' },
+        card: { source: 'provider', size_class: 'L' },
+      },
+    ];
+    writeFileSync(cachePath, JSON.stringify({ models: cacheModels }), 'utf8');
+    const backends = {
+      retired: { enabled: false, models: ['retired-model'] },
+      enabled: { url: 'http://127.0.0.1:9000/v1', models: ['enabled-model'] },
+    };
+
+    const serving = buildServingCatalog({ cachePath, backends, overrides: {} });
+    assert.deepEqual(serving.map((entry) => entry.id), ['enabled-model']);
+
+    const advertised = mergeDiscoveredCatalog(
+      buildModelCatalog(backends, null, 'off'),
+      cacheModels,
+      backends,
+    );
+    assert.deepEqual(advertised.map((entry) => entry.id), ['enabled-model']);
+
+    const catalog = buildCapabilityCatalog(serving, { getLifecycleFn: activeLifecycle });
+    const bucket = resolveBucket({
+      bucket: { model_class: 'L', sensitivity: 'secret' },
+      catalog,
+      isRoutable: () => true,
+    });
+    assert.deepEqual(bucket.members.map((entry) => entry.id), ['enabled-model']);
   });
 });
 

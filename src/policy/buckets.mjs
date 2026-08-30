@@ -323,6 +323,49 @@ export function meetsClassFloor(entry, floorClass) {
 }
 
 /**
+ * Does this REQUEST need a tool-capable model? True only for a non-empty
+ * `tools` array on the OpenAI request body.
+ *
+ * Deriving the requirement from the request is what keeps the gate below from
+ * shrinking availability: traffic that never asked for tools keeps the whole
+ * fleet. Card P4.3's `x-sk-require: tool_use` header is the EXPLICIT form of
+ * the same requirement and is unimplemented (it depends on the `@match`
+ * pipeline, `routing.match_enabled`, which is off). This covers the case that
+ * matters today, where the caller already told us by sending tools.
+ *
+ * @param {object|null} requestBody parsed OpenAI request body
+ * @returns {boolean}
+ */
+export function requiresToolUse(requestBody) {
+  const tools = requestBody?.tools;
+  return Array.isArray(tools) && tools.length > 0;
+}
+
+/**
+ * Tool-call evidence for one catalog entry, measurement over declaration.
+ *
+ * A card `supported_parameters: [tools]` is a CLAIM by the provider. A probe
+ * result is evidence. They disagree in practice: on this fleet 2026-08-29
+ * `mistralai/mistral-nemotron` emits tool_calls but fails every reasoning
+ * probe, while `nvidia/ising-calibration-1.5-31b` answers in prose and never
+ * emits a tool_call at all. So a measured failure overrides a claiming card,
+ * and an unknown is NOT treated as capable: absence of evidence is the same
+ * discipline meetsClassFloor() already applies to an unknown size class.
+ *
+ * @param {object} entry merged catalog entry
+ * @returns {{ok: boolean, basis: string}}
+ */
+export function toolUseEvidence(entry) {
+  const measured = entry?.lifecycle?.measured_capabilities || entry?.measured_capabilities || null;
+  const status = measured?.tool_call?.status || null;
+  if (status === 'fail') return { ok: false, basis: 'measured tool_call fail' };
+  if (status === 'pass') return { ok: true, basis: 'measured tool_call pass' };
+  const score = entry?.capabilities?.tool_use?.score;
+  if (score >= 1) return { ok: true, basis: 'card declares tools' };
+  return { ok: false, basis: score === 0 ? 'card declares no tools' : 'no tool_use signal' };
+}
+
+/**
  * Resolve a bucket to its eligible members, with the rejects and why.
  *
  * Returns rejects because an empty pool must produce a 503 an operator can act
@@ -334,9 +377,11 @@ export function meetsClassFloor(entry, floorClass) {
  * @param {Array<object>} args.catalog merged catalog entries
  * @param {Record<string,number>} [args.sensitivityPolicy]
  * @param {(e:object)=>boolean} [args.isRoutable] lifecycle gate, injected
+ * @param {boolean} [args.requireToolUse] when the caller sent a `tools` array,
+ *   admit only models with affirmative tool-call evidence
  * @returns {{members: Array<object>, rejected: Array<object>, ceiling: number}}
  */
-export function resolveBucket({ bucket, catalog = [], sensitivityPolicy, isRoutable = () => true }) {
+export function resolveBucket({ bucket, catalog = [], sensitivityPolicy, isRoutable = () => true, requireToolUse = false }) {
   const { ceiling } = resolveZoneCeiling(bucket.sensitivity, sensitivityPolicy);
   const members = [];
   const rejected = [];
@@ -364,18 +409,182 @@ export function resolveBucket({ bucket, catalog = [], sensitivityPolicy, isRouta
       });
       continue;
     }
+    if (requireToolUse) {
+      const tools = toolUseEvidence(entry);
+      if (!tools.ok) {
+        rejected.push({ id: entry.id, reason: `request sent tools; ${tools.basis}` });
+        continue;
+      }
+    }
     members.push({
       id: entry.id,
       class_basis: floor.basis,
       model_class: floor.modelClass,
       trust_zone: zone ?? null,
-      // COST metadata is copied only after the independent trust ceiling has
-      // admitted the model. It can order this resolved set, never expand it.
-      cost_tier: entry?.capabilities?.sovereignty || entry?.card?.tier || null,
+      // Alias count is not physical capacity. Models declared by the same
+      // backend URL share one resource id, so four request aliases for one
+      // llama-server remain four addressable members but one physical server.
+      physical_resource_id: entry?.url
+        ? `${entry.provider || 'backend'}@${entry.url}`
+        : (entry?.provider || `model:${entry.id}`),
+      // Preference metadata is copied only after the independent trust ceiling
+      // has admitted the model. Neither field can expand this resolved set.
+      family: entry?.card?.family ?? null,
+      ...(entry?.card?.family == null && entry?.card?.unfamilied_reason
+        ? { unfamilied_reason: entry.card.unfamilied_reason }
+        : {}),
+      cost_tier: entry?.card?.cost_tier ?? null,
     });
   }
 
   return { members, rejected, ceiling };
+}
+
+/**
+ * Validate a comma-separated family preference string.
+ *
+ * Preference uses a comma-separated contract (x-sk-prefer: "claude,codex,free")
+ * and is validated as broad family tokens or 'sovereign'/'free' keywords.
+ * Raw model ids (containing slashes, version patterns, or vendor prefixes) are rejected.
+ * The 'free' keyword is refused outside public sensitivity.
+ *
+ * @param {string|null} preferenceStr comma-separated preference string
+ * @param {string} sensitivity the job sensitivity level
+ * @returns {{valid: boolean, preference: Array<string>|null, reason: string|null}}
+ */
+export function validateFamilyPreference(preferenceStr, sensitivity = 'public') {
+  if (!preferenceStr || typeof preferenceStr !== 'string') {
+    return { valid: true, preference: null, reason: null };
+  }
+
+  // Parse comma-separated string
+  const parts = preferenceStr.split(',').map(p => p.trim()).filter(p => p.length > 0);
+  if (parts.length === 0) {
+    return { valid: true, preference: null, reason: null };
+  }
+
+  const preference = [];
+
+  for (const entry of parts) {
+    const trimmed = entry.toLowerCase();
+
+    // Reject raw model ids: they contain slashes, versions, or vendor-specific patterns
+    if (trimmed.includes('/') ||
+        /-\d+\.\d+(-|$)/.test(trimmed) ||  // -3.5-, -4.0-, etc.
+        /-v\d+(-|$)/.test(trimmed) ||      // -v1-, -v2-, etc.
+        /-\d+(?:k|b|m|t)$/.test(trimmed)) { // -128k, -70b, -7b, etc.
+      return {
+        valid: false,
+        preference: null,
+        reason: `preference must name a family, not a raw model id: "${entry}"`,
+      };
+    }
+
+    // Validate the special 'free' and 'sovereign' keywords
+    if (trimmed === 'free') {
+      // 'free' is ONLY allowed at public sensitivity
+      if (sensitivity !== 'public') {
+        return {
+          valid: false,
+          preference: null,
+          reason: `prefer "free" is not allowed at sensitivity="${sensitivity}"; free remote providers train on submitted content`,
+        };
+      }
+      preference.push('free');
+      continue;
+    }
+
+    if (trimmed === 'sovereign') {
+      preference.push('sovereign');
+      continue;
+    }
+
+    // Validate it's a plausible family name (alphanumeric, hyphens, underscores)
+    if (!/^[a-z][a-z0-9-_]*$/.test(trimmed)) {
+      return {
+        valid: false,
+        preference: null,
+        reason: `invalid family name "${entry}": must start with a letter and contain only letters, digits, hyphens, and underscores`,
+      };
+    }
+
+    preference.push(trimmed);
+  }
+
+  return {
+    valid: true,
+    preference,
+    reason: null,
+  };
+}
+
+/**
+ * Apply a family preference to an already-resolved member set.
+ *
+ * THE INVARIANT: this function NEVER widens the member set. It ONLY reorders
+ * the already-resolved members to put preferred families earlier in the list.
+ * If no member matches any preference, the original order is preserved.
+ *
+ * The 'free' special keyword matches members with cost_tier='free-remote'.
+ * The 'sovereign' special keyword matches members with trust_zone='sovereign'.
+ * Regular family names match against the top-level 'family' field on member.
+ *
+ * @param {Array<object>} members members already admitted by resolveBucket
+ * @param {Array<string>} preference ordered list of family names or 'free'/'sovereign'
+ * @returns {Array<object>} reordered members, same length as input
+ */
+export function applyFamilyPreference(members, preference) {
+  if (!Array.isArray(members) || members.length === 0) {
+    return members;
+  }
+
+  if (!preference || !Array.isArray(preference) || preference.length === 0) {
+    return members;
+  }
+
+  // Partition members into three buckets: matched, unmatched
+  const matched = [];
+  const unmatched = [];
+  const seenIds = new Set();
+
+  for (const rawPref of preference) {
+    // validateFamilyPreference() already lowercases, but applyFamilyPreference
+    // is exported and called directly (tests, and any future caller that has a
+    // preference from somewhere other than the header). Normalise here too so
+    // matching is case-insensitive regardless of who calls it.
+    const pref = typeof rawPref === 'string' ? rawPref.toLowerCase() : rawPref;
+    for (const member of members) {
+      if (seenIds.has(member.id)) continue;
+
+      let isMatch = false;
+
+      if (pref === 'free') {
+        // Special case: 'free' matches the free-remote cost tier
+        isMatch = member.cost_tier === 'free-remote';
+      } else if (pref === 'sovereign') {
+        // Special case: 'sovereign' matches the sovereign trust zone
+        isMatch = member.trust_zone === 'sovereign';
+      } else {
+        // Regular family name matches against member.family (top-level field)
+        isMatch = member.family?.toLowerCase() === pref;
+      }
+
+      if (isMatch) {
+        matched.push(member);
+        seenIds.add(member.id);
+      }
+    }
+  }
+
+  // Collect all unmatched members in their original order
+  for (const member of members) {
+    if (!seenIds.has(member.id)) {
+      unmatched.push(member);
+    }
+  }
+
+  // Return preferred first, then the rest in original order
+  return [...matched, ...unmatched];
 }
 
 /** Cost preference, deliberately independent from trust-zone order. */
@@ -425,10 +634,28 @@ export function orderMembersByCost(members, counter = 0) {
  * tiers remain failover candidates through `orderMembersByCost()`, but are not
  * selected while an equally eligible cheaper tier exists.
  *
+ * An optional family preference is applied WITHIN the selected cost tier,
+ * allowing callers to prefer a family at the same cost level. The preference
+ * never widens the member set and never selects a costlier tier over a cheaper
+ * one. If no member in the cheapest tier matches the preference, the normal
+ * cost-tier rotation is used.
+ *
  * @param {Array<object>} members members already admitted by resolveBucket
  * @param {number} counter monotonically increasing per bucket
+ * @param {Array<string>|null} [familyPreference=null] ordered list of family names or 'free'/'sovereign'
  * @returns {object|null}
  */
-export function selectMember(members, counter = 0) {
-  return orderMembersByCost(members, counter)[0] || null;
+export function selectMember(members, counter = 0, familyPreference = null) {
+  const costOrdered = orderMembersByCost(members, counter);
+  if (costOrdered.length === 0) return null;
+
+  // Find all members in the cheapest cost tier
+  const cheapestTier = costOrdered[0].cost_tier;
+  const cheapestMembers = costOrdered.filter(m => m.cost_tier === cheapestTier);
+
+  // Apply family preference only within the cheapest tier
+  const preferredInCheapest = applyFamilyPreference(cheapestMembers, familyPreference);
+
+  // Return the first preferred member in the cheapest tier
+  return preferredInCheapest[0] || null;
 }

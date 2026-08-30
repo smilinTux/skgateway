@@ -3,9 +3,9 @@ Description=Ornith 1.5 9B Q6_K (CUDA sm_120, OpenAI API on :8082)
 After=default.target
 
 [Service]
-Environment=PATH=/home/cbrd21/.local/bin:/usr/local/cuda-12.8/bin:/usr/bin:/bin
+Environment=PATH=/home/OPERATOR/.local/bin:/usr/local/cuda-12.8/bin:/usr/bin:/bin
 Environment=CUDA_VISIBLE_DEVICES=0
-ExecStart=/home/cbrd21/clawd/skcapstone-repos/skgateway/scripts/nodes/node100/run-ornith-1.5.sh
+ExecStart=/home/OPERATOR/clawd/skcapstone-repos/skgateway/scripts/nodes/node100/run-ornith-1.5.sh
 Restart=on-failure
 RestartSec=5
 RestartSteps=8

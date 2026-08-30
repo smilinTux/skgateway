@@ -201,7 +201,7 @@ mkdir -p ~/.config/systemd/user
 cp scripts/skgateway.service ~/.config/systemd/user/skgateway.service
 ```
 
-If your checkout is not at `/home/cbrd21/clawd/skcapstone-repos/skgateway`, edit
+If your checkout is not at `/home/OPERATOR/clawd/skcapstone-repos/skgateway`, edit
 the `ExecStart` and `WorkingDirectory` paths in the copied unit to match your
 home and checkout location. The `EnvironmentFile=` line uses `%h`, so it already
 resolves to your home directory and needs no edit.

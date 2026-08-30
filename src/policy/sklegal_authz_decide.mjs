@@ -14,13 +14,16 @@ import {
   openSync,
   readFileSync,
 } from "node:fs";
-import { isAbsolute } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 
 const DEFAULT_TIMEOUT_MS = 2000;
 const DEFAULT_CREDENTIAL_MAX_AGE_MS = 5 * 60 * 1000;
 const MAX_CREDENTIAL_BYTES = 8 * 1024;
 const MAX_TEXT = 256;
 const MAX_OBLIGATIONS = 16;
+const SYSTEMD_CREDENTIALS_ROOT = "/run/credentials";
+const SKLEGAL_QUALIFICATION_UNIT = "skgateway-sklegal-qualification.service";
+const SKLEGAL_CREDENTIAL_NAME = "skgateway-authz-service-token";
 
 export const SKLEGAL_SERVICE_AUTHORIZATION_HEADER = "X-SKLegal-Service-Authorization";
 
@@ -117,6 +120,70 @@ function credentialFileUnavailable() {
   return new Error("SKLegal service credential file is unavailable");
 }
 
+function unescapeMountPath(value) {
+  return value.replace(/\\(040|011|012|134)/g, (match, octal) =>
+    String.fromCharCode(Number.parseInt(octal, 8)));
+}
+
+function exactSystemdCredentialMount(mountInfo, directory) {
+  if (typeof mountInfo !== "string") return false;
+  return mountInfo.trimEnd().split("\n").some((line) => {
+    const sections = line.split(" - ");
+    if (sections.length !== 2) return false;
+    const before = sections[0].split(" ");
+    const after = sections[1].split(" ");
+    if (before.length < 6 || after.length < 3) return false;
+    if (unescapeMountPath(before[4]) !== directory) return false;
+    if (!new Set(["ramfs", "tmpfs"]).has(after[0])) return false;
+    const mountOptions = new Set(before[5].split(","));
+    const superOptions = new Set(after[2].split(","));
+    return mountOptions.has("ro")
+      && !mountOptions.has("rw")
+      && mountOptions.has("nosuid")
+      && mountOptions.has("nodev")
+      && superOptions.has("ro")
+      && !superOptions.has("rw");
+  });
+}
+
+function exactSystemdServiceCgroup(cgroup, unit) {
+  if (typeof cgroup !== "string") return false;
+  return cgroup.trimEnd().split("\n").some((line) => {
+    const fields = line.split(":");
+    if (fields.length !== 3) return false;
+    return fields[2].split("/").includes(unit);
+  });
+}
+
+function isApprovedSystemd0440(file, opened, opts) {
+  const root = opts.systemdCredentialsRoot ?? SYSTEMD_CREDENTIALS_ROOT;
+  const expectedDirectory = join(root, SKLEGAL_QUALIFICATION_UNIT);
+  const credentialDirectory = opts.systemdCredentialDirectory;
+  if (
+    opened.uid !== BigInt(opts.systemdRootUid ?? 0)
+    || resolve(file) !== file
+    || credentialDirectory !== expectedDirectory
+    || dirname(file) !== expectedDirectory
+    || file !== join(expectedDirectory, SKLEGAL_CREDENTIAL_NAME)
+  ) return false;
+  let directory;
+  let cgroup;
+  let mountInfo;
+  try {
+    directory = lstatSync(expectedDirectory, { bigint: true });
+    if (!directory.isDirectory()
+      || directory.isSymbolicLink()
+      || directory.uid !== BigInt(opts.systemdRootUid ?? 0)
+      || Number(directory.mode & 0o007n) !== 0) return false;
+    cgroup = opts.systemdCgroup ?? readFileSync("/proc/self/cgroup", "utf8");
+    mountInfo = opts.systemdMountInfo ?? readFileSync("/proc/self/mountinfo", "utf8");
+  } catch {
+    return false;
+  }
+  return exactSystemdServiceCgroup(cgroup, SKLEGAL_QUALIFICATION_UNIT)
+    && exactSystemdCredentialMount(mountInfo, expectedDirectory);
+}
+
 /**
  * Read one systemd-compatible service credential without following links or
  * retaining a cross-request value. The optional hooks are test seams only.
@@ -149,8 +216,9 @@ export function readSkLegalServiceCredential(file, opts = {}) {
       || opened.dev !== before.dev
       || opened.ino !== before.ino
       || opened.nlink !== 1n
-      || !new Set([0, currentUid]).has(owner)
-      || !new Set([0o400, 0o600]).has(mode)
+      || (mode === 0o440
+        ? !isApprovedSystemd0440(file, opened, opts)
+        : !new Set([0o400, 0o600]).has(mode) || !new Set([0, currentUid]).has(owner))
       || opened.size < 1n
       || opened.size > BigInt(MAX_CREDENTIAL_BYTES)
       || !Number.isFinite(age)
@@ -231,6 +299,7 @@ export function createSkLegalAuthzClient(opts = {}) {
       if (qualificationEnabled) {
         credential = readSkLegalServiceCredential(serviceCredentialFile, {
           maxAgeMs: serviceCredentialMaxAgeMs,
+          systemdCredentialDirectory: env.CREDENTIALS_DIRECTORY,
         });
         serviceAuthorization = `Bearer ${credential.toString("ascii")}`;
       } else {

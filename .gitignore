@@ -11,3 +11,14 @@ __pycache__/
 .ruff_cache/
 *.egg-info/
 node_modules
+
+# Live deployment state and credentials. secrets/codex-auth.json is a synced copy
+# of the Codex CLI credential (mode 0600) and was NOT ignored, so a blind
+# "git add -A" in this checkout would have committed it.
+secrets/*
+!secrets/*.example
+!secrets/README.md
+config/skgateway-codex.yaml
+config/registry.yaml
+*.bak-*
+*.pre-*
