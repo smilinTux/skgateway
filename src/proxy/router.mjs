@@ -22,7 +22,7 @@ import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
 import { sendUpstream } from "./upstream.mjs";
-import { createEvent } from "../siem/events.mjs";
+import { createEvent, EventType } from "../siem/events.mjs";
 import { isAnthropicBackend, toAnthropicRequest, toOpenAIResponse } from "./anthropic-adapter.mjs";
 import {
   isCodexBackend,
@@ -441,6 +441,7 @@ export function _throttleStateForTests(backendId, model) {
  * @property {string}  [model]        Model ID from the incoming request body
  * @property {string}  [agentId]      Agent identifier (for restriction checks)
  * @property {string}  [path]         Request path (e.g. "/v1/chat/completions")
+ * @property {string}  [sessionId]    Conversation/session identifier for audit correlation
  */
 
 // ---------------------------------------------------------------------------
@@ -2133,12 +2134,13 @@ function eolGatedResponse(err) {
  * @param {Record<string, string>} clientHeaders  Incoming client headers
  * @param {Buffer}  body           Buffered request body
  * @param {boolean} [usePool=true] Whether to use the connection pool
- * @param {?function(object): void} [siem=null]
- *   Optional best-effort SIEM hook. Called with a fully-structured
+ * @param {?function(object): (void|Promise<void>)} [siem=null]
+ *   Optional SIEM sink. Called with a fully-structured
  *   {@link module:siem/events.GatewayEvent} at each request lifecycle point
  *   (auth decision, route/model selected, upstream error, failover, and
- *   completion with status/latency/tokens). The hook MUST NEVER block or throw
- *   into the hot path — invocations are guarded and any error is swallowed.
+ *   completion with status/latency/tokens). When configured, each call is
+ *   awaited and a sink failure rejects the request boundary rather than
+ *   allowing a success with no audit record.
  * @returns {Promise<{
  *   status: number,
  *   headers: Record<string, string>,
@@ -2349,9 +2351,9 @@ function invalidBucketIdResponse(id, reason) {
  * @param {{bucket:string, model_class:string, sensitivity:string}} addr
  * @param {object} request
  * @param {Buffer} body raw request body, rewritten to the chosen concrete model
- * @param {(type:string, details?:object, ctx?:object)=>void} [emitSiem]
+ * @param {(type:string, details?:object, ctx?:object)=>Promise<object|null>} [emitSiem]
  */
-async function resolveBucketCandidates(router, addr, request, body, emitSiem = () => {}) {
+async function resolveBucketCandidates(router, addr, request, body, emitSiem = async () => null) {
   let catalog = [];
   try {
     catalog = buildMatchCatalog();
@@ -2380,7 +2382,10 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = (
     },
   });
 
-  emitSiem("bucket_resolve", {
+  await emitSiem(EventType.REQUEST, {
+    decision: "bucket_resolve",
+    phase: "eligibility",
+    outcome: members.length > 0 ? "eligible_members" : "no_eligible_member",
     bucket: addr.bucket,
     model_class: addr.model_class,
     sensitivity: addr.sensitivity,
@@ -2515,10 +2520,12 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = (
     } catch (err) {
       if (err instanceof ModelEolError) {
         skipped.push(member.id);
-        emitSiem("bucket_member_skipped", {
+        await emitSiem(EventType.ANOMALY, {
+          type: "bucket_member_skipped",
+          outcome: "skipped",
           bucket: addr.bucket,
           member: member.id,
-          eol_reason: err.reason || err.message,
+          eol_reason: err.eolReason || err.message,
         }, {});
         continue;
       }
@@ -2560,7 +2567,10 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = (
     };
   }
 
-  emitSiem("bucket_resolve", {
+  await emitSiem(EventType.REQUEST, {
+    decision: "bucket_resolve",
+    phase: "candidate_chain",
+    outcome: "candidate_chain_built",
     bucket: addr.bucket,
     chain_length: candidates.length,
     skipped,
@@ -2568,6 +2578,36 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = (
   return {
     candidates,
     isBucketChain: true,
+  };
+}
+
+/**
+ * Build the typed, fail-closed SIEM boundary used by routeAndSend().
+ *
+ * Event construction and sink completion are both part of emission: an
+ * unknown EventType throws before the sink is called, and a synchronous throw
+ * or rejected sink promise rejects the caller. This prevents a policy/routing
+ * decision from succeeding without its required record. Absence of a sink is
+ * still an explicit no-op because SIEM itself is optional in configuration.
+ *
+ * @param {Function|null} siem
+ * @param {object|(() => object)} requestSource
+ * @param {string} [requestId]
+ * @returns {(type:string, details?:object, ctx?:object)=>Promise<object|null>}
+ */
+export function createRouteSiemEmitter(siem, requestSource = {}, requestId = randomUUID()) {
+  return async (type, details = {}, ctx = {}) => {
+    const request = typeof requestSource === "function" ? requestSource() : requestSource;
+    const event = createEvent(type, details, {
+      request_id: requestId,
+      ...(request?.agentId ? { agent_id: request.agentId } : {}),
+      ...(request?.sessionId ? { session_id: request.sessionId } : {}),
+      ...(request?.model ? { model: request.model } : {}),
+      ...ctx,
+    });
+    if (typeof siem !== "function") return null;
+    await siem(event);
+    return event;
   };
 }
 
@@ -2592,22 +2632,12 @@ export async function routeAndSend(router, request, upstreamPath, method, client
   // ── SIEM: per-request audit correlation ──
   // Every lifecycle event emitted for this request shares one request_id so a
   // SIEM/SOC can stitch auth → request → (failover) → response|error together.
-  // The hook is best-effort: guarded (typeof check) and fully swallowed so a
-  // throwing or slow consumer can never break or delay routing.
+  // Audit decisions are a fail-closed boundary: createEvent() type errors and
+  // synchronous or asynchronous sink failures propagate. A request must not
+  // report success after its required evidence was rejected by the contract or
+  // sink. No configured sink remains an explicit, backwards-compatible no-op.
   const _siemRequestId = randomUUID();
-  const emitSiem = (type, details = {}, ctx = {}) => {
-    if (typeof siem !== "function") return;
-    try {
-      siem(createEvent(type, details, {
-        request_id: _siemRequestId,
-        ...(request?.agentId ? { agent_id: request.agentId } : {}),
-        ...(request?.model   ? { model:    request.model }   : {}),
-        ...ctx,
-      }));
-    } catch {
-      // SIEM must never break routing.
-    }
-  };
+  const emitSiem = createRouteSiemEmitter(siem, () => request, _siemRequestId);
 
   // ── Per-agent model routing (CR-5.1: registry agent:<id> context) ──
   // Map the resolved CapAuth agent identity to its pinned target read LIVE from
@@ -2680,7 +2710,10 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           `Not falling through to registry defaults, which would apply no ` +
           `capability floor and no trust-zone ceiling.`,
       );
-      emitSiem("invalid_bucket_id", {
+      await emitSiem(EventType.ERROR, {
+        type: "invalid_bucket_id",
+        status_code: 400,
+        outcome: "rejected",
         model: request.model,
         reason: attempt.reason,
       }, {});
@@ -2912,12 +2945,15 @@ export async function routeAndSend(router, request, upstreamPath, method, client
               `${isSensitivityEnforced() ? "BLOCKS" : "would block (shadow)"} ` +
               `cloud failover to ${fb.id} (zone ${fbZone})`;
             console.warn(msg);
-            emitSiem("sensitivity_gate", {
+            await emitSiem(EventType.POLICY_VIOLATION, {
+              rule: "sensitivity_ceiling",
+              severity: "warning",
               enforced: isSensitivityEnforced(),
               sensitivity: zc.sensitivity,
               ceiling: zc.ceiling,
               candidate_zone: fbZone,
               action: isSensitivityEnforced() ? "blocked" : "shadow",
+              outcome: isSensitivityEnforced() ? "blocked" : "shadow",
             }, { backend: fb.id });
           }
           // Shadow mode logs and does nothing else, so a soak can show what
@@ -2968,7 +3004,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
               `failing over to ${fc.fallbackBackend}/${fc.fallbackModel} ` +
               `(sovereign-first, cloud-fallback)`
             );
-            emitSiem("failover", {
+            await emitSiem("failover", {
               from_backend: "reg:" + reg.backend,
               to_backend: fb.id,
               reason: "local_backend_unhealthy",
@@ -3048,7 +3084,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         }), "utf8"),
         requestedModel,
       };
-      emitSiem("response", { status: 404, code: "unknown_model", requested_model: requestedModel }, {});
+      await emitSiem("response", { status: 404, code: "unknown_model", requested_model: requestedModel }, {});
       return result;
     }
     try {
@@ -3078,7 +3114,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       }), 'utf8'),
       requestedModel,
     };
-    emitSiem('error', { status: 503, code: 'codex_provider_unavailable', requested_model: requestedModel }, {});
+    await emitSiem('error', { status: 503, code: 'codex_provider_unavailable', requested_model: requestedModel }, {});
     return result;
   }
 
@@ -3089,8 +3125,8 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     const authType = primary.backend?.auth_type || "none";
     const authOk = authType === "none" ||
       (primary.authHeaders && Object.keys(primary.authHeaders).length > 0);
-    emitSiem("auth", { success: !!authOk, method: authType }, { backend: primary.backendId });
-    emitSiem("request", {
+    await emitSiem("auth", { success: !!authOk, method: authType }, { backend: primary.backendId });
+    await emitSiem("request", {
       path: upstreamPath,
       method,
       candidate_count: candidates.length,
@@ -3147,7 +3183,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         `[router] FAILOVER: ${candidates[i - 1].backendId} → ${backendId}` +
         ` (prev_status=${lastResult?.status})`
       );
-      emitSiem("failover", {
+      await emitSiem("failover", {
         from_backend: candidates[i - 1].backendId,
         to_backend: backendId,
         reason: `previous_status_${lastResult?.status ?? "error"}`,
@@ -3233,7 +3269,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         // which leaves after dispatch: no failover and no backend-health write.
         if (err instanceof PoolAdmissionError && err.code === "client_closed") {
           const queueWaitMs = Date.now() - queueStart;
-          emitSiem("response", {
+          await emitSiem("response", {
             status: 499,
             latency_ms: queueWaitMs,
             queue_wait_ms: queueWaitMs,
@@ -3269,7 +3305,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           ? err.retryAfterSeconds
           : 1;
         console.error(`[routeAndSend] pool rejected backend=${backendId}: ${err.message}`);
-        emitSiem("error", {
+        await emitSiem("error", {
           type: code === "queue_timeout" ? "pool_queue_timeout" : "pool_capacity_exceeded",
           status_code: 503,
           backend: backendId,
@@ -3278,7 +3314,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           message: err.message,
         }, { backend: backendId });
         const queueWaitMs = Date.now() - queueStart;
-        emitSiem("response", {
+        await emitSiem("response", {
           status: 503,
           latency_ms: queueWaitMs,
           queue_wait_ms: queueWaitMs,
@@ -3446,7 +3482,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         lastResult.bucket = bucketAddr.bucket;
         lastResult.bucketMember = candidateModel;
       }
-      emitSiem("response", {
+      await emitSiem("response", {
         status: 499,
         latency_ms: latencyMs,
         queue_wait_ms: queueWaitMs,
@@ -3550,7 +3586,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
 
     // Dead-alias auto-quarantine transitions (card 2d1f3a2c). Mirror the
     // failover pattern: a stdout JSON line (always) plus a structured SIEM
-    // event via the shared emitter (best-effort). Quarantine removes the alias
+    // event via the shared fail-closed emitter. Quarantine removes the alias
     // from rotation; re-admit returns it once a probe succeeds.
     if (qTransition) {
       const isQ = qTransition.transition === "quarantined";
@@ -3563,7 +3599,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         consecutive_failures: qTransition.consecutiveFailures,
         threshold: qTransition.threshold,
       }) + "\n");
-      emitSiem("anomaly", {
+      await emitSiem("anomaly", {
         type: isQ ? "backend_quarantine" : "backend_recovery",
         backend: backendId,
         consecutive_failures: qTransition.consecutiveFailures,
@@ -3621,14 +3657,14 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         try { detail = res.body?.toString("utf-8").slice(0, 500); } catch { /* ignore */ }
         console.warn(`[router] ${res.status} upstream_error backend=${backendId} body=${detail}`);
         // 4xx are non-retryable but are client/payload errors the SOC needs.
-        emitSiem("error", {
+        await emitSiem("error", {
           type: "upstream_client_error",
           status_code: res.status,
           backend: backendId,
         }, { backend: backendId });
       }
       // Completion — status + latency + best-effort token usage.
-      emitSiem("response", {
+      await emitSiem("response", {
         status: res.status,
         latency_ms: latencyMs,
         queue_wait_ms: queueWaitMs,
@@ -3656,7 +3692,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         `cooldown=${cooldownMs}ms` +
         (i < candidates.length - 1 ? " (trying next door)" : " (no more candidates)")
       );
-      emitSiem("anomaly", {
+      await emitSiem("anomaly", {
         type: "rate_limited",
         backend: backendId,
         status_code: res.status,
@@ -3670,7 +3706,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       (i < candidates.length - 1 ? " — trying next backend" : " — no more backends")
     );
     // Retryable upstream failure (>=500) — one error event per failed attempt.
-    emitSiem("error", {
+    await emitSiem("error", {
       type: "upstream_error",
       status_code: res.status,
       backend: backendId,
@@ -3700,7 +3736,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       `[router] 429 ALL CANDIDATES THROTTLED model=${request.model} ` +
       `tried=[${throttledAttempts.map((t) => `${t.backendId}/${t.model}`).join(", ")}]`
     );
-    emitSiem("response", {
+    await emitSiem("response", {
       status: 429,
       failover: didFailover,
       all_backends_failed: true,
@@ -3717,7 +3753,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
 
   // All backends failed for some other (non-throttle) reason: return the
   // last response so the caller can relay the error.
-  emitSiem("response", {
+  await emitSiem("response", {
     status: lastResult?.status ?? 502,
     failover: didFailover,
     all_backends_failed: true,

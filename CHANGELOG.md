@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Five SKGateway bucket and sensitivity decision points now emit typed SIEM
+  `EventType` values instead of ad-hoc strings, and an unknown event type fails
+  closed rather than being written as evidence. SIEM sink calls are awaited so a
+  sink failure propagates instead of being dropped on the floor, and request and
+  session identity are preserved on the emitted events, which is what makes a
+  routing decision traceable back to who asked for it (card 000068c8).
+
 - Model catalog rows now carry broad family and separately declared cost-tier
   metadata. Bucket administration exposes family on each member, while trust
   zones remain derived only from sovereignty and provider retention posture.
