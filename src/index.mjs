@@ -1460,7 +1460,7 @@ export const server = http.createServer(async (req, res) => {
       // onto the reconciled health/status entries and GUARANTEES every model
       // carries a non-empty provider (see src/proxy/advertise.mjs). The
       // allowlist is applied last, exactly as on /admin/models.
-      const merged = mergeDiscoveredCatalog(reconciled, discovered);
+      const merged = mergeDiscoveredCatalog(reconciled, discovered, advertiseBackends);
       const allowlist = loadAllowlist();
       const allowed = applyAllowlist(merged, allowlist);
       // Aliases (buckets + registry roles): additive, allowlist-aware,
@@ -1518,8 +1518,9 @@ export const server = http.createServer(async (req, res) => {
     if (!id) { notFound(); return; }
     try {
       const discovered = await getDiscoveredCatalog();
-      const reconciled = buildModelCatalog(effectiveAdvertiseBackends(config.backends || {}, router), router, advertiseReconcileMode);
-      const merged = mergeDiscoveredCatalog(reconciled, discovered);
+      const advertiseBackends = effectiveAdvertiseBackends(config.backends || {}, router);
+      const reconciled = buildModelCatalog(advertiseBackends, router, advertiseReconcileMode);
+      const merged = mergeDiscoveredCatalog(reconciled, discovered, advertiseBackends);
       const data = applyAllowlist(merged, loadAllowlist());
       const entry = data.find((m) => m.id === id);
       // Registry role (sk-default/sk-auto/sk-creative/...): a valid routing

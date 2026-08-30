@@ -168,9 +168,15 @@ export function tagLocalModels(backends = {}) {
  * @param {Array<object>} [discovered]
  * @returns {Array<object>}
  */
-export function mergeDiscoveredCatalog(reconciled = [], discovered = []) {
+export function mergeDiscoveredCatalog(reconciled = [], discovered = [], backends = null) {
+  const enabledProviders = backends && typeof backends === "object"
+    ? new Set(Object.entries(backends)
+      .filter(([, backend]) => !isCatalogDisabledBackend(backend))
+      .map(([id]) => id))
+    : null;
   const byId = new Map(reconciled.map((m) => [m.id, { ...m }]));
   for (const { id, ...tags } of discovered) {
+    if (enabledProviders && !enabledProviders.has(tags.provider)) continue;
     if (typeof id === "string" && /^(?:disabled|placeholder)(?:-|$)/i.test(id)) continue;
     const base = byId.get(id) || { id, object: "model", created: 0, owned_by: tags.provider || "discovery" };
     byId.set(id, { ...base, ...tags, id });

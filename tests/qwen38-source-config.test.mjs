@@ -28,12 +28,52 @@ const cards = loadYaml(
   readFileSync(join(ROOT, 'config/model-cards.overrides.yaml'), 'utf8'),
 ).overrides;
 
-test('chiap08-qwen38 claims the exact served id before its compatibility aliases', () => {
-  const backend = config.backends['chiap08-qwen38'];
-  assert.equal(backend.url, 'http://TAILNET_HOST:11439/v1');
-  assert.equal(backend.auth_type, 'none');
-  assert.equal(backend.priority, 3);
-  assert.deepEqual(backend.models, MODEL_IDS);
+test('both Qwen3.8 replicas claim the same canonical id and compatibility aliases', () => {
+  const chiap01 = config.backends['chiap01-qwen38'];
+  const chiap08 = config.backends['chiap08-qwen38'];
+
+  assert.equal(chiap01.url, 'http://chiap01:18810/v1');
+  assert.equal(chiap08.url, 'http://TAILNET_HOST:11439/v1');
+  for (const backend of [chiap01, chiap08]) {
+    assert.equal(backend.auth_type, 'none');
+    assert.equal(backend.priority, 3);
+    assert.deepEqual(backend.models, MODEL_IDS);
+  }
+  assert.equal(
+    new Set([...chiap01.models, ...chiap08.models]).size,
+    MODEL_IDS.length,
+    'a replica must not create a fifth request alias',
+  );
+});
+
+test('the replicas retain separate bounded capacity domains', () => {
+  assert.deepEqual(config.pooling.capacity_domains['chiap08-qwen38'], {
+    members: ['chiap08-qwen38', 'reg:qwen38'],
+    max: 3,
+    maxQueue: 8,
+    queueTimeoutMs: 30_000,
+  });
+  assert.deepEqual(config.pooling.capacity_domains['chiap01-qwen38'], {
+    members: ['chiap01-qwen38'],
+    max: 2,
+    maxQueue: 4,
+    queueTimeoutMs: 30_000,
+  });
+});
+
+test('either physical replica can route the canonical logical model', async () => {
+  const { createRouter } = await import('../src/proxy/router.mjs');
+  const router = createRouter({
+    backends: {
+      'chiap01-qwen38': config.backends['chiap01-qwen38'],
+      'chiap08-qwen38': config.backends['chiap08-qwen38'],
+    },
+  });
+  const candidates = await router.route({ model: SERVED_ID, agentId: 'replica-fold-test' });
+  assert.deepEqual(candidates.map((candidate) => candidate.backendId), [
+    'chiap01-qwen38',
+    'chiap08-qwen38',
+  ]);
 });
 
 test('every qwen38 id has the same bounded context and truthful served-model card', () => {
