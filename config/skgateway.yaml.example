@@ -11,10 +11,14 @@
 ## (credentials_path). Real secrets arrive at runtime through a 0600
 ## EnvironmentFile (see docs/COLD-BOOTSTRAP.md), never in this YAML.
 ##
-## Every field has a code-level default in src/config.mjs, so a section you
-## delete falls back to that default. Reload the file at runtime with
-## `kill -HUP <pid>` (config only; secrets and backend topology need a full
-## restart).
+## Most fields have code-level defaults in src/config.mjs, so an omitted
+## section falls back to that default. `backends:` is different: when present,
+## it is the complete backend registry, so omitting an entry removes that
+## built-in backend. For explicit intent use `backend-name: { enabled: false }`.
+## Remove its pooling.per_backend and capacity_domains member references too;
+## orphan direct or reg:<backend> references fail startup validation. Reload the
+## file at runtime with `kill -HUP <pid>` (config only; secrets and backend
+## topology need a full restart).
 
 server:
   port: 18780
@@ -54,7 +58,11 @@ pooling:
 
 ## Backends are matched by model name. A request routes to the lowest priority
 ## NUMBER that lists a matching model (priority 1 wins), failing over to the next
-## eligible backend on 5xx. Replace the example host IPs and ports below with the
+## eligible backend on 5xx. This mapping replaces the built-in registry. Omit a
+## backend to remove it, or retain an explicit tombstone such as:
+##   anthropic: { enabled: false }
+## Disabled entries are removed before routing, discovery, advertisement, and
+## bucket construction. Replace the example host IPs and ports below with the
 ## reachable upstreams on THIS network.
 backends:
   ## Local OpenAI-compatible server (example: an ornith/llama.cpp box).
@@ -363,6 +371,44 @@ identity:
   enabled: true
   allow_anonymous: true
   require_agent_id: false
+
+## Authorization is disabled unless enforce is explicitly enabled. The SKLegal
+## qualification lane is separately explicit. Its exact synthetic scope comes
+## only from this trusted process configuration, never from request headers.
+## Qualification service credentials are read from a systemd credential file.
+## Request-local credentials come from the incoming Authorization header. Do
+## not place either credential value in this file or the process environment.
+authz:
+  enforce: false
+  url: null
+  cache_ttl_ms: 5000
+  timeout_ms: 2000
+  trust_internal: true
+  sklegal_qualification:
+    enabled: false
+    ## URL may come from SKLEGAL_CAPAUTH_AUTHZ_ENDPOINT. When enabled, the
+    ## service credential must come from this absolute systemd credential path.
+    ## SKLEGAL_AUTHZ_SERVICE_TOKEN is rejected in qualification mode.
+    url: null
+    service_credential_file: null
+    service_credential_max_age_ms: 300000
+    routes: []
+    ## Example synthetic route shape:
+    # routes:
+    #   - method: POST
+    #     path: /v1/chat/completions
+    #     subject: synthetic-agent
+    #     resource:
+    #       tenant_id: synthetic-tenant
+    #       matter_id: synthetic-matter
+    #       material_id: synthetic-material
+    #       material_version: "1"
+    #       route_id: synthetic-route
+    #     context:
+    #       purpose: research
+    #       classification: public
+    #       privilege: none
+    #       ethical_wall: clear
 
 ## Per-agent model routing rules (P4.3). Pin a resolved agent identity to a
 ## specific model or alias/role, overriding the model the caller asked for. The

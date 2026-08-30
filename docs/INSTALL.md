@@ -206,14 +206,10 @@ mkdir -p ~/.config/systemd/user
 cp scripts/skgateway.service ~/.config/systemd/user/skgateway.service
 ```
 
-Set the `ExecStart` and `WorkingDirectory` paths in the copied unit to
-`$SKGATEWAY_DIR` (expand the variable to its current value when editing). The
-`EnvironmentFile=` line uses `%h`, so it already resolves to your home directory
-and needs no edit.
-
-```bash
-${EDITOR:-nano} ~/.config/systemd/user/skgateway.service
-```
+If your checkout is not at `/home/OPERATOR/clawd/skcapstone-repos/skgateway`, edit
+the `ExecStart` and `WorkingDirectory` paths in the copied unit to match your
+home and checkout location. The `EnvironmentFile=` line uses `%h`, so it already
+resolves to your home directory and needs no edit.
 
 **Step 2: Enable lingering** so the service runs without an active login
 session (the unit is `WantedBy=default.target`, a user target that only comes up

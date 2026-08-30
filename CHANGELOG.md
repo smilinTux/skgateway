@@ -7,6 +7,141 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Bucket resolution is now tool-aware. `resolveBucket()` gated only on lifecycle
+  routability, trust zone and size class, and size is a prior, not proof: a
+  model can clear the L floor and still emit no `tool_calls` at all. Measured on
+  this fleet 2026-08-29, `sk-*` buckets could reach a reward model that cannot
+  chat, a calibration model that never emits tool calls, translation models that
+  return HTTP 400, and a model that calls tools cleanly but scores 0/3 on every
+  graded task. Members are now filtered on demonstrated tool-use capability, and
+  a micro-eval harness (`src/ranking/eval.mjs`) grades that capability rather
+  than inferring it from parameter count.
+
+- Five SKGateway bucket and sensitivity decision points now emit typed SIEM
+  `EventType` values instead of ad-hoc strings, and an unknown event type fails
+  closed rather than being written as evidence. SIEM sink calls are awaited so a
+  sink failure propagates instead of being dropped on the floor, and request and
+  session identity are preserved on the emitted events, which is what makes a
+  routing decision traceable back to who asked for it (card 000068c8).
+
+- Model catalog rows now carry broad family and separately declared cost-tier
+  metadata. Bucket administration exposes family on each member, while trust
+  zones remain derived only from sovereignty and provider retention posture.
+  Free remote tiers are documented with the trains-on-content correlation from
+  provider records verified 2026-08-15 rather than described as merely cheap.
+
+- Requires Node 22. Node 20 left security support in April 2026, and the repo
+  still declared , pinned  to 20, and tested a 20/22
+  matrix while the deployment unit executed 20. Three runtimes were reachable on
+  the gateway host at once (unit v20, shell v22, npm v26), which is how
+   was built against one and run under another, silently
+  disabling all request telemetry. CI now tests 22 only.
+
+### Fixed
+
+- Dead Ornith model claims are purged from the serving config and from every
+  catalog and bucket projection, and repeated fast failures (404, 410, 502,
+  connection refused) now quarantine the exact backend-model claim rather than
+  marking the id globally EOL while another backend still claims it. Members
+  also carry a `physical_resource_id`, because alias count is not physical
+  capacity: four request aliases pointing at one llama-server are four
+  addressable members but a single physical server, and treating them as four
+  is how a pool believes it has depth it does not have (card db431f61).
+
+- Bucket family preference now uses one strict comma-separated `x-sk-prefer`
+  contract and applies only within the cheapest eligible cost tier, so a
+  preference reorders who serves without ever widening the resolved set or
+  overriding the cost ladder. Preference tokens are validated as broad family
+  names (or `sovereign`/`free`), never raw model ids, and `free` is refused
+  outside public sensitivity. Matching reads the top-level `member.family`
+  emitted by `resolveBucket` rather than `member.card.family`, which is what
+  made a stated preference silently fail to match (card 1e26943e, repairing the
+  SKW-ROUTE-03 launch).
+
+- Z.ai is now inferred as discovery-managed, so an empty catalog at startup can
+  no longer wildcard-claim models it does not serve. While Z.ai discovery is
+  pending or has failed, a GLM request fails closed with an attributable 503
+  instead of silently falling through to NVIDIA, and successful routing records
+  the discovery and readiness revisions it was decided against. Cold-start,
+  timeout, connection-failure, stale-catalog and recovery drills assert NVIDIA
+  receives zero calls (card f361407c).
+
+- Response sanitization no longer strips evidence the caller needs. The
+  public-surface and tool-call paths in `src/proxy/sanitizer.mjs` and
+  `src/proxy/response-contract.mjs` now preserve tool-call structure and the
+  attribution fields that identify which backend and model actually served a
+  request, rather than flattening them out of the reply (card d4edd98f).
+
+- A non-stream completion that comes back with no assistant content is now
+  rejected instead of being relayed to the client as a successful empty answer.
+  An upstream that returns 200 with an empty choice looked identical to a real
+  reply from outside the gateway, so the caller saw success and no text, and
+  nothing in the logs marked it as a failure (card 7e08803b).
+
+- The CapAuth authorization service now accepts systemd's exact credential file
+  mode. `LoadCredential=` installs credentials `0400` root-owned into
+  `$CREDENTIALS_DIRECTORY`, and the stricter-or-equal check rejected that exact
+  mode, so the PDP failed to load its own credential under the unit that
+  provisions it (card d9a5ea28).
+
+- Added the chiap01 B70 Qwen3.8 server as an independent replica of the canonical
+  chiap08 logical model, with separate admission limits of two and three. The
+  same-model router now uses an eligible replica with free capacity before
+  queueing, without changing trust-zone or sensitivity ceilings.
+
+- A metrics collector that is explicitly enabled in config and then fails to load
+  is now reported as a degradation instead of being logged as `(optional)` at info
+  level. On 2026-08-27 an `npm ci` rebuilt `better-sqlite3` against a different
+  Node than the systemd unit runs, the collector threw, and the gateway came up
+  serving traffic with metrics off. Every `request_log`, energy and cost row
+  stopped being written and nothing alerted, because from the outside the gateway
+  was healthy: it routed, returned 200s, and `/queue` looked normal. The message
+  now names exactly what stops being written, detects the native-module ABI
+  mismatch specifically and gives the actionable remedy (rebuild against the same
+  Node the service executes), and `SKGATEWAY_REQUIRE_METRICS=1` makes the process
+  refuse to start rather than degrade.
+
+### Added
+
+- `.nvmrc` pinning Node 20, matching the CI matrix floor and the version the
+  deployed unit actually executes. Three different Node versions were resolvable
+  on the deployment host (unit v20, shell v22, npm v26), which is what produced
+  the ABI mismatch above.
+
+### Added
+
+- SKGateway now serves its own operator facet on the daemon's existing port:
+  `GET /operator/v1/{healthz,readyz,explain,observe}` and a reserved
+  `POST /operator/v1/act` that always returns 501. This fixes the dead-`spec.cli`
+  problem (the `skgateway` binary is not on the control-plane node's PATH) without
+  waiting for the node move, and makes that later move a one-field endpoint update.
+  Conditions come from in-process state, never a self-HTTP probe: `UpstreamServing`
+  from the live per-backend health table, `PoolHealthy` from quarantine flags plus
+  real queue/capacity numbers, and `CatalogFresh` from the discovery cache. Every
+  condition renders only True/False/Unknown with a specific reason code; a
+  cold-start backend yields `Unknown (NoObservedTraffic)` rather than a fabricated
+  healthy, and one failing data source degrades only its own condition.
+
+### Fixed
+
+- Made a declared `backends` mapping authoritative instead of deep-merging
+  omitted built-in backends back into service. Operators can also use the
+  schema-valid `enabled: false` tombstone. Removed backends are excluded from
+  discovery, advertisement, and bucket inputs, while orphan direct or
+  `reg:<backend>` pooling references now fail startup validation.
+
+- Cost-rank bucket members only after capability and trust eligibility, rotate
+  equal-cost peers, and bound bucket completion liveness so a listed but hung
+  backend fails over instead of holding the route. The fleet has no declared
+  S-class model, so `sk-s-*` remains explicitly a capability floor pool.
+
+- Honor dashboard and metrics disablement during startup. Disabled qualification
+  configurations no longer create the dashboard listener, initialize the metrics
+  database, expose the dashboard redirect, permit a forced discovery refresh, or
+  forward events when SIEM is explicitly disabled.
+
 ### Documentation
 
 - Documented least-privilege GitHub authentication bootstrap for headless fleet
@@ -19,6 +154,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checks for the new surfaces.
 
 ### Added
+
+- Added `scripts/sync-pi-models.mjs` and `npm run sync:pi-models` to
+  synchronize Pi's `skgateway` provider from the live `/v1/models` catalog.
+  The tool includes bucket aliases, preserves unrelated Pi configuration,
+  refuses empty catalogs, supports dry-run, and writes atomically.
 
 - Added the GitHub-tracked `.100` Ornith 1.5 launcher and user unit, pinning the
   verified model alias, model path, port, 32768 context, CUDA settings, and

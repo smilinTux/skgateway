@@ -27,6 +27,7 @@ import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import { load as yamlLoad } from 'js-yaml';
 import { isRegistryRouted, loadRegistry } from './proxy/registry.mjs';
+import { assertCodexRegistryPurity } from './policy/codex-purity.mjs';
 
 // ─── paths ────────────────────────────────────────────────────────────────────
 
@@ -124,6 +125,46 @@ const DEFAULTS = {
     keep_start: 2,
     keep_end: 12,
     strip_thinking: true,
+  },
+
+  client_auth: {
+    enabled: false,
+    credentials_file: null,
+    agent_header: 'x-agent-id',
+    client_header: 'x-sk-client-id',
+    revision_header: 'x-sk-credential-revision',
+    expected_owner_uid: null,
+    expected_group_gid: null,
+    max_authorization_bytes: 4096,
+    max_agent_id_bytes: 128,
+    max_client_id_bytes: 128,
+    max_revision_bytes: 128,
+    max_token_bytes: 2048,
+    max_request_body_bytes: 120000,
+    max_credential_file_bytes: 1048576,
+    max_credentials: 4096,
+    denial_window_ms: 60000,
+    denial_max: 120,
+  },
+
+  operator_auth: {
+    enabled: false,
+    credentials_file: null,
+    agent_header: 'x-sk-operator-id',
+    client_header: 'x-sk-operator-client-id',
+    revision_header: 'x-sk-operator-credential-revision',
+    expected_owner_uid: null,
+    expected_group_gid: null,
+    max_authorization_bytes: 4096,
+    max_agent_id_bytes: 128,
+    max_client_id_bytes: 128,
+    max_revision_bytes: 128,
+    max_token_bytes: 2048,
+    max_request_body_bytes: 65536,
+    max_credential_file_bytes: 1048576,
+    max_credentials: 256,
+    denial_window_ms: 60000,
+    denial_max: 30,
   },
 
   // Streaming → non-streaming auto-flip for upstream stability on large /
@@ -262,6 +303,16 @@ const DEFAULTS = {
     cache_ttl_ms: 5000,
     timeout_ms: 2000,
     trust_internal: true,
+    // The SKLegal lane is explicit and disabled by default. Each configured
+    // route carries operator-trusted synthetic qualification scope. The lane
+    // ignores caller scope headers, bypasses no internal peer, and never caches.
+    sklegal_qualification: {
+      enabled: false,
+      url: null,
+      service_credential_file: null,
+      service_credential_max_age_ms: 300000,
+      routes: [],
+    },
   },
 
   // Dynamic provider model discovery (SKGateway dynamic-provider-model-discovery).
@@ -359,6 +410,88 @@ function deepClone(obj) {
   return JSON.parse(JSON.stringify(obj));
 }
 
+/** True only for a YAML mapping, never null or an array. */
+function isMapping(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
+ * Merge one parsed config document over the defaults.
+ *
+ * `backends` is deliberately different from ordinary nested settings: when a
+ * file declares the key, that mapping is the complete backend registry. This
+ * makes omission an actual removal instead of allowing deepMerge() to restore
+ * a same-named built-in backend. `enabled: false` is the explicit equivalent;
+ * a disabled entry needs no url, auth, models, or priority because it is
+ * removed before backend validation and before any consumer sees the config.
+ *
+ * @param {object} base mutable clone of DEFAULTS
+ * @param {object} fromFile parsed YAML document
+ * @returns {Set<string>} backend ids explicitly disabled or removed from defaults
+ */
+function mergeConfigDocument(base, fromFile) {
+  if (!isMapping(fromFile)) {
+    throw new ConfigError(['configuration document must be a YAML mapping']);
+  }
+
+  const hasBackends = Object.prototype.hasOwnProperty.call(fromFile, 'backends');
+  const rest = { ...fromFile };
+  delete rest.backends;
+  deepMerge(base, rest);
+
+  if (!hasBackends) return new Set();
+  if (!isMapping(fromFile.backends)) {
+    throw new ConfigError(['backends must be a mapping when declared']);
+  }
+
+  const problems = [];
+  const configured = {};
+  const removed = new Set(
+    Object.keys(DEFAULTS.backends).filter(
+      (id) => !Object.prototype.hasOwnProperty.call(fromFile.backends, id),
+    ),
+  );
+
+  for (const [id, backend] of Object.entries(fromFile.backends)) {
+    if (!isMapping(backend)) {
+      problems.push(`backends.${id} must be an object or { enabled: false }`);
+      continue;
+    }
+    if (Object.prototype.hasOwnProperty.call(backend, 'enabled') && typeof backend.enabled !== 'boolean') {
+      problems.push(`backends.${id}.enabled must be a boolean`);
+      continue;
+    }
+    if (backend.enabled === false) {
+      removed.add(id);
+      continue;
+    }
+    const inherited = Object.prototype.hasOwnProperty.call(DEFAULTS.backends, id)
+      ? deepClone(DEFAULTS.backends[id])
+      : {};
+    configured[id] = deepMerge(inherited, backend);
+  }
+
+  if (problems.length) throw new ConfigError(problems);
+  base.backends = configured;
+  return removed;
+}
+
+/**
+ * A discovery provider without a same-named serving backend cannot produce a
+ * routable catalog entry. Turn those inherited defaults off in the effective
+ * config so removing a backend cannot leave provider polling or cached catalog
+ * advertisement enabled behind it.
+ */
+function disableOrphanDiscoveryProviders(cfg) {
+  const providers = cfg.discovery?.providers;
+  if (!isMapping(providers)) return;
+  for (const [id, provider] of Object.entries(providers)) {
+    if (!Object.prototype.hasOwnProperty.call(cfg.backends || {}, id) && isMapping(provider)) {
+      provider.enabled = false;
+    }
+  }
+}
+
 // ─── env overrides ────────────────────────────────────────────────────────────
 
 /**
@@ -398,8 +531,15 @@ export function applyEnvOverrides(cfg) {
   if (e.SKGATEWAY_PORT)           cfg.server.port            = Number(e.SKGATEWAY_PORT);
   if (e.SKGATEWAY_DASHBOARD_PORT) cfg.server.dashboard_port  = Number(e.SKGATEWAY_DASHBOARD_PORT);
   if (e.SKGATEWAY_BIND)           cfg.server.bind            = e.SKGATEWAY_BIND;
-  if (e.SKGATEWAY_TARGET)         cfg.backends.nvidia.url    = e.SKGATEWAY_TARGET;
-  if (e.SKGATEWAY_NVIDIA_KEY_ENV) cfg.backends.nvidia.api_key_env = e.SKGATEWAY_NVIDIA_KEY_ENV;
+  if (e.SKGATEWAY_TARGET || e.SKGATEWAY_NVIDIA_KEY_ENV) {
+    if (!cfg.backends?.nvidia) {
+      throw new ConfigError([
+        'SKGATEWAY_TARGET/SKGATEWAY_NVIDIA_KEY_ENV cannot target removed backend "nvidia"',
+      ]);
+    }
+    if (e.SKGATEWAY_TARGET) cfg.backends.nvidia.url = e.SKGATEWAY_TARGET;
+    if (e.SKGATEWAY_NVIDIA_KEY_ENV) cfg.backends.nvidia.api_key_env = e.SKGATEWAY_NVIDIA_KEY_ENV;
+  }
   if (e.SKGATEWAY_METRICS_DB)     cfg.metrics.db_path        = e.SKGATEWAY_METRICS_DB;
   if (e.SKGATEWAY_RETENTION_DAYS) cfg.metrics.retention_days = Number(e.SKGATEWAY_RETENTION_DAYS);
 
@@ -575,7 +715,12 @@ function modelMatchesPattern(pattern, model) {
  *   used at boot/reload.
  * @returns {string[]} The accumulated problems (empty when the routes are valid).
  */
-export function assertProviderRoutes(cfg, errs = [], registryPath = undefined) {
+export function assertProviderRoutes(
+  cfg,
+  errs = [],
+  registryPath = undefined,
+  removedBackendIds = new Set(),
+) {
   const backends = (cfg.backends && typeof cfg.backends === 'object') ? cfg.backends : {};
   const backendIds = new Set(Object.keys(backends));
 
@@ -652,6 +797,10 @@ export function assertProviderRoutes(cfg, errs = [], registryPath = undefined) {
             errs.push(`${prefix}.members entries must be non-empty strings`);
             continue;
           }
+          const configuredId = member.startsWith('reg:') ? member.slice(4) : member;
+          if (removedBackendIds.has(configuredId)) {
+            errs.push(`${prefix}.members references disabled or removed backend ${configuredId}`);
+          }
           if (!backendIds.has(member) && !/^reg:[A-Za-z0-9._-]+$/.test(member)) {
             errs.push(
               `${prefix}.members contains unknown route ${member}; expected a declared ` +
@@ -711,6 +860,15 @@ export function assertProviderRoutes(cfg, errs = [], registryPath = undefined) {
     }
   }
 
+  // Codex is a provider boundary, not a capability hint. Validate the live
+  // registry at boot and reload so a Codex-labelled role cannot point at a
+  // local Qwen or a third-party aggregator even transiently.
+  try {
+    assertCodexRegistryPurity(loadRegistry(registryPath), errs);
+  } catch {
+    errs.push('Codex provider-purity registry validation failed closed');
+  }
+
   return errs;
 }
 
@@ -722,7 +880,7 @@ export function assertProviderRoutes(cfg, errs = [], registryPath = undefined) {
  * @param {object} cfg
  * @throws {ConfigError}
  */
-function validate(cfg) {
+function validate(cfg, removedBackendIds = new Set()) {
   const errs = [];
 
   // server
@@ -776,6 +934,25 @@ function validate(cfg) {
   if (typeof cfg.sanitizer.max_body_bytes !== 'number' || cfg.sanitizer.max_body_bytes < 1)
     errs.push('sanitizer.max_body_bytes must be a positive number');
 
+  // estate-agent client authentication
+  for (const [name, ca] of [['client_auth', cfg.client_auth], ['operator_auth', cfg.operator_auth]]) {
+    if (!ca || typeof ca.enabled !== 'boolean') errs.push(`${name}.enabled must be a boolean`);
+    if (ca?.enabled) {
+      if (typeof ca.credentials_file !== 'string' || !ca.credentials_file) errs.push(`${name}.credentials_file must be set when enabled`);
+      const expectedHeaders = name === 'client_auth'
+        ? { agent_header: 'x-agent-id', client_header: 'x-sk-client-id', revision_header: 'x-sk-credential-revision' }
+        : { agent_header: 'x-sk-operator-id', client_header: 'x-sk-operator-client-id', revision_header: 'x-sk-operator-credential-revision' };
+      for (const [key, expected] of Object.entries(expectedHeaders)) {
+        if (ca[key] !== expected) errs.push(`${name}.${key} must be ${expected}`);
+      }
+      if (!Number.isInteger(ca.expected_owner_uid) || ca.expected_owner_uid < 0) errs.push(`${name}.expected_owner_uid must be a non-negative integer`);
+      if (ca.expected_group_gid != null && (!Number.isInteger(ca.expected_group_gid) || ca.expected_group_gid < 0)) errs.push(`${name}.expected_group_gid must be null or a non-negative integer`);
+    }
+    for (const key of ['max_authorization_bytes', 'max_agent_id_bytes', 'max_client_id_bytes', 'max_revision_bytes', 'max_token_bytes', 'max_request_body_bytes', 'max_credential_file_bytes', 'max_credentials', 'denial_window_ms', 'denial_max']) {
+      if (!Number.isInteger(ca?.[key]) || ca[key] < 1) errs.push(`${name}.${key} must be a positive integer`);
+    }
+  }
+
   // metrics
   if (typeof cfg.metrics.enabled !== 'boolean')
     errs.push('metrics.enabled must be a boolean');
@@ -784,9 +961,27 @@ function validate(cfg) {
   if (!Number.isInteger(cfg.metrics.retention_days) || cfg.metrics.retention_days < 1)
     errs.push('metrics.retention_days must be a positive integer');
 
+  // SIEM
+  if (typeof cfg.siem.enabled !== 'boolean')
+    errs.push('siem.enabled must be a boolean');
+
   // dashboard
+  if (typeof cfg.dashboard.enabled !== 'boolean')
+    errs.push('dashboard.enabled must be a boolean');
   if (typeof cfg.dashboard.refresh_ms !== 'number' || cfg.dashboard.refresh_ms < 100)
     errs.push('dashboard.refresh_ms must be >= 100');
+
+  // discovery
+  if (typeof cfg.discovery.enabled !== 'boolean')
+    errs.push('discovery.enabled must be a boolean');
+
+  // authorization
+  if (typeof cfg.authz.enforce !== 'boolean')
+    errs.push('authz.enforce must be a boolean');
+  if (typeof cfg.authz.trust_internal !== 'boolean')
+    errs.push('authz.trust_internal must be a boolean');
+  if (!Number.isFinite(cfg.authz.cache_ttl_ms) || cfg.authz.cache_ttl_ms < 0)
+    errs.push('authz.cache_ttl_ms must be a non-negative number');
 
   // energy (joule-economy P0 metering)
   if (cfg.energy) {
@@ -804,7 +999,7 @@ function validate(cfg) {
   // Provider-route consistency (card 7ec1d18a): assert routes map to known
   // backends / resolvable aliases at boot AND reload, so a mis-wired route fails
   // fast here rather than silently mis-routing at first request.
-  assertProviderRoutes(cfg, errs);
+  assertProviderRoutes(cfg, errs, undefined, removedBackendIds);
 
   if (errs.length) throw new ConfigError(errs);
 }
@@ -834,6 +1029,17 @@ function resolvePaths(cfg) {
     cfg.metrics.db_path = cfg.metrics.db_path.startsWith('~')
       ? expandHome(cfg.metrics.db_path)
       : resolve(REPO_ROOT, cfg.metrics.db_path);
+  }
+
+  if (cfg.client_auth?.credentials_file) {
+    cfg.client_auth.credentials_file = cfg.client_auth.credentials_file.startsWith('~')
+      ? expandHome(cfg.client_auth.credentials_file)
+      : resolve(REPO_ROOT, cfg.client_auth.credentials_file);
+  }
+  if (cfg.operator_auth?.credentials_file) {
+    cfg.operator_auth.credentials_file = cfg.operator_auth.credentials_file.startsWith('~')
+      ? expandHome(cfg.operator_auth.credentials_file)
+      : resolve(REPO_ROOT, cfg.operator_auth.credentials_file);
   }
 
   // siem output paths
@@ -925,24 +1131,25 @@ export function getConfig() {
 function _readAndBuild(filePath, silent) {
   const base = deepClone(DEFAULTS);
 
+  let removedBackendIds = new Set();
   if (existsSync(filePath)) {
+    let fromFile;
     try {
       const raw = readFileSync(filePath, 'utf8');
-      const fromFile = yamlLoad(raw) ?? {};
-      deepMerge(base, fromFile);
-      if (!silent) process.stderr.write(`[skgateway:config] Loaded ${filePath}\n`);
+      fromFile = yamlLoad(raw) ?? {};
     } catch (err) {
-      // Parse error — fall back to defaults and warn
-      process.stderr.write(`[skgateway:config] WARN: could not parse ${filePath}: ${err.message}\n`);
-      process.stderr.write('[skgateway:config] Falling back to built-in defaults.\n');
+      throw new ConfigError([`could not parse ${filePath}: ${err.message}`]);
     }
+    removedBackendIds = mergeConfigDocument(base, fromFile);
+    if (!silent) process.stderr.write(`[skgateway:config] Loaded ${filePath}\n`);
   } else {
     if (!silent) process.stderr.write(`[skgateway:config] ${filePath} not found — using defaults.\n`);
   }
 
+  disableOrphanDiscoveryProviders(base);
   applyEnvOverrides(base);
   resolvePaths(base);
-  validate(base);   // throws ConfigError on bad values
+  validate(base, removedBackendIds);   // throws ConfigError on bad values
 
   return base;
 }

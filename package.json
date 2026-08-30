@@ -10,15 +10,16 @@
   "scripts": {
     "start": "node src/index.mjs",
     "dev": "node --watch src/index.mjs",
+    "sync:pi-models": "node scripts/sync-pi-models.mjs",
     "test": "node --test --import ./tests/_setup.mjs tests/*.test.mjs"
   },
   "dependencies": {
     "better-sqlite3": "^12.10.1",
     "js-yaml": "5.3.0",
-    "openpgp": "^6.3.1"
+    "openpgp": "6.3.1"
   },
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=22.0.0"
   },
   "license": "MIT"
 }

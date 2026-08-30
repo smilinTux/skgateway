@@ -13,17 +13,31 @@ import http from "node:http";
 import { loadConfig, getConfig } from "./config.mjs";
 import { createProxyServer, handleRequest, buildConfig } from "./proxy/core.mjs";
 import { createRouter, routeAndSend } from "./proxy/router.mjs";
-import { buildModelCatalog, reconcileModeFromConfig, tagLocalModels, mergeDiscoveredCatalog, isModelAvailable } from "./proxy/advertise.mjs";
+import { buildModelCatalog, reconcileModeFromConfig, tagLocalModels, mergeDiscoveredCatalog, isModelAvailable, excludedModelIds, withoutExcludedModels } from "./proxy/advertise.mjs";
 import { loadAllowlist, saveAllowlist, applyAllowlist } from "./advertise.mjs";
 import { discoverCatalog, loadCache, saveCache, fetchNvidia, fetchOpenRouter, fetchOpencode, fetchAnthropicWrapper, fetchCodex, fetchZai, catalogStatus, loadCardOverrides, applyCardOverlays, buildServingCatalog } from "./discovery.mjs";
 import { getPool, resetPool } from "./proxy/connection-pool.mjs";
 import { loadAgentRegistry, extractIdentity, normalizeAgentId, ANONYMOUS_AGENT_ID } from "./identity/capauth.mjs";
+import { ClientAuthenticator, classifyAuthenticationRoute, stripCallerCredentials, stripCredentialQuery } from "./identity/client-auth.mjs";
 import { createAuthzClient } from "./policy/authz_decide.mjs";
+import { createSkLegalAuthzClient } from "./policy/sklegal_authz_decide.mjs";
 import { classifyRoute } from "./policy/authz_routes.mjs";
-import { authzEnforceEnabled, authorizeRequest } from "./policy/authz_gate.mjs";
+import { runModelEval, isEvalEligible, createLoopbackChatComplete } from "./ranking/eval.mjs";
+import {
+  authzEnforceEnabled,
+  authorizeRequest,
+  createSkLegalQualificationResolver,
+} from "./policy/authz_gate.mjs";
 import { isInternalRemote } from "./policy/net_trust.mjs";
 import { classifyRequest, toSiemEvent } from "./classifiers/engine.mjs";
 import { handleModuleManifest } from "./operator/manifest.mjs";
+import {
+  handleHealthz as handleOperatorHealthz,
+  handleReadyz as handleOperatorReadyz,
+  handleExplain as handleOperatorExplain,
+  handleObserve as handleOperatorObserve,
+  handleAct as handleOperatorAct,
+} from "./operator/http.mjs";
 import { fromAnthropicRequest, toAnthropicMessage, modelRetrieveObject } from "./proxy/anthropic-frontend.mjs";
 import { readCodexAuthHeaders } from "./proxy/codex-adapter.mjs";
 import { readZaiAuthHeaders, ZAI_CREDENTIALS_PATH } from "./proxy/zai-adapter.mjs";
@@ -61,6 +75,8 @@ const _cfgEmitter = await loadConfig({ configPath });
 const config = _cfgEmitter.current();
 const port = portOverride || config.server?.port || 18780;
 const bind = config.server?.bind || "127.0.0.1";
+let clientAuthenticator = config.client_auth?.enabled ? new ClientAuthenticator(config.client_auth) : null;
+let operatorAuthenticator = config.operator_auth?.enabled ? new ClientAuthenticator(config.operator_auth) : null;
 
 // ─── Capability-aware routing master gate (design 7.2), DEFAULT OFF ───
 // Governs BOTH the `@match` role ranking branch (router.mjs, card P4.2) and
@@ -224,20 +240,19 @@ export function registerDiscoveredRoutes(cfg, catalog, opts = {}) {
     // For discovery-managed backends the configured list is a cold-start seed,
     // not a permanent union. The first authoritative cycle replaces it so a
     // retired model can actually leave routing.
-    const staticModels = cfg.backends?.[name]?.discovery
+    const staticModels = backend.discovery
       ? []
       : (cfg.backends?.[name]?.models || []).filter((x) => typeof x === "string");
     const merged = [...new Set([...staticModels, ...ids])];
-    backend.models = filterRoutableModelIds(merged, getLifecycleFn, [name]);
-    // Lifecycle pruning can legitimately empty this list (every known id for
-    // this provider is currently eol/dead). Backend#supportsModel() treats an
-    // EMPTY models array as "wildcard match everything" UNLESS the backend is
-    // flagged `discovery`-managed (router.mjs:398), and this function IS the
-    // discovery route registrar for nvidia/openrouter, whether or not the
-    // operator also set config.backends.<name>.discovery in YAML. Without
-    // this guard an all-eol provider would flip from "serves nothing"
-    // (correct) to "serves everything" (exactly what P1.4 exists to prevent).
-    if (backend.models.length === 0) backend.discovery = backend.discovery || name;
+    const routable = filterRoutableModelIds(merged, getLifecycleFn, [name]);
+    if (typeof backend.replaceDiscoveredModels === "function" && backend.discovery) {
+      backend.replaceDiscoveredModels(routable);
+    } else {
+      backend.models = routable;
+      // Lifecycle pruning can legitimately empty this list. Mark it discovery
+      // managed so empty never becomes the ordinary wildcard convention.
+      if (backend.models.length === 0) backend.discovery = backend.discovery || name;
+    }
   }
 }
 
@@ -606,6 +621,17 @@ export async function refreshCatalog(cfg, discoverCatalogFn = discoverCatalog) {
   });
   _catalog = models;
   registerDiscoveredRoutes(cfg, models);
+  // Providers absent from the returned catalog still completed a discovery
+  // attempt. Record that outcome so pending becomes attributable failed/stale
+  // instead of remaining ambiguous forever.
+  const zaiProvider = _discoveryCache.providers?.zai;
+  if (cfg.backends?.zai && !models.some((m) => m.provider === "zai")) {
+    router.registerDiscoveredModels?.("zai", [], {
+      ok: zaiProvider?.ok !== false,
+      stale: zaiProvider?.ok === false,
+      at: zaiProvider?.lastAttemptAt || Date.now(),
+    });
+  }
   saveCache(_discoveryCache);
   return models;
 }
@@ -670,14 +696,56 @@ const poolConfig = {
 };
 const pool = getPool(poolConfig);
 
-// Metrics collector (lazy — may not be installed yet)
+// ─── Operator-plane self-served facet data sources (epic c880017b, Phase 3.4) ───
+// The live objects the /operator/v1/* routes (below, near /health) read from.
+// Defined once, right after router/pool exist, so it can never observe them
+// as undefined. Each source is a zero-arg accessor — operator/http.mjs treats
+// a throw from any one of them as that condition's evidence, never a crash
+// into a 500 (see buildObservation() there). getConfig() (not the module-load
+// `config` local) so a hot-reloaded discovery.enabled flag is honored live,
+// same convention getDiscoveredStatus() below already follows.
+const operatorHttpDeps = {
+  getHealth: () => router.getHealth(),
+  getPoolStats: () => pool.getTotalStats(),
+  getCatalogStatus: () => getDiscoveredStatus(),
+  discoveryEnabled: () => getConfig().discovery?.enabled !== false,
+};
+
+// Metrics collector (lazy, and not imported when disabled)
 let metrics = null;
-try {
-  const { createMetricsCollector } = await import("./metrics/collector.mjs");
-  metrics = createMetricsCollector(config.metrics || {});
-  console.log("[skgateway] metrics collector initialized");
-} catch (e) {
-  console.log("[skgateway] metrics collector not available (optional):", e.message);
+if (config.metrics?.enabled === true) {
+  try {
+    const { createMetricsCollector } = await import("./metrics/collector.mjs");
+    metrics = createMetricsCollector(config.metrics);
+    console.log("[skgateway] metrics collector initialized");
+  } catch (e) {
+    // Metrics was explicitly ENABLED in config and still failed to load. That is a
+    // degradation, not an option, and it must not be logged as though it were fine.
+    // Observed 2026-08-27: an npm ci rebuilt better-sqlite3 against a different
+    // Node than the service runs, the collector failed here, and the gateway came
+    // up cheerfully with metrics off. Every request_log row stopped being written
+    // and nothing noticed, because this line said "(optional)" at info level while
+    // the whole fleet's telemetry was gone.
+    const abi = /NODE_MODULE_VERSION|was compiled against a different Node\.js version/i.test(
+      String(e && e.message),
+    );
+    console.error(
+      "[skgateway] METRICS DEGRADED: collector is enabled in config but failed to load.",
+      "\n  request_log, energy and cost telemetry will NOT be written.",
+      "\n  cause:", e && e.message,
+      abi
+        ? "\n  remedy: the native binding was built for a different Node than this process." +
+          "\n          run:  npm rebuild better-sqlite3 --build-from-source" +
+          "\n          using the SAME node that runs the service (check the unit's ExecStart)."
+        : "\n  remedy: check config.metrics and that ./metrics/collector.mjs loads.",
+    );
+    if (process.env.SKGATEWAY_REQUIRE_METRICS === "1") {
+      console.error("[skgateway] SKGATEWAY_REQUIRE_METRICS=1 is set, refusing to start without metrics.");
+      process.exit(1);
+    }
+  }
+} else {
+  console.log("[skgateway] metrics collector disabled by configuration");
 }
 
 // ─── CapAuth agent-identity registry (P2.1) ───
@@ -711,10 +779,8 @@ if (identityEnabled) {
 // flag flips, but it is only ever consulted inside the `if (authzEnforce)` guard.
 const authzCfg = config.authz || {};
 const authzEnforce = authzEnforceEnabled(process.env, config);
-// "Allow internal, gate external" posture: a request from a trusted internal peer
-// (loopback / Tailscale CGNAT / RFC1918) is allowed without a PDP call; only
-// external peers are delegated to the PDP. Default ON; set authz.trust_internal
-// or $SKGATEWAY_AUTHZ_TRUST_INTERNAL=0 to gate ALL callers (strict mode).
+// The legacy lane can retain its internal-peer posture. Explicit SKLegal
+// qualification routes never use this bypass and always call the strict client.
 const authzTrustInternal =
   (process.env.SKGATEWAY_AUTHZ_TRUST_INTERNAL ?? "").trim() === "0"
     ? false
@@ -724,10 +790,26 @@ const authzClient = createAuthzClient({
   cacheTtlMs: authzCfg.cache_ttl_ms,
   timeoutMs: authzCfg.timeout_ms,
 });
+const sklegalAuthzCfg = authzCfg.sklegal_qualification || {};
+// Exact governed wire: X-SKLegal-Service-Authorization carries the service
+// credential and request_capauth carries the request-local Authorization value.
+const sklegalQualification = createSkLegalQualificationResolver(
+  authzEnforce ? sklegalAuthzCfg : {},
+);
+const sklegalAuthzClient = createSkLegalAuthzClient({
+  url: sklegalAuthzCfg.url,
+  timeoutMs: sklegalAuthzCfg.timeout_ms ?? authzCfg.timeout_ms,
+  qualificationEnabled: sklegalQualification.enabled,
+  serviceCredentialFile: sklegalAuthzCfg.service_credential_file,
+  serviceCredentialMaxAgeMs: sklegalAuthzCfg.service_credential_max_age_ms,
+});
 if (authzEnforce) {
   console.log(
-    `[skgateway] authz ENFORCE ON — delegating to capauth decide endpoint ` +
-    `(${authzClient.configured ? "configured" : "NOT configured → all gated routes DENY"})`,
+    `[skgateway] authz ENFORCE ON; generic PDP ` +
+    `${authzClient.configured ? "configured" : "not configured"}; ` +
+    `SKLegal qualification ${sklegalQualification.enabled
+      ? (sklegalAuthzClient.configured ? "configured" : "not configured, governed routes deny")
+      : "disabled"}`,
   );
 } else {
   console.log("[skgateway] authz enforce OFF (byte-identical passthrough; no decide call)");
@@ -743,17 +825,21 @@ if (authzEnforce) {
  * by construction (coverage-gap guard, standard §3).
  */
 async function enforceAuthz(req, res, identity) {
-  // Allow-internal, gate-external: a trusted internal TCP peer (loopback/tailnet/
-  // RFC1918) is authorized without a PDP call. remoteAddress is the real peer (no
-  // trusted proxy in front), so this is a network-layer boundary, not a spoofable
-  // header. The verdict still flows to the SIEM hook below for the audit trail.
-  const internal = authzTrustInternal && isInternalRemote(req.socket?.remoteAddress);
+  // Resolve trusted SKLegal scope before considering the legacy internal-peer
+  // behavior. A governed route always calls the PDP, including from loopback.
+  const qualification = sklegalQualification.resolve(req.method, req.url);
+  const internal = !qualification
+    && authzTrustInternal
+    && isInternalRemote(req.socket?.remoteAddress);
   const verdict = await authorizeRequest({
     method: req.method,
     url: req.url,
     identity,
     client: authzClient,
     internal,
+    sklegalQualification: qualification,
+    requestCapAuth: req.headers.authorization,
+    sklegalClient: sklegalAuthzClient,
   });
   if (verdict.kind === "public") return false;
 
@@ -765,6 +851,10 @@ async function enforceAuthz(req, res, identity) {
     capability: verdict.capability,
     decision: verdict.allowed ? "allow" : "deny",
     reason: verdict.reason,
+    governed: verdict.governed === true,
+    decision_id: verdict.decision_id ?? null,
+    policy_revision: verdict.policy_revision ?? null,
+    correlation_id: verdict.correlation_id ?? null,
     path: (req.url || "").split("?")[0],
     method: (req.method || "GET").toUpperCase(),
     remote: req.socket?.remoteAddress ?? null,
@@ -786,30 +876,37 @@ async function enforceAuthz(req, res, identity) {
 // import of this module (see tests/advertise-lifecycle.test.mjs's
 // registerDiscoveredRoutes group); no production code depends on the export.
 export let dashboard = null;
-try {
-  const { createDashboardServer } = await import("./dashboard/server.mjs");
-  const dashPort = config.dashboard?.port || config.server?.dashboard_port || 18781;
-  dashboard = createDashboardServer({
-    port:    dashPort,
-    bind:    config.server?.bind || "0.0.0.0",
-    metrics,
-    router,
-    config,
-  });
-  console.log(`[skgateway] dashboard server started on port ${dashPort}`);
-} catch (e) {
-  console.log("[skgateway] dashboard server not available (optional):", e.message);
+if (config.dashboard?.enabled === true) {
+  try {
+    const { createDashboardServer } = await import("./dashboard/server.mjs");
+    const dashPort = config.dashboard?.port || config.server?.dashboard_port || 18781;
+    dashboard = createDashboardServer({
+      port:    dashPort,
+      bind:    config.server?.bind || "0.0.0.0",
+      metrics,
+      router,
+      config,
+    });
+    console.log(`[skgateway] dashboard server started on port ${dashPort}`);
+  } catch (e) {
+    console.log("[skgateway] dashboard server not available (optional):", e.message);
+  }
+} else {
+  console.log("[skgateway] dashboard server disabled by configuration");
 }
 
 // ─── SIEM hook — append gateway decisions to logs/audit.jsonl ───
 import fs from "node:fs";
 import path from "node:path";
+const siemEnabled = config.siem?.enabled === true;
 const siemPath = path.resolve(
   path.dirname(new URL(import.meta.url).pathname),
   "..",
   config.siem?.outputs?.[0]?.path || "./logs/audit.jsonl",
 );
-try { fs.mkdirSync(path.dirname(siemPath), { recursive: true }); } catch {}
+if (siemEnabled) {
+  try { fs.mkdirSync(path.dirname(siemPath), { recursive: true }); } catch {}
+}
 // Optional skcapstone bridge — shares warn+ SIEM events on the mesh-wide
 // sk-alert bus when ~/.skcapstone is present; no-op otherwise.
 import * as skcapstone from "./integration.mjs";
@@ -819,17 +916,19 @@ import * as skcapstone from "./integration.mjs";
 // no-op unless `enabled: true` (or SKGATEWAY_SYSLOG_* env is set). Shipping to
 // syslog never blocks or breaks the existing file/append + skcapstone path.
 let syslogOutputs = [];
-try {
-  const { createSyslogOutput } = await import("./siem/syslog.mjs");
-  syslogOutputs = (config.siem?.outputs || [])
-    .filter((o) => o && o.type === "syslog")
-    .map((o) => createSyslogOutput(o))
-    .filter((a) => a.enabled);
-  if (syslogOutputs.length) {
-    console.log(`[skgateway] syslog output(s) enabled: ${syslogOutputs.length}`);
+if (siemEnabled) {
+  try {
+    const { createSyslogOutput } = await import("./siem/syslog.mjs");
+    syslogOutputs = (config.siem?.outputs || [])
+      .filter((o) => o && o.type === "syslog")
+      .map((o) => createSyslogOutput(o))
+      .filter((a) => a.enabled);
+    if (syslogOutputs.length) {
+      console.log(`[skgateway] syslog output(s) enabled: ${syslogOutputs.length}`);
+    }
+  } catch (e) {
+    console.log("[skgateway] syslog output not available (optional):", e.message);
   }
-} catch (e) {
-  console.log("[skgateway] syslog output not available (optional):", e.message);
 }
 
 // ─── Elasticsearch / OpenSearch output (_bulk) - disabled by default ───
@@ -838,20 +937,23 @@ try {
 // is a no-op unless `enabled: true` with an endpoint (or SKGATEWAY_ES_* env is
 // set). Shipping to ES never blocks or breaks the file/append + syslog path.
 let esOutputs = [];
-try {
-  const { createElasticsearchOutput } = await import("./siem/elasticsearch.mjs");
-  esOutputs = (config.siem?.outputs || [])
-    .filter((o) => o && (o.type === "elasticsearch" || o.type === "opensearch"))
-    .map((o) => createElasticsearchOutput(o))
-    .filter((a) => a.enabled);
-  if (esOutputs.length) {
-    console.log(`[skgateway] elasticsearch/opensearch output(s) enabled: ${esOutputs.length}`);
+if (siemEnabled) {
+  try {
+    const { createElasticsearchOutput } = await import("./siem/elasticsearch.mjs");
+    esOutputs = (config.siem?.outputs || [])
+      .filter((o) => o && (o.type === "elasticsearch" || o.type === "opensearch"))
+      .map((o) => createElasticsearchOutput(o))
+      .filter((a) => a.enabled);
+    if (esOutputs.length) {
+      console.log(`[skgateway] elasticsearch/opensearch output(s) enabled: ${esOutputs.length}`);
+    }
+  } catch (e) {
+    console.log("[skgateway] elasticsearch output not available (optional):", e.message);
   }
-} catch (e) {
-  console.log("[skgateway] elasticsearch output not available (optional):", e.message);
 }
 
 function siemHook(evt) {
+  if (!siemEnabled) return;
   try {
     fs.appendFile(siemPath, JSON.stringify(evt) + "\n", () => {});
   } catch (e) {
@@ -1121,7 +1223,66 @@ const proxyConfig = buildConfig({
 // (see tests/advertise-lifecycle.test.mjs); no production code depends on it.
 export const server = http.createServer(async (req, res) => {
   const startTime = Date.now();
+  if (clientAuthenticator || operatorAuthenticator) {
+    try {
+      req.url = stripCredentialQuery(req.url ?? '/');
+    } catch {
+      res.writeHead(400, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+      res.end(JSON.stringify({ error: { message: 'Invalid request path', code: 'invalid_path', status: 400 } }));
+      return;
+    }
+  }
   if (process.env.SKGW_REQLOG) { console.log("[REQLOG]", req.method, req.url); }
+
+  // Authentication is disabled by default. Once either boundary is enabled,
+  // only an explicit public allowlist can run without credentials. Admin uses
+  // a separate operator registry, so a forwarding proxy cannot confer trust by
+  // making a remote socket appear loopback-local.
+  if (clientAuthenticator || operatorAuthenticator) {
+    const routeAuth = classifyAuthenticationRoute(req.method, req.url);
+    if (routeAuth.kind === 'invalid') {
+      res.writeHead(400, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+      res.end(JSON.stringify({ error: { message: 'Invalid request path', code: 'invalid_path', status: 400 } }));
+      return;
+    }
+    if (routeAuth.kind !== 'public') {
+      const isAdmin = routeAuth.kind === 'admin';
+      const authenticator = isAdmin ? operatorAuthenticator : clientAuthenticator;
+      const authConfig = isAdmin ? config.operator_auth : config.client_auth;
+      if (!authenticator) {
+        siemHook({ ts: new Date().toISOString(), event: isAdmin ? 'operator_auth.denied' : 'client_auth.denied', reason: 'boundary_unavailable', status: 403, path: routeAuth.path });
+        res.writeHead(403, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+        res.end(JSON.stringify({ error: { message: 'Authentication boundary unavailable', code: 'authentication_unavailable', status: 403 } }));
+        return;
+      }
+      const contentLength = Number(req.headers['content-length'] ?? 0);
+      const tooLarge = !Number.isFinite(contentLength) || contentLength < 0 || contentLength > authConfig.max_request_body_bytes;
+      const checked = tooLarge ? { ok: false, reason: 'request_too_large' } : authenticator.authenticate(req.headers);
+      if (!checked.ok) {
+        const allowed = authenticator.denialAllowed();
+        const status = tooLarge ? 413 : (allowed ? 401 : 429);
+        const code = tooLarge ? 'request_too_large' : (allowed ? 'client_auth_denied' : 'client_auth_rate_limited');
+        siemHook({ ts: new Date().toISOString(), event: isAdmin ? 'operator_auth.denied' : 'client_auth.denied', reason: checked.reason, status, path: routeAuth.path });
+        res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+        res.end(JSON.stringify({ error: { message: tooLarge ? 'Request body exceeds configured limit' : 'Client authentication failed', code, status } }));
+        return;
+      }
+      if (isAdmin) {
+        req.operator_identity = checked.identity;
+        req.identity = { ...checked.identity, method: 'operator_auth' };
+        req.agent_id = checked.identity.agent_id;
+      }
+      else {
+        req.identity = checked.identity;
+        req.agent_id = checked.identity.agent_id;
+        req.headers['x-agent-id'] = checked.identity.agent_id;
+        req.headers['x-sk-client-id'] = checked.identity.client_id;
+        req.headers['x-sk-credential-revision'] = checked.identity.credential_revision;
+      }
+      stripCallerCredentials(req.headers);
+      siemHook({ ts: new Date().toISOString(), event: isAdmin ? 'operator_auth.accepted' : 'client_auth.accepted', agent_id: checked.identity.agent_id, client_id: checked.identity.client_id, credential_revision: checked.identity.credential_revision, registry_revision: checked.identity.registry_revision, path: routeAuth.path });
+    }
+  }
 
   // ── SKWorld authorization gate (L1.8) — OFF BY DEFAULT ──
   // This ENTIRE block is skipped unless SKGATEWAY_AUTHZ_ENFORCE / config.authz.
@@ -1132,12 +1293,12 @@ export const server = http.createServer(async (req, res) => {
   // the capauth PDP, and 403 a gated-route deny before any handler runs. Public
   // routes (health/status/discovery/model-listing) pass straight through.
   if (authzEnforce) {
-    let gateIdentity = {
+    let gateIdentity = req.identity ?? {
       agent_id: req.headers["x-agent-id"] || ANONYMOUS_AGENT_ID,
       method: req.headers["x-agent-id"] ? "header" : "anonymous",
       agent: null,
     };
-    if (identityRegistry) {
+    if (!req.identity && identityRegistry) {
       try {
         gateIdentity = await extractIdentity(req, identityRegistry);
       } catch {
@@ -1168,6 +1329,36 @@ export const server = http.createServer(async (req, res) => {
   // health URL resolves against wherever the caller reached the gateway.
   if (req.url === "/.well-known/skworld-module.json" && req.method === "GET") {
     handleModuleManifest(req, res);
+    return;
+  }
+
+  // ── Operator-plane self-served facet (epic c880017b, Phase 3.4) ──
+  // /operator/v1/{healthz,readyz,explain,observe} mirror
+  // docs/OPERATOR_PLANE_REMOTE_STANDARD.md's wire contract directly off this
+  // daemon's existing port, replacing the dead-cli / advisory-only path ATLAS
+  // has had to rely on. Read-only, unauthenticated (see operator/http.mjs's
+  // module docstring for why that is safe today) GETs; act is a reserved POST
+  // stub that always 501s — see handleOperatorAct. Routing is a flat path
+  // switch (no sub-router) to match this file's existing style for every
+  // other single-purpose route above/below.
+  if (req.url === "/operator/v1/healthz" && req.method === "GET") {
+    handleOperatorHealthz(req, res);
+    return;
+  }
+  if (req.url === "/operator/v1/readyz" && req.method === "GET") {
+    handleOperatorReadyz(req, res, operatorHttpDeps);
+    return;
+  }
+  if (req.url === "/operator/v1/explain" && req.method === "GET") {
+    handleOperatorExplain(req, res);
+    return;
+  }
+  if (req.url === "/operator/v1/observe" && req.method === "GET") {
+    await handleOperatorObserve(req, res, operatorHttpDeps);
+    return;
+  }
+  if (req.url === "/operator/v1/act" && req.method === "POST") {
+    handleOperatorAct(req, res);
     return;
   }
 
@@ -1228,6 +1419,11 @@ export const server = http.createServer(async (req, res) => {
 
   // ── Dashboard redirect (future) ──
   if (req.url === "/" || req.url === "/dashboard") {
+    if (config.dashboard?.enabled !== true) {
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "Dashboard is disabled", code: 404 } }));
+      return;
+    }
     const dashboardPort = config.dashboard?.port || config.server?.dashboard_port || 18781;
     const host = req.headers.host?.split(":")[0] || "localhost";
     res.writeHead(302, { location: `http://${host}:${dashboardPort}/` });
@@ -1260,12 +1456,14 @@ export const server = http.createServer(async (req, res) => {
     try {
       const discovered = await getDiscoveredCatalog();
       const advertiseBackends = effectiveAdvertiseBackends(config.backends || {}, router);
-      const reconciled = buildModelCatalog(advertiseBackends, router, advertiseReconcileMode);
+      const excluded = excludedModelIds(config);
+      const reconciled = buildModelCatalog(advertiseBackends, router, advertiseReconcileMode, excluded);
       // mergeDiscoveredCatalog() layers the discovered provider/free/stale tags
       // onto the reconciled health/status entries and GUARANTEES every model
       // carries a non-empty provider (see src/proxy/advertise.mjs). The
       // allowlist is applied last, exactly as on /admin/models.
-      const merged = mergeDiscoveredCatalog(reconciled, discovered);
+      const merged = withoutExcludedModels(
+        mergeDiscoveredCatalog(reconciled, discovered, advertiseBackends), excluded);
       const allowlist = loadAllowlist();
       const allowed = applyAllowlist(merged, allowlist);
       // Aliases (buckets + registry roles): additive, allowlist-aware,
@@ -1287,7 +1485,8 @@ export const server = http.createServer(async (req, res) => {
     } catch (e) {
       console.warn("[skgateway] /v1/models discovery merge failed, falling back to static catalog:", e.message);
       const advertiseBackends = effectiveAdvertiseBackends(config.backends || {}, router);
-      const fallback = buildModelCatalog(advertiseBackends, router, advertiseReconcileMode);
+      const excluded = excludedModelIds(config);
+      const fallback = buildModelCatalog(advertiseBackends, router, advertiseReconcileMode, excluded);
       const allowlist = loadAllowlist();
       const allowed = applyAllowlist(fallback, allowlist);
       const aliases = allowAliases(aliasCatalogEntries(getConfig()), allowlist);
@@ -1323,8 +1522,11 @@ export const server = http.createServer(async (req, res) => {
     if (!id) { notFound(); return; }
     try {
       const discovered = await getDiscoveredCatalog();
-      const reconciled = buildModelCatalog(effectiveAdvertiseBackends(config.backends || {}, router), router, advertiseReconcileMode);
-      const merged = mergeDiscoveredCatalog(reconciled, discovered);
+      const excluded = excludedModelIds(config);
+      const advertiseBackends = effectiveAdvertiseBackends(config.backends || {}, router);
+      const reconciled = buildModelCatalog(advertiseBackends, router, advertiseReconcileMode, excluded);
+      const merged = withoutExcludedModels(
+        mergeDiscoveredCatalog(reconciled, discovered, advertiseBackends), excluded);
       const data = applyAllowlist(merged, loadAllowlist());
       const entry = data.find((m) => m.id === id);
       // Registry role (sk-default/sk-auto/sk-creative/...): a valid routing
@@ -1360,7 +1562,10 @@ export const server = http.createServer(async (req, res) => {
       // Overlay our curated cards so static models (claude/ornith, which
       // discovery never gives a card) show their real capabilities + dex
       // fields here, not just the discovered ones (model-dex work).
-      const full = applyCardOverlays(await getDiscoveredCatalog(), loadCardOverrides());
+      const full = withoutExcludedModels(
+        applyCardOverlays(await getDiscoveredCatalog(), loadCardOverrides()),
+        excludedModelIds(config),
+      );
       const allow = loadAllowlist();
       // Aliases (buckets + registry roles): additive to the admin view.
       // Buckets gated on routing.buckets_enabled; roles always advertised.
@@ -1472,6 +1677,13 @@ export const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: { message: "Admin routes are loopback only", code: 403 } }));
       return;
     }
+    if (getConfig().discovery?.enabled === false) {
+      res.writeHead(409, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        error: { message: "Model discovery is disabled", code: 409 },
+      }));
+      return;
+    }
     try {
       await refreshCatalog(getConfig());
     } catch (e) {
@@ -1492,6 +1704,71 @@ export const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ── POST /admin/models/eval?model=<id> — card P3.5, the micro-eval harness ──
+  // Runs the deterministic battery (capability-assessment.mjs: tool_call,
+  // structured_output, instruction_following, min_output_tokens) against ONE
+  // model THROUGH this gateway, and persists the result onto that model's
+  // lifecycle record, where catalog.mjs threads it back into
+  // capabilities.tool_use as `basis:'eval'`.
+  //
+  // EXPLICITLY OPERATOR-TRIGGERED, never automatic (design 6.3: "Never runs in
+  // the hot path or refresh loop"). The battery spends real completions and
+  // real latency; attaching that to the refresh loop is how a smoke test
+  // quietly becomes a benchmark nobody authorised. Loopback only, same gate as
+  // every other /admin route.
+  if (req.method === "POST" && req.url.split("?")[0] === "/admin/models/eval") {
+    if (!isLoopback(req)) {
+      res.writeHead(403, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "Admin routes are loopback only", code: 403 } }));
+      return;
+    }
+    let modelId = null;
+    try {
+      modelId = new URL(req.url, "http://127.0.0.1").searchParams.get("model");
+    } catch {
+      modelId = null;
+    }
+    if (!modelId) {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "query parameter `model` is required", code: 400 } }));
+      return;
+    }
+    try {
+      const catalog = buildCapabilityCatalog(buildServingCatalog(), { getLifecycleFn: getLifecycle });
+      const entry = catalog.find((e) => e.id === modelId);
+      if (!entry) {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: `unknown model ${modelId}`, code: 404 } }));
+        return;
+      }
+      if (!isEvalEligible(entry)) {
+        // Design 6.3 scopes the harness to free/local. An UNKNOWN tier lands
+        // here too: billing someone's paid account to discover a capability is
+        // the most expensive possible way to guess.
+        res.writeHead(409, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          error: {
+            message: "eval runs against free/local models only",
+            code: 409,
+            model: modelId,
+            sovereignty: entry.capabilities?.sovereignty ?? null,
+          },
+        }));
+        return;
+      }
+      const out = await runModelEval(modelId, {
+        chatComplete: createLoopbackChatComplete({ port }),
+      });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, ...out }));
+    } catch (e) {
+      console.warn("[skgateway] /admin/models/eval failed:", e.message);
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "eval failed", code: 500 } }));
+    }
+    return;
+  }
+
   // ── GET /admin/buckets — live per-bucket pool membership (Part 1b) ──
   // Loopback only, read-only (pattern: /admin/models/rank).
   if (req.url === "/admin/buckets" && req.method === "GET") {
@@ -1505,7 +1782,9 @@ export const server = http.createServer(async (req, res) => {
       // the live bucket request path. Raw discovery omits local/Anthropic
       // entries and carries no derived trust_zone, which made this endpoint
       // report every internal and secret pool as empty while routing disagreed.
-      const catalog = buildCapabilityCatalog(buildServingCatalog(), {
+      const cfg = getConfig();
+      const excluded = excludedModelIds(cfg);
+      const catalog = buildCapabilityCatalog(withoutExcludedModels(buildServingCatalog(), excluded), {
         getLifecycleFn: getLifecycle,
       });
       const policy = policyFromRegistry(loadRegistry());
@@ -1515,7 +1794,6 @@ export const server = http.createServer(async (req, res) => {
           .map((backend) => backend.id);
         return isEffectivelyRoutable(getLifecycle(e.id), claimers);
       };
-      const cfg = getConfig();
       const bucketsEnabled = cfg?.routing?.buckets_enabled === true;
       const all = allBuckets();
       const out = [];
@@ -1527,12 +1805,16 @@ export const server = http.createServer(async (req, res) => {
             sensitivityPolicy: policy,
             isRoutable: isRoutableFn,
           });
+          const physicalResources = new Set(members.map((m) => m.physical_resource_id));
           out.push({
             bucket: b.bucket,
             model_class: b.model_class,
             sensitivity: b.sensitivity,
             ceiling,
             members,
+            member_alias_count: members.length,
+            physical_server_count: physicalResources.size,
+            physical_resources: [...physicalResources],
             rejected,
           });
         } catch (e) {
@@ -1584,7 +1866,10 @@ export const server = http.createServer(async (req, res) => {
     try {
       // Overlay curated cards first so static models (claude/ornith) carry the
       // capabilities the ranker needs (tools/ctx), not just discovered models.
-      const full = applyCardOverlays(await getDiscoveredCatalog(), loadCardOverrides());
+      const full = withoutExcludedModels(
+        applyCardOverlays(await getDiscoveredCatalog(), loadCardOverrides()),
+        excludedModelIds(config),
+      );
       const catalog = buildRankCatalog(full);
       const allow = loadAllowlist();
       const chain = rankModels(catalog, requirements, {
@@ -1613,14 +1898,14 @@ export const server = http.createServer(async (req, res) => {
     // flag. Per-agent spend queries are exact matches, so that split one agent
     // into two keys nothing joins back together.
     const headerAgent = normalizeAgentId(req.headers["x-agent-id"]);
-    let identity = {
+    let identity = req.identity ?? {
       agent_id: headerAgent ?? ANONYMOUS_AGENT_ID,
       verified: false,
       method: headerAgent ? "header" : "anonymous",
       session_id: req.headers["x-session-id"] || null,
       fingerprint: null,
     };
-    if (identityRegistry) {
+    if (!req.identity && identityRegistry) {
       try {
         identity = await extractIdentity(req, identityRegistry);
       } catch (e) {
@@ -1659,7 +1944,17 @@ export const server = http.createServer(async (req, res) => {
 
     // Buffer the request body so we can read the model for routing.
     const chunks = [];
-    for await (const chunk of req) chunks.push(chunk);
+    let receivedBytes = 0;
+    for await (const chunk of req) {
+      receivedBytes += chunk.length;
+      if (clientAuthenticator && receivedBytes > config.client_auth.max_request_body_bytes) {
+        siemHook({ ts: new Date().toISOString(), event: 'client_auth.denied', reason: 'request_too_large', status: 413, agent_id: identity.agent_id, path: req.url });
+        res.writeHead(413, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+        res.end(JSON.stringify({ error: { message: 'Request body exceeds configured limit', code: 'request_too_large', status: 413 } }));
+        return;
+      }
+      chunks.push(chunk);
+    }
     const body = Buffer.concat(chunks);
 
     // ── Anthropic Messages FRONTEND (POST /v1/messages) ──
@@ -1846,6 +2141,9 @@ export const server = http.createServer(async (req, res) => {
       messages: parsedMessages,
       // Verified CapAuth identity (falls back to X-Agent-Id / anonymous).
       agentId: metricsAgentId,
+      // Preserve the resolved request/session identity on every typed router
+      // audit event, alongside agent and per-request correlation ids.
+      sessionId: identity.session_id || req.headers["x-session-id"] || undefined,
       // skmodels registry role/context routing (single source of truth).
       // Present => routeAndSend resolves via ~/.skcapstone/models/registry.yaml
       // (precedence context > service > role > default) before backend select.
@@ -2046,9 +2344,7 @@ export const server = http.createServer(async (req, res) => {
           // this is undefined on exactly those paths and the column stays NULL
           // meaning unobserved. That is by construction, not by a special
           // case, and it must never be widened to `|| parsedModel`.
-          modelServed: typeof parsedBody?.model === "string" && parsedBody.model
-            ? parsedBody.model
-            : undefined,
+          modelServed: result?.servedModel,
           energy: result?.energy,
           energyAttempts: result?.energyAttempts,
         });
@@ -2085,8 +2381,12 @@ process.on("SIGINT", () => shutdown("SIGINT"));
 _cfgEmitter.on("config-changed", () => {
   try {
     Object.assign(config, _cfgEmitter.current());
+    clientAuthenticator = config.client_auth?.enabled ? new ClientAuthenticator(config.client_auth) : null;
+    operatorAuthenticator = config.operator_auth?.enabled ? new ClientAuthenticator(config.operator_auth) : null;
     console.log("[skgateway] config reloaded");
   } catch (e) {
+    if (clientAuthenticator) clientAuthenticator.available = false;
+    if (operatorAuthenticator) operatorAuthenticator.available = false;
     console.error("[skgateway] config reload failed:", e.message);
   }
 });
@@ -2097,8 +2397,12 @@ server.listen(port, bind, () => {
     const backendNames = Object.keys(config.backends || {});
     console.log("[skgateway] backends: " + (backendNames.join(", ") || "default"));
     console.log("[skgateway] metrics: " + (metrics ? "enabled" : "disabled"));
-    const dashPort = config.server?.dashboard_port || 18781;
-    console.log("[skgateway] dashboard: port " + dashPort + " (coming soon)");
+    if (dashboard) {
+      const dashPort = config.dashboard?.port || config.server?.dashboard_port || 18781;
+      console.log("[skgateway] dashboard: port " + dashPort);
+    } else {
+      console.log("[skgateway] dashboard: disabled");
+    }
     // Advertise to skcapstone service discovery when present (no-op otherwise).
     try {
       if (skcapstone.registerService({ healthUrl: `http://localhost:${port}/health` })) {

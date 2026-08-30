@@ -157,9 +157,9 @@ it exists and is `0600` if you keep that backend.
 ```bash
 mkdir -p ~/.config/systemd/user
 cp scripts/skgateway.service ~/.config/systemd/user/skgateway.service
-# Set ExecStart + WorkingDirectory in the copied unit to $SKGATEWAY_DIR.
-# The EnvironmentFile line uses %h and needs no edit.
-${EDITOR:-nano} ~/.config/systemd/user/skgateway.service
+# If your checkout is NOT at /home/OPERATOR/clawd/skcapstone-repos/skgateway,
+# edit ExecStart + WorkingDirectory in the copied unit. The EnvironmentFile
+# line uses %h and needs no edit.
 loginctl enable-linger "$USER"
 systemctl --user daemon-reload
 systemctl --user enable --now skgateway.service

@@ -258,14 +258,26 @@ describe("classifyRoute is method-aware and coverage-complete", () => {
 });
 
 describe("subjectFromIdentity resolves from the credential-backed entry only", () => {
-  test("prefers fqid, then capauth_uri (scheme stripped), then agent_id", () => {
-    assert.equal(subjectFromIdentity({ agent_id: "lumina", agent: { fqid: "lumina@chef.skworld" } }), "lumina@chef.skworld");
-    assert.equal(subjectFromIdentity({ agent_id: "lumina", agent: { capauth_uri: "capauth:lumina@skworld.io" } }), "lumina@skworld.io");
-    assert.equal(subjectFromIdentity({ agent_id: "lumina", agent: null }), "lumina");
+  test("once verified, prefers fqid, then capauth_uri (scheme stripped), then agent_id", () => {
+    assert.equal(subjectFromIdentity({ agent_id: "lumina", agent: { fqid: "lumina@chef.skworld" }, verified: true }), "lumina@chef.skworld");
+    assert.equal(subjectFromIdentity({ agent_id: "lumina", agent: { capauth_uri: "capauth:lumina@skworld.io" }, verified: true }), "lumina@skworld.io");
+    assert.equal(subjectFromIdentity({ agent_id: "lumina", agent: null, verified: true }), "lumina");
   });
   test("anonymous / empty resolves to '' so the PDP denies (fail closed)", () => {
-    assert.equal(subjectFromIdentity({ agent_id: "anonymous", agent: null }), "");
-    assert.equal(subjectFromIdentity({ agent_id: "", agent: null }), "");
+    assert.equal(subjectFromIdentity({ agent_id: "anonymous", agent: null, verified: true }), "");
+    assert.equal(subjectFromIdentity({ agent_id: "", agent: null, verified: true }), "");
     assert.equal(subjectFromIdentity(null), "");
+  });
+  // SKW-AUTONOMY-E1 / card 1911481e / incident inc-37456f9f: this is the
+  // negative test the containment card requires. Before the fix, verified was
+  // never inspected here, so an unverified identity with a fully-populated
+  // registry entry (the exact shape a header or bearer claim produces) resolved
+  // a real subject string, identical to what a signed request would produce.
+  // This test fails on unfixed subjectFromIdentity() and passes after the fix.
+  test("unverified identity yields no policy-decision subject, even with a full agent match", () => {
+    assert.equal(subjectFromIdentity({ agent_id: "lumina", agent: { fqid: "lumina@chef.skworld" }, verified: false }), "");
+    assert.equal(subjectFromIdentity({ agent_id: "lumina", agent: { capauth_uri: "capauth:lumina@skworld.io" }, verified: false }), "");
+    assert.equal(subjectFromIdentity({ agent_id: "lumina", agent: { fqid: "lumina@chef.skworld" } }), ""); // verified omitted (header/bearer shape)
+    assert.equal(subjectFromIdentity({ agent_id: "lumina", agent: null, verified: false }), "");
   });
 });

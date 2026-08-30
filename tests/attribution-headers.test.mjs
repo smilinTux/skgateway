@@ -147,14 +147,16 @@ function startUpstream() {
         try { wantStream = !!JSON.parse(Buffer.concat(chunks).toString("utf8")).stream; } catch {}
         if (wantStream) {
           r.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
-          r.write('data: {"id":"c1","choices":[{"delta":{"content":"hi"}}]}\n\n');
-          r.write('data: {"id":"c1","choices":[{"delta":{}}],"usage":{"prompt_tokens":3,"completion_tokens":2}}\n\n');
+          r.write('data: {"id":"c1","model":"attrib-model","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}\n\n');
+          r.write('data: {"id":"c1","model":"attrib-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n');
+          r.write('data: {"id":"c1","model":"attrib-model","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2}}\n\n');
           r.write("data: [DONE]\n\n");
           r.end();
         } else {
           r.writeHead(200, { "content-type": "application/json" });
           r.end(JSON.stringify({
             id: "cmpl-test",
+            model: "attrib-model",
             choices: [{ message: { role: "assistant", content: "hi" } }],
             usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
           }));
@@ -354,7 +356,7 @@ function startNamedUpstream(status) {
         r.writeHead(status, { "content-type": "application/json" });
         r.end(JSON.stringify(
           status === 200
-            ? { id: "c", choices: [{ message: { role: "assistant", content: "hi" } }] }
+            ? { id: "c", model: "served-by-good", choices: [{ message: { role: "assistant", content: "hi" } }] }
             : { error: { message: "boom" } },
         ));
       });
@@ -401,7 +403,8 @@ describe("attribution headers name the SERVING attempt on a failover", () => {
 
     const h = attributionHeaders("req-failover", result);
     assert.equal(h["x-sk-backend"], "fallback", "the SERVING attempt, not the failed one");
-    assert.equal(h["x-sk-model-served"], "m");
+    assert.equal(h["x-sk-model-served"], "served-by-good");
+    assert.equal(h["x-sk-model-requested"], "m");
     assert.equal(
       h["x-sk-backend"].includes("primary"), false,
       "never a blend: one value means one backend",
@@ -418,11 +421,8 @@ describe("attribution headers name the SERVING attempt on a failover", () => {
       { "content-type": "application/json" },
       Buffer.from(JSON.stringify({ model: "asked-for" })), false, null,
     );
-    // With no candidate-level rewrite in play the two coincide, which is the
-    // ordinary case; the field is populated from the candidate rather than
-    // from request.model so that a rewriting candidate (@match, cloud
-    // fallback, registry) reports what it really served.
-    assert.equal(result.servedModel, "asked-for");
-    assert.equal(attributionHeaders("r", result)["x-sk-model-served"], "asked-for");
+    assert.equal(result.servedModel, "served-by-good");
+    assert.equal(attributionHeaders("r", result)["x-sk-model-requested"], "asked-for");
+    assert.equal(attributionHeaders("r", result)["x-sk-model-served"], "served-by-good");
   });
 });

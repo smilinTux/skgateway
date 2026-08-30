@@ -30,7 +30,7 @@ jobs:
         # package.json declares engines.node >= 20. publish.yml builds on 20, so
         # 20 is the version that actually ships; 22 is the current LTS the suite
         # is developed against.
-        node-version: ["20", "22"]
+        node-version: ["22"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

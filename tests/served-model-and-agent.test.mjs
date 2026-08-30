@@ -303,8 +303,9 @@ function startUpstream() {
         try { parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")); } catch {}
         if (parsed.stream) {
           r.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
-          r.write(`data: {"id":"c1","model":"${SERVED_ID}","choices":[{"delta":{"content":"hi"}}]}\n\n`);
-          r.write('data: {"id":"c1","choices":[{"delta":{}}],"usage":{"prompt_tokens":3,"completion_tokens":2}}\n\n');
+          r.write(`data: {"id":"c1","model":"${SERVED_ID}","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}\n\n`);
+          r.write('data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n');
+          r.write('data: {"id":"c1","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2}}\n\n');
           r.write("data: [DONE]\n\n");
           r.end();
           return;
@@ -456,26 +457,21 @@ describe("model_served and agent_id on the live gateway", () => {
     assert.ok(row, "no closed request_log row for the plain call");
     assert.equal(row.model, "a8-model", "the requested id belongs in .model");
     assert.equal(row.model_served, SERVED_ID, "the served id belongs in .model_served");
-    // The header from card 3351d25b carries the DISPATCHED model, which here
-    // still echoes the request. Asserting they differ is what proves the column
-    // is reading the response body and not that header's value.
-    assert.equal(calls.plain.headers["x-sk-model-served"], "a8-model");
-    assert.notEqual(row.model_served, calls.plain.headers["x-sk-model-served"]);
+    assert.equal(calls.plain.headers["x-sk-model-requested"], "a8-model");
+    assert.equal(calls.plain.headers["x-sk-model-served"], SERVED_ID);
+    assert.equal(row.model_served, calls.plain.headers["x-sk-model-served"]);
   });
 
-  test("NEGATIVE CONTROL: an SSE response leaves model_served NULL, never the requested id", async () => {
+  test("an SSE response records the exact served model", async () => {
     const row = await rowFor(calls.stream.headers["x-sk-req-id"]);
     assert.ok(row, "no closed request_log row for the streamed call");
     assert.match(
       calls.stream.headers["content-type"] ?? "", /event-stream/,
       "this must really be the streaming path, not a JSON response in disguise",
     );
-    assert.equal(row.model_served, null, "an unparseable body means UNOBSERVED, which is NULL");
-    assert.notEqual(row.model_served, "a8-model", "must not fall back to the requested model");
-    // The SSE frames DID name SERVED_ID, and we still do not claim it: the
-    // gateway parses the buffered body as JSON and that is what fails here. A
-    // stream-aware extraction is a separate change with its own evidence.
-    assert.notEqual(row.model_served, SERVED_ID);
+    assert.equal(row.model_served, SERVED_ID);
+    assert.equal(calls.stream.headers["x-sk-model-served"], SERVED_ID);
+    assert.equal(calls.stream.headers["x-sk-model-requested"], "a8-model");
   });
 
   test("NEGATIVE CONTROL: a JSON body with no model field leaves model_served NULL", async () => {

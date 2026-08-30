@@ -5,13 +5,13 @@
  * `routeAndSend(...)` — it does NOT use core.mjs/handleRequest. Before this
  * wiring the SIEM hook was only reachable from the unused handleRequest path,
  * so logs/audit.jsonl went dead. These tests prove the hook now fires with
- * fully-structured GatewayEvents at each lifecycle point, and that a broken
- * hook never breaks (or delays into a failure) the request.
+ * fully-structured GatewayEvents at each lifecycle point, and that an invalid
+ * event or broken configured sink fails closed rather than disappearing.
  *
  * Coverage:
  *   1. A driven request emits auth + request + response events (correct shape).
  *   2. The response event carries status, latency, and best-effort token usage.
- *   3. A throwing SIEM hook never breaks the request (200 still returned).
+ *   3. Unknown event types and failed sinks are surfaced (fail closed).
  *   4. Failover across backends emits failover + error + response events.
  *
  * Run with:  node --test tests/siem-live-hook.test.mjs
@@ -21,7 +21,7 @@ import { test, describe, before, after } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 
-import { createRouter, routeAndSend } from "../src/proxy/router.mjs";
+import { createRouteSiemEmitter, createRouter, routeAndSend } from "../src/proxy/router.mjs";
 import { EventType } from "../src/siem/events.mjs";
 
 // ─── fake upstream helpers ────────────────────────────────────────────────────
@@ -127,34 +127,51 @@ describe("SIEM live hook — happy path", () => {
   });
 });
 
-// ─── 3. a broken hook never breaks the request ────────────────────────────────
+// ─── 3. invalid evidence cannot pass silently ────────────────────────────────
 
-describe("SIEM live hook — resilience", () => {
+describe("SIEM live hook — fail-closed evidence boundary", () => {
   let up;
   before(async () => { up = await startUpstream(ok200); });
   after(async () => { await up.close(); });
 
-  test("a throwing SIEM hook does not break the request", async () => {
+  test("an unknown type is rejected before the sink and cannot pass silently", async () => {
+    let calls = 0;
+    const emit = createRouteSiemEmitter(
+      () => { calls++; },
+      { model: "m", agentId: "lumina", sessionId: "sess-negative" },
+      "request-negative",
+    );
+
+    await assert.rejects(
+      () => emit("not_in_frozen_enum", { outcome: "must-not-write" }),
+      /Unknown event type: "not_in_frozen_enum"/,
+    );
+    assert.equal(calls, 0, "type validation must happen before sink invocation");
+  });
+
+  test("a rejected sink prevents route success instead of being swallowed", async () => {
     const router = createRouter({
       backends: { fake: { url: up.url, auth_type: "none", models: ["*"], priority: 1 } },
       siem_log: false,
     });
-
     let calls = 0;
-    const throwingHook = () => { calls++; throw new Error("siem down"); };
+    const before = up.requests.length;
+    const failedSink = async () => { calls++; throw new Error("siem sink down"); };
 
-    const result = await routeAndSend(
-      router,
-      { model: "m" },
-      "/v1/chat/completions", "POST",
-      { "content-type": "application/json" },
-      Buffer.from(JSON.stringify({ model: "m" })),
-      false,
-      throwingHook,
+    await assert.rejects(
+      () => routeAndSend(
+        router,
+        { model: "m", agentId: "lumina", sessionId: "sess-sink-fail" },
+        "/v1/chat/completions", "POST",
+        { "content-type": "application/json" },
+        Buffer.from(JSON.stringify({ model: "m" })),
+        false,
+        failedSink,
+      ),
+      /siem sink down/,
     );
-
-    assert.equal(result.status, 200, "request must succeed despite hook throwing");
-    assert.ok(calls > 0, "hook should have been attempted");
+    assert.equal(calls, 1, "the first required sink failure must surface");
+    assert.equal(up.requests.length, before, "failure occurs at pre-dispatch auth evidence");
   });
 
   test("a non-function hook is a safe no-op", async () => {

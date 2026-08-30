@@ -51,7 +51,7 @@ const CONFIG_YAML = [
   '    priority: 1',
   '    models: [ornith-1.5-9b]',
   '  chiap08-qwen38:',
-  '    url: http://100.81.238.58:11439/v1',
+  '    url: http://TAILNET_HOST:11439/v1',
   '    auth_type: none',
   '    priority: 2',
   '    models: [qwen3.8-27b-huihui-abliterated-q4_k_m, qwen3.8-27b-ud-q5_k_xl, qwen3.8-27b, qwen38-abliterated]',
