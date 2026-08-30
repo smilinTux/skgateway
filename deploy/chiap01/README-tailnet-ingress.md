@@ -55,17 +55,20 @@ Backends (chiap08-qwen38, chiap01-qwen38)
 
 | File | Target Path | SHA-256 |
 |------|-------------|---------|
-| skgateway.shared-shadow.yaml | /etc/sklegal/skgateway/shared-shadow.yaml | a1daf4452261a36169b9a1f0d455bc4c774cf917293338c335af67778bf15e3e |
-| skgateway-shared-tailnet.socket | /etc/systemd/system/skgateway-shared-tailnet.socket | c950e7bdaea22d27f471513a75f31e3ebdc231f14d893d990c1a041a6f5760a2 |
-| skgateway-shared-tailnet.service | /etc/systemd/system/skgateway-shared-tailnet.service | dffe38774797da9331c66d0753da875a17c97ccfa5ce2755cab3003112fc0acb |
-| skgateway-shared-shadow.service | /etc/systemd/system/skgateway-shared-shadow.service | 839d7d542503ddee5fc9062104beefab95007ed4adaceb4babcb51de1947dc57 |
+| skgateway.shared-shadow.yaml | /etc/sklegal/skgateway/shared-shadow.yaml | abd1a4615ff7065f76265a1ae74e37f58521dfb58810e1a4c4b2762597b40fc8 |
+
+The other units (socket, service) are tracked by git for content integrity.
+The shadow.yaml hash is also stored in `skgateway.shared-shadow.yaml.sha256`,
+and the tailnet proxy service verifies it before starting with ExecStartPre,
+so a tampered config is detected and the service refuses to start.
 
 ## Deployment Procedure
 
 ### 1. Verify Profile Hash
 
 ```bash
-# Expected: a1daf4452261a36169b9a1f0d455bc4c774cf917293338c335af67778bf15e3e
+# Expected: abd1a4615ff7065f76265a1ae74e37f58521dfb58810e1a4c4b2762597b40fc8
+cd deploy/chiap01 && sha256sum -c skgateway.shared-shadow.yaml.sha256
 ```
 
 ### 2. Install Configuration Files

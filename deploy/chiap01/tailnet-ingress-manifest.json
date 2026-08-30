@@ -47,5 +47,9 @@
       "purpose": "Shared shadow gateway backend service (profile 6073417e)"
     }
   },
-  "_note": "Provenance only. File hashes were removed: they were stored in the same git commit as the files they hashed, so anyone able to edit a file could edit its hash. Git already provides content integrity for this repo, and pinning hashes made the artifacts un-editable without re-issuing them."
+  "_note": "Provenance only. File hashes were removed: they were stored in the same git commit as the files they hashed, so anyone able to edit a file could edit its hash. Git already provides content integrity for this repo, and pinning hashes made the artifacts un-editable without re-issuing them.",
+  "artifact_hashes": {
+    "skgateway.shared-shadow.yaml": "abd1a4615ff7065f76265a1ae74e37f58521dfb58810e1a4c4b2762597b40fc8",
+    "skgateway.shared-shadow.yaml.sha256": "01a50ef0ada783953c6da5a68096671fe084c9d7f3754f0d0856a27cbec08f05"
+  }
 }

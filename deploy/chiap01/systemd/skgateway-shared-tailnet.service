@@ -61,6 +61,7 @@ TimeoutStopSec=10s
 ## used Accept=yes (systemd accepts and hands over the connection) while socat
 ## was told TCP4-LISTEN:0 (open a NEW listener on a random port), so the
 ## accepted connection was never served and the listener nothing dialled.
+ExecStartPre=/usr/bin/sha256sum -c /etc/sklegal/skgateway/shared-shadow.yaml.sha256
 ExecStart=/usr/lib/systemd/systemd-socket-proxyd --exit-idle-time=300s 127.0.0.1:28880
 
 ## Environment
