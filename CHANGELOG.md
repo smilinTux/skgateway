@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Bucket resolution is now tool-aware. `resolveBucket()` gated only on lifecycle
+  routability, trust zone and size class, and size is a prior, not proof: a
+  model can clear the L floor and still emit no `tool_calls` at all. Measured on
+  this fleet 2026-08-29, `sk-*` buckets could reach a reward model that cannot
+  chat, a calibration model that never emits tool calls, translation models that
+  return HTTP 400, and a model that calls tools cleanly but scores 0/3 on every
+  graded task. Members are now filtered on demonstrated tool-use capability, and
+  a micro-eval harness (`src/ranking/eval.mjs`) grades that capability rather
+  than inferring it from parameter count.
+
 - Five SKGateway bucket and sensitivity decision points now emit typed SIEM
   `EventType` values instead of ad-hoc strings, and an unknown event type fails
   closed rather than being written as evidence. SIEM sink calls are awaited so a

@@ -58,7 +58,17 @@ import {
   policyFromRegistry,
   TRUST_ZONES,
 } from "../policy/sensitivity.mjs";
-import { parseBucketId, resolveBucket, orderMembersByCost, validateFamilyPreference, applyFamilyPreference, selectMember, looksLikeBucketAttempt, allBuckets } from "../policy/buckets.mjs";
+import {
+  parseBucketId,
+  resolveBucket,
+  orderMembersByCost,
+  validateFamilyPreference,
+  applyFamilyPreference,
+  selectMember,
+  requiresToolUse,
+  looksLikeBucketAttempt,
+  allBuckets,
+} from "../policy/buckets.mjs";
 import { codexPurityProblems } from "../policy/codex-purity.mjs";
 
 // sk-auto routing decision cache (TTL+LRU); keyed by request fingerprint + config epoch.
@@ -2369,10 +2379,24 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
     policy = undefined;
   }
 
+  // A caller that sent `tools` must not be handed a model that cannot hold a
+  // tool call. buckets.mjs gates on size class, and size is a PRIOR: on this
+  // fleet `nvidia/ising-calibration-1.5-31b` clears the class floor and still
+  // answers in prose with no tool_calls. Parsing is FAIL-SOFT on purpose, an
+  // unreadable body simply does not narrow the pool, so a malformed request
+  // degrades to today's behaviour instead of 503ing.
+  let wantsTools = false;
+  try {
+    wantsTools = requiresToolUse(JSON.parse(Buffer.from(body).toString("utf-8")));
+  } catch {
+    wantsTools = false;
+  }
+
   const { members, rejected, ceiling } = resolveBucket({
     bucket: addr,
     catalog,
     sensitivityPolicy: policy,
+    requireToolUse: wantsTools,
     isRoutable: (e) => {
       const claimers = typeof router.getBackends === "function"
         ? router.getBackends()
@@ -2393,6 +2417,7 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
     ceiling,
     eligible: members.length,
     rejected: rejected.length,
+    require_tool_use: wantsTools,
   }, {});
 
   if (members.length === 0) {

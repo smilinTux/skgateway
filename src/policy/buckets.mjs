@@ -323,6 +323,49 @@ export function meetsClassFloor(entry, floorClass) {
 }
 
 /**
+ * Does this REQUEST need a tool-capable model? True only for a non-empty
+ * `tools` array on the OpenAI request body.
+ *
+ * Deriving the requirement from the request is what keeps the gate below from
+ * shrinking availability: traffic that never asked for tools keeps the whole
+ * fleet. Card P4.3's `x-sk-require: tool_use` header is the EXPLICIT form of
+ * the same requirement and is unimplemented (it depends on the `@match`
+ * pipeline, `routing.match_enabled`, which is off). This covers the case that
+ * matters today, where the caller already told us by sending tools.
+ *
+ * @param {object|null} requestBody parsed OpenAI request body
+ * @returns {boolean}
+ */
+export function requiresToolUse(requestBody) {
+  const tools = requestBody?.tools;
+  return Array.isArray(tools) && tools.length > 0;
+}
+
+/**
+ * Tool-call evidence for one catalog entry, measurement over declaration.
+ *
+ * A card `supported_parameters: [tools]` is a CLAIM by the provider. A probe
+ * result is evidence. They disagree in practice: on this fleet 2026-08-29
+ * `mistralai/mistral-nemotron` emits tool_calls but fails every reasoning
+ * probe, while `nvidia/ising-calibration-1.5-31b` answers in prose and never
+ * emits a tool_call at all. So a measured failure overrides a claiming card,
+ * and an unknown is NOT treated as capable: absence of evidence is the same
+ * discipline meetsClassFloor() already applies to an unknown size class.
+ *
+ * @param {object} entry merged catalog entry
+ * @returns {{ok: boolean, basis: string}}
+ */
+export function toolUseEvidence(entry) {
+  const measured = entry?.lifecycle?.measured_capabilities || entry?.measured_capabilities || null;
+  const status = measured?.tool_call?.status || null;
+  if (status === 'fail') return { ok: false, basis: 'measured tool_call fail' };
+  if (status === 'pass') return { ok: true, basis: 'measured tool_call pass' };
+  const score = entry?.capabilities?.tool_use?.score;
+  if (score >= 1) return { ok: true, basis: 'card declares tools' };
+  return { ok: false, basis: score === 0 ? 'card declares no tools' : 'no tool_use signal' };
+}
+
+/**
  * Resolve a bucket to its eligible members, with the rejects and why.
  *
  * Returns rejects because an empty pool must produce a 503 an operator can act
@@ -334,9 +377,11 @@ export function meetsClassFloor(entry, floorClass) {
  * @param {Array<object>} args.catalog merged catalog entries
  * @param {Record<string,number>} [args.sensitivityPolicy]
  * @param {(e:object)=>boolean} [args.isRoutable] lifecycle gate, injected
+ * @param {boolean} [args.requireToolUse] when the caller sent a `tools` array,
+ *   admit only models with affirmative tool-call evidence
  * @returns {{members: Array<object>, rejected: Array<object>, ceiling: number}}
  */
-export function resolveBucket({ bucket, catalog = [], sensitivityPolicy, isRoutable = () => true }) {
+export function resolveBucket({ bucket, catalog = [], sensitivityPolicy, isRoutable = () => true, requireToolUse = false }) {
   const { ceiling } = resolveZoneCeiling(bucket.sensitivity, sensitivityPolicy);
   const members = [];
   const rejected = [];
@@ -363,6 +408,13 @@ export function resolveBucket({ bucket, catalog = [], sensitivityPolicy, isRouta
         reason: `class ${floor.modelClass || 'unknown'} (${floor.basis}) below floor ${bucket.model_class}`,
       });
       continue;
+    }
+    if (requireToolUse) {
+      const tools = toolUseEvidence(entry);
+      if (!tools.ok) {
+        rejected.push({ id: entry.id, reason: `request sent tools; ${tools.basis}` });
+        continue;
+      }
     }
     members.push({
       id: entry.id,

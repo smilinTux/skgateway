@@ -628,6 +628,147 @@ overrides:
     latency_class: batch
     notes: "slow (~40s), batch/cron use"
 
+  # ── NIM fleet, tool-call capability MEASURED 2026-08-29 ──────────────────
+  # Probe: a real `tools` request (get_weather, city=Paris) plus three graded
+  # tasks (multi-step clock arithmetic, letter counting, strict-JSON with a
+  # negation). Before this block 20 of 21 NIM models derived
+  # `tool_use=0 (heuristic)`, i.e. no signal at all, which is indistinguishable
+  # from "cannot" to resolveBucket's tool gate. `supported_parameters: [tools]`
+  # below is EVIDENCE (the model emitted a well-formed tool_call), not a
+  # provider claim. Scores in the notes are the 3-task result, a separate axis
+  # from tool support: mistral-nemotron calls tools correctly and still scores
+  # 0/3, so it is tool-capable and a poor reasoner at the same time.
+  openai/gpt-oss-120b:
+    display_name: "GPT-OSS 120B"
+    org: OpenAI (open weights, NVIDIA NIM)
+    supported_parameters: [tools, tool_choice]
+    tier: free-remote
+    notes: "measured 2026-08-29: tools OK, 3/3, 4.4s. Fastest 3/3 model in the whole survey, free or paid."
+  nvidia/nemotron-3-super-120b-a12b:
+    display_name: "Nemotron 3 Super 120B-A12B"
+    org: NVIDIA
+    supported_parameters: [tools, tool_choice]
+    tier: free-remote
+    notes: "measured 2026-08-29: tools OK, 3/3, 11.7s"
+  nvidia/nemotron-3-ultra-550b-a55b:
+    display_name: "Nemotron 3 Ultra 550B-A55B"
+    org: NVIDIA
+    supported_parameters: [tools, tool_choice]
+    tier: free-remote
+    notes: "measured 2026-08-29: tools OK, 3/3, 13.7s on NIM. Same model via the OpenRouter :free route took 85s; prefer NIM."
+  nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:
+    display_name: "Nemotron 3 Nano Omni 30B-A3B (reasoning)"
+    org: NVIDIA
+    supported_parameters: [tools, tool_choice, reasoning]
+    tier: free-remote
+    notes: "measured 2026-08-29: tools OK, 3/3, 12.6s"
+  nvidia/nemotron-3-nano-30b-a3b:
+    display_name: "Nemotron 3 Nano 30B-A3B"
+    org: NVIDIA
+    supported_parameters: [tools, tool_choice]
+    tier: free-remote
+    notes: "measured 2026-08-29: tools OK, 3/3, 15.6s"
+  nvidia/nemotron-3.5-lightning-30b-a3b:
+    display_name: "Nemotron 3.5 Lightning 30B-A3B"
+    org: NVIDIA
+    supported_parameters: [tools, tool_choice]
+    tier: free-remote
+    notes: "measured 2026-08-29: tools OK, 3/3, 18.4s"
+  meta/llama-3.2-90b-vision-instruct:
+    display_name: "Llama 3.2 90B Vision Instruct"
+    org: Meta
+    supported_parameters: [tools, tool_choice]
+    modality: "text+image->text"
+    tier: free-remote
+    latency_class: batch
+    notes: "measured 2026-08-29: tools OK, 2/3 (missed letter counting), 45.3s"
+  meta/llama-3.2-11b-vision-instruct:
+    display_name: "Llama 3.2 11B Vision Instruct"
+    org: Meta
+    supported_parameters: [tools, tool_choice]
+    modality: "text+image->text"
+    tier: free-remote
+    notes: "measured 2026-08-29: tools OK but only 1/3. Small vision model; fine for captioning, not for graded work."
+  moonshotai/kimi-k3:
+    display_name: "Kimi K3"
+    org: Moonshot AI
+    supported_parameters: [tools, tool_choice]
+    tier: free-remote
+    notes: "measured 2026-08-29: tools OK, 1/3 (two tasks errored), 8.2s"
+  minimaxai/minimax-m3:
+    display_name: "MiniMax M3"
+    org: MiniMax
+    supported_parameters: [tools, tool_choice]
+    tier: free-remote
+    latency_class: batch
+    notes: "measured 2026-08-29: tools OK, 2/3 (missed clock arithmetic), 117s"
+  poolside/laguna-xs-2.1:
+    display_name: "Laguna XS 2.1"
+    org: Poolside
+    supported_parameters: [tools, tool_choice]
+    tier: free-remote
+    latency_class: batch
+    notes: "measured 2026-08-29: tools OK, 2/3, 77.7s"
+  google/diffusiongemma-26b-a4b-it:
+    display_name: "DiffusionGemma 26B-A4B IT"
+    org: Google
+    supported_parameters: [tools, tool_choice]
+    tier: free-remote
+    latency_class: batch
+    notes: "measured 2026-08-29: tools OK, 2/3, 152s"
+  deepseek-ai/deepseek-v4-flash-0731:
+    display_name: "DeepSeek V4 Flash (0731)"
+    org: DeepSeek
+    supported_parameters: [tools, tool_choice]
+    tier: free-remote
+    latency_class: batch
+    notes: "measured 2026-08-29: tools OK, 3/3, but 173s. Full marks, batch only despite the name."
+  deepseek-ai/deepseek-v4-pro-0813:
+    display_name: "DeepSeek V4 Pro (0813)"
+    org: DeepSeek
+    supported_parameters: [tools, tool_choice]
+    tier: free-remote
+    latency_class: batch
+    notes: "measured 2026-08-29: tools OK, 1/3, 616s. Slowest model measured; batch only."
+  meta/muse-glimmer-30b:
+    display_name: "Muse Glimmer 30B"
+    org: Meta
+    supported_parameters: [tools, tool_choice]
+    tier: free-remote
+    latency_class: batch
+    notes: "measured 2026-08-29: tools OK, 3/3, 221s"
+  mistralai/mistral-nemotron:
+    display_name: "Mistral Nemotron"
+    org: Mistral / NVIDIA
+    supported_parameters: [tools, tool_choice]
+    tier: free-remote
+    notes: "measured 2026-08-29: tools OK, 0/3 on every graded task, 4.2s. Tool-capable, weak reasoner: fine as a tool dispatcher, not for judgement."
+
+  # Measured NOT tool-capable, or not a chat model. Deliberately NO
+  # `supported_parameters: [tools]`, so resolveBucket's tool gate excludes them
+  # from any request that carries tools. They stay routable for plain chat.
+  nvidia/ising-calibration-1.5-31b:
+    display_name: "Ising Calibration 1.5 31B"
+    org: NVIDIA
+    tier: free-remote
+    notes: "measured 2026-08-29: NO tool_calls, answers in prose. Clears the L class floor on size alone, which is exactly the trap the bucket tool gate closes."
+  nvidia/riva-translate-4b-instruct-v1.1:
+    display_name: "Riva Translate 4B Instruct v1.1"
+    org: NVIDIA
+    tier: free-remote
+    notes: "measured 2026-08-29: HTTP 400 on a chat/tools request. Translation model, not a chat model."
+  nvidia/riva-translate-4b-instruct-v2:
+    display_name: "Riva Translate 4B Instruct v2"
+    org: NVIDIA
+    tier: free-remote
+    notes: "measured 2026-08-29: HTTP 400 on a chat/tools request. Translation model, not a chat model."
+  google/gemma-4-31b-it:
+    display_name: "Gemma 4 31B IT"
+    org: Google
+    tier: free-remote
+    latency_class: batch
+    notes: "measured 2026-08-29: probe timed out at 800s, tool support UNKNOWN not disproven. Left undeclared so the tool gate excludes it until someone re-measures."
+
 # ─────────────────────────────────────────────────────────────────────────
 # providers: per-PROVIDER trust posture (card N2, design doc section 4.3).
 # Sibling of `overrides:` above, not nested under it: this describes WHO
