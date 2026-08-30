@@ -24,6 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The CapAuth authorization service now accepts systemd's exact credential file
+  mode. `LoadCredential=` installs credentials `0400` root-owned into
+  `$CREDENTIALS_DIRECTORY`, and the stricter-or-equal check rejected that exact
+  mode, so the PDP failed to load its own credential under the unit that
+  provisions it (card d9a5ea28).
+
 - Added the chiap01 B70 Qwen3.8 server as an independent replica of the canonical
   chiap08 logical model, with separate admission limits of two and three. The
   same-model router now uses an eligible replica with free capacity before
