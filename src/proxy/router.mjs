@@ -3589,6 +3589,27 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         } else {
           res = await sendUpstream(upstreamPath, method, forwardHeaders, attemptBody, targetUrl, attemptTimeoutMs, abortSignal);
         }
+      } else if (isCodexBackend(backend)) {
+        // Translate OpenAI chat-completions -> Codex Responses API (OpenAI
+        // *subscription* inference; see codex-adapter.mjs). Same contract as
+        // the Anthropic branch above: a translatable body is converted and the
+        // buffered upstream SSE answer converted back (to SSE for the client
+        // when the client asked stream:true); anything else passes through.
+        const tr = toCodexRequest(attemptBody);
+        if (tr) {
+          if (tr.dropped.length) {
+            console.warn(
+              `[router] codex ${backendId}: dropped unsupported params [${tr.dropped.join(",")}] ` +
+                `for model=${candidateModel}`,
+            );
+          }
+          const cHeaders = { ...forwardHeaders, ...tr.headers };
+          delete cHeaders["content-length"];
+          const raw = await sendUpstream(tr.path, method, cHeaders, tr.body, targetUrl, backend.timeout_ms, abortSignal);
+          res = raw?.cancelled ? raw : fromCodexResponse(raw, candidateModel, tr.clientStream);
+        } else {
+          res = await sendUpstream(upstreamPath, method, forwardHeaders, attemptBody, targetUrl, backend.timeout_ms, abortSignal);
+        }
       } else {
         res = await sendUpstream(upstreamPath, method, forwardHeaders, attemptBody, targetUrl, attemptTimeoutMs, abortSignal);
       }
