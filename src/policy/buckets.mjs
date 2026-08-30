@@ -489,7 +489,12 @@ export function applyFamilyPreference(members, preference) {
   const unmatched = [];
   const seenIds = new Set();
 
-  for (const pref of preference) {
+  for (const rawPref of preference) {
+    // validateFamilyPreference() already lowercases, but applyFamilyPreference
+    // is exported and called directly (tests, and any future caller that has a
+    // preference from somewhere other than the header). Normalise here too so
+    // matching is case-insensitive regardless of who calls it.
+    const pref = typeof rawPref === 'string' ? rawPref.toLowerCase() : rawPref;
     for (const member of members) {
       if (seenIds.has(member.id)) continue;
 
