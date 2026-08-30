@@ -101,17 +101,26 @@ export function classifyRoute(method, url) {
 
 /**
  * Resolve the PDP subject from the resolved identity, from the credential-backed
- * registry entry only (never from raw request input). Preference:
+ * registry entry only (never from raw request input), and only when the identity
+ * was cryptographically verified. Preference, once verified:
  *   1. agent.fqid                       — the sovereign <agent>@<operator>.<realm>
  *   2. agent.capauth_uri (strip scheme) — capauth:lumina@skworld.io → lumina@skworld.io
  *   3. agent_id                          — bare name, last resort
- * Anonymous / unresolved → "" so the PDP denies on an unknown subject (fail closed).
  *
- * @param {{ agent_id?: string, agent?: object }} identity
+ * An identity with verified !== true yields "" (SKW-AUTONOMY-E1, card 1911481e,
+ * incident inc-37456f9f): an X-Agent-Id header or bearer token resolves an
+ * agent_id and even a registry entry, but extractIdentity() only ever sets
+ * verified true on the capauth method after a successful cryptographic PGP
+ * check, so before this fix an unauthenticated header claim produced the same
+ * policy-decision subject as a signed one. Anonymous, unresolved, and unverified
+ * all collapse to "" so the PDP denies on an unknown subject (fail closed).
+ *
+ * @param {{ agent_id?: string, agent?: object, verified?: boolean }} identity
  * @returns {string}
  */
 export function subjectFromIdentity(identity) {
   if (!identity) return "";
+  if (identity.verified !== true) return "";
   const agent = identity.agent || null;
   if (agent && typeof agent.fqid === "string" && agent.fqid.trim()) return agent.fqid.trim();
   if (agent && typeof agent.capauth_uri === "string" && agent.capauth_uri.trim()) {

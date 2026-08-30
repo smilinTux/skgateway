@@ -17,6 +17,7 @@
 // and because parseNvidia/parseOpenRouterFree below are the pre-adapter
 // functions whose output shape those tests pin.
 import { isChatModelId } from './discovery/classify.mjs';
+import { isCatalogDisabledBackend } from './proxy/advertise.mjs';
 
 /** Kept as a named export: tests/discovery.test.mjs pins this exact behavior. */
 export const isChatModel = isChatModelId;
@@ -467,6 +468,7 @@ export function servingConfigModels(backends = {}) {
   const out = [];
   if (!backends || typeof backends !== 'object') return out;
   for (const [name, b] of Object.entries(backends)) {
+    if (isCatalogDisabledBackend(b)) continue;
     const paidBackend = isAnthropicBackend(b) || isCodexBackend(b) || isZaiBackend(b);
     for (const id of (b && b.models) || []) {
       if (typeof id !== 'string' || id.includes('*')) continue;
@@ -558,6 +560,21 @@ function unionEntry(serving, discovered) {
  * @param {Record<string,object>} [opts.overrides] card overlay; omit to read the committed file
  * @returns {Array<object>} merged catalog entries, overlay applied
  */
+export function filterServingCacheModels(models = [], backends = {}) {
+  if (!Array.isArray(models) || !backends || typeof backends !== 'object' || Array.isArray(backends)) {
+    return [];
+  }
+  const disabled = new Set(
+    Object.entries(backends)
+      .filter(([, backend]) => isCatalogDisabledBackend(backend))
+      .map(([id]) => id),
+  );
+  return models.filter((model) =>
+    model && typeof model.id === 'string' &&
+    typeof model.provider === 'string' && !disabled.has(model.provider),
+  );
+}
+
 export function buildServingCatalog(opts = {}) {
   let cached = [];
   try {
@@ -569,11 +586,14 @@ export function buildServingCatalog(opts = {}) {
   }
 
   let serving = [];
+  let catalogBackends = {};
   if (opts.backends !== undefined) {
-    serving = servingConfigModels(opts.backends);
+    catalogBackends = opts.backends;
+    serving = servingConfigModels(catalogBackends);
   } else {
     try {
-      serving = servingConfigModels(getConfig().backends || {});
+      catalogBackends = getConfig().backends || {};
+      serving = servingConfigModels(catalogBackends);
     } catch (err) {
       // getConfig() throws when no config has been loaded (every unit test
       // that never boots the gateway) and _readAndBuild throws on an invalid
@@ -584,6 +604,8 @@ export function buildServingCatalog(opts = {}) {
       serving = [];
     }
   }
+
+  cached = filterServingCacheModels(cached, catalogBackends);
 
   const byId = new Map();
   for (const m of serving) {

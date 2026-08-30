@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Model catalog rows now carry broad family and separately declared cost-tier
+  metadata. Bucket administration exposes family on each member, while trust
+  zones remain derived only from sovereignty and provider retention posture.
+  Free remote tiers are documented with the trains-on-content correlation from
+  provider records verified 2026-08-15 rather than described as merely cheap.
+
+- Requires Node 22. Node 20 left security support in April 2026, and the repo
+  still declared , pinned  to 20, and tested a 20/22
+  matrix while the deployment unit executed 20. Three runtimes were reachable on
+  the gateway host at once (unit v20, shell v22, npm v26), which is how
+   was built against one and run under another, silently
+  disabling all request telemetry. CI now tests 22 only.
+
+### Fixed
+
+- The CapAuth authorization service now accepts systemd's exact credential file
+  mode. `LoadCredential=` installs credentials `0400` root-owned into
+  `$CREDENTIALS_DIRECTORY`, and the stricter-or-equal check rejected that exact
+  mode, so the PDP failed to load its own credential under the unit that
+  provisions it (card d9a5ea28).
+
+- Added the chiap01 B70 Qwen3.8 server as an independent replica of the canonical
+  chiap08 logical model, with separate admission limits of two and three. The
+  same-model router now uses an eligible replica with free capacity before
+  queueing, without changing trust-zone or sensitivity ceilings.
+
+- A metrics collector that is explicitly enabled in config and then fails to load
+  is now reported as a degradation instead of being logged as `(optional)` at info
+  level. On 2026-08-27 an `npm ci` rebuilt `better-sqlite3` against a different
+  Node than the systemd unit runs, the collector threw, and the gateway came up
+  serving traffic with metrics off. Every `request_log`, energy and cost row
+  stopped being written and nothing alerted, because from the outside the gateway
+  was healthy: it routed, returned 200s, and `/queue` looked normal. The message
+  now names exactly what stops being written, detects the native-module ABI
+  mismatch specifically and gives the actionable remedy (rebuild against the same
+  Node the service executes), and `SKGATEWAY_REQUIRE_METRICS=1` makes the process
+  refuse to start rather than degrade.
+
+### Added
+
+- `.nvmrc` pinning Node 20, matching the CI matrix floor and the version the
+  deployed unit actually executes. Three different Node versions were resolvable
+  on the deployment host (unit v20, shell v22, npm v26), which is what produced
+  the ABI mismatch above.
+
 ### Added
 
 - SKGateway now serves its own operator facet on the daemon's existing port:
@@ -22,6 +69,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   healthy, and one failing data source degrades only its own condition.
 
 ### Fixed
+
+- Made a declared `backends` mapping authoritative instead of deep-merging
+  omitted built-in backends back into service. Operators can also use the
+  schema-valid `enabled: false` tombstone. Removed backends are excluded from
+  discovery, advertisement, and bucket inputs, while orphan direct or
+  `reg:<backend>` pooling references now fail startup validation.
+
+- Cost-rank bucket members only after capability and trust eligibility, rotate
+  equal-cost peers, and bound bucket completion liveness so a listed but hung
+  backend fails over instead of holding the route. The fleet has no declared
+  S-class model, so `sk-s-*` remains explicitly a capability floor pool.
 
 - Honor dashboard and metrics disablement during startup. Disabled qualification
   configurations no longer create the dashboard listener, initialize the metrics

@@ -7,12 +7,18 @@
  *   - fail-safe degradation (invalid signature / token → anonymous, never throws)
  *   - request enrichment (agent_id stamped, SIEM event carries verified flag)
  *   - middleware auth gate (require_agent_id opt-in)
+ *   - end-to-end PGP verification with openpgp installed (SKW-AUTONOMY-E1, card
+ *     1911481e): proves the openpgp import path in verifyPgpSignature() is
+ *     reachable and produces a real cryptographic result, not just the
+ *     structural fallback.
  *
  * Run with:  node --test tests/capauth-identity.test.mjs
  */
 
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import * as openpgp from "openpgp";
 
 import {
   loadAgentRegistry,
@@ -149,6 +155,98 @@ describe("extractIdentity", () => {
     const reg = mkRegistry();
     const id = await extractIdentity(mkReq({ "x-agent-id": "opus", "x-session-id": "sess-42" }), reg);
     assert.equal(id.session_id, "sess-42");
+  });
+});
+
+// ─── end-to-end PGP verification (openpgp installed) ───────────────────────────
+
+/**
+ * Recompute the exact challenge buildChallenge() builds inside capauth.mjs:
+ * sha256(METHOD + PATH + agentId + timestamp). Not exported (private helper),
+ * so the test reconstructs it from the same public contract documented on
+ * extractIdentity() and buildChallenge()'s own JSDoc.
+ */
+function reconstructChallenge(method, path, agentId, timestamp) {
+  return createHash("sha256").update(`${method}${path}${agentId}${timestamp}`).digest();
+}
+
+describe("extractIdentity CapAuth verification, openpgp installed (SKW-AUTONOMY-E1 / card 1911481e)", () => {
+  test("a fixture-signed request verifies end to end through verifyPgpSignature", async () => {
+    const { privateKey, publicKey } = await openpgp.generateKey({
+      type: "ecc",
+      curve: "ed25519Legacy",
+      userIDs: [{ name: "jarvis-fixture", email: "jarvis@skworld.test" }],
+      format: "armored",
+    });
+
+    const reg = mkRegistry({ agents: [{ name: "jarvis", public_key_armor: publicKey }] });
+
+    const method = "POST";
+    const url = "/v1/chat/completions";
+    const agentId = "jarvis";
+    const timestamp = String(Math.floor(Date.now() / 1000));
+    const challenge = reconstructChallenge(method, url, agentId, timestamp);
+
+    const signingKey = await openpgp.readPrivateKey({ armoredKey: privateKey });
+    const message = await openpgp.createMessage({ binary: challenge });
+    const signatureArmor = await openpgp.sign({ message, signingKeys: signingKey, detached: true, format: "armored" });
+
+    const id = await extractIdentity(mkReq({
+      "x-agent-id": agentId,
+      "x-capauth-signature": signatureArmor,
+      "x-capauth-timestamp": timestamp,
+    }, { method, url }), reg);
+
+    assert.equal(id.agent_id, "jarvis");
+    assert.equal(id.method, "capauth");
+    // This is the proof the openpgp path is reachable and doing real crypto,
+    // not the pre-fix structural-header check that always returned false.
+    assert.equal(id.verified, true);
+  });
+
+  // NOTE (found while writing this fixture, not part of the card's required
+  // change): openpgp.verify() THROWS rather than resolving verified:false when
+  // none of the supplied verificationKeys match the signature's key ID, so this
+  // case is actually caught by verifyPgpSignature()'s generic try/catch and
+  // falls through to the pre-existing structural-armor check, which returns
+  // false anyway. The end result (unverified) is correct either way, but it
+  // goes through the fallback branch rather than a genuine openpgp verify()
+  // rejection. Left as-is: reworking that catch is outside this card's two
+  // approved changes.
+  test("a signature from the wrong key stays unverified", async () => {
+    const { publicKey } = await openpgp.generateKey({
+      type: "ecc",
+      curve: "ed25519Legacy",
+      userIDs: [{ name: "jarvis-fixture", email: "jarvis@skworld.test" }],
+      format: "armored",
+    });
+    const wrongKeyPair = await openpgp.generateKey({
+      type: "ecc",
+      curve: "ed25519Legacy",
+      userIDs: [{ name: "impostor", email: "impostor@skworld.test" }],
+      format: "armored",
+    });
+
+    const reg = mkRegistry({ agents: [{ name: "jarvis", public_key_armor: publicKey }] });
+
+    const method = "POST";
+    const url = "/v1/chat/completions";
+    const agentId = "jarvis";
+    const timestamp = String(Math.floor(Date.now() / 1000));
+    const challenge = reconstructChallenge(method, url, agentId, timestamp);
+
+    const wrongSigningKey = await openpgp.readPrivateKey({ armoredKey: wrongKeyPair.privateKey });
+    const message = await openpgp.createMessage({ binary: challenge });
+    const signatureArmor = await openpgp.sign({ message, signingKeys: wrongSigningKey, detached: true, format: "armored" });
+
+    const id = await extractIdentity(mkReq({
+      "x-agent-id": agentId,
+      "x-capauth-signature": signatureArmor,
+      "x-capauth-timestamp": timestamp,
+    }, { method, url }), reg);
+
+    assert.equal(id.method, "capauth");
+    assert.equal(id.verified, false);
   });
 });
 

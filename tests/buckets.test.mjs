@@ -20,6 +20,7 @@ import {
   classRank,
   meetsClassFloor,
   resolveBucket,
+  orderMembersByCost,
   selectMember,
   gradeVocabulary,
   measuredClassCeiling,
@@ -149,6 +150,25 @@ describe('C9: eligibility composes the floor with the sovereignty ceiling', () =
     assert.match(rejected.find((r) => r.id === 'mystery').reason, /unknown/);
   });
 
+  test('members expose family and declared cost separately from trust', () => {
+    const decorated = {
+      ...entry('claude-opus', { zone: TRUST_ZONES.PAID_CONTRACTUAL, declared: 'XL' }),
+      card: { family: 'claude', cost_tier: 'paid-cloud' },
+    };
+    const { members } = resolveBucket({
+      bucket: { model_class: 'XL', sensitivity: 'internal' },
+      catalog: [decorated],
+    });
+    assert.deepEqual(members, [{
+      id: 'claude-opus',
+      class_basis: 'declared-size-prior',
+      model_class: 'XL',
+      trust_zone: TRUST_ZONES.PAID_CONTRACTUAL,
+      family: 'claude',
+      cost_tier: 'paid-cloud',
+    }]);
+  });
+
   test('lifecycle exclusion still applies', () => {
     const { members } = resolveBucket({
       bucket: { model_class: 'L', sensitivity: 'public' },
@@ -173,11 +193,43 @@ describe('C9: eligibility composes the floor with the sovereignty ceiling', () =
   });
 });
 
-describe('C9: rotation spreads load rather than hammering the favourite', () => {
-  const members = [{ id: 'a' }, { id: 'b' }, { id: 'c' }];
+describe('C9: cost-ranked selection rotates only among equal-cost members', () => {
+  const members = [
+    { id: 'paid', cost_tier: 'paid-cloud' },
+    { id: 'local-a', cost_tier: 'local' },
+    { id: 'free', cost_tier: 'free-remote' },
+    { id: 'local-b', cost_tier: 'local' },
+  ];
 
-  test('successive requests walk the pool', () => {
-    assert.deepEqual([0, 1, 2, 3, 4].map((i) => selectMember(members, i).id), ['a', 'b', 'c', 'a', 'b']);
+  test('successive requests share the cheapest tier without spilling into costlier tiers', () => {
+    assert.deepEqual(
+      [0, 1, 2, 3, 4].map((i) => selectMember(members, i).id),
+      ['local-a', 'local-b', 'local-a', 'local-b', 'local-a'],
+    );
+  });
+
+  test('DRILL: an S-graded public card moves from blind fleet rotation to the sovereign local tier', () => {
+    const liveShape = [
+      ...Array.from({ length: 17 }, (_, i) => ({ id: `paid-${i}`, cost_tier: 'paid-cloud' })),
+      ...Array.from({ length: 9 }, (_, i) => ({ id: `free-${i}`, cost_tier: 'free-remote' })),
+      ...Array.from({ length: 7 }, (_, i) => ({ id: `local-${i}`, cost_tier: 'local' })),
+    ];
+    const counts = (chosen) => chosen.reduce((out, member) => {
+      out[member.cost_tier] = (out[member.cost_tier] || 0) + 1;
+      return out;
+    }, {});
+    const before = counts(Array.from({ length: 66 }, (_, i) => liveShape[i % liveShape.length]));
+    const after = counts(Array.from({ length: 66 }, (_, i) => selectMember(liveShape, i)));
+
+    assert.deepEqual(before, { 'paid-cloud': 34, 'free-remote': 18, local: 14 });
+    assert.deepEqual(after, { local: 66 });
+  });
+
+  test('the failover chain exhausts equal-cost peers before costlier tiers', () => {
+    assert.deepEqual(
+      orderMembersByCost(members, 1).map((m) => m.id),
+      ['local-b', 'local-a', 'free', 'paid'],
+    );
   });
 
   test('an empty pool selects nothing rather than throwing', () => {
@@ -189,6 +241,47 @@ describe('C9: rotation spreads load rather than hammering the favourite', () => 
     for (const c of [-1, -7, 1e9, 0.5]) {
       assert.ok(members.includes(selectMember(members, c)));
     }
+  });
+
+  test('NEGATIVE CONTROL: ranking cannot admit a member rejected by the trust ceiling', () => {
+    const catalog = [
+      {
+        ...entry('local', { zone: TRUST_ZONES.SOVEREIGN_LOCAL, declared: 'L' }),
+        card: { cost_tier: 'local' },
+      },
+      {
+        ...entry('free', { zone: TRUST_ZONES.FREE_REMOTE, declared: 'L' }),
+        card: { cost_tier: 'free-remote' },
+      },
+    ];
+    const { members: eligible, rejected } = resolveBucket({
+      bucket: { model_class: 'L', sensitivity: 'secret' },
+      catalog,
+    });
+    const admittedBeforeRanking = structuredClone(eligible);
+    const ranked = orderMembersByCost(eligible, 0);
+
+    assert.deepEqual(eligible.map((m) => m.id), ['local']);
+    assert.deepEqual(ranked.map((m) => m.id), ['local']);
+    assert.deepEqual(eligible, admittedBeforeRanking, 'ranking must not mutate trust-zone metadata');
+    assert.deepEqual(
+      ranked.map(({ id, trust_zone }) => [id, trust_zone]),
+      [['local', TRUST_ZONES.SOVEREIGN_LOCAL]],
+      'ranking preserves the resolved trust zone and has no path to the rejected zone',
+    );
+    assert.equal(rejected.some((r) => r.id === 'free'), true, 'free-remote stays excluded');
+  });
+
+  test('the cost and trust ladders remain independent', () => {
+    const eligible = [
+      { id: 'paid-zone-1', cost_tier: 'paid-cloud', trust_zone: TRUST_ZONES.PAID_CONTRACTUAL },
+      { id: 'free-zone-2', cost_tier: 'free-remote', trust_zone: TRUST_ZONES.FREE_REMOTE },
+    ];
+    assert.deepEqual(
+      orderMembersByCost(eligible, 0).map((m) => m.id),
+      ['free-zone-2', 'paid-zone-1'],
+      'free-remote is cheaper even though it is less trusted; cost must not impersonate trust',
+    );
   });
 });
 

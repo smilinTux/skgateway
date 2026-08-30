@@ -364,30 +364,230 @@ export function resolveBucket({ bucket, catalog = [], sensitivityPolicy, isRouta
       });
       continue;
     }
-    members.push({ id: entry.id, class_basis: floor.basis, model_class: floor.modelClass, trust_zone: zone ?? null });
+    members.push({
+      id: entry.id,
+      class_basis: floor.basis,
+      model_class: floor.modelClass,
+      trust_zone: zone ?? null,
+      // Preference metadata is copied only after the independent trust ceiling
+      // has admitted the model. Neither field can expand this resolved set.
+      family: entry?.card?.family ?? null,
+      ...(entry?.card?.family == null && entry?.card?.unfamilied_reason
+        ? { unfamilied_reason: entry.card.unfamilied_reason }
+        : {}),
+      cost_tier: entry?.card?.cost_tier ?? null,
+    });
   }
 
   return { members, rejected, ceiling };
 }
 
+/** Cost preference, deliberately independent from trust-zone order. */
+export const COST_TIER_ORDER = Object.freeze(['local', 'free-remote', 'paid-cloud']);
+
+/**
+ * Validate a family preference list.
+ *
+ * A preference is an ordered list of family names (strings) or the special
+ * keyword 'free' which maps to the 'free-remote' cost tier. Returns an object
+ * with either a valid preference or a rejection reason.
+ *
+ * Family names are reviewed broad-family mappings from routing-metadata.mjs,
+ * never raw model ids. A preference containing a raw model id (one containing
+ * a slash, a version pattern like -3.5- or -v1-, or a vendor-specific prefix
+ * not in the reviewed list) is rejected.
+ *
+ * @param {Array<string>|null} preference the ordered preference list
+ * @param {string} sensitivity the job sensitivity level
+ * @returns {{valid: boolean, preference: Array<string>|null, reason: string|null}}
+ */
+export function validateFamilyPreference(preference, sensitivity = 'public') {
+  if (!preference || !Array.isArray(preference) || preference.length === 0) {
+    return { valid: true, preference: null, reason: null };
+  }
+
+  // Validate each entry is a string
+  for (const entry of preference) {
+    if (typeof entry !== 'string') {
+      return {
+        valid: false,
+        preference: null,
+        reason: `preference entries must be strings, got ${typeof entry}`,
+      };
+    }
+
+    const trimmed = entry.trim().toLowerCase();
+
+    // Reject raw model ids: they contain slashes, versions, or vendor-specific patterns
+    if (trimmed.includes('/') ||
+        /-\d+\.\d+(-|$)/.test(trimmed) ||  // -3.5-, -4.0-, etc.
+        /-v\d+(-|$)/.test(trimmed) ||      // -v1-, -v2-, etc.
+        /-\d+(?:k|b|m|t)$/.test(trimmed)) { // -128k, -70b, -7b, etc.
+      return {
+        valid: false,
+        preference: null,
+        reason: `preference must name a family, not a raw model id: "${entry}"`,
+      };
+    }
+
+    // Validate the special 'free' keyword
+    if (trimmed === 'free') {
+      // 'free' is ONLY allowed at public sensitivity
+      if (sensitivity !== 'public') {
+        return {
+          valid: false,
+          preference: null,
+          reason: `prefer "free" is not allowed at sensitivity="${sensitivity}"; free remote providers train on submitted content and may only be used for public work`,
+        };
+      }
+      continue;
+    }
+
+    // Validate it's a plausible family name (alphanumeric, hyphens, underscores)
+    if (!/^[a-z][a-z0-9-_]*$/.test(trimmed)) {
+      return {
+        valid: false,
+        preference: null,
+        reason: `invalid family name "${entry}": must start with a letter and contain only letters, digits, hyphens, and underscores`,
+      };
+    }
+  }
+
+  return {
+    valid: true,
+    preference: preference.map(p => p.trim().toLowerCase()),
+    reason: null,
+  };
+}
+
+/**
+ * Apply a family preference to an already-resolved member set.
+ *
+ * THE INVARIANT: this function NEVER widens the member set. It ONLY reorders
+ * the already-resolved members to put preferred families earlier in the list.
+ * If no member matches any preference, the original order is preserved.
+ *
+ * The 'free' special keyword matches members with cost_tier='free-remote'.
+ * Regular family names match against the 'family' field on member.card.
+ *
+ * @param {Array<object>} members members already admitted by resolveBucket
+ * @param {Array<string>} preference ordered list of family names or 'free'
+ * @returns {Array<object>} reordered members, same length as input
+ */
+export function applyFamilyPreference(members, preference) {
+  if (!Array.isArray(members) || members.length === 0) {
+    return members;
+  }
+
+  if (!preference || !Array.isArray(preference) || preference.length === 0) {
+    return members;
+  }
+
+  // Partition members into three buckets: matched, unmatched
+  const matched = [];
+  const unmatched = [];
+  const seenIds = new Set();
+
+  for (const pref of preference) {
+    const trimmed = pref.trim().toLowerCase();
+
+    for (const member of members) {
+      if (seenIds.has(member.id)) continue;
+
+      let isMatch = false;
+
+      if (trimmed === 'free') {
+        // Special case: 'free' matches the free-remote cost tier
+        isMatch = member.cost_tier === 'free-remote';
+      } else {
+        // Regular family name matches against member.card.family
+        isMatch = member.card?.family?.toLowerCase() === trimmed;
+      }
+
+      if (isMatch) {
+        matched.push(member);
+        seenIds.add(member.id);
+      }
+    }
+  }
+
+  // Collect all unmatched members in their original order
+  for (const member of members) {
+    if (!seenIds.has(member.id)) {
+      unmatched.push(member);
+    }
+  }
+
+  // Return preferred first, then the rest in original order
+  return [...matched, ...unmatched];
+}
+
+/**
+ * Return the complete eligible failover chain in cost order.
+ *
+ * `resolveBucket()` has already applied the capability floor and trust ceiling.
+ * This function therefore accepts ONLY that resolved member array and never
+ * consults sensitivity or admits another model. The cost ladder remains the
+ * deliberate inverse of trust for `free-remote`: free is cheaper than paid,
+ * even though it is less trusted. Unknown cost metadata sorts last.
+ *
+ * Catalog order is the deterministic tie break. The counter rotates each
+ * equal-cost tier so one local model is not hammered while its equally cheap
+ * peer idles. A request exhausts that cheapest tier before trying the next.
+ *
+ * @param {Array<object>} members members already admitted by resolveBucket
+ * @param {number} counter monotonically increasing per bucket
+ * @returns {Array<object>}
+ */
+export function orderMembersByCost(members, counter = 0) {
+  if (!Array.isArray(members) || members.length === 0) return [];
+  const groups = new Map();
+  for (const member of members) {
+    const rank = COST_TIER_ORDER.indexOf(member?.cost_tier);
+    const key = rank === -1 ? COST_TIER_ORDER.length : rank;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(member);
+  }
+
+  const n = Math.abs(Math.trunc(counter));
+  const ordered = [];
+  for (const key of [...groups.keys()].sort((a, b) => a - b)) {
+    const group = groups.get(key);
+    const start = n % group.length;
+    ordered.push(...group.slice(start), ...group.slice(0, start));
+  }
+  return ordered;
+}
+
 /**
  * Pick which member serves THIS request.
  *
- * Ranking decides who is ELIGIBLE. Rotation decides who SERVES. Always taking
- * the top-ranked member hammers one model into a rate limit while the rest of
- * the pool idles, and on a free fleet throttling is the normal operating
- * condition rather than an edge case (card 9e28de88). Spreading load is how a
- * free pool stays usable, not a nicety.
+ * Selection rotates only within the cheapest available cost tier. Costlier
+ * tiers remain failover candidates through `orderMembersByCost()`, but are not
+ * selected while an equally eligible cheaper tier exists.
  *
- * Deterministic round-robin over a caller-supplied counter, so it is testable
- * and so two gateway processes do not need to agree on anything.
+ * An optional family preference is applied WITHIN the selected cost tier,
+ * allowing callers to prefer a family at the same cost level. The preference
+ * never widens the member set and never selects a costlier tier over a cheaper
+ * one. If no member in the cheapest tier matches the preference, the normal
+ * cost-tier rotation is used.
  *
- * @param {Array<object>} members
+ * @param {Array<object>} members members already admitted by resolveBucket
  * @param {number} counter monotonically increasing per bucket
+ * @param {Array<string>|null} [familyPreference=null] ordered list of family names or 'free'
  * @returns {object|null}
  */
-export function selectMember(members, counter = 0) {
-  if (!Array.isArray(members) || members.length === 0) return null;
-  const i = Math.abs(Math.trunc(counter)) % members.length;
-  return members[i];
+export function selectMember(members, counter = 0, familyPreference = null) {
+  const costOrdered = orderMembersByCost(members, counter);
+  if (costOrdered.length === 0) return null;
+
+  // Find all members in the cheapest cost tier
+  const cheapestTier = costOrdered[0].cost_tier;
+  const cheapestMembers = costOrdered.filter(m => m.cost_tier === cheapestTier);
+
+  // Apply family preference only within the cheapest tier
+  const preferredInCheapest = applyFamilyPreference(cheapestMembers, familyPreference);
+
+  // Return the first preferred member in the cheapest tier
+  return preferredInCheapest[0] || null;
 }
