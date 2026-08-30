@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The sanitizer and model-limit stages are now wired into the live `/v1` path.
+  `trimSystemMessages()`, `trimConversationHistory()` and `sanitizeResponse()`
+  existed and were unit-tested but were never invoked by `index.mjs`, so the
+  configured `sanitizer:` and `model_limits:` sections had no effect on real
+  traffic. Requests are trimmed before dispatch and responses are sanitized
+  before the client receives bytes (card 080e032e).
+
 - z.ai is available as a first-class provider. A dedicated adapter and provider
   posture entry cover GLM model discovery and auth-candidate resolution, and the
   connection-pool admission ceilings are tuned per backend rather than sharing
