@@ -71,8 +71,16 @@
 #
 # A `providers:` top-level block (sibling of `overrides:`, see the bottom of
 # this file) carries per-PROVIDER data_retention posture, each with a dated
-# verification. Per-model `data_retention` overrides belong on the model's
-# own override entry (design 4.3) and win over the provider default.
+# verification, and a separately declared cost_tier. Per-model data_retention
+# and cost_tier overrides belong on the model's own entry and win over provider
+# defaults. Family is declared per card or assigned by the reviewed broad-family
+# map in src/discovery/routing-metadata.mjs. Unmapped live ids are retained with
+# family: null and an unfamilied_reason rather than guessed.
+#
+# Cost and trust are intentionally separate. In particular, free-remote is not
+# simply "cheap": provider records verified 2026-08-15 show that the free
+# NVIDIA, OpenRouter, and OpenCode routes correlate with trains-on-content.
+# deriveTrustZone remains exclusively authoritative for where data may go.
 
 overrides:
 
@@ -649,6 +657,7 @@ providers:
   # or "ollama" (all our self-hosted backend keys).
   local:
     data_retention: local-only
+    cost_tier: local
 
   # Verified 2026-08-15 against Anthropic's commercial terms
   # (https://www.anthropic.com/legal/commercial-terms), Section B: "Anthropic
@@ -662,6 +671,7 @@ providers:
   # asserted here.
   anthropic:
     data_retention: contractual-zero
+    cost_tier: paid-cloud
     verified: "2026-08-15"
     ref: "https://www.anthropic.com/legal/commercial-terms, Section B"
 
@@ -675,6 +685,7 @@ providers:
   # which carry the identical restriction per the same page.
   nvidia:
     data_retention: trains
+    cost_tier: free-remote
     verified: "2026-08-15"
     ref: "https://opencode.ai/docs/zen (quoting NVIDIA's NIM free-tier trial banner)"
 
@@ -690,6 +701,7 @@ providers:
   # provider was individually confirmed to train.
   openrouter:
     data_retention: trains
+    cost_tier: free-remote
     verified: "2026-08-15"
     ref: "https://openrouter.ai/docs/features/privacy-and-logging (policy varies per routed provider; free tier assumed worst-case)"
 
@@ -703,6 +715,7 @@ providers:
   # (`discovery: free` in skgateway.yaml, opencode backend), the free tier.
   opencode:
     data_retention: trains
+    cost_tier: free-remote
     verified: "2026-08-15"
     ref: "https://opencode.ai/docs/zen (free-tier models: 'collected data may be used to improve the model')"
 
@@ -721,6 +734,7 @@ providers:
   # rule as every other entry in this block.
   codex:
     data_retention: trains
+    cost_tier: paid-cloud
     verified: "2026-08-22"
     ref: "https://help.openai.com/en/articles/5729567-how-your-data-is-used (ChatGPT consumer plans: training exclusion is conditional on per-account data controls, not contractual)"
 
@@ -729,5 +743,6 @@ providers:
   # fail-safe zone-2 boundary until the current terms are reviewed.
   zai:
     data_retention: unknown
+    cost_tier: paid-cloud
     verified: "2026-08-22"
     ref: "ZCode subscription entitlement observed locally; provider retention terms still require human review"

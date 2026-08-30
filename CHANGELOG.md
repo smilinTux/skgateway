@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Model catalog rows now carry broad family and separately declared cost-tier
+  metadata. Bucket administration exposes family on each member, while trust
+  zones remain derived only from sovereignty and provider retention posture.
+  Free remote tiers are documented with the trains-on-content correlation from
+  provider records verified 2026-08-15 rather than described as merely cheap.
+
 - Requires Node 22. Node 20 left security support in April 2026, and the repo
   still declared , pinned  to 20, and tested a 20/22
   matrix while the deployment unit executed 20. Three runtimes were reachable on
