@@ -18,6 +18,7 @@ import { loadAllowlist, saveAllowlist, applyAllowlist } from "./advertise.mjs";
 import { discoverCatalog, loadCache, saveCache, fetchNvidia, fetchOpenRouter, fetchOpencode, fetchAnthropicWrapper, fetchCodex, fetchZai, catalogStatus, loadCardOverrides, applyCardOverlays, buildServingCatalog } from "./discovery.mjs";
 import { getPool, resetPool } from "./proxy/connection-pool.mjs";
 import { loadAgentRegistry, extractIdentity, normalizeAgentId, ANONYMOUS_AGENT_ID } from "./identity/capauth.mjs";
+import { ClientAuthenticator, classifyAuthenticationRoute, stripCallerCredentials, stripCredentialQuery } from "./identity/client-auth.mjs";
 import { createAuthzClient } from "./policy/authz_decide.mjs";
 import { createSkLegalAuthzClient } from "./policy/sklegal_authz_decide.mjs";
 import { classifyRoute } from "./policy/authz_routes.mjs";
@@ -29,6 +30,13 @@ import {
 import { isInternalRemote } from "./policy/net_trust.mjs";
 import { classifyRequest, toSiemEvent } from "./classifiers/engine.mjs";
 import { handleModuleManifest } from "./operator/manifest.mjs";
+import {
+  handleHealthz as handleOperatorHealthz,
+  handleReadyz as handleOperatorReadyz,
+  handleExplain as handleOperatorExplain,
+  handleObserve as handleOperatorObserve,
+  handleAct as handleOperatorAct,
+} from "./operator/http.mjs";
 import { fromAnthropicRequest, toAnthropicMessage, modelRetrieveObject } from "./proxy/anthropic-frontend.mjs";
 import { readCodexAuthHeaders } from "./proxy/codex-adapter.mjs";
 import { readZaiAuthHeaders, ZAI_CREDENTIALS_PATH } from "./proxy/zai-adapter.mjs";
@@ -66,6 +74,8 @@ const _cfgEmitter = await loadConfig({ configPath });
 const config = _cfgEmitter.current();
 const port = portOverride || config.server?.port || 18780;
 const bind = config.server?.bind || "127.0.0.1";
+let clientAuthenticator = config.client_auth?.enabled ? new ClientAuthenticator(config.client_auth) : null;
+let operatorAuthenticator = config.operator_auth?.enabled ? new ClientAuthenticator(config.operator_auth) : null;
 
 // ─── Capability-aware routing master gate (design 7.2), DEFAULT OFF ───
 // Governs BOTH the `@match` role ranking branch (router.mjs, card P4.2) and
@@ -675,6 +685,21 @@ const poolConfig = {
 };
 const pool = getPool(poolConfig);
 
+// ─── Operator-plane self-served facet data sources (epic c880017b, Phase 3.4) ───
+// The live objects the /operator/v1/* routes (below, near /health) read from.
+// Defined once, right after router/pool exist, so it can never observe them
+// as undefined. Each source is a zero-arg accessor — operator/http.mjs treats
+// a throw from any one of them as that condition's evidence, never a crash
+// into a 500 (see buildObservation() there). getConfig() (not the module-load
+// `config` local) so a hot-reloaded discovery.enabled flag is honored live,
+// same convention getDiscoveredStatus() below already follows.
+const operatorHttpDeps = {
+  getHealth: () => router.getHealth(),
+  getPoolStats: () => pool.getTotalStats(),
+  getCatalogStatus: () => getDiscoveredStatus(),
+  discoveryEnabled: () => getConfig().discovery?.enabled !== false,
+};
+
 // Metrics collector (lazy, and not imported when disabled)
 let metrics = null;
 if (config.metrics?.enabled === true) {
@@ -683,7 +708,30 @@ if (config.metrics?.enabled === true) {
     metrics = createMetricsCollector(config.metrics);
     console.log("[skgateway] metrics collector initialized");
   } catch (e) {
-    console.log("[skgateway] metrics collector not available (optional):", e.message);
+    // Metrics was explicitly ENABLED in config and still failed to load. That is a
+    // degradation, not an option, and it must not be logged as though it were fine.
+    // Observed 2026-08-27: an npm ci rebuilt better-sqlite3 against a different
+    // Node than the service runs, the collector failed here, and the gateway came
+    // up cheerfully with metrics off. Every request_log row stopped being written
+    // and nothing noticed, because this line said "(optional)" at info level while
+    // the whole fleet's telemetry was gone.
+    const abi = /NODE_MODULE_VERSION|was compiled against a different Node\.js version/i.test(
+      String(e && e.message),
+    );
+    console.error(
+      "[skgateway] METRICS DEGRADED: collector is enabled in config but failed to load.",
+      "\n  request_log, energy and cost telemetry will NOT be written.",
+      "\n  cause:", e && e.message,
+      abi
+        ? "\n  remedy: the native binding was built for a different Node than this process." +
+          "\n          run:  npm rebuild better-sqlite3 --build-from-source" +
+          "\n          using the SAME node that runs the service (check the unit's ExecStart)."
+        : "\n  remedy: check config.metrics and that ./metrics/collector.mjs loads.",
+    );
+    if (process.env.SKGATEWAY_REQUIRE_METRICS === "1") {
+      console.error("[skgateway] SKGATEWAY_REQUIRE_METRICS=1 is set, refusing to start without metrics.");
+      process.exit(1);
+    }
   }
 } else {
   console.log("[skgateway] metrics collector disabled by configuration");
@@ -1164,7 +1212,66 @@ const proxyConfig = buildConfig({
 // (see tests/advertise-lifecycle.test.mjs); no production code depends on it.
 export const server = http.createServer(async (req, res) => {
   const startTime = Date.now();
+  if (clientAuthenticator || operatorAuthenticator) {
+    try {
+      req.url = stripCredentialQuery(req.url ?? '/');
+    } catch {
+      res.writeHead(400, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+      res.end(JSON.stringify({ error: { message: 'Invalid request path', code: 'invalid_path', status: 400 } }));
+      return;
+    }
+  }
   if (process.env.SKGW_REQLOG) { console.log("[REQLOG]", req.method, req.url); }
+
+  // Authentication is disabled by default. Once either boundary is enabled,
+  // only an explicit public allowlist can run without credentials. Admin uses
+  // a separate operator registry, so a forwarding proxy cannot confer trust by
+  // making a remote socket appear loopback-local.
+  if (clientAuthenticator || operatorAuthenticator) {
+    const routeAuth = classifyAuthenticationRoute(req.method, req.url);
+    if (routeAuth.kind === 'invalid') {
+      res.writeHead(400, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+      res.end(JSON.stringify({ error: { message: 'Invalid request path', code: 'invalid_path', status: 400 } }));
+      return;
+    }
+    if (routeAuth.kind !== 'public') {
+      const isAdmin = routeAuth.kind === 'admin';
+      const authenticator = isAdmin ? operatorAuthenticator : clientAuthenticator;
+      const authConfig = isAdmin ? config.operator_auth : config.client_auth;
+      if (!authenticator) {
+        siemHook({ ts: new Date().toISOString(), event: isAdmin ? 'operator_auth.denied' : 'client_auth.denied', reason: 'boundary_unavailable', status: 403, path: routeAuth.path });
+        res.writeHead(403, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+        res.end(JSON.stringify({ error: { message: 'Authentication boundary unavailable', code: 'authentication_unavailable', status: 403 } }));
+        return;
+      }
+      const contentLength = Number(req.headers['content-length'] ?? 0);
+      const tooLarge = !Number.isFinite(contentLength) || contentLength < 0 || contentLength > authConfig.max_request_body_bytes;
+      const checked = tooLarge ? { ok: false, reason: 'request_too_large' } : authenticator.authenticate(req.headers);
+      if (!checked.ok) {
+        const allowed = authenticator.denialAllowed();
+        const status = tooLarge ? 413 : (allowed ? 401 : 429);
+        const code = tooLarge ? 'request_too_large' : (allowed ? 'client_auth_denied' : 'client_auth_rate_limited');
+        siemHook({ ts: new Date().toISOString(), event: isAdmin ? 'operator_auth.denied' : 'client_auth.denied', reason: checked.reason, status, path: routeAuth.path });
+        res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+        res.end(JSON.stringify({ error: { message: tooLarge ? 'Request body exceeds configured limit' : 'Client authentication failed', code, status } }));
+        return;
+      }
+      if (isAdmin) {
+        req.operator_identity = checked.identity;
+        req.identity = { ...checked.identity, method: 'operator_auth' };
+        req.agent_id = checked.identity.agent_id;
+      }
+      else {
+        req.identity = checked.identity;
+        req.agent_id = checked.identity.agent_id;
+        req.headers['x-agent-id'] = checked.identity.agent_id;
+        req.headers['x-sk-client-id'] = checked.identity.client_id;
+        req.headers['x-sk-credential-revision'] = checked.identity.credential_revision;
+      }
+      stripCallerCredentials(req.headers);
+      siemHook({ ts: new Date().toISOString(), event: isAdmin ? 'operator_auth.accepted' : 'client_auth.accepted', agent_id: checked.identity.agent_id, client_id: checked.identity.client_id, credential_revision: checked.identity.credential_revision, registry_revision: checked.identity.registry_revision, path: routeAuth.path });
+    }
+  }
 
   // ── SKWorld authorization gate (L1.8) — OFF BY DEFAULT ──
   // This ENTIRE block is skipped unless SKGATEWAY_AUTHZ_ENFORCE / config.authz.
@@ -1175,12 +1282,12 @@ export const server = http.createServer(async (req, res) => {
   // the capauth PDP, and 403 a gated-route deny before any handler runs. Public
   // routes (health/status/discovery/model-listing) pass straight through.
   if (authzEnforce) {
-    let gateIdentity = {
+    let gateIdentity = req.identity ?? {
       agent_id: req.headers["x-agent-id"] || ANONYMOUS_AGENT_ID,
       method: req.headers["x-agent-id"] ? "header" : "anonymous",
       agent: null,
     };
-    if (identityRegistry) {
+    if (!req.identity && identityRegistry) {
       try {
         gateIdentity = await extractIdentity(req, identityRegistry);
       } catch {
@@ -1211,6 +1318,36 @@ export const server = http.createServer(async (req, res) => {
   // health URL resolves against wherever the caller reached the gateway.
   if (req.url === "/.well-known/skworld-module.json" && req.method === "GET") {
     handleModuleManifest(req, res);
+    return;
+  }
+
+  // ── Operator-plane self-served facet (epic c880017b, Phase 3.4) ──
+  // /operator/v1/{healthz,readyz,explain,observe} mirror
+  // docs/OPERATOR_PLANE_REMOTE_STANDARD.md's wire contract directly off this
+  // daemon's existing port, replacing the dead-cli / advisory-only path ATLAS
+  // has had to rely on. Read-only, unauthenticated (see operator/http.mjs's
+  // module docstring for why that is safe today) GETs; act is a reserved POST
+  // stub that always 501s — see handleOperatorAct. Routing is a flat path
+  // switch (no sub-router) to match this file's existing style for every
+  // other single-purpose route above/below.
+  if (req.url === "/operator/v1/healthz" && req.method === "GET") {
+    handleOperatorHealthz(req, res);
+    return;
+  }
+  if (req.url === "/operator/v1/readyz" && req.method === "GET") {
+    handleOperatorReadyz(req, res, operatorHttpDeps);
+    return;
+  }
+  if (req.url === "/operator/v1/explain" && req.method === "GET") {
+    handleOperatorExplain(req, res);
+    return;
+  }
+  if (req.url === "/operator/v1/observe" && req.method === "GET") {
+    await handleOperatorObserve(req, res, operatorHttpDeps);
+    return;
+  }
+  if (req.url === "/operator/v1/act" && req.method === "POST") {
+    handleOperatorAct(req, res);
     return;
   }
 
@@ -1313,7 +1450,7 @@ export const server = http.createServer(async (req, res) => {
       // onto the reconciled health/status entries and GUARANTEES every model
       // carries a non-empty provider (see src/proxy/advertise.mjs). The
       // allowlist is applied last, exactly as on /admin/models.
-      const merged = mergeDiscoveredCatalog(reconciled, discovered);
+      const merged = mergeDiscoveredCatalog(reconciled, discovered, advertiseBackends);
       const allowlist = loadAllowlist();
       const allowed = applyAllowlist(merged, allowlist);
       // Aliases (buckets + registry roles): additive, allowlist-aware,
@@ -1371,8 +1508,9 @@ export const server = http.createServer(async (req, res) => {
     if (!id) { notFound(); return; }
     try {
       const discovered = await getDiscoveredCatalog();
-      const reconciled = buildModelCatalog(effectiveAdvertiseBackends(config.backends || {}, router), router, advertiseReconcileMode);
-      const merged = mergeDiscoveredCatalog(reconciled, discovered);
+      const advertiseBackends = effectiveAdvertiseBackends(config.backends || {}, router);
+      const reconciled = buildModelCatalog(advertiseBackends, router, advertiseReconcileMode);
+      const merged = mergeDiscoveredCatalog(reconciled, discovered, advertiseBackends);
       const data = applyAllowlist(merged, loadAllowlist());
       const entry = data.find((m) => m.id === id);
       // Registry role (sk-default/sk-auto/sk-creative/...): a valid routing
@@ -1668,14 +1806,14 @@ export const server = http.createServer(async (req, res) => {
     // flag. Per-agent spend queries are exact matches, so that split one agent
     // into two keys nothing joins back together.
     const headerAgent = normalizeAgentId(req.headers["x-agent-id"]);
-    let identity = {
+    let identity = req.identity ?? {
       agent_id: headerAgent ?? ANONYMOUS_AGENT_ID,
       verified: false,
       method: headerAgent ? "header" : "anonymous",
       session_id: req.headers["x-session-id"] || null,
       fingerprint: null,
     };
-    if (identityRegistry) {
+    if (!req.identity && identityRegistry) {
       try {
         identity = await extractIdentity(req, identityRegistry);
       } catch (e) {
@@ -1714,7 +1852,17 @@ export const server = http.createServer(async (req, res) => {
 
     // Buffer the request body so we can read the model for routing.
     const chunks = [];
-    for await (const chunk of req) chunks.push(chunk);
+    let receivedBytes = 0;
+    for await (const chunk of req) {
+      receivedBytes += chunk.length;
+      if (clientAuthenticator && receivedBytes > config.client_auth.max_request_body_bytes) {
+        siemHook({ ts: new Date().toISOString(), event: 'client_auth.denied', reason: 'request_too_large', status: 413, agent_id: identity.agent_id, path: req.url });
+        res.writeHead(413, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+        res.end(JSON.stringify({ error: { message: 'Request body exceeds configured limit', code: 'request_too_large', status: 413 } }));
+        return;
+      }
+      chunks.push(chunk);
+    }
     const body = Buffer.concat(chunks);
 
     // ── Anthropic Messages FRONTEND (POST /v1/messages) ──
@@ -2101,9 +2249,7 @@ export const server = http.createServer(async (req, res) => {
           // this is undefined on exactly those paths and the column stays NULL
           // meaning unobserved. That is by construction, not by a special
           // case, and it must never be widened to `|| parsedModel`.
-          modelServed: typeof parsedBody?.model === "string" && parsedBody.model
-            ? parsedBody.model
-            : undefined,
+          modelServed: result?.servedModel,
           energy: result?.energy,
           energyAttempts: result?.energyAttempts,
         });
@@ -2140,8 +2286,12 @@ process.on("SIGINT", () => shutdown("SIGINT"));
 _cfgEmitter.on("config-changed", () => {
   try {
     Object.assign(config, _cfgEmitter.current());
+    clientAuthenticator = config.client_auth?.enabled ? new ClientAuthenticator(config.client_auth) : null;
+    operatorAuthenticator = config.operator_auth?.enabled ? new ClientAuthenticator(config.operator_auth) : null;
     console.log("[skgateway] config reloaded");
   } catch (e) {
+    if (clientAuthenticator) clientAuthenticator.available = false;
+    if (operatorAuthenticator) operatorAuthenticator.available = false;
     console.error("[skgateway] config reload failed:", e.message);
   }
 });

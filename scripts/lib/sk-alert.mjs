@@ -2,7 +2,7 @@
  * sk-alert.mjs - the ONE real invocation path to the fleet's sk-alert binary.
  *
  * Card a7f65226. There is a standing fleet incident
- * (~/.claude/projects/-home-cbrd21-clawd/memory/sk-alert-never-fired-from-schedulers.md,
+ * (~/.claude/projects/-home-OPERATOR-clawd/memory/sk-alert-never-fired-from-schedulers.md,
  * skos #24 / card 95a3b69e) where sk-cron-run's realtime-alert branch NEVER
  * fired for any scheduled job, because of two silent failures stacked on one
  * line: (1) `command -v sk-alert` evaluated false under a scheduler's PATH

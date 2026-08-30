@@ -36,6 +36,15 @@ export const RECONCILE_MODES = new Set(["flag", "hide", "off"]);
 /** Default mode: non-breaking (nothing silently disappears). */
 export const DEFAULT_RECONCILE_MODE = "flag";
 
+/** A backend disabled for routing must never become a catalog promise. */
+export function isCatalogDisabledBackend(backend = {}) {
+  if (backend?.enabled === false || backend?.advertise === false) return true;
+  const models = Array.isArray(backend?.models) ? backend.models : [];
+  return models.length > 0 && models.every((id) =>
+    typeof id === "string" && /^(?:disabled|placeholder)(?:-|$)/i.test(id)
+  );
+}
+
 /**
  * Coerce an arbitrary config value into a valid reconcile mode.
  * Unknown / missing values fall back to the safe default ("flag").
@@ -126,6 +135,7 @@ export function isModelAvailable(model, router) {
 export function tagLocalModels(backends = {}) {
   const out = [];
   for (const [name, b] of Object.entries(backends || {})) {
+    if (isCatalogDisabledBackend(b)) continue;
     if (name === "nvidia" || name === "openrouter") continue;
     const paidBackend = isAnthropicBackend(b) || isCodexBackend(b) || isZaiBackend(b);
     for (const id of (b?.models || [])) {
@@ -158,9 +168,16 @@ export function tagLocalModels(backends = {}) {
  * @param {Array<object>} [discovered]
  * @returns {Array<object>}
  */
-export function mergeDiscoveredCatalog(reconciled = [], discovered = []) {
+export function mergeDiscoveredCatalog(reconciled = [], discovered = [], backends = null) {
+  const enabledProviders = backends && typeof backends === "object"
+    ? new Set(Object.entries(backends)
+      .filter(([, backend]) => !isCatalogDisabledBackend(backend))
+      .map(([id]) => id))
+    : null;
   const byId = new Map(reconciled.map((m) => [m.id, { ...m }]));
   for (const { id, ...tags } of discovered) {
+    if (enabledProviders && !enabledProviders.has(tags.provider)) continue;
+    if (typeof id === "string" && /^(?:disabled|placeholder)(?:-|$)/i.test(id)) continue;
     const base = byId.get(id) || { id, object: "model", created: 0, owned_by: tags.provider || "discovery" };
     byId.set(id, { ...base, ...tags, id });
   }
@@ -175,6 +192,7 @@ export function buildModelCatalog(backends = {}, router = null, mode = DEFAULT_R
   const seen = new Set();
   const data = [];
   for (const [id, b] of Object.entries(backends || {})) {
+    if (isCatalogDisabledBackend(b)) continue;
     for (const model of (b?.models || [])) {
       if (typeof model !== "string" || model.includes("*") || seen.has(model)) continue;
       seen.add(model);

@@ -1,23 +1,48 @@
 [Unit]
 Description=SKGateway - Enterprise AI Inference Proxy
 After=network.target
+# Crash-loop backstop: if it dies more than 5 times in 60s, stop trying so a
+# genuinely broken config surfaces instead of spinning forever.
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/node /home/cbrd21/clawd/skcapstone-repos/skgateway/src/index.mjs --port 18780 --config /home/cbrd21/clawd/skcapstone-repos/skgateway/config/skgateway.yaml
-Restart=on-failure
-RestartSec=5
+# Paths use %h (systemd expands to the invoking user's home). The repo is
+# expected at the fleet-standard location ~/clawd/skcapstone-repos/skgateway.
+# scripts/install.sh auto-detects the actual repo dir and rewrites these lines
+# if this checkout lives somewhere else, so a cold machine needs no hand edits.
+WorkingDirectory=%h/clawd/skcapstone-repos/skgateway
+# Requires Node >= 22 (see package.json engines and .nvmrc). Node 20 is past
+# end of life. If /usr/bin/node is older, point this at a v22+ binary: a
+# mismatch between the node that BUILT better-sqlite3 and the node that runs
+# this unit silently disables the metrics collector and all request telemetry.
+ExecStart=/usr/bin/node %h/clawd/skcapstone-repos/skgateway/src/index.mjs --port 18780 --config %h/clawd/skcapstone-repos/skgateway/config/skgateway.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+
 # Secrets (NVIDIA_API_KEY, etc.) come from a 0600 EnvironmentFile sourced from
 # skvault, never inline here. The leading '-' makes it optional so a missing
-# file does not block startup. See docs/INSTALL.md and docs/RUNBOOK.md.
+# file does not block startup. scripts/install.sh drops a placeholder skeleton.
 # Note: systemd reads this file only at start, so rotating a secret requires a
 # full restart (ExecReload / SIGHUP does not re-read it).
 EnvironmentFile=-%h/.config/skgateway/secrets.env
 Environment=NODE_ENV=production
 Environment=SKCAPSTONE_AGENT=lumina
-Environment=PATH=/home/cbrd21/.skenv/bin:/usr/local/bin:/usr/bin:/bin
-ExecReload=/bin/kill -HUP $MAINPID
-WorkingDirectory=/home/cbrd21/clawd/skcapstone-repos/skgateway
+Environment=PATH=%h/.skenv/bin:/usr/local/bin:/usr/bin:/bin
+
+# Always restart: this is a core proxy other services route through, so a clean
+# exit or a crash should both bring it straight back.
+Restart=always
+RestartSec=5
+
+# Memory guard. .41 has a history of memory-thrash freezes (see MEMORY.md), so
+# this Node proxy gets a hard ceiling. Steady-state RSS is well under 300MB even
+# with connection pooling + metrics; 1G leaves generous headroom for burst load
+# and buffered streaming bodies while still killing a runaway before it can
+# thrash the host into a freeze. MemoryHigh applies reclaim pressure before the
+# hard MemoryMax OOM-kill. Raise both together if legitimately tripped.
+MemoryHigh=768M
+MemoryMax=1G
 
 [Install]
 WantedBy=default.target
