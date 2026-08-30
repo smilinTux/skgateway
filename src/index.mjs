@@ -22,6 +22,7 @@ import { ClientAuthenticator, classifyAuthenticationRoute, stripCallerCredential
 import { createAuthzClient } from "./policy/authz_decide.mjs";
 import { createSkLegalAuthzClient } from "./policy/sklegal_authz_decide.mjs";
 import { classifyRoute } from "./policy/authz_routes.mjs";
+import { runModelEval, isEvalEligible, createLoopbackChatComplete } from "./ranking/eval.mjs";
 import {
   authzEnforceEnabled,
   authorizeRequest,
@@ -1699,6 +1700,71 @@ export const server = http.createServer(async (req, res) => {
       console.warn("[skgateway] /admin/models/refresh status failed:", e.message);
       res.writeHead(500, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: { message: "internal error building catalog status", code: 500 } }));
+    }
+    return;
+  }
+
+  // ── POST /admin/models/eval?model=<id> — card P3.5, the micro-eval harness ──
+  // Runs the deterministic battery (capability-assessment.mjs: tool_call,
+  // structured_output, instruction_following, min_output_tokens) against ONE
+  // model THROUGH this gateway, and persists the result onto that model's
+  // lifecycle record, where catalog.mjs threads it back into
+  // capabilities.tool_use as `basis:'eval'`.
+  //
+  // EXPLICITLY OPERATOR-TRIGGERED, never automatic (design 6.3: "Never runs in
+  // the hot path or refresh loop"). The battery spends real completions and
+  // real latency; attaching that to the refresh loop is how a smoke test
+  // quietly becomes a benchmark nobody authorised. Loopback only, same gate as
+  // every other /admin route.
+  if (req.method === "POST" && req.url.split("?")[0] === "/admin/models/eval") {
+    if (!isLoopback(req)) {
+      res.writeHead(403, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "Admin routes are loopback only", code: 403 } }));
+      return;
+    }
+    let modelId = null;
+    try {
+      modelId = new URL(req.url, "http://127.0.0.1").searchParams.get("model");
+    } catch {
+      modelId = null;
+    }
+    if (!modelId) {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "query parameter `model` is required", code: 400 } }));
+      return;
+    }
+    try {
+      const catalog = buildCapabilityCatalog(buildServingCatalog(), { getLifecycleFn: getLifecycle });
+      const entry = catalog.find((e) => e.id === modelId);
+      if (!entry) {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: `unknown model ${modelId}`, code: 404 } }));
+        return;
+      }
+      if (!isEvalEligible(entry)) {
+        // Design 6.3 scopes the harness to free/local. An UNKNOWN tier lands
+        // here too: billing someone's paid account to discover a capability is
+        // the most expensive possible way to guess.
+        res.writeHead(409, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          error: {
+            message: "eval runs against free/local models only",
+            code: 409,
+            model: modelId,
+            sovereignty: entry.capabilities?.sovereignty ?? null,
+          },
+        }));
+        return;
+      }
+      const out = await runModelEval(modelId, {
+        chatComplete: createLoopbackChatComplete({ port }),
+      });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, ...out }));
+    } catch (e) {
+      console.warn("[skgateway] /admin/models/eval failed:", e.message);
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "eval failed", code: 500 } }));
     }
     return;
   }
