@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- z.ai is available as a first-class provider. A dedicated adapter and provider
+  posture entry cover GLM model discovery and auth-candidate resolution, and the
+  connection-pool admission ceilings are tuned per backend rather than sharing
+  one global default, so a slow provider can no longer consume the whole
+  admission budget.
+
 - Bucket resolution is now tool-aware. `resolveBucket()` gated only on lifecycle
   routability, trust zone and size class, and size is a prior, not proof: a
   model can clear the L floor and still emit no `tool_calls` at all. Measured on
