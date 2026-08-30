@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# skgw-lanes: what each model lane actually did, from the gateway's own metrics.
+#
+# Reads request_log in the skgateway metrics store. Two traps this avoids, both
+# of which produced wrong answers on 2026-08-27:
+#   started_at is epoch MILLISECONDS, not an ISO string. Filtering it as text
+#   returns nothing and reads as "no traffic".
+#   id is random hex, not sequential. `ORDER BY id DESC` returns random rows,
+#   not the newest ones.
+set -euo pipefail
+WINDOW="${1:-60}"          # minutes
+DB="${SKGW_METRICS_DB:-$HOME/skgateway-codex/data/metrics.db}"
+[ -f "$DB" ] || { echo "no metrics db at $DB" >&2; exit 1; }
+
+WINDOW="$WINDOW" DB="$DB" python3 - <<'PY'
+import os, sqlite3, time, datetime
+db = os.environ["DB"]; mins = int(os.environ["WINDOW"])
+now = int(time.time() * 1000); cut = now - mins * 60 * 1000
+c = sqlite3.connect(db)
+rows = list(c.execute(
+    "select backend, model, count(*) n, "
+    "sum(case when status_code >= 400 then 1 else 0 end) errs, "
+    "round(avg(total_ms)) avg_ms "
+    "from request_log where started_at > ? "
+    "group by backend, model order by n desc", (cut,)))
+total = sum(r[2] for r in rows)
+print("gateway lanes, last %d min   (%d requests)" % (mins, total))
+print("-" * 74)
+if not total:
+    print("  no traffic in this window. Widen it: skgw-lanes 360")
+for b, m, n, e, ms in rows:
+    share = 100.0 * n / total if total else 0
+    flag = "  <-- ERRORS" if e else ""
+    print("  %-12s %-24s %6d  %5.1f%%  errors=%-5d avg=%sms%s"
+          % (str(b)[:12], str(m)[:24], n, share, e, ms, flag))
+print()
+lanes = {}
+for b, m, n, e, ms in rows:
+    key = "codex" if (b == "codex" or str(m).startswith("sk-codex")) else (
+          "glm/zai" if (b == "zai" or "glm" in str(m)) else str(b))
+    a, x = lanes.get(key, (0, 0)); lanes[key] = (a + n, x + e)
+print("by lane:")
+for k, (n, e) in sorted(lanes.items(), key=lambda x: -x[1][0]):
+    print("  %-10s %6d requests, %d errors" % (k, n, e))
+print()
+print("a lane missing here means it sent nothing, NOT that it is broken.")
+print("cross-check what the rotation launched:")
+print("  grep -h 'LAUNCHED|' ~/.skcapstone/evidence/fleet-rotation/*/actions.log \\")
+print("    | grep -oE 'lane=[a-z]+' | sort | uniq -c")
+PY

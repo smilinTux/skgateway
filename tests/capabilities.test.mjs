@@ -290,6 +290,17 @@ describe('size_class (card N2)', () => {
 });
 
 describe('trust_zone (card N2)', () => {
+  test('changing cost tier cannot change a trust zone', () => {
+    const providers = { anthropic: { data_retention: 'contractual-zero', cost_tier: 'paid-cloud' } };
+    const base = {
+      id: 'claude-test', provider: 'anthropic', free: false,
+      card: { tier: 'paid-cloud', supported_parameters: [] },
+    };
+    const changed = { ...base, card: { ...base.card, cost_tier: 'free-remote' } };
+    assert.equal(deriveCapabilities(base, { providers }).trust_zone, 1);
+    assert.equal(deriveCapabilities(changed, { providers }).trust_zone, 1);
+  });
+
   test('zone 0: sovereignty local, regardless of any providers map', () => {
     const card = { id: 'ornith-1.0-9b', provider: 'local', free: true, card: { tier: 'local' } };
     assert.equal(deriveCapabilities(card, {}).trust_zone, 0);

@@ -150,6 +150,29 @@ describe('C9: eligibility composes the floor with the sovereignty ceiling', () =
     assert.match(rejected.find((r) => r.id === 'mystery').reason, /unknown/);
   });
 
+  test('members expose family and declared cost separately from trust', () => {
+    const decorated = {
+      ...entry('claude-opus', { zone: TRUST_ZONES.PAID_CONTRACTUAL, declared: 'XL' }),
+      card: { family: 'claude', cost_tier: 'paid-cloud' },
+    };
+    const { members } = resolveBucket({
+      bucket: { model_class: 'XL', sensitivity: 'internal' },
+      catalog: [decorated],
+    });
+    assert.deepEqual(members, [{
+      id: 'claude-opus',
+      class_basis: 'declared-size-prior',
+      model_class: 'XL',
+      trust_zone: TRUST_ZONES.PAID_CONTRACTUAL,
+      family: 'claude',
+      cost_tier: 'paid-cloud',
+      // Card db431f61: alias count is not physical capacity, so every member
+      // also carries the id of the server actually behind it. This entry has
+      // no url, so it falls back to the model form.
+      physical_resource_id: 'model:claude-opus',
+    }]);
+  });
+
   test('lifecycle exclusion still applies', () => {
     const { members } = resolveBucket({
       bucket: { model_class: 'L', sensitivity: 'public' },
@@ -228,20 +251,28 @@ describe('C9: cost-ranked selection rotates only among equal-cost members', () =
     const catalog = [
       {
         ...entry('local', { zone: TRUST_ZONES.SOVEREIGN_LOCAL, declared: 'L' }),
-        capabilities: { trust_zone: TRUST_ZONES.SOVEREIGN_LOCAL, size_class: 'L', sovereignty: 'local' },
+        card: { cost_tier: 'local' },
       },
       {
         ...entry('free', { zone: TRUST_ZONES.FREE_REMOTE, declared: 'L' }),
-        capabilities: { trust_zone: TRUST_ZONES.FREE_REMOTE, size_class: 'L', sovereignty: 'free-remote' },
+        card: { cost_tier: 'free-remote' },
       },
     ];
     const { members: eligible, rejected } = resolveBucket({
       bucket: { model_class: 'L', sensitivity: 'secret' },
       catalog,
     });
+    const admittedBeforeRanking = structuredClone(eligible);
+    const ranked = orderMembersByCost(eligible, 0);
 
     assert.deepEqual(eligible.map((m) => m.id), ['local']);
-    assert.deepEqual(orderMembersByCost(eligible, 0).map((m) => m.id), ['local']);
+    assert.deepEqual(ranked.map((m) => m.id), ['local']);
+    assert.deepEqual(eligible, admittedBeforeRanking, 'ranking must not mutate trust-zone metadata');
+    assert.deepEqual(
+      ranked.map(({ id, trust_zone }) => [id, trust_zone]),
+      [['local', TRUST_ZONES.SOVEREIGN_LOCAL]],
+      'ranking preserves the resolved trust zone and has no path to the rejected zone',
+    );
     assert.equal(rejected.some((r) => r.id === 'free'), true, 'free-remote stays excluded');
   });
 
