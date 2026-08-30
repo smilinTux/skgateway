@@ -115,6 +115,7 @@ export const INTERNAL_CONTROL_HEADERS = [
   "x-sk-operator-credential-revision",
   "x-session-id",
   "x-model",
+  "x-sk-family-preference",
   "x-sklegal-service-authorization",
   "x-sklegal-tenant-id",
   "x-sklegal-matter-id",
@@ -574,6 +575,57 @@ function exitMeter(url) {
 }
 
 // ---------------------------------------------------------------------------
+// Deterministic backend-door balancer for equal-priority same-model replicas
+// ---------------------------------------------------------------------------
+
+/**
+ * Round-robin counters keyed by (priority, model) tuples.
+ * Each counter rotates through backends in that group to ensure balanced
+ * selection across equal-priority doors serving the same model.
+ *
+ * The key format is "<priority>:<model>" so chiap08-qwen38 and chiap01-qwen38
+ * (both priority 1, both serving qwen3.8-27b-huihui-abliterated-q4_k_m)
+ * share counter "1:qwen3.8-27b-huihui-abliterated-q4_k_m" and alternate.
+ *
+ * @type {Map<string, number>}
+ */
+const _replicaBalancers = new Map();
+
+/**
+ * Get the next backend index for a (priority, model) group using round-robin.
+ * This is deterministic and ensures equal distribution across all backends
+ * in the group over time.
+ *
+ * @param {number} priority
+ * @param {string} model
+ * @param {number} count  Number of backends in the group
+ * @returns {number} Index (0 to count-1) of the backend to select
+ */
+function nextReplicaIndex(priority, model, count) {
+  if (count <= 1) return 0; // No balancing needed for single backend
+  const key = `${priority}:${model}`;
+  const current = _replicaBalancers.get(key) || 0;
+  const next = (current + 1) % count;
+  _replicaBalancers.set(key, next);
+  return current; // Use current index before incrementing
+}
+
+/**
+ * Reset all balancer counters. Used only in tests.
+ */
+export function _resetReplicaBalancers() {
+  _replicaBalancers.clear();
+}
+
+/**
+ * Get the current balancer state. Used only in tests.
+ * @returns {Record<string, number>}
+ */
+export function _replicaBalancerState() {
+  return Object.fromEntries(_replicaBalancers);
+}
+
+// ---------------------------------------------------------------------------
 // Sliding-window latency tracker (P50 via reservoir sampling)
 // ---------------------------------------------------------------------------
 
@@ -649,7 +701,14 @@ export class Backend {
     // at runtime by registerDiscoveredRoutes() once a discovery fetch
     // succeeds. See supportsModel(): an empty list on a discovery backend must
     // NOT wildcard-match, unlike an ordinary statically-configured backend.
-    this.discovery = config.discovery || null;
+    // Discovery-managed backends claim only models registered by an
+    // authoritative catalog. Z.ai predates the explicit `discovery:` key, so
+    // infer its source rather than treating `models: []` as accept-everything.
+    this.discovery = config.discovery || (isZaiBackend(config) ? "zai" : null);
+    this.discoveryStatus = this.discovery ? "pending" : "static";
+    this.discoveryRevision = 0;
+    this.readinessRevision = 0;
+    this.discoveryAt = null;
     this.priority = typeof config.priority === "number" ? config.priority : 99;
     this.cooldown_ms = config.cooldown_ms || DEFAULT_COOLDOWN_MS;
     // Optional per-backend idle timeout (ms). 0 = no timeout (default). Used to
@@ -754,6 +813,25 @@ export class Backend {
     if (!model) return true;
     if (this.models.length === 0) return !this.discovery;
     return this.models.some((pattern) => modelMatches(pattern, model));
+  }
+
+  /** Whether an unclaimed id belongs to this provider's discovery namespace. */
+  mayDiscoverModel(model) {
+    return Boolean(this.discovery && model &&
+      (this.discovery === "zai" ? /^glm-/i.test(model) : false));
+  }
+
+  /** Replace one provider snapshot and advance observable process revisions. */
+  replaceDiscoveredModels(models, { ok = true, stale = false, at = Date.now() } = {}) {
+    const next = [...new Set((models || []).filter((id) => typeof id === "string"))];
+    const status = ok ? (stale ? "stale" : "ready") : (next.length ? "stale" : "failed");
+    this.discoveryRevision += 1;
+    if (status !== this.discoveryStatus || JSON.stringify(next) !== JSON.stringify(this.models)) {
+      this.readinessRevision += 1;
+    }
+    this.models = next;
+    this.discoveryStatus = status;
+    this.discoveryAt = at;
   }
 
   // -------------------------------------------------------------------------
@@ -1351,6 +1429,10 @@ export function createRouter(config = {}) {
    * Find backends that claim to support `model`, sorted by priority.
    * Falls back to all available backends if none explicitly match.
    *
+   * Equal-priority backends serving the same model are balanced using a
+   * deterministic round-robin mechanism to prevent one backend from
+   * queuing while another remains idle (card 786d9232).
+   *
    * @param {string|undefined} model
    * @param {string|undefined} agentId
    * @returns {Backend[]}
@@ -1362,6 +1444,42 @@ export function createRouter(config = {}) {
 
     // Exact or glob match first
     const matched = available.filter((b) => b.supportsModel(model));
+
+    // Balancing for equal-priority same-model replicas (card 786d9232).
+    // Group backends by priority and apply round-robin within each group.
+    if (matched.length > 1) {
+      // Group by priority
+      const byPriority = new Map();
+      for (const backend of matched) {
+        const p = backend.priority;
+        if (!byPriority.has(p)) {
+          byPriority.set(p, []);
+        }
+        byPriority.get(p).push(backend);
+      }
+
+      // For each priority group with multiple backends, rotate the order
+      // using the deterministic balancer
+      const balanced = [];
+      for (const [priority, group] of byPriority) {
+        if (group.length > 1) {
+          // Use round-robin to select the first backend in the group
+          const selectedIndex = nextReplicaIndex(priority, model, group.length);
+          // Rotate the array so the selected backend is first
+          const rotated = [
+            ...group.slice(selectedIndex),
+            ...group.slice(0, selectedIndex),
+          ];
+          balanced.push(...rotated);
+        } else {
+          balanced.push(...group);
+        }
+      }
+      // Preserve overall priority order by sorting the balanced result
+      balanced.sort((a, b) => a.priority - b.priority);
+      // Replace matched with the balanced ordering
+      matched.splice(0, matched.length, ...balanced);
+    }
 
     // The gate has to be checked here too, not only in the fallback branch
     // below. `Backend.models` is a snapshot written by
@@ -1642,7 +1760,14 @@ export function createRouter(config = {}) {
   // Return router interface
   // -------------------------------------------------------------------------
 
-  return { route, getHealth, addBackend, removeBackend, getBackend, getBackends, resolveAgentTarget };
+  function registerDiscoveredModels(id, models, outcome) {
+    const backend = backends.get(id);
+    if (!backend?.discovery) return false;
+    backend.replaceDiscoveredModels(models, outcome);
+    return true;
+  }
+
+  return { route, getHealth, addBackend, removeBackend, getBackend, getBackends, registerDiscoveredModels, resolveAgentTarget };
 }
 
 // ---------------------------------------------------------------------------
@@ -2377,6 +2502,17 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = (
   // path does await the same call; this one was simply missed, and no test ever
   // reached it. The normalization is kept for the resolved value, which really
   // can be a single object or an array.
+  // selectMember() returns the ONE best member (cheapest cost tier, preference
+  // applied within that tier). The candidate loop below still needs the full
+  // member list so failover, quarantine and pooling keep working when the
+  // chosen member's backend is down. Rebuild it with the picked member first,
+  // then every other member in cost order: the preference decides who serves,
+  // it does not remove anyone from the failover chain.
+  const orderedMembers = [
+    picked,
+    ...orderMembersByCost(members, n).filter((m) => m.id !== picked.id),
+  ];
+
   const candidates = [];
   const seen = new Set();
   const skipped = [];
@@ -2866,6 +3002,42 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       : [];
     const claimsRequested = configured.some((backend) => backend.supportsModel?.(request.model));
     if (request.model && configured.length > 0 && !claimsRequested) {
+      const awaiting = configured.find((backend) =>
+        backend.mayDiscoverModel?.(request.model) &&
+        (backend.discoveryStatus === "pending" || backend.discoveryStatus === "failed")
+      );
+      if (awaiting) {
+        const result = {
+          status: 503,
+          headers: { "content-type": "application/json", "retry-after": "1" },
+          body: Buffer.from(JSON.stringify({
+            error: {
+              message: `Model capability discovery is not ready: ${awaiting.id}/${request.model}`,
+              code: "model_discovery_not_ready",
+              type: "service_unavailable",
+            },
+            requested_model: requestedModel,
+            backend: awaiting.id,
+            readiness_revision: awaiting.readinessRevision,
+            discovery_revision: awaiting.discoveryRevision,
+            discovery_status: awaiting.discoveryStatus,
+          }), "utf8"),
+          backendId: null,
+          requestedModel,
+          readinessRevision: awaiting.readinessRevision,
+          discoveryRevision: awaiting.discoveryRevision,
+        };
+        emitSiem("error", {
+          status: 503,
+          code: "model_discovery_not_ready",
+          requested_model: requestedModel,
+          candidate_backend: awaiting.id,
+          readiness_revision: awaiting.readinessRevision,
+          discovery_revision: awaiting.discoveryRevision,
+          discovery_status: awaiting.discoveryStatus,
+        }, {});
+        return result;
+      }
       const lifecycle = getLifecycle(request.model);
       if (!isRoutable(lifecycle)) {
         try {
@@ -3418,7 +3590,14 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // Set from the attempt that is about to be returned, so on a failover it
     // names the SERVING attempt and never a blend across attempts, which is
     // the same ruling the energy headers already follow.
-    lastResult = { ...res, backendId, failover: didFailover, queueWaitMs };
+    lastResult = {
+      ...res,
+      backendId,
+      readinessRevision: backend.readinessRevision,
+      discoveryRevision: backend.discoveryRevision,
+      failover: didFailover,
+      queueWaitMs,
+    };
     if (isBucketChain) {
       lastResult.bucket = bucketAddr.bucket;
       lastResult.bucketMember = candidateModel;
@@ -3463,7 +3642,10 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         queue_wait_ms: queueWaitMs,
         failover: didFailover,
         requested_model: lastResult.requestedModel,
+        chosen_backend: backendId,
         served_model: lastResult.servedModel,
+        readiness_revision: lastResult.readinessRevision,
+        discovery_revision: lastResult.discoveryRevision,
         ...extractUsage(res.body),
       }, { backend: backendId });
       return lastResult;
