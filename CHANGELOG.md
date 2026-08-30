@@ -24,6 +24,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Z.ai is now inferred as discovery-managed, so an empty catalog at startup can
+  no longer wildcard-claim models it does not serve. While Z.ai discovery is
+  pending or has failed, a GLM request fails closed with an attributable 503
+  instead of silently falling through to NVIDIA, and successful routing records
+  the discovery and readiness revisions it was decided against. Cold-start,
+  timeout, connection-failure, stale-catalog and recovery drills assert NVIDIA
+  receives zero calls (card f361407c).
+
 - Response sanitization no longer strips evidence the caller needs. The
   public-surface and tool-call paths in `src/proxy/sanitizer.mjs` and
   `src/proxy/response-contract.mjs` now preserve tool-call structure and the
