@@ -13,6 +13,10 @@ Type=simple
 # scripts/install.sh auto-detects the actual repo dir and rewrites these lines
 # if this checkout lives somewhere else, so a cold machine needs no hand edits.
 WorkingDirectory=%h/clawd/skcapstone-repos/skgateway
+# Requires Node >= 22 (see package.json engines and .nvmrc). Node 20 is past
+# end of life. If /usr/bin/node is older, point this at a v22+ binary: a
+# mismatch between the node that BUILT better-sqlite3 and the node that runs
+# this unit silently disables the metrics collector and all request telemetry.
 ExecStart=/usr/bin/node %h/clawd/skcapstone-repos/skgateway/src/index.mjs --port 18780 --config %h/clawd/skcapstone-repos/skgateway/config/skgateway.yaml
 ExecReload=/bin/kill -HUP $MAINPID
 

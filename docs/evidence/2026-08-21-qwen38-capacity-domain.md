@@ -56,7 +56,7 @@ Observed in the implementation worktree on 2026-08-21:
 ## Live AC5 qualification on `.41`
 
 The live gate ran against `http://localhost:18780` on
-`cbrd21-laptop12thgenintelcore` without changing gateway/model configuration,
+`OPERATOR-laptop` without changing gateway/model configuration,
 restarting services, or changing llama.cpp parallelism.
 
 - run id: `ac5-8b64febc-1787349857924`

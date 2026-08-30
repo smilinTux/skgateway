@@ -58,7 +58,7 @@ import {
   policyFromRegistry,
   TRUST_ZONES,
 } from "../policy/sensitivity.mjs";
-import { parseBucketId, resolveBucket, selectMember, looksLikeBucketAttempt, allBuckets } from "../policy/buckets.mjs";
+import { parseBucketId, resolveBucket, orderMembersByCost, looksLikeBucketAttempt, allBuckets, validateFamilyPreference, applyFamilyPreference } from "../policy/buckets.mjs";
 import { codexPurityProblems } from "../policy/codex-purity.mjs";
 
 // sk-auto routing decision cache (TTL+LRU); keyed by request fingerprint + config epoch.
@@ -114,6 +114,7 @@ export const INTERNAL_CONTROL_HEADERS = [
   "x-sk-operator-credential-revision",
   "x-session-id",
   "x-model",
+  "x-sk-family-preference",
   "x-sklegal-service-authorization",
   "x-sklegal-tenant-id",
   "x-sklegal-matter-id",
@@ -570,6 +571,57 @@ function exitMeter(url) {
   if (!url) return;
   const n = (_inFlight.get(url) ?? 1) - 1;
   if (n <= 0) _inFlight.delete(url); else _inFlight.set(url, n);
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic backend-door balancer for equal-priority same-model replicas
+// ---------------------------------------------------------------------------
+
+/**
+ * Round-robin counters keyed by (priority, model) tuples.
+ * Each counter rotates through backends in that group to ensure balanced
+ * selection across equal-priority doors serving the same model.
+ *
+ * The key format is "<priority>:<model>" so chiap08-qwen38 and chiap01-qwen38
+ * (both priority 1, both serving qwen3.8-27b-huihui-abliterated-q4_k_m)
+ * share counter "1:qwen3.8-27b-huihui-abliterated-q4_k_m" and alternate.
+ *
+ * @type {Map<string, number>}
+ */
+const _replicaBalancers = new Map();
+
+/**
+ * Get the next backend index for a (priority, model) group using round-robin.
+ * This is deterministic and ensures equal distribution across all backends
+ * in the group over time.
+ *
+ * @param {number} priority
+ * @param {string} model
+ * @param {number} count  Number of backends in the group
+ * @returns {number} Index (0 to count-1) of the backend to select
+ */
+function nextReplicaIndex(priority, model, count) {
+  if (count <= 1) return 0; // No balancing needed for single backend
+  const key = `${priority}:${model}`;
+  const current = _replicaBalancers.get(key) || 0;
+  const next = (current + 1) % count;
+  _replicaBalancers.set(key, next);
+  return current; // Use current index before incrementing
+}
+
+/**
+ * Reset all balancer counters. Used only in tests.
+ */
+export function _resetReplicaBalancers() {
+  _replicaBalancers.clear();
+}
+
+/**
+ * Get the current balancer state. Used only in tests.
+ * @returns {Record<string, number>}
+ */
+export function _replicaBalancerState() {
+  return Object.fromEntries(_replicaBalancers);
 }
 
 // ---------------------------------------------------------------------------
@@ -1350,6 +1402,10 @@ export function createRouter(config = {}) {
    * Find backends that claim to support `model`, sorted by priority.
    * Falls back to all available backends if none explicitly match.
    *
+   * Equal-priority backends serving the same model are balanced using a
+   * deterministic round-robin mechanism to prevent one backend from
+   * queuing while another remains idle (card 786d9232).
+   *
    * @param {string|undefined} model
    * @param {string|undefined} agentId
    * @returns {Backend[]}
@@ -1361,6 +1417,42 @@ export function createRouter(config = {}) {
 
     // Exact or glob match first
     const matched = available.filter((b) => b.supportsModel(model));
+
+    // Balancing for equal-priority same-model replicas (card 786d9232).
+    // Group backends by priority and apply round-robin within each group.
+    if (matched.length > 1) {
+      // Group by priority
+      const byPriority = new Map();
+      for (const backend of matched) {
+        const p = backend.priority;
+        if (!byPriority.has(p)) {
+          byPriority.set(p, []);
+        }
+        byPriority.get(p).push(backend);
+      }
+
+      // For each priority group with multiple backends, rotate the order
+      // using the deterministic balancer
+      const balanced = [];
+      for (const [priority, group] of byPriority) {
+        if (group.length > 1) {
+          // Use round-robin to select the first backend in the group
+          const selectedIndex = nextReplicaIndex(priority, model, group.length);
+          // Rotate the array so the selected backend is first
+          const rotated = [
+            ...group.slice(selectedIndex),
+            ...group.slice(0, selectedIndex),
+          ];
+          balanced.push(...rotated);
+        } else {
+          balanced.push(...group);
+        }
+      }
+      // Preserve overall priority order by sorting the balanced result
+      balanced.sort((a, b) => a.priority - b.priority);
+      // Replace matched with the balanced ordering
+      matched.splice(0, matched.length, ...balanced);
+    }
 
     // The gate has to be checked here too, not only in the fallback branch
     // below. `Backend.models` is a snapshot written by
@@ -2108,6 +2200,31 @@ function isBucketsEnabled() {
   }
 }
 
+/**
+ * A catalog listing is not completion liveness. Bound bucket attempts even
+ * when a backend has no general timeout, so a socket-accepting black hole
+ * becomes a retryable 504 instead of holding the selected route forever.
+ *
+ * This is intentionally bucket-only. Named-model and registry-role traffic
+ * retain each backend's existing timeout contract. An explicit shorter backend
+ * timeout stays shorter. Tests may lower the boundary through the environment;
+ * zero and malformed values cannot disable it.
+ */
+export const DEFAULT_BUCKET_LIVENESS_TIMEOUT_MS = 60_000;
+
+export function bucketLivenessTimeoutMs(
+  backendTimeoutMs = 0,
+  raw = process.env.SKGATEWAY_BUCKET_LIVENESS_TIMEOUT_MS,
+) {
+  const configured = Number(raw);
+  const boundary = Number.isFinite(configured) && configured > 0
+    ? Math.trunc(configured)
+    : DEFAULT_BUCKET_LIVENESS_TIMEOUT_MS;
+  return Number.isFinite(backendTimeoutMs) && backendTimeoutMs > 0
+    ? Math.min(Math.trunc(backendTimeoutMs), boundary)
+    : boundary;
+}
+
 /** Per-bucket rotation counters. Ranking decides eligibility, this decides who serves. */
 const _bucketCounters = new Map();
 
@@ -2271,14 +2388,72 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = (
 
   const n = (_bucketCounters.get(addr.bucket) || 0) + 1;
   _bucketCounters.set(addr.bucket, n);
-  const picked = selectMember(members, n);
-  const start = members.indexOf(picked);
-  const orderedMembers = [...members.slice(start), ...members.slice(0, start)];
+  let orderedMembers = orderMembersByCost(members, n);
+
+  // Read and validate family preference from request header (card 93220ffc)
+  const prefHeader = request.headers?.['x-sk-family-preference'];
+  let familyPreference = null;
+  let prefError = null;
+
+  if (prefHeader !== undefined) {
+    try {
+      const parsed = typeof prefHeader === 'string' ? JSON.parse(prefHeader) : prefHeader;
+      const validation = validateFamilyPreference(parsed, addr.sensitivity);
+      if (validation.valid) {
+        familyPreference = validation.preference;
+        if (familyPreference && familyPreference.length > 0) {
+          console.log(
+            `[router] bucket ${addr.bucket} applying family preference: ${JSON.stringify(familyPreference)}`,
+          );
+          orderedMembers = applyFamilyPreference(orderedMembers, familyPreference);
+        }
+      } else {
+        prefError = validation.reason;
+        console.warn(
+          `[router] bucket ${addr.bucket} invalid family preference: ${prefError}`,
+        );
+        // Preference validation errors fail the request - this is a caller contract violation
+        return {
+          failClosed: {
+            status: 400,
+            headers: { "content-type": "application/json" },
+            body: Buffer.from(JSON.stringify({
+              error: {
+                message: prefError,
+                code: 400,
+                type: "invalid_family_preference",
+                bucket: addr.bucket,
+              },
+            }), "utf-8"),
+          },
+        };
+      }
+    } catch (err) {
+      prefError = `unable to parse family preference header: ${err.message}`;
+      console.warn(`[router] bucket ${addr.bucket} ${prefError}`);
+      return {
+        failClosed: {
+          status: 400,
+          headers: { "content-type": "application/json" },
+          body: Buffer.from(JSON.stringify({
+            error: {
+              message: prefError,
+              code: 400,
+              type: "invalid_family_preference",
+              bucket: addr.bucket,
+            },
+          }), "utf-8"),
+        },
+      };
+    }
+  }
+
+  const picked = orderedMembers[0];
 
   console.log(
     `[router] bucket ${addr.bucket} -> ${picked.id} ` +
       `(class ${picked.model_class || "?"} via ${picked.class_basis}, zone ${picked.trust_zone ?? "?"}, ` +
-      `${members.length} eligible)`,
+      `family ${picked.card?.family || "none"}, ${members.length} eligible)`,
   );
 
   // Resolve the chosen id through the router's own model matching, so
@@ -2882,6 +3057,9 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // in the list (candidatesFor() only ever matches on model id), so
     // request.model is the correct default.
     const candidateModel = candidates[i].model || request.model;
+    const attemptTimeoutMs = isBucketChain
+      ? bucketLivenessTimeoutMs(backend.timeout_ms)
+      : backend.timeout_ms;
 
     if (i > 0) {
       didFailover = true;
@@ -3120,7 +3298,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         if (tr) {
           const aHeaders = { ...forwardHeaders, ...tr.headers };
           delete aHeaders["content-length"];
-          const raw = await sendUpstream(tr.path, method, aHeaders, tr.body, targetUrl, backend.timeout_ms, abortSignal);
+          const raw = await sendUpstream(tr.path, method, aHeaders, tr.body, targetUrl, attemptTimeoutMs, abortSignal);
           if (raw?.cancelled) {
             res = raw;
           } else {
@@ -3133,7 +3311,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
             res = toOpenAIResponse(raw, request.model);
           }
         } else {
-          res = await sendUpstream(upstreamPath, method, forwardHeaders, attemptBody, targetUrl, backend.timeout_ms, abortSignal);
+          res = await sendUpstream(upstreamPath, method, forwardHeaders, attemptBody, targetUrl, attemptTimeoutMs, abortSignal);
         }
       } else if (isCodexBackend(backend)) {
         // Translate OpenAI chat-completions -> Codex Responses API (OpenAI
@@ -3151,13 +3329,13 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           }
           const cHeaders = { ...forwardHeaders, ...tr.headers };
           delete cHeaders["content-length"];
-          const raw = await sendUpstream(tr.path, method, cHeaders, tr.body, targetUrl, backend.timeout_ms, abortSignal);
+          const raw = await sendUpstream(tr.path, method, cHeaders, tr.body, targetUrl, attemptTimeoutMs, abortSignal);
           res = raw?.cancelled ? raw : fromCodexResponse(raw, candidateModel, tr.clientStream);
         } else {
-          res = await sendUpstream(upstreamPath, method, forwardHeaders, attemptBody, targetUrl, backend.timeout_ms, abortSignal);
+          res = await sendUpstream(upstreamPath, method, forwardHeaders, attemptBody, targetUrl, attemptTimeoutMs, abortSignal);
         }
       } else {
-        res = await sendUpstream(upstreamPath, method, forwardHeaders, attemptBody, targetUrl, backend.timeout_ms, abortSignal);
+        res = await sendUpstream(upstreamPath, method, forwardHeaders, attemptBody, targetUrl, attemptTimeoutMs, abortSignal);
       }
       attemptConcurrency = meterUrl ? inFlightOnMeter(meterUrl) : 1;
     } catch (err) {
