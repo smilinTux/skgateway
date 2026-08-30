@@ -58,7 +58,7 @@ import {
   policyFromRegistry,
   TRUST_ZONES,
 } from "../policy/sensitivity.mjs";
-import { parseBucketId, resolveBucket, orderMembersByCost, looksLikeBucketAttempt, allBuckets, validateFamilyPreference, applyFamilyPreference } from "../policy/buckets.mjs";
+import { parseBucketId, resolveBucket, orderMembersByCost, validateFamilyPreference, applyFamilyPreference, selectMember, looksLikeBucketAttempt, allBuckets } from "../policy/buckets.mjs";
 import { codexPurityProblems } from "../policy/codex-purity.mjs";
 
 // sk-auto routing decision cache (TTL+LRU); keyed by request fingerprint + config epoch.
@@ -103,6 +103,7 @@ export const CLIENT_CREDENTIAL_HEADERS = [
 export const INTERNAL_CONTROL_HEADERS = [
   "x-sk-card-id",
   "x-sk-context",
+  "x-sk-prefer",
   "x-sk-require",
   "x-sk-role",
   "x-sk-service",
@@ -2426,59 +2427,35 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
 
   const n = (_bucketCounters.get(addr.bucket) || 0) + 1;
   _bucketCounters.set(addr.bucket, n);
-  let orderedMembers = orderMembersByCost(members, n);
-
-  // Read and validate family preference from request header (card 93220ffc)
-  const prefHeader = request.headers?.['x-sk-family-preference'];
+  
+  // Read and validate family preference from x-sk-prefer header (card 1e26943e)
+  const prefHeader = request.headers?.['x-sk-prefer'];
   let familyPreference = null;
   let prefError = null;
 
   if (prefHeader !== undefined) {
-    try {
-      const parsed = typeof prefHeader === 'string' ? JSON.parse(prefHeader) : prefHeader;
-      const validation = validateFamilyPreference(parsed, addr.sensitivity);
-      if (validation.valid) {
-        familyPreference = validation.preference;
-        if (familyPreference && familyPreference.length > 0) {
-          console.log(
-            `[router] bucket ${addr.bucket} applying family preference: ${JSON.stringify(familyPreference)}`,
-          );
-          orderedMembers = applyFamilyPreference(orderedMembers, familyPreference);
-        }
-      } else {
-        prefError = validation.reason;
-        console.warn(
-          `[router] bucket ${addr.bucket} invalid family preference: ${prefError}`,
+    const validation = validateFamilyPreference(prefHeader, addr.sensitivity);
+    if (validation.valid) {
+      familyPreference = validation.preference;
+      if (familyPreference && familyPreference.length > 0) {
+        console.log(
+          `[router] bucket ${addr.bucket} applying family preference: ${familyPreference.join(',')}`,
         );
-        // Preference validation errors fail the request - this is a caller contract violation
-        return {
-          failClosed: {
-            status: 400,
-            headers: { "content-type": "application/json" },
-            body: Buffer.from(JSON.stringify({
-              error: {
-                message: prefError,
-                code: 400,
-                type: "invalid_family_preference",
-                bucket: addr.bucket,
-              },
-            }), "utf-8"),
-          },
-        };
       }
-    } catch (err) {
-      prefError = `unable to parse family preference header: ${err.message}`;
-      console.warn(`[router] bucket ${addr.bucket} ${prefError}`);
+    } else {
+      prefError = validation.reason;
+      console.warn(
+        `[router] bucket ${addr.bucket} invalid family preference: ${prefError}`,
+      );
       return {
         failClosed: {
           status: 400,
           headers: { "content-type": "application/json" },
           body: Buffer.from(JSON.stringify({
             error: {
-              message: prefError,
+              message: `Invalid family preference: ${prefError}`,
               code: 400,
               type: "invalid_family_preference",
-              bucket: addr.bucket,
             },
           }), "utf-8"),
         },
@@ -2486,12 +2463,32 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
     }
   }
 
-  const picked = orderedMembers[0];
+  // Apply family preference within cheapest cost tier
+  const picked = selectMember(members, n, familyPreference);
+  
+  if (!picked) {
+    console.warn(`[router] bucket ${addr.bucket} no member selected after preference`);
+    return {
+      failClosed: {
+        status: 503,
+        headers: { "content-type": "application/json" },
+        body: Buffer.from(JSON.stringify({
+          error: {
+            message: `No model available for bucket ${addr.bucket}`,
+            code: 503,
+            type: "bucket_no_member",
+          },
+        }), "utf-8"),
+      },
+    };
+  }
 
   console.log(
     `[router] bucket ${addr.bucket} -> ${picked.id} ` +
       `(class ${picked.model_class || "?"} via ${picked.class_basis}, zone ${picked.trust_zone ?? "?"}, ` +
-      `family ${picked.card?.family || "none"}, ${members.length} eligible)`,
+      `family ${picked.family || "?"}, ` +
+      `${members.length} eligible)` +
+      (familyPreference ? ` [preference: ${familyPreference.join(',')}]` : ''),
   );
 
   // Resolve the chosen id through the router's own model matching, so
@@ -2510,6 +2507,17 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
   // path does await the same call; this one was simply missed, and no test ever
   // reached it. The normalization is kept for the resolved value, which really
   // can be a single object or an array.
+  // selectMember() returns the ONE best member (cheapest cost tier, preference
+  // applied within that tier). The candidate loop below still needs the full
+  // member list so failover, quarantine and pooling keep working when the
+  // chosen member's backend is down. Rebuild it with the picked member first,
+  // then every other member in cost order: the preference decides who serves,
+  // it does not remove anyone from the failover chain.
+  const orderedMembers = [
+    picked,
+    ...orderMembersByCost(members, n).filter((m) => m.id !== picked.id),
+  ];
+
   const candidates = [];
   const seen = new Set();
   const skipped = [];

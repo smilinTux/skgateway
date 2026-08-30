@@ -31,6 +31,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Bucket family preference now uses one strict comma-separated `x-sk-prefer`
+  contract and applies only within the cheapest eligible cost tier, so a
+  preference reorders who serves without ever widening the resolved set or
+  overriding the cost ladder. Preference tokens are validated as broad family
+  names (or `sovereign`/`free`), never raw model ids, and `free` is refused
+  outside public sensitivity. Matching reads the top-level `member.family`
+  emitted by `resolveBucket` rather than `member.card.family`, which is what
+  made a stated preference silently fail to match (card 1e26943e, repairing the
+  SKW-ROUTE-03 launch).
+
 - Z.ai is now inferred as discovery-managed, so an empty catalog at startup can
   no longer wildcard-claim models it does not serve. While Z.ai discovery is
   pending or has failed, a GLM request fails closed with an attributable 503

@@ -33,7 +33,7 @@ describe('SKW-ROUTE-03: validateFamilyPreference', () => {
       preference: null,
       reason: null,
     });
-    assert.deepEqual(validateFamilyPreference([]), {
+    assert.deepEqual(validateFamilyPreference(''), {
       valid: true,
       preference: null,
       reason: null,
@@ -46,27 +46,33 @@ describe('SKW-ROUTE-03: validateFamilyPreference', () => {
   });
 
   test('valid family names are accepted', () => {
-    const result = validateFamilyPreference(['claude', 'codex', 'glm']);
+    const result = validateFamilyPreference('claude,codex,glm');
     assert.equal(result.valid, true);
     assert.deepEqual(result.preference, ['claude', 'codex', 'glm']);
     assert.equal(result.reason, null);
   });
 
   test('preference entries are normalized to lowercase', () => {
-    const result = validateFamilyPreference(['CLAUDE', 'Codex', 'GLM']);
+    const result = validateFamilyPreference('CLAUDE,Codex,GLM');
     assert.equal(result.valid, true);
     assert.deepEqual(result.preference, ['claude', 'codex', 'glm']);
   });
 
-  test('non-string entries are rejected', () => {
-    const result = validateFamilyPreference(['claude', 123]);
-    assert.equal(result.valid, false);
-    assert.equal(result.preference, null);
-    assert.match(result.reason, /must be strings, got number/);
+  test('a non-string preference argument is ignored rather than throwing', () => {
+    // The contract is a comma-separated STRING (x-sk-prefer). Anything else is
+    // not a malformed preference, it is the absence of one, so it must yield
+    // "no preference" rather than a 400 (card 1e26943e).
+    for (const bad of [123, ['claude'], {}, true]) {
+      assert.deepEqual(validateFamilyPreference(bad), {
+        valid: true,
+        preference: null,
+        reason: null,
+      });
+    }
   });
 
   test('AC 4: raw model ids with slashes are rejected', () => {
-    const result = validateFamilyPreference(['openai/gpt-4']);
+    const result = validateFamilyPreference('openai/gpt-4');
     assert.equal(result.valid, false);
     assert.equal(result.preference, null);
     assert.match(result.reason, /must name a family, not a raw model id/);
@@ -80,26 +86,26 @@ describe('SKW-ROUTE-03: validateFamilyPreference', () => {
       'qwen-72b-v1',
       'llama-3.1-70b',
     ]) {
-      const result = validateFamilyPreference([badId]);
+      const result = validateFamilyPreference(badId);
       assert.equal(result.valid, false, `${badId} should be rejected`);
       assert.match(result.reason, /must name a family, not a raw model id/);
     }
   });
 
   test('AC 4: raw model ids with parameter count patterns are rejected', () => {
-    const result = validateFamilyPreference(['gpt-4-turbo-128k']);
+    const result = validateFamilyPreference('gpt-4-turbo-128k');
     assert.equal(result.valid, false);
     assert.match(result.reason, /must name a family, not a raw model id/);
   });
 
   test('valid family names with hyphens and underscores are accepted', () => {
-    const result = validateFamilyPreference(['deep-seek', 'minimax_ai', 'gemma-2']);
+    const result = validateFamilyPreference('deep-seek,minimax_ai,gemma-2');
     assert.equal(result.valid, true);
     assert.deepEqual(result.preference, ['deep-seek', 'minimax_ai', 'gemma-2']);
   });
 
   test('family names must start with a letter', () => {
-    const result = validateFamilyPreference(['123family', '_invalid', '9gpt']);
+    const result = validateFamilyPreference('123family,_invalid,9gpt');
     assert.equal(result.valid, false);
     assert.match(result.reason, /must start with a letter/);
   });
@@ -107,13 +113,13 @@ describe('SKW-ROUTE-03: validateFamilyPreference', () => {
 
 describe('SKW-ROUTE-03: validateFamilyPreference - free constraint', () => {
   test('AC 3: prefer "free" is allowed at public sensitivity', () => {
-    const result = validateFamilyPreference(['free'], 'public');
+    const result = validateFamilyPreference('free', 'public');
     assert.equal(result.valid, true);
     assert.deepEqual(result.preference, ['free']);
   });
 
   test('AC 3: prefer "free" is REFUSED at internal sensitivity', () => {
-    const result = validateFamilyPreference(['free'], 'internal');
+    const result = validateFamilyPreference('free', 'internal');
     assert.equal(result.valid, false);
     assert.equal(result.preference, null);
     assert.match(result.reason, /not allowed at sensitivity="internal"/);
@@ -121,7 +127,7 @@ describe('SKW-ROUTE-03: validateFamilyPreference - free constraint', () => {
   });
 
   test('AC 3: prefer "free" is REFUSED at secret sensitivity', () => {
-    const result = validateFamilyPreference(['free'], 'secret');
+    const result = validateFamilyPreference('free', 'secret');
     assert.equal(result.valid, false);
     assert.equal(result.preference, null);
     assert.match(result.reason, /not allowed at sensitivity="secret"/);
@@ -129,13 +135,13 @@ describe('SKW-ROUTE-03: validateFamilyPreference - free constraint', () => {
   });
 
   test('prefer "free" is rejected in a mixed preference list at internal', () => {
-    const result = validateFamilyPreference(['claude', 'free', 'codex'], 'internal');
+    const result = validateFamilyPreference('claude,free,codex', 'internal');
     assert.equal(result.valid, false);
     assert.match(result.reason, /not allowed at sensitivity="internal"/);
   });
 
   test('free is normalized to lowercase and validated against sensitivity', () => {
-    const result = validateFamilyPreference(['FREE'], 'public');
+    const result = validateFamilyPreference('FREE', 'public');
     assert.equal(result.valid, true);
     assert.deepEqual(result.preference, ['free']);
   });
@@ -143,18 +149,18 @@ describe('SKW-ROUTE-03: validateFamilyPreference - free constraint', () => {
 
 describe('SKW-ROUTE-03: applyFamilyPreference', () => {
   const members = [
-    { id: 'claude-opus', card: { family: 'claude' }, cost_tier: 'paid-cloud' },
-    { id: 'gpt-4', card: { family: 'codex' }, cost_tier: 'paid-cloud' },
-    { id: 'glm-4', card: { family: 'glm' }, cost_tier: 'free-remote' },
-    { id: 'ornith-35b', card: { family: 'ornith' }, cost_tier: 'local' },
-    { id: 'llama-3', card: { family: 'llama' }, cost_tier: 'local' },
+    { id: 'claude-opus', family: 'claude', cost_tier: 'paid-cloud' },
+    { id: 'gpt-4', family: 'codex', cost_tier: 'paid-cloud' },
+    { id: 'glm-4', family: 'glm', cost_tier: 'free-remote' },
+    { id: 'ornith-35b', family: 'ornith', cost_tier: 'local' },
+    { id: 'llama-3', family: 'llama', cost_tier: 'local' },
   ];
 
   test('AC 1: a preference lands on that family when available', () => {
     const result = applyFamilyPreference(members, ['claude']);
     assert.equal(result.length, members.length);
     assert.equal(result[0].id, 'claude-opus');
-    assert.equal(result[0].card.family, 'claude');
+    assert.equal(result[0].family, 'claude');
   });
 
   test('preference respects order: first preferred family first', () => {
@@ -165,9 +171,9 @@ describe('SKW-ROUTE-03: applyFamilyPreference', () => {
 
   test('multiple members of the same preferred family are grouped together', () => {
     const multiFamily = [
-      { id: 'claude-3', card: { family: 'claude' }, cost_tier: 'paid-cloud' },
-      { id: 'claude-3.5', card: { family: 'claude' }, cost_tier: 'paid-cloud' },
-      { id: 'gpt-4', card: { family: 'codex' }, cost_tier: 'paid-cloud' },
+      { id: 'claude-3', family: 'claude', cost_tier: 'paid-cloud' },
+      { id: 'claude-3.5', family: 'claude', cost_tier: 'paid-cloud' },
+      { id: 'gpt-4', family: 'codex', cost_tier: 'paid-cloud' },
     ];
     const result = applyFamilyPreference(multiFamily, ['claude']);
     assert.equal(result[0].id, 'claude-3');
@@ -211,10 +217,10 @@ describe('SKW-ROUTE-03: applyFamilyPreference', () => {
 
 describe('SKW-ROUTE-03: applyFamilyPreference - free special case', () => {
   const members = [
-    { id: 'local-1', card: { family: 'llama' }, cost_tier: 'local' },
-    { id: 'free-1', card: { family: 'glm' }, cost_tier: 'free-remote' },
-    { id: 'free-2', card: { family: 'qwen' }, cost_tier: 'free-remote' },
-    { id: 'paid-1', card: { family: 'claude' }, cost_tier: 'paid-cloud' },
+    { id: 'local-1', family: 'llama', cost_tier: 'local' },
+    { id: 'free-1', family: 'glm', cost_tier: 'free-remote' },
+    { id: 'free-2', family: 'qwen', cost_tier: 'free-remote' },
+    { id: 'paid-1', family: 'claude', cost_tier: 'paid-cloud' },
   ];
 
   test('prefer "free" matches free-remote cost tier', () => {
@@ -237,8 +243,8 @@ describe('SKW-ROUTE-03: applyFamilyPreference - free special case', () => {
 
   test('no free-remote members: preference has no effect', () => {
     const noFree = [
-      { id: 'local-1', card: { family: 'llama' }, cost_tier: 'local' },
-      { id: 'paid-1', card: { family: 'claude' }, cost_tier: 'paid-cloud' },
+      { id: 'local-1', family: 'llama', cost_tier: 'local' },
+      { id: 'paid-1', family: 'claude', cost_tier: 'paid-cloud' },
     ];
     const result = applyFamilyPreference(noFree, ['free']);
     // Order unchanged since no matches
@@ -248,10 +254,10 @@ describe('SKW-ROUTE-03: applyFamilyPreference - free special case', () => {
 
 describe('SKW-ROUTE-03: applyFamilyPreference - partial matches', () => {
   const members = [
-    { id: 'a1', card: { family: 'alpha' }, cost_tier: 'local' },
-    { id: 'b1', card: { family: 'beta' }, cost_tier: 'local' },
-    { id: 'a2', card: { family: 'alpha' }, cost_tier: 'paid-cloud' },
-    { id: 'c1', card: { family: 'gamma' }, cost_tier: 'paid-cloud' },
+    { id: 'a1', family: 'alpha', cost_tier: 'local' },
+    { id: 'b1', family: 'beta', cost_tier: 'local' },
+    { id: 'a2', family: 'alpha', cost_tier: 'paid-cloud' },
+    { id: 'c1', family: 'gamma', cost_tier: 'paid-cloud' },
   ];
 
   test('preferred families first, then unmatched in original order', () => {
@@ -267,10 +273,10 @@ describe('SKW-ROUTE-03: applyFamilyPreference - partial matches', () => {
 
 describe('SKW-ROUTE-03: selectMember with family preference', () => {
   const members = [
-    { id: 'local-a', card: { family: 'llama' }, cost_tier: 'local' },
-    { id: 'local-b', card: { family: 'ornith' }, cost_tier: 'local' },
-    { id: 'free-a', card: { family: 'glm' }, cost_tier: 'free-remote' },
-    { id: 'paid-a', card: { family: 'claude' }, cost_tier: 'paid-cloud' },
+    { id: 'local-a', family: 'llama', cost_tier: 'local' },
+    { id: 'local-b', family: 'ornith', cost_tier: 'local' },
+    { id: 'free-a', family: 'glm', cost_tier: 'free-remote' },
+    { id: 'paid-a', family: 'claude', cost_tier: 'paid-cloud' },
   ];
 
   test('selectMember applies cost ranking first, then family preference within cheapest tier', () => {
@@ -353,14 +359,14 @@ describe('SKW-ROUTE-03: integration - preference with bucket resolution', () => 
     const bucketMembers = [
       {
         id: 'local-llama',
-        card: { family: 'llama' },
+        family: 'llama',
         cost_tier: 'local',
         trust_zone: TRUST_ZONES.SOVEREIGN_LOCAL,
         model_class: 'L',
       },
       {
         id: 'local-ornith',
-        card: { family: 'ornith' },
+        family: 'ornith',
         cost_tier: 'local',
         trust_zone: TRUST_ZONES.SOVEREIGN_LOCAL,
         model_class: 'L',
@@ -383,10 +389,10 @@ describe('SKW-ROUTE-03: integration - preference with bucket resolution', () => 
   test('preference works within a cost-ranked set', () => {
     // Cost-ordered members (local, then free-remote, then paid-cloud)
     const costOrdered = [
-      { id: 'local-a', card: { family: 'llama' }, cost_tier: 'local' },
-      { id: 'local-b', card: { family: 'ornith' }, cost_tier: 'local' },
-      { id: 'free-a', card: { family: 'glm' }, cost_tier: 'free-remote' },
-      { id: 'paid-a', card: { family: 'claude' }, cost_tier: 'paid-cloud' },
+      { id: 'local-a', family: 'llama', cost_tier: 'local' },
+      { id: 'local-b', family: 'ornith', cost_tier: 'local' },
+      { id: 'free-a', family: 'glm', cost_tier: 'free-remote' },
+      { id: 'paid-a', family: 'claude', cost_tier: 'paid-cloud' },
     ];
 
     // Apply preference for 'ornith' (in the cheapest tier)
