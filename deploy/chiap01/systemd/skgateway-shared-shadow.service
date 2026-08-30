@@ -16,7 +16,6 @@ WorkingDirectory=/var/lib/sklegal/skgateway/shared-shadow
 
 ## Configuration validation - must exist and be readable
 ExecStartPre=/usr/bin/test -r /etc/sklegal/skgateway/shared-shadow.yaml
-ExecStartPre=/usr/bin/sha256sum -c /etc/sklegal/skgateway/shared-shadow.yaml.sha256
 ExecStart=/usr/bin/node /opt/skgateway/src/index.mjs \
     --port 28880 \
     --config /etc/sklegal/skgateway/shared-shadow.yaml

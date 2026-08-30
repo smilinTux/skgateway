@@ -40,7 +40,7 @@ const REGISTRY = `backends:
     model: ornith-1.0-9b
     kind: chat
   qwen38:
-    url: http://100.81.238.58:11439/v1
+    url: http://TAILNET_HOST:11439/v1
     model: qwen3.8-27b-huihui-abliterated-q4_k_m
     kind: chat
 roles:

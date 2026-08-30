@@ -35,6 +35,29 @@ Config is loaded with deep-merge semantics: nested objects in your file are
 merged over the defaults key-by-key. Arrays in your file **replace** (not
 append to) the corresponding default array.
 
+`backends` is the deliberate exception. If the YAML declares `backends:`, that
+mapping is the complete backend registry and replaces the built-in registry.
+Omitting a backend from that mapping removes it. To make the intent visible,
+an operator may instead declare only `enabled: false`; the loader removes that
+entry before validation and before routing, discovery, advertisement, or bucket
+catalog construction sees it:
+
+```yaml
+backends:
+  anthropic:
+    enabled: false
+  local:
+    url: http://127.0.0.1:8082/v1
+    auth_type: none
+    models: [local-model]
+    priority: 1
+```
+
+A disabled entry must not retain `pooling.per_backend` or
+`pooling.capacity_domains.*.members` references, including a
+`reg:<backend>` member. Such orphan references fail validation before startup.
+Malformed YAML also fails startup; it never falls back to built-in backends.
+
 ---
 
 ## Config File Location
@@ -206,6 +229,7 @@ backends:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
+| `enabled` | boolean | `true` | Set exactly `false` to remove the backend. No other fields are required on a disabled entry. Any other type is rejected. |
 | `url` | string | _(required)_ | Base URL of the upstream API including the `/v1` suffix. |
 | `auth_type` | enum | `"api_key"` | Authentication strategy. One of `api_key`, `oauth`, `bearer`, `none`. |
 | `api_key_env` | string | — | Name of the environment variable holding the API key. Used when `auth_type: api_key`. |

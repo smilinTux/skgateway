@@ -4,6 +4,11 @@ Documentation=https://github.com/sk-oss/skgateway
 BindsTo=skgateway-shared-tailnet.socket
 After=skgateway-shared-shadow.service
 Requires=skgateway-shared-shadow.service
+## Restart rate limiting belongs in [Unit]; systemd ignores these keys in
+## [Service] and logged "Unknown key name 'StartLimitIntervalSec'", so the
+## restart limit was silently not applied.
+StartLimitIntervalSec=60s
+StartLimitBurst=3
 
 [Service]
 ## Root-owned hardened supervised proxy
@@ -43,23 +48,20 @@ CPUQuota=50%
 ## Restart policy - bounded restarts with backoff
 Restart=on-failure
 RestartSec=5s
-StartLimitIntervalSec=60s
-StartLimitBurst=3
 
 ## Timeout settings
 TimeoutStartSec=30s
 TimeoutStopSec=10s
 
-## socat proxy: Tailscale ingress -> loopback backend
-## - TCP4-LISTEN: accepts from socket (bound to 100.80.180.78)
-## - TCP4: forwards to 127.0.0.1:28880 (shared shadow gateway)
-## - verify-chain: validates SSL/TLS if used (future proofing)
-## - reuseaddr: allows quick restart
-## - fork: handles concurrent connections
-ExecStart=/usr/bin/socat \
-    -T 300 \
-    TCP4-LISTEN:0,reuseaddr,fork,bind=100.80.180.78 \
-    TCP4:127.0.0.1:28880
+## Forward the tailnet-accepted connection to the loopback backend.
+##
+## systemd-socket-proxyd ships with systemd and does exactly this: it takes the
+## listening socket passed by the .socket unit and proxies to the given
+## address. It replaces a socat invocation that did not work: the socket unit
+## used Accept=yes (systemd accepts and hands over the connection) while socat
+## was told TCP4-LISTEN:0 (open a NEW listener on a random port), so the
+## accepted connection was never served and the listener nothing dialled.
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd --exit-idle-time=300s 127.0.0.1:28880
 
 ## Environment
 Environment=NODE_ENV=production

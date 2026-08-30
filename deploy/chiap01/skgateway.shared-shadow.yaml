@@ -6,7 +6,7 @@
 ##
 ## SECURITY: This profile is served on 127.0.0.1:28880 only.
 ## Network access is mediated by a separate systemd socket/proxy unit
-## that binds exclusively to the Tailscale interface (100.80.180.78:28880).
+## that binds exclusively to the Tailscale interface (tailscale0:28880).
 ##
 ## BACKEND PROFILE:
 ## - qwen3.8-27b-huihui-abliterated-q4_k_m (chiap08 and chiap01)
@@ -43,7 +43,7 @@ pooling:
 ## Backends - non-Matter only, exact profile 6073417e
 backends:
   chiap01-qwen38:
-    url: http://100.80.180.78:18810/v1
+    url: http://chiap01:18810/v1
     auth_type: none
     models:
       - qwen3.8-27b-huihui-abliterated-q4_k_m
@@ -53,7 +53,7 @@ backends:
     priority: 3
 
   chiap08-qwen38:
-    url: http://100.81.238.58:11439/v1
+    url: http://chiap08:11439/v1
     auth_type: none
     models:
       - qwen3.8-27b-huihui-abliterated-q4_k_m

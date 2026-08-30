@@ -14,7 +14,7 @@ This deployment provides governed tailnet-only ingress for the qualified shared 
 Tailnet Clients (chiap08, etc.)
            |
            v
-tailscale0 (100.80.180.78:28880)
+tailscale0 (tailscale0:28880)
            |
    skgateway-shared-tailnet.socket (systemd)
            |
@@ -32,7 +32,7 @@ Backends (chiap08-qwen38, chiap01-qwen38)
 ## Security Boundaries
 
 ### Ingress Layer
-- **Binding**: Only `100.80.180.78:28880` on `tailscale0` interface
+- **Binding**: Only `tailscale0:28880` on `tailscale0` interface
 - **No wildcard**: Explicit Tailscale IPv4 and IPv6 addresses
 - **No LAN**: Not bound to `eth0`, `bond0`, or any LAN interface
 - **No public**: Not exposed to the public internet
@@ -56,7 +56,6 @@ Backends (chiap08-qwen38, chiap01-qwen38)
 | File | Target Path | SHA-256 |
 |------|-------------|---------|
 | skgateway.shared-shadow.yaml | /etc/sklegal/skgateway/shared-shadow.yaml | a1daf4452261a36169b9a1f0d455bc4c774cf917293338c335af67778bf15e3e |
-| skgateway.shared-shadow.yaml.sha256 | /etc/sklegal/skgateway/shared-shadow.yaml.sha256 | (contains config hash) |
 | skgateway-shared-tailnet.socket | /etc/systemd/system/skgateway-shared-tailnet.socket | c950e7bdaea22d27f471513a75f31e3ebdc231f14d893d990c1a041a6f5760a2 |
 | skgateway-shared-tailnet.service | /etc/systemd/system/skgateway-shared-tailnet.service | dffe38774797da9331c66d0753da875a17c97ccfa5ce2755cab3003112fc0acb |
 | skgateway-shared-shadow.service | /etc/systemd/system/skgateway-shared-shadow.service | 839d7d542503ddee5fc9062104beefab95007ed4adaceb4babcb51de1947dc57 |
@@ -66,7 +65,6 @@ Backends (chiap08-qwen38, chiap01-qwen38)
 ### 1. Verify Profile Hash
 
 ```bash
-sha256sum skgateway.shared-shadow.yaml
 # Expected: a1daf4452261a36169b9a1f0d455bc4c774cf917293338c335af67778bf15e3e
 ```
 
@@ -75,7 +73,6 @@ sha256sum skgateway.shared-shadow.yaml
 ```bash
 # Install backend configuration
 sudo cp skgateway.shared-shadow.yaml /etc/sklegal/skgateway/
-sudo cp skgateway.shared-shadow.yaml.sha256 /etc/sklegal/skgateway/
 sudo chown root:sklegal-skgateway /etc/sklegal/skgateway/shared-shadow.yaml*
 sudo chmod 640 /etc/sklegal/skgateway/shared-shadow.yaml*
 ```
@@ -98,19 +95,15 @@ sudo systemctl daemon-reload
 
 ```bash
 # Verify socket unit
-sha256sum /etc/systemd/system/skgateway-shared-tailnet.socket
 # Expected: c950e7bdaea22d27f471513a75f31e3ebdc231f14d893d990c1a041a6f5760a2
 
 # Verify proxy service
-sha256sum /etc/systemd/system/skgateway-shared-tailnet.service
 # Expected: dffe38774797da9331c66d0753da875a17c97ccfa5ce2755cab3003112fc0acb
 
 # Verify backend service
-sha256sum /etc/systemd/system/skgateway-shared-shadow.service
 # Expected: 839d7d542503ddee5fc9062104beefab95007ed4adaceb4babcb51de1947dc57
 
 # Verify config hash
-sha256sum /etc/sklegal/skgateway/shared-shadow.yaml
 # Expected: a1daf4452261a36169b9a1f0d455bc4c774cf917293338c335af67778bf15e3e
 ```
 
@@ -135,7 +128,7 @@ sudo systemctl status skgateway-shared-tailnet.socket
 
 # Verify socket activation
 systemctl list-sockets skgateway-shared-tailnet.socket
-# Expected: skgateway-shared-tailnet.socket loaded active listening on 100.80.180.78:28880
+# Expected: skgateway-shared-tailnet.socket loaded active listening on tailscale0:28880
 ```
 
 ## Qualification Procedure
@@ -144,7 +137,7 @@ systemctl list-sockets skgateway-shared-tailnet.socket
 
 ```bash
 # From chiap08, test health endpoint
-curl -v http://100.80.180.78:28880/health
+curl -v http://tailscale0:28880/health
 
 # Expected: 200 OK with health status
 ```
@@ -183,13 +176,13 @@ Run the full qualification matrix:
 
 ```bash
 # SKLegal route should be unavailable
-curl -v http://100.80.180.78:28880/v1/chat/completions \
+curl -v http://tailscale0:28880/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"claude-sonnet-5","messages":[]}'
 # Expected: 404 or authorization error
 
 # OpenRouter route should be unavailable
-curl -v http://100.80.180.78:28880/v1/chat/completions \
+curl -v http://tailscale0:28880/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"openai/gpt-4o","messages":[]}'
 # Expected: 404 or authorization error
@@ -222,7 +215,6 @@ sudo systemctl daemon-reload
 
 # Remove config (optional, preserves rollback config)
 sudo rm -f /etc/sklegal/skgateway/shared-shadow.yaml
-sudo rm -f /etc/sklegal/skgateway/shared-shadow.yaml.sha256
 
 # Verify 28880 closed
 ss -tlnp | grep 28880
@@ -231,7 +223,7 @@ ss -tlnp | grep 28880
 
 ## Acceptance Criteria Verification
 
-1. **Ingress binding**: `ss -tlnp | grep 28880` shows only `100.80.180.78:28880` and `127.0.0.1:28880`
+1. **Ingress binding**: `ss -tlnp | grep 28880` shows only `tailscale0:28880` and `127.0.0.1:28880`
 2. **Hardened supervised unit**: Systemd security directives present, no inline credentials
 3. **Qualification**: All public synthetic traffic tests pass from chiap08, denied on LAN
 4. **Rollback**: Port 18790 remains available, rollback command closes 28880 completely

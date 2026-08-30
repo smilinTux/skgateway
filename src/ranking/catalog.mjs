@@ -35,6 +35,7 @@
 
 import { deriveCapabilities } from "./capabilities.mjs";
 import { loadProviderPostures } from "../discovery/provider-posture.mjs";
+import { declareRoutingMetadata } from "../discovery/routing-metadata.mjs";
 
 /**
  * PROVIDER POSTURE IS PART OF THE MAPPING, not an optional extra.
@@ -91,9 +92,23 @@ export function buildCapabilityCatalog(entries, opts = {}) {
   const deriveCapabilitiesFn = opts.deriveCapabilitiesFn || deriveCapabilities;
   const metricsFn = opts.metricsFn || (() => ({}));
   const providers = opts.providers !== undefined ? opts.providers : loadProviderPostures();
-  return entries.map((entry) => ({
-    ...entry,
-    lifecycle: getLifecycleFn(entry.id),
-    capabilities: deriveCapabilitiesFn(entry, { metrics: metricsFn(entry.id), providers }),
-  }));
+  return entries.map((entry) => {
+    const declared = declareRoutingMetadata(entry, providers);
+    const lifecycle = getLifecycleFn(declared.id);
+    return {
+      ...declared,
+      lifecycle,
+      // `measured` is the P3.5 evidence channel. It rides on the PERSISTENT
+      // lifecycle record rather than the catalog entry precisely because the
+      // catalog is rebuilt from provider metadata every discovery cycle and
+      // would clobber a measured fact the moment a provider re-declares its
+      // card. Threading it here is what makes the eval harness's results
+      // visible to rank.mjs and resolveBucket instead of write-only.
+      capabilities: deriveCapabilitiesFn(declared, {
+        metrics: metricsFn(declared.id),
+        providers,
+        measured: lifecycle?.measured_capabilities,
+      }),
+    };
+  });
 }
