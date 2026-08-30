@@ -58,7 +58,7 @@ import {
   policyFromRegistry,
   TRUST_ZONES,
 } from "../policy/sensitivity.mjs";
-import { parseBucketId, resolveBucket, orderMembersByCost, looksLikeBucketAttempt, allBuckets } from "../policy/buckets.mjs";
+import { parseBucketId, resolveBucket, orderMembersByCost, looksLikeBucketAttempt, allBuckets, validateFamilyPreference, applyFamilyPreference } from "../policy/buckets.mjs";
 import { codexPurityProblems } from "../policy/codex-purity.mjs";
 
 // sk-auto routing decision cache (TTL+LRU); keyed by request fingerprint + config epoch.
@@ -114,6 +114,7 @@ export const INTERNAL_CONTROL_HEADERS = [
   "x-sk-operator-credential-revision",
   "x-session-id",
   "x-model",
+  "x-sk-family-preference",
   "x-sklegal-service-authorization",
   "x-sklegal-tenant-id",
   "x-sklegal-matter-id",
@@ -2387,13 +2388,72 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = (
 
   const n = (_bucketCounters.get(addr.bucket) || 0) + 1;
   _bucketCounters.set(addr.bucket, n);
-  const orderedMembers = orderMembersByCost(members, n);
+  let orderedMembers = orderMembersByCost(members, n);
+
+  // Read and validate family preference from request header (card 93220ffc)
+  const prefHeader = request.headers?.['x-sk-family-preference'];
+  let familyPreference = null;
+  let prefError = null;
+
+  if (prefHeader !== undefined) {
+    try {
+      const parsed = typeof prefHeader === 'string' ? JSON.parse(prefHeader) : prefHeader;
+      const validation = validateFamilyPreference(parsed, addr.sensitivity);
+      if (validation.valid) {
+        familyPreference = validation.preference;
+        if (familyPreference && familyPreference.length > 0) {
+          console.log(
+            `[router] bucket ${addr.bucket} applying family preference: ${JSON.stringify(familyPreference)}`,
+          );
+          orderedMembers = applyFamilyPreference(orderedMembers, familyPreference);
+        }
+      } else {
+        prefError = validation.reason;
+        console.warn(
+          `[router] bucket ${addr.bucket} invalid family preference: ${prefError}`,
+        );
+        // Preference validation errors fail the request - this is a caller contract violation
+        return {
+          failClosed: {
+            status: 400,
+            headers: { "content-type": "application/json" },
+            body: Buffer.from(JSON.stringify({
+              error: {
+                message: prefError,
+                code: 400,
+                type: "invalid_family_preference",
+                bucket: addr.bucket,
+              },
+            }), "utf-8"),
+          },
+        };
+      }
+    } catch (err) {
+      prefError = `unable to parse family preference header: ${err.message}`;
+      console.warn(`[router] bucket ${addr.bucket} ${prefError}`);
+      return {
+        failClosed: {
+          status: 400,
+          headers: { "content-type": "application/json" },
+          body: Buffer.from(JSON.stringify({
+            error: {
+              message: prefError,
+              code: 400,
+              type: "invalid_family_preference",
+              bucket: addr.bucket,
+            },
+          }), "utf-8"),
+        },
+      };
+    }
+  }
+
   const picked = orderedMembers[0];
 
   console.log(
     `[router] bucket ${addr.bucket} -> ${picked.id} ` +
       `(class ${picked.model_class || "?"} via ${picked.class_basis}, zone ${picked.trust_zone ?? "?"}, ` +
-      `${members.length} eligible)`,
+      `family ${picked.card?.family || "none"}, ${members.length} eligible)`,
   );
 
   // Resolve the chosen id through the router's own model matching, so
