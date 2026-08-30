@@ -469,8 +469,24 @@ describe("completed SSE tool-call structure", () => {
   });
 
   test("rejects incomplete and invalid JSON arguments", () => {
-    assertRejected([{ delta: { tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "lookup", arguments: "{\"term\":" } }] } }]);
-    assertRejected([{ delta: { tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "lookup", arguments: "not json" } }] } }]);
+    for (const argumentsText of [
+      '{"term":',
+      "not json",
+      '{"term":"public",}',
+      '"scalar"',
+      "null",
+      "[]",
+      '{"term":1,"\\u0074erm":2}',
+      '{"term":"\\q"}',
+      '{"term":"\\uD800"}',
+    ]) {
+      assertRejected([{ delta: { tool_calls: [{
+        index: 0,
+        id: "call_1",
+        type: "function",
+        function: { name: "lookup", arguments: argumentsText },
+      }] } }]);
+    }
   });
 
   test("rejects conflicting fragments and duplicate identities", () => {
@@ -493,14 +509,19 @@ describe("completed SSE tool-call structure", () => {
   });
 
   test("preserves a valid fragmented call", () => {
+    const firstArguments = ' \n { "term" : ';
+    const secondArguments = '"public" } \t ';
     const result = response([
-      { delta: { reasoning_content: "private chain", tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "lookup", arguments: "{\"term\":" } }] } },
-      { delta: { tool_calls: [{ index: 0, function: { arguments: "\"public\"}" } }] } },
+      { delta: { reasoning_content: "private chain", tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "lookup", arguments: firstArguments } }] } },
+      { delta: { tool_calls: [{ index: 0, function: { arguments: secondArguments } }] } },
       { delta: {}, finishReason: "tool_calls" },
     ]);
     assert.equal(result.status, 200);
-    assert.match(result.body.toString(), /call_1/);
-    assert.match(result.body.toString(), /PUBLIC|public/);
+    const fragments = result.body.toString().split("\n")
+      .filter((line) => line.startsWith("data:") && !line.includes("[DONE]"))
+      .map((line) => JSON.parse(line.slice(5)).choices?.[0]?.delta?.tool_calls?.[0]?.function?.arguments)
+      .filter((value) => value !== undefined);
+    assert.deepEqual(fragments, [firstArguments, secondArguments]);
     assert.equal(result.body.includes(Buffer.from("private chain")), false);
     assert.equal(result.servedModel, MODEL);
   });

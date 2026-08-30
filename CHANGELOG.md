@@ -24,6 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Response sanitization no longer strips evidence the caller needs. The
+  public-surface and tool-call paths in `src/proxy/sanitizer.mjs` and
+  `src/proxy/response-contract.mjs` now preserve tool-call structure and the
+  attribution fields that identify which backend and model actually served a
+  request, rather than flattening them out of the reply (card d4edd98f).
+
 - A non-stream completion that comes back with no assistant content is now
   rejected instead of being relayed to the client as a successful empty answer.
   An upstream that returns 200 with an empty choice looked identical to a real

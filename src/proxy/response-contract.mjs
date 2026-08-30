@@ -103,7 +103,9 @@ function stripReasoning(value) {
   if (!value || typeof value !== "object") return value;
   const out = Array.isArray(value) ? value.map(stripReasoning) : { ...value };
   if (!Array.isArray(out)) {
+    delete out.reasoning;
     delete out.reasoning_content;
+    delete out.analysis;
     delete out._hadReasoning;
     for (const [key, child] of Object.entries(out)) out[key] = stripReasoning(child);
   }
@@ -218,13 +220,18 @@ function hasCompletedToolCalls(calls) {
   if (calls.size === 0) return false;
   return [...calls.values()].every((call) => {
     if (!call.id || call.type !== "function" || !call.name || !call.sawArguments) return false;
-    try {
-      JSON.parse(call.arguments);
-      return true;
-    } catch {
-      return false;
-    }
+    return hasValidToolArguments(call.arguments);
   });
+}
+
+function hasValidToolArguments(input) {
+  if (typeof input !== "string" || !hasUniqueJsonMembers(input)) return false;
+  try {
+    const parsed = JSON.parse(input);
+    return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed);
+  } catch {
+    return false;
+  }
 }
 
 function hasValidNonStreamToolCalls(toolCalls) {
@@ -238,12 +245,7 @@ function hasValidNonStreamToolCalls(toolCalls) {
         || typeof call.function.name !== "string" || !call.function.name.trim()
         || typeof call.function.arguments !== "string") return false;
     ids.add(call.id);
-    try {
-      JSON.parse(call.function.arguments);
-      return true;
-    } catch {
-      return false;
-    }
+    return hasValidToolArguments(call.function.arguments);
   });
 }
 
