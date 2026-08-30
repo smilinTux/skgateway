@@ -186,27 +186,10 @@ backends:
     # SPOF fail-fast: the wrapper is a single local service outside this repo.
     # If it wedges (accepts the socket but never replies) the request would hang
     # forever with no failover. This idle timeout aborts a stalled wrapper call
-    # with a 504 so the router fails over to anthropic-direct below. Generous
+    # with a 504 rather than hanging. There is NO failover target by design:
+    # the subscription path is the only claude-* route. Generous
     # enough for a real `claude --print` completion; a live stream resets it on
     # each chunk, so only a truly stalled upstream trips it.
-    timeout_ms: 120000
-
-  ## EMERGENCY FALLBACK for claude-* when the :18782 wrapper is down/wedged.
-  ## Same models, LOWER priority (higher number) than the wrapper, so the router
-  ## only reaches it after the wrapper fails (failover on 5xx/504). This is a
-  ## DEGRADED path: hitting api.anthropic.com with the raw subscription OAuth
-  ## token bills as third-party extra-usage (not the plan) and can 400 under
-  ## load — acceptable as a last resort to keep claude-* answering, not as the
-  ## steady state. auth_type oauth → the anthropic-adapter translates
-  ## OpenAI→Messages and attaches the token from the Claude Code creds file.
-  ## Mitigates SPOF card 2b5bcedd (RUNBOOK "claude-code-api wrapper dependency").
-  anthropic-direct:
-    url: https://api.anthropic.com/v1
-    auth_type: oauth
-    credentials_path: ~/.claude/.credentials.json
-    discovery: anthropic
-    models: *claude_cold_start_models
-    priority: 8
     timeout_ms: 120000
 
   ollama:
