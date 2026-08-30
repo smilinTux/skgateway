@@ -166,6 +166,10 @@ describe('C9: eligibility composes the floor with the sovereignty ceiling', () =
       trust_zone: TRUST_ZONES.PAID_CONTRACTUAL,
       family: 'claude',
       cost_tier: 'paid-cloud',
+      // Card db431f61: alias count is not physical capacity, so every member
+      // also carries the id of the server actually behind it. This entry has
+      // no url, so it falls back to the model form.
+      physical_resource_id: 'model:claude-opus',
     }]);
   });
 

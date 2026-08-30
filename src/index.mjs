@@ -13,7 +13,7 @@ import http from "node:http";
 import { loadConfig, getConfig } from "./config.mjs";
 import { createProxyServer, handleRequest, buildConfig } from "./proxy/core.mjs";
 import { createRouter, routeAndSend } from "./proxy/router.mjs";
-import { buildModelCatalog, reconcileModeFromConfig, tagLocalModels, mergeDiscoveredCatalog, isModelAvailable } from "./proxy/advertise.mjs";
+import { buildModelCatalog, reconcileModeFromConfig, tagLocalModels, mergeDiscoveredCatalog, isModelAvailable, excludedModelIds, withoutExcludedModels } from "./proxy/advertise.mjs";
 import { loadAllowlist, saveAllowlist, applyAllowlist } from "./advertise.mjs";
 import { discoverCatalog, loadCache, saveCache, fetchNvidia, fetchOpenRouter, fetchOpencode, fetchAnthropicWrapper, fetchCodex, fetchZai, catalogStatus, loadCardOverrides, applyCardOverlays, buildServingCatalog } from "./discovery.mjs";
 import { getPool, resetPool } from "./proxy/connection-pool.mjs";
@@ -1456,12 +1456,14 @@ export const server = http.createServer(async (req, res) => {
     try {
       const discovered = await getDiscoveredCatalog();
       const advertiseBackends = effectiveAdvertiseBackends(config.backends || {}, router);
-      const reconciled = buildModelCatalog(advertiseBackends, router, advertiseReconcileMode);
+      const excluded = excludedModelIds(config);
+      const reconciled = buildModelCatalog(advertiseBackends, router, advertiseReconcileMode, excluded);
       // mergeDiscoveredCatalog() layers the discovered provider/free/stale tags
       // onto the reconciled health/status entries and GUARANTEES every model
       // carries a non-empty provider (see src/proxy/advertise.mjs). The
       // allowlist is applied last, exactly as on /admin/models.
-      const merged = mergeDiscoveredCatalog(reconciled, discovered, advertiseBackends);
+      const merged = withoutExcludedModels(
+        mergeDiscoveredCatalog(reconciled, discovered, advertiseBackends), excluded);
       const allowlist = loadAllowlist();
       const allowed = applyAllowlist(merged, allowlist);
       // Aliases (buckets + registry roles): additive, allowlist-aware,
@@ -1483,7 +1485,8 @@ export const server = http.createServer(async (req, res) => {
     } catch (e) {
       console.warn("[skgateway] /v1/models discovery merge failed, falling back to static catalog:", e.message);
       const advertiseBackends = effectiveAdvertiseBackends(config.backends || {}, router);
-      const fallback = buildModelCatalog(advertiseBackends, router, advertiseReconcileMode);
+      const excluded = excludedModelIds(config);
+      const fallback = buildModelCatalog(advertiseBackends, router, advertiseReconcileMode, excluded);
       const allowlist = loadAllowlist();
       const allowed = applyAllowlist(fallback, allowlist);
       const aliases = allowAliases(aliasCatalogEntries(getConfig()), allowlist);
@@ -1519,9 +1522,11 @@ export const server = http.createServer(async (req, res) => {
     if (!id) { notFound(); return; }
     try {
       const discovered = await getDiscoveredCatalog();
+      const excluded = excludedModelIds(config);
       const advertiseBackends = effectiveAdvertiseBackends(config.backends || {}, router);
-      const reconciled = buildModelCatalog(advertiseBackends, router, advertiseReconcileMode);
-      const merged = mergeDiscoveredCatalog(reconciled, discovered, advertiseBackends);
+      const reconciled = buildModelCatalog(advertiseBackends, router, advertiseReconcileMode, excluded);
+      const merged = withoutExcludedModels(
+        mergeDiscoveredCatalog(reconciled, discovered, advertiseBackends), excluded);
       const data = applyAllowlist(merged, loadAllowlist());
       const entry = data.find((m) => m.id === id);
       // Registry role (sk-default/sk-auto/sk-creative/...): a valid routing
@@ -1557,7 +1562,10 @@ export const server = http.createServer(async (req, res) => {
       // Overlay our curated cards so static models (claude/ornith, which
       // discovery never gives a card) show their real capabilities + dex
       // fields here, not just the discovered ones (model-dex work).
-      const full = applyCardOverlays(await getDiscoveredCatalog(), loadCardOverrides());
+      const full = withoutExcludedModels(
+        applyCardOverlays(await getDiscoveredCatalog(), loadCardOverrides()),
+        excludedModelIds(config),
+      );
       const allow = loadAllowlist();
       // Aliases (buckets + registry roles): additive to the admin view.
       // Buckets gated on routing.buckets_enabled; roles always advertised.
@@ -1774,7 +1782,9 @@ export const server = http.createServer(async (req, res) => {
       // the live bucket request path. Raw discovery omits local/Anthropic
       // entries and carries no derived trust_zone, which made this endpoint
       // report every internal and secret pool as empty while routing disagreed.
-      const catalog = buildCapabilityCatalog(buildServingCatalog(), {
+      const cfg = getConfig();
+      const excluded = excludedModelIds(cfg);
+      const catalog = buildCapabilityCatalog(withoutExcludedModels(buildServingCatalog(), excluded), {
         getLifecycleFn: getLifecycle,
       });
       const policy = policyFromRegistry(loadRegistry());
@@ -1784,7 +1794,6 @@ export const server = http.createServer(async (req, res) => {
           .map((backend) => backend.id);
         return isEffectivelyRoutable(getLifecycle(e.id), claimers);
       };
-      const cfg = getConfig();
       const bucketsEnabled = cfg?.routing?.buckets_enabled === true;
       const all = allBuckets();
       const out = [];
@@ -1796,12 +1805,16 @@ export const server = http.createServer(async (req, res) => {
             sensitivityPolicy: policy,
             isRoutable: isRoutableFn,
           });
+          const physicalResources = new Set(members.map((m) => m.physical_resource_id));
           out.push({
             bucket: b.bucket,
             model_class: b.model_class,
             sensitivity: b.sensitivity,
             ceiling,
             members,
+            member_alias_count: members.length,
+            physical_server_count: physicalResources.size,
+            physical_resources: [...physicalResources],
             rejected,
           });
         } catch (e) {
@@ -1853,7 +1866,10 @@ export const server = http.createServer(async (req, res) => {
     try {
       // Overlay curated cards first so static models (claude/ornith) carry the
       // capabilities the ranker needs (tools/ctx), not just discovered models.
-      const full = applyCardOverlays(await getDiscoveredCatalog(), loadCardOverrides());
+      const full = withoutExcludedModels(
+        applyCardOverlays(await getDiscoveredCatalog(), loadCardOverrides()),
+        excludedModelIds(config),
+      );
       const catalog = buildRankCatalog(full);
       const allow = loadAllowlist();
       const chain = rankModels(catalog, requirements, {

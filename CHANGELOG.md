@@ -41,6 +41,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Dead Ornith model claims are purged from the serving config and from every
+  catalog and bucket projection, and repeated fast failures (404, 410, 502,
+  connection refused) now quarantine the exact backend-model claim rather than
+  marking the id globally EOL while another backend still claims it. Members
+  also carry a `physical_resource_id`, because alias count is not physical
+  capacity: four request aliases pointing at one llama-server are four
+  addressable members but a single physical server, and treating them as four
+  is how a pool believes it has depth it does not have (card db431f61).
+
 - Bucket family preference now uses one strict comma-separated `x-sk-prefer`
   contract and applies only within the cheapest eligible cost tier, so a
   preference reorders who serves without ever widening the resolved set or
