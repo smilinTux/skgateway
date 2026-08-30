@@ -1,0 +1,25 @@
+[Unit]
+Description=SKGateway shared shadow tailnet-only ingress socket
+Documentation=https://github.com/sk-oss/skgateway
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Socket]
+## TAILNET-ONLY BINDING, host-agnostic.
+##
+## BindToDevice= is the kernel-level SO_BINDTODEVICE: the socket accepts ONLY
+## on the named interface, whatever address that interface happens to carry.
+## No wildcard, no LAN, no public. Binding by INTERFACE rather than by address
+## is both portable (this unit is identical on every node) and more correct: a
+## Tailscale address can change, the interface name does not.
+##
+## systemd also gains an automatic BindsTo=/After= dependency on the tailscale0
+## device unit, so the socket cannot come up before the tailnet does.
+BindToDevice=tailscale0
+ListenStream=28880
+Accept=no
+KeepAlive=true
+NoDelay=true
+
+[Install]
+WantedBy=sockets.target
