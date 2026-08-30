@@ -107,7 +107,21 @@ function priorScore(tokens, boostTokens) {
  * @param {object} card modelCard.card
  * @returns {{score:0|1, basis:'card'|'heuristic'}}
  */
-function deriveToolUse(card) {
+function deriveToolUse(card, measured) {
+  // MEASUREMENT OVER DECLARATION (design 6.3, card P3.5). A card's
+  // `supported_parameters` is a provider CLAIM; a `measured_capabilities`
+  // entry is a completion this gateway actually ran. Measured 2026-08-14, the
+  // motivating case for card C9: models.dev declared `tool_call: true` for all
+  // seven live free OpenCode models, and testing them showed five that really
+  // emit a tool_call and two that could not be verified at all. So a
+  // determinate measurement wins over the card in BOTH directions, and only a
+  // determinate one: 'unmeasured' means the probe was throttled or timed out,
+  // which is not evidence of anything and must fall through to the card rather
+  // than manufacture a 0.
+  const status = measured?.tool_call?.status;
+  if (status === 'pass') return { score: 1, basis: 'eval' };
+  if (status === 'fail') return { score: 0, basis: 'eval' };
+
   const declared = Array.isArray(card.supported_parameters)
     && card.supported_parameters.includes('tools');
   if (declared) return { score: 1, basis: 'card' };
@@ -315,7 +329,7 @@ export function deriveCapabilities(modelCard, opts = {}) {
   const posture = resolveProviderPosture(modelCard, opts.providers);
 
   return {
-    tool_use: deriveToolUse(card),
+    tool_use: deriveToolUse(card, opts.measured),
     vision: deriveVision(card),
     ctx_tokens: deriveCtxTokens(card),
     latency_p50_ms: typeof metrics.latency_p50_ms === 'number' ? metrics.latency_p50_ms : null,

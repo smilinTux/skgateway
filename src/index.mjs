@@ -14,7 +14,7 @@ import { loadConfig, getConfig } from "./config.mjs";
 import { createProxyServer, handleRequest, buildConfig, trimSystemMessages, trimConversationHistory } from "./proxy/core.mjs";
 import { createRouter, routeAndSend } from "./proxy/router.mjs";
 import { sanitizeResponse } from "./proxy/sanitizer.mjs";
-import { buildModelCatalog, reconcileModeFromConfig, tagLocalModels, mergeDiscoveredCatalog, isModelAvailable } from "./proxy/advertise.mjs";
+import { buildModelCatalog, reconcileModeFromConfig, tagLocalModels, mergeDiscoveredCatalog, isModelAvailable, excludedModelIds, withoutExcludedModels } from "./proxy/advertise.mjs";
 import { loadAllowlist, saveAllowlist, applyAllowlist } from "./advertise.mjs";
 import { discoverCatalog, loadCache, saveCache, fetchNvidia, fetchOpenRouter, fetchOpencode, fetchAnthropicWrapper, fetchCodex, fetchZai, catalogStatus, loadCardOverrides, applyCardOverlays, buildServingCatalog } from "./discovery.mjs";
 import { getPool, resetPool } from "./proxy/connection-pool.mjs";
@@ -23,6 +23,7 @@ import { ClientAuthenticator, classifyAuthenticationRoute, stripCallerCredential
 import { createAuthzClient } from "./policy/authz_decide.mjs";
 import { createSkLegalAuthzClient } from "./policy/sklegal_authz_decide.mjs";
 import { classifyRoute } from "./policy/authz_routes.mjs";
+import { runModelEval, isEvalEligible, createLoopbackChatComplete } from "./ranking/eval.mjs";
 import {
   authzEnforceEnabled,
   authorizeRequest,
@@ -240,20 +241,19 @@ export function registerDiscoveredRoutes(cfg, catalog, opts = {}) {
     // For discovery-managed backends the configured list is a cold-start seed,
     // not a permanent union. The first authoritative cycle replaces it so a
     // retired model can actually leave routing.
-    const staticModels = cfg.backends?.[name]?.discovery
+    const staticModels = backend.discovery
       ? []
       : (cfg.backends?.[name]?.models || []).filter((x) => typeof x === "string");
     const merged = [...new Set([...staticModels, ...ids])];
-    backend.models = filterRoutableModelIds(merged, getLifecycleFn, [name]);
-    // Lifecycle pruning can legitimately empty this list (every known id for
-    // this provider is currently eol/dead). Backend#supportsModel() treats an
-    // EMPTY models array as "wildcard match everything" UNLESS the backend is
-    // flagged `discovery`-managed (router.mjs:398), and this function IS the
-    // discovery route registrar for nvidia/openrouter, whether or not the
-    // operator also set config.backends.<name>.discovery in YAML. Without
-    // this guard an all-eol provider would flip from "serves nothing"
-    // (correct) to "serves everything" (exactly what P1.4 exists to prevent).
-    if (backend.models.length === 0) backend.discovery = backend.discovery || name;
+    const routable = filterRoutableModelIds(merged, getLifecycleFn, [name]);
+    if (typeof backend.replaceDiscoveredModels === "function" && backend.discovery) {
+      backend.replaceDiscoveredModels(routable);
+    } else {
+      backend.models = routable;
+      // Lifecycle pruning can legitimately empty this list. Mark it discovery
+      // managed so empty never becomes the ordinary wildcard convention.
+      if (backend.models.length === 0) backend.discovery = backend.discovery || name;
+    }
   }
 }
 
@@ -622,6 +622,17 @@ export async function refreshCatalog(cfg, discoverCatalogFn = discoverCatalog) {
   });
   _catalog = models;
   registerDiscoveredRoutes(cfg, models);
+  // Providers absent from the returned catalog still completed a discovery
+  // attempt. Record that outcome so pending becomes attributable failed/stale
+  // instead of remaining ambiguous forever.
+  const zaiProvider = _discoveryCache.providers?.zai;
+  if (cfg.backends?.zai && !models.some((m) => m.provider === "zai")) {
+    router.registerDiscoveredModels?.("zai", [], {
+      ok: zaiProvider?.ok !== false,
+      stale: zaiProvider?.ok === false,
+      at: zaiProvider?.lastAttemptAt || Date.now(),
+    });
+  }
   saveCache(_discoveryCache);
   return models;
 }
@@ -1446,12 +1457,14 @@ export const server = http.createServer(async (req, res) => {
     try {
       const discovered = await getDiscoveredCatalog();
       const advertiseBackends = effectiveAdvertiseBackends(config.backends || {}, router);
-      const reconciled = buildModelCatalog(advertiseBackends, router, advertiseReconcileMode);
+      const excluded = excludedModelIds(config);
+      const reconciled = buildModelCatalog(advertiseBackends, router, advertiseReconcileMode, excluded);
       // mergeDiscoveredCatalog() layers the discovered provider/free/stale tags
       // onto the reconciled health/status entries and GUARANTEES every model
       // carries a non-empty provider (see src/proxy/advertise.mjs). The
       // allowlist is applied last, exactly as on /admin/models.
-      const merged = mergeDiscoveredCatalog(reconciled, discovered);
+      const merged = withoutExcludedModels(
+        mergeDiscoveredCatalog(reconciled, discovered, advertiseBackends), excluded);
       const allowlist = loadAllowlist();
       const allowed = applyAllowlist(merged, allowlist);
       // Aliases (buckets + registry roles): additive, allowlist-aware,
@@ -1473,7 +1486,8 @@ export const server = http.createServer(async (req, res) => {
     } catch (e) {
       console.warn("[skgateway] /v1/models discovery merge failed, falling back to static catalog:", e.message);
       const advertiseBackends = effectiveAdvertiseBackends(config.backends || {}, router);
-      const fallback = buildModelCatalog(advertiseBackends, router, advertiseReconcileMode);
+      const excluded = excludedModelIds(config);
+      const fallback = buildModelCatalog(advertiseBackends, router, advertiseReconcileMode, excluded);
       const allowlist = loadAllowlist();
       const allowed = applyAllowlist(fallback, allowlist);
       const aliases = allowAliases(aliasCatalogEntries(getConfig()), allowlist);
@@ -1509,8 +1523,11 @@ export const server = http.createServer(async (req, res) => {
     if (!id) { notFound(); return; }
     try {
       const discovered = await getDiscoveredCatalog();
-      const reconciled = buildModelCatalog(effectiveAdvertiseBackends(config.backends || {}, router), router, advertiseReconcileMode);
-      const merged = mergeDiscoveredCatalog(reconciled, discovered);
+      const excluded = excludedModelIds(config);
+      const advertiseBackends = effectiveAdvertiseBackends(config.backends || {}, router);
+      const reconciled = buildModelCatalog(advertiseBackends, router, advertiseReconcileMode, excluded);
+      const merged = withoutExcludedModels(
+        mergeDiscoveredCatalog(reconciled, discovered, advertiseBackends), excluded);
       const data = applyAllowlist(merged, loadAllowlist());
       const entry = data.find((m) => m.id === id);
       // Registry role (sk-default/sk-auto/sk-creative/...): a valid routing
@@ -1546,7 +1563,10 @@ export const server = http.createServer(async (req, res) => {
       // Overlay our curated cards so static models (claude/ornith, which
       // discovery never gives a card) show their real capabilities + dex
       // fields here, not just the discovered ones (model-dex work).
-      const full = applyCardOverlays(await getDiscoveredCatalog(), loadCardOverrides());
+      const full = withoutExcludedModels(
+        applyCardOverlays(await getDiscoveredCatalog(), loadCardOverrides()),
+        excludedModelIds(config),
+      );
       const allow = loadAllowlist();
       // Aliases (buckets + registry roles): additive to the admin view.
       // Buckets gated on routing.buckets_enabled; roles always advertised.
@@ -1685,6 +1705,71 @@ export const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ── POST /admin/models/eval?model=<id> — card P3.5, the micro-eval harness ──
+  // Runs the deterministic battery (capability-assessment.mjs: tool_call,
+  // structured_output, instruction_following, min_output_tokens) against ONE
+  // model THROUGH this gateway, and persists the result onto that model's
+  // lifecycle record, where catalog.mjs threads it back into
+  // capabilities.tool_use as `basis:'eval'`.
+  //
+  // EXPLICITLY OPERATOR-TRIGGERED, never automatic (design 6.3: "Never runs in
+  // the hot path or refresh loop"). The battery spends real completions and
+  // real latency; attaching that to the refresh loop is how a smoke test
+  // quietly becomes a benchmark nobody authorised. Loopback only, same gate as
+  // every other /admin route.
+  if (req.method === "POST" && req.url.split("?")[0] === "/admin/models/eval") {
+    if (!isLoopback(req)) {
+      res.writeHead(403, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "Admin routes are loopback only", code: 403 } }));
+      return;
+    }
+    let modelId = null;
+    try {
+      modelId = new URL(req.url, "http://127.0.0.1").searchParams.get("model");
+    } catch {
+      modelId = null;
+    }
+    if (!modelId) {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "query parameter `model` is required", code: 400 } }));
+      return;
+    }
+    try {
+      const catalog = buildCapabilityCatalog(buildServingCatalog(), { getLifecycleFn: getLifecycle });
+      const entry = catalog.find((e) => e.id === modelId);
+      if (!entry) {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: `unknown model ${modelId}`, code: 404 } }));
+        return;
+      }
+      if (!isEvalEligible(entry)) {
+        // Design 6.3 scopes the harness to free/local. An UNKNOWN tier lands
+        // here too: billing someone's paid account to discover a capability is
+        // the most expensive possible way to guess.
+        res.writeHead(409, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          error: {
+            message: "eval runs against free/local models only",
+            code: 409,
+            model: modelId,
+            sovereignty: entry.capabilities?.sovereignty ?? null,
+          },
+        }));
+        return;
+      }
+      const out = await runModelEval(modelId, {
+        chatComplete: createLoopbackChatComplete({ port }),
+      });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, ...out }));
+    } catch (e) {
+      console.warn("[skgateway] /admin/models/eval failed:", e.message);
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "eval failed", code: 500 } }));
+    }
+    return;
+  }
+
   // ── GET /admin/buckets — live per-bucket pool membership (Part 1b) ──
   // Loopback only, read-only (pattern: /admin/models/rank).
   if (req.url === "/admin/buckets" && req.method === "GET") {
@@ -1698,7 +1783,9 @@ export const server = http.createServer(async (req, res) => {
       // the live bucket request path. Raw discovery omits local/Anthropic
       // entries and carries no derived trust_zone, which made this endpoint
       // report every internal and secret pool as empty while routing disagreed.
-      const catalog = buildCapabilityCatalog(buildServingCatalog(), {
+      const cfg = getConfig();
+      const excluded = excludedModelIds(cfg);
+      const catalog = buildCapabilityCatalog(withoutExcludedModels(buildServingCatalog(), excluded), {
         getLifecycleFn: getLifecycle,
       });
       const policy = policyFromRegistry(loadRegistry());
@@ -1708,7 +1795,6 @@ export const server = http.createServer(async (req, res) => {
           .map((backend) => backend.id);
         return isEffectivelyRoutable(getLifecycle(e.id), claimers);
       };
-      const cfg = getConfig();
       const bucketsEnabled = cfg?.routing?.buckets_enabled === true;
       const all = allBuckets();
       const out = [];
@@ -1720,12 +1806,16 @@ export const server = http.createServer(async (req, res) => {
             sensitivityPolicy: policy,
             isRoutable: isRoutableFn,
           });
+          const physicalResources = new Set(members.map((m) => m.physical_resource_id));
           out.push({
             bucket: b.bucket,
             model_class: b.model_class,
             sensitivity: b.sensitivity,
             ceiling,
             members,
+            member_alias_count: members.length,
+            physical_server_count: physicalResources.size,
+            physical_resources: [...physicalResources],
             rejected,
           });
         } catch (e) {
@@ -1777,7 +1867,10 @@ export const server = http.createServer(async (req, res) => {
     try {
       // Overlay curated cards first so static models (claude/ornith) carry the
       // capabilities the ranker needs (tools/ctx), not just discovered models.
-      const full = applyCardOverlays(await getDiscoveredCatalog(), loadCardOverrides());
+      const full = withoutExcludedModels(
+        applyCardOverlays(await getDiscoveredCatalog(), loadCardOverrides()),
+        excludedModelIds(config),
+      );
       const catalog = buildRankCatalog(full);
       const allow = loadAllowlist();
       const chain = rankModels(catalog, requirements, {
@@ -2061,7 +2154,16 @@ export const server = http.createServer(async (req, res) => {
         const maxBodyBytes = perModel.maxBodyBytes || 120000;
         const maxSystemBytes = perModel.maxSystemBytes || 40000;
 
-        const cfg = { maxBodyBytes, maxSystemBytes };
+        // trimSystemMessages() and trimConversationHistory() both do
+        //     const log = cfg.logger.log.bind(cfg.logger);
+        // so a cfg without a logger throws on the FIRST line of the trim, the
+        // fail-closed catch below turns that into a 500, and every request the
+        // gateway serves 500s. A logger is not optional here.
+        const cfg = {
+          maxBodyBytes,
+          maxSystemBytes,
+          logger: { log: (msg) => console.log(`[skgateway] ${msg}`) },
+        };
 
         // Trim system messages first (to free budget for history)
         trimSystemMessages(parsedBody, cfg);
@@ -2097,6 +2199,9 @@ export const server = http.createServer(async (req, res) => {
       messages: transformedMessages,
       // Verified CapAuth identity (falls back to X-Agent-Id / anonymous).
       agentId: metricsAgentId,
+      // Preserve the resolved request/session identity on every typed router
+      // audit event, alongside agent and per-request correlation ids.
+      sessionId: identity.session_id || req.headers["x-session-id"] || undefined,
       // skmodels registry role/context routing (single source of truth).
       // Present => routeAndSend resolves via ~/.skcapstone/models/registry.yaml
       // (precedence context > service > role > default) before backend select.

@@ -36,9 +36,6 @@ const DEFAULT_KEEP_START = 2;
 /** Default number of non-system messages to keep from the end of history. */
 const DEFAULT_KEEP_END = 12;
 
-/** Minimum threshold (chars) for promoting reasoning→content after sanitization. */
-const REASONING_PROMOTE_MIN_CHARS = 300;
-
 // ---------------------------------------------------------------------------
 // Kimi / leaked-markup patterns (pre-compiled)
 // ---------------------------------------------------------------------------
@@ -298,6 +295,8 @@ function stripKimiMarkup(text, { label = "sanitizer" } = {}) {
     }
   }
 
+  if (cleaned === text) return text;
+
   // Collapse excess whitespace
   cleaned = cleaned.replace(RE_EXCESS_NEWLINES, "\n\n").trim();
 
@@ -311,84 +310,20 @@ function stripKimiMarkup(text, { label = "sanitizer" } = {}) {
  * Handle `<think>...</think>` blocks according to config.
  *
  * @param {string} text
- * @param {"strip"|"promote"} [mode="strip"]
- *   - "strip"   — remove the think block entirely
- *   - "promote" — move block content to a `[Reasoning]: ...` prefix
  * @returns {{ text: string, hadThinking: boolean }}
  */
-function handleThinkBlocks(text, mode = "strip") {
+function handleThinkBlocks(text) {
   if (!text || !RE_THINK_BLOCK.test(text)) return { text, hadThinking: false };
 
   RE_THINK_BLOCK.lastIndex = 0;
   const matches = [...text.matchAll(RE_THINK_BLOCK)];
   if (matches.length === 0) return { text, hadThinking: false };
 
-  let result = text;
-  if (mode === "promote") {
-    const thoughts = matches.map((m) => m[0].replace(/<\/?think>/gi, "").trim()).join("\n\n");
-    RE_THINK_BLOCK.lastIndex = 0;
-    result = result.replace(RE_THINK_BLOCK, "");
-    result = `[Reasoning]: ${thoughts}\n\n${result}`.trim();
-  } else {
-    RE_THINK_BLOCK.lastIndex = 0;
-    result = result.replace(RE_THINK_BLOCK, "");
-  }
+  RE_THINK_BLOCK.lastIndex = 0;
+  let result = text.replace(RE_THINK_BLOCK, "");
 
   result = result.replace(RE_EXCESS_NEWLINES, "\n\n").trim();
   return { text: result, hadThinking: true };
-}
-
-/**
- * Attempt to repair malformed JSON in a tool call argument string.
- * Tries JSON.parse; on failure attempts to recover by:
- *  1. Closing open arrays/objects
- *  2. Removing trailing commas
- *  3. Quoting bare property values
- *
- * Returns the original string unchanged if repair is impossible.
- *
- * @param {string} jsonStr
- * @returns {string} Repaired JSON string, or original if unfixable.
- */
-function repairToolCallJson(jsonStr) {
-  if (!jsonStr || typeof jsonStr !== "string") return jsonStr;
-
-  // Already valid
-  try {
-    JSON.parse(jsonStr);
-    return jsonStr;
-  } catch (_) {
-    // fall through
-  }
-
-  let s = jsonStr.trim();
-
-  // Pass 1: close unclosed structures by counting brackets/braces
-  const opens = [];
-  let inStr = false;
-  let escape = false;
-  for (const ch of s) {
-    if (escape) { escape = false; continue; }
-    if (ch === "\\") { escape = true; continue; }
-    if (ch === '"' && !inStr) { inStr = true; continue; }
-    if (ch === '"' && inStr) { inStr = false; continue; }
-    if (inStr) continue;
-    if (ch === "{") opens.push("}");
-    else if (ch === "[") opens.push("]");
-    else if (ch === "}" || ch === "]") opens.pop();
-  }
-  s = s + opens.reverse().join("");
-
-  // Pass 2: remove trailing commas before } or ] (handles "key": val, } patterns)
-  s = s.replace(/,\s*([}\]])/g, "$1");
-
-  try {
-    JSON.parse(s);
-    return s;
-  } catch (_) {
-    // Could not repair — return original
-    return jsonStr;
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -405,20 +340,16 @@ function repairToolCallJson(jsonStr) {
  * Operations performed (in order):
  *  1a. Recover leaked Kimi K2 tool-call markup in `message.content` into
  *      proper `message.tool_calls` (only if `tool_calls` is empty); when
- *      recovery succeeds, set `choice.finish_reason = "tool_calls"`.
+ *      recovery succeeds, preserve the upstream terminal reason.
  *  1b. Strip any remaining Kimi K2.5 leaked tool-call markup from
  *      `message.content`.
- *  2. Handle `<think>...</think>` blocks per `config.thinkMode`.
- *  3. Promote `message.reasoning` → `message.content` if content is empty and
- *     the reasoning is substantial (> REASONING_PROMOTE_MIN_CHARS chars).
- *  4. Attempt JSON repair on malformed tool-call arguments.
- *  5. Remove empty content blocks (null, undefined, whitespace-only).
+ *  2. Strip `<think>...</think>` blocks.
+ *  3. Remove private reasoning fields without creating public content.
+ *  4. Preserve tool-call arguments exactly as received.
+ *  5. Preserve public content bytes exactly when no private marker is removed.
  *
  * @param {object} body - Parsed JSON response body from the upstream model.
  * @param {object} [config={}]
- * @param {string} [config.thinkMode="strip"]
- *   How to handle `<think>` blocks: "strip" removes them, "promote" converts
- *   them to a visible [Reasoning] prefix.
  * @param {string} [config.label="sanitizer"]
  *   Log prefix for console output.
  * @returns {object} Sanitized body (shallow clone of input).
@@ -427,7 +358,6 @@ export function sanitizeResponse(body, config = {}) {
   if (!body || typeof body !== "object") return body;
 
   const label = config.label ?? "sanitizer";
-  const thinkMode = config.thinkMode ?? "strip";
 
   // Shallow clone to avoid mutating caller's object
   const out = { ...body };
@@ -452,7 +382,6 @@ export function sanitizeResponse(body, config = {}) {
       if (recovered.length > 0) {
         c.message.tool_calls = recovered;
         c.message.content = recoveredContent;
-        c.finish_reason = "tool_calls";
         const names = recovered.map((tc) => tc.function?.name).join(",");
         console.log(
           `[${label}] SANITIZED: recovered ${recovered.length} tool_call(s) from leaked markup [${names}]`
@@ -467,52 +396,17 @@ export function sanitizeResponse(body, config = {}) {
 
     // --- Step 2: Handle <think> blocks ---
     if (typeof c.message.content === "string") {
-      const { text, hadThinking } = handleThinkBlocks(c.message.content, thinkMode);
+      const { text, hadThinking } = handleThinkBlocks(c.message.content);
       if (hadThinking) {
-        console.log(`[${label}] SANITIZED: processed <think> block (mode=${thinkMode})`);
+        console.log(`[${label}] SANITIZED: stripped <think> block`);
         c.message.content = text;
       }
     }
 
-    // --- Step 3: Promote reasoning → content ---
-    const hadReasoning = !!(c.message.reasoning || c.message.reasoning_content);
-    if (!c.message.content && c.message.reasoning) {
-      const cleaned = stripKimiMarkup(c.message.reasoning.trim(), { label });
-      if (cleaned.length >= REASONING_PROMOTE_MIN_CHARS) {
-        c.message.content = cleaned;
-        console.log(`[${label}] SANITIZED: promoted reasoning→content (${cleaned.length} chars)`);
-      } else if (cleaned.length > 0) {
-        console.log(`[${label}] SANITIZED: suppressed short reasoning (${cleaned.length} chars)`);
-      }
-      delete c.message.reasoning;
-    }
-    // Suppress reasoning_content field regardless
-    if (c.message.reasoning_content !== undefined) {
-      delete c.message.reasoning_content;
-    }
-
-    // --- Step 4: Repair malformed tool-call JSON arguments ---
-    if (Array.isArray(c.message.tool_calls)) {
-      c.message.tool_calls = c.message.tool_calls.map((tc) => {
-        if (tc?.function?.arguments && typeof tc.function.arguments === "string") {
-          const repaired = repairToolCallJson(tc.function.arguments);
-          if (repaired !== tc.function.arguments) {
-            console.log(`[${label}] SANITIZED: repaired malformed tool-call JSON for ${tc.function?.name}`);
-            return { ...tc, function: { ...tc.function, arguments: repaired } };
-          }
-        }
-        return tc;
-      });
-    }
-
-    // --- Step 5: Remove empty content blocks ---
-    if (typeof c.message.content === "string" && c.message.content.trim() === "") {
-      // Leave as empty string; callers that need to inject fallback can check length
-      c.message.content = "";
-    }
-
-    // Annotate whether original response had reasoning (for caller's empty-response logic)
-    c._hadReasoning = hadReasoning;
+    // --- Step 3: Remove private reasoning without modifying public evidence ---
+    delete c.message.reasoning;
+    delete c.message.reasoning_content;
+    delete c.message.analysis;
 
     return c;
   });
