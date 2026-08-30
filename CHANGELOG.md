@@ -24,6 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A non-stream completion that comes back with no assistant content is now
+  rejected instead of being relayed to the client as a successful empty answer.
+  An upstream that returns 200 with an empty choice looked identical to a real
+  reply from outside the gateway, so the caller saw success and no text, and
+  nothing in the logs marked it as a failure (card 7e08803b).
+
 - The CapAuth authorization service now accepts systemd's exact credential file
   mode. `LoadCredential=` installs credentials `0400` root-owned into
   `$CREDENTIALS_DIRECTORY`, and the stricter-or-equal check rejected that exact
