@@ -239,20 +239,19 @@ export function registerDiscoveredRoutes(cfg, catalog, opts = {}) {
     // For discovery-managed backends the configured list is a cold-start seed,
     // not a permanent union. The first authoritative cycle replaces it so a
     // retired model can actually leave routing.
-    const staticModels = cfg.backends?.[name]?.discovery
+    const staticModels = backend.discovery
       ? []
       : (cfg.backends?.[name]?.models || []).filter((x) => typeof x === "string");
     const merged = [...new Set([...staticModels, ...ids])];
-    backend.models = filterRoutableModelIds(merged, getLifecycleFn, [name]);
-    // Lifecycle pruning can legitimately empty this list (every known id for
-    // this provider is currently eol/dead). Backend#supportsModel() treats an
-    // EMPTY models array as "wildcard match everything" UNLESS the backend is
-    // flagged `discovery`-managed (router.mjs:398), and this function IS the
-    // discovery route registrar for nvidia/openrouter, whether or not the
-    // operator also set config.backends.<name>.discovery in YAML. Without
-    // this guard an all-eol provider would flip from "serves nothing"
-    // (correct) to "serves everything" (exactly what P1.4 exists to prevent).
-    if (backend.models.length === 0) backend.discovery = backend.discovery || name;
+    const routable = filterRoutableModelIds(merged, getLifecycleFn, [name]);
+    if (typeof backend.replaceDiscoveredModels === "function" && backend.discovery) {
+      backend.replaceDiscoveredModels(routable);
+    } else {
+      backend.models = routable;
+      // Lifecycle pruning can legitimately empty this list. Mark it discovery
+      // managed so empty never becomes the ordinary wildcard convention.
+      if (backend.models.length === 0) backend.discovery = backend.discovery || name;
+    }
   }
 }
 
@@ -621,6 +620,17 @@ export async function refreshCatalog(cfg, discoverCatalogFn = discoverCatalog) {
   });
   _catalog = models;
   registerDiscoveredRoutes(cfg, models);
+  // Providers absent from the returned catalog still completed a discovery
+  // attempt. Record that outcome so pending becomes attributable failed/stale
+  // instead of remaining ambiguous forever.
+  const zaiProvider = _discoveryCache.providers?.zai;
+  if (cfg.backends?.zai && !models.some((m) => m.provider === "zai")) {
+    router.registerDiscoveredModels?.("zai", [], {
+      ok: zaiProvider?.ok !== false,
+      stale: zaiProvider?.ok === false,
+      at: zaiProvider?.lastAttemptAt || Date.now(),
+    });
+  }
   saveCache(_discoveryCache);
   return models;
 }
@@ -1451,7 +1461,8 @@ export const server = http.createServer(async (req, res) => {
       // onto the reconciled health/status entries and GUARANTEES every model
       // carries a non-empty provider (see src/proxy/advertise.mjs). The
       // allowlist is applied last, exactly as on /admin/models.
-      const merged = withoutExcludedModels(mergeDiscoveredCatalog(reconciled, discovered), excluded);
+      const merged = withoutExcludedModels(
+        mergeDiscoveredCatalog(reconciled, discovered, advertiseBackends), excluded);
       const allowlist = loadAllowlist();
       const allowed = applyAllowlist(merged, allowlist);
       // Aliases (buckets + registry roles): additive, allowlist-aware,
@@ -1511,8 +1522,10 @@ export const server = http.createServer(async (req, res) => {
     try {
       const discovered = await getDiscoveredCatalog();
       const excluded = excludedModelIds(config);
-      const reconciled = buildModelCatalog(effectiveAdvertiseBackends(config.backends || {}, router), router, advertiseReconcileMode, excluded);
-      const merged = withoutExcludedModels(mergeDiscoveredCatalog(reconciled, discovered), excluded);
+      const advertiseBackends = effectiveAdvertiseBackends(config.backends || {}, router);
+      const reconciled = buildModelCatalog(advertiseBackends, router, advertiseReconcileMode, excluded);
+      const merged = withoutExcludedModels(
+        mergeDiscoveredCatalog(reconciled, discovered, advertiseBackends), excluded);
       const data = applyAllowlist(merged, loadAllowlist());
       const entry = data.find((m) => m.id === id);
       // Registry role (sk-default/sk-auto/sk-creative/...): a valid routing
@@ -2062,6 +2075,9 @@ export const server = http.createServer(async (req, res) => {
       messages: parsedMessages,
       // Verified CapAuth identity (falls back to X-Agent-Id / anonymous).
       agentId: metricsAgentId,
+      // Preserve the resolved request/session identity on every typed router
+      // audit event, alongside agent and per-request correlation ids.
+      sessionId: identity.session_id || req.headers["x-session-id"] || undefined,
       // skmodels registry role/context routing (single source of truth).
       // Present => routeAndSend resolves via ~/.skcapstone/models/registry.yaml
       // (precedence context > service > role > default) before backend select.

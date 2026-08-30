@@ -375,13 +375,164 @@ export function resolveBucket({ bucket, catalog = [], sensitivityPolicy, isRouta
       physical_resource_id: entry?.url
         ? `${entry.provider || 'backend'}@${entry.url}`
         : (entry?.provider || `model:${entry.id}`),
-      // COST metadata is copied only after the independent trust ceiling has
-      // admitted the model. It can order this resolved set, never expand it.
-      cost_tier: entry?.capabilities?.sovereignty || entry?.card?.tier || null,
+      // Preference metadata is copied only after the independent trust ceiling
+      // has admitted the model. Neither field can expand this resolved set.
+      family: entry?.card?.family ?? null,
+      ...(entry?.card?.family == null && entry?.card?.unfamilied_reason
+        ? { unfamilied_reason: entry.card.unfamilied_reason }
+        : {}),
+      cost_tier: entry?.card?.cost_tier ?? null,
     });
   }
 
   return { members, rejected, ceiling };
+}
+
+/**
+ * Validate a comma-separated family preference string.
+ *
+ * Preference uses a comma-separated contract (x-sk-prefer: "claude,codex,free")
+ * and is validated as broad family tokens or 'sovereign'/'free' keywords.
+ * Raw model ids (containing slashes, version patterns, or vendor prefixes) are rejected.
+ * The 'free' keyword is refused outside public sensitivity.
+ *
+ * @param {string|null} preferenceStr comma-separated preference string
+ * @param {string} sensitivity the job sensitivity level
+ * @returns {{valid: boolean, preference: Array<string>|null, reason: string|null}}
+ */
+export function validateFamilyPreference(preferenceStr, sensitivity = 'public') {
+  if (!preferenceStr || typeof preferenceStr !== 'string') {
+    return { valid: true, preference: null, reason: null };
+  }
+
+  // Parse comma-separated string
+  const parts = preferenceStr.split(',').map(p => p.trim()).filter(p => p.length > 0);
+  if (parts.length === 0) {
+    return { valid: true, preference: null, reason: null };
+  }
+
+  const preference = [];
+
+  for (const entry of parts) {
+    const trimmed = entry.toLowerCase();
+
+    // Reject raw model ids: they contain slashes, versions, or vendor-specific patterns
+    if (trimmed.includes('/') ||
+        /-\d+\.\d+(-|$)/.test(trimmed) ||  // -3.5-, -4.0-, etc.
+        /-v\d+(-|$)/.test(trimmed) ||      // -v1-, -v2-, etc.
+        /-\d+(?:k|b|m|t)$/.test(trimmed)) { // -128k, -70b, -7b, etc.
+      return {
+        valid: false,
+        preference: null,
+        reason: `preference must name a family, not a raw model id: "${entry}"`,
+      };
+    }
+
+    // Validate the special 'free' and 'sovereign' keywords
+    if (trimmed === 'free') {
+      // 'free' is ONLY allowed at public sensitivity
+      if (sensitivity !== 'public') {
+        return {
+          valid: false,
+          preference: null,
+          reason: `prefer "free" is not allowed at sensitivity="${sensitivity}"; free remote providers train on submitted content`,
+        };
+      }
+      preference.push('free');
+      continue;
+    }
+
+    if (trimmed === 'sovereign') {
+      preference.push('sovereign');
+      continue;
+    }
+
+    // Validate it's a plausible family name (alphanumeric, hyphens, underscores)
+    if (!/^[a-z][a-z0-9-_]*$/.test(trimmed)) {
+      return {
+        valid: false,
+        preference: null,
+        reason: `invalid family name "${entry}": must start with a letter and contain only letters, digits, hyphens, and underscores`,
+      };
+    }
+
+    preference.push(trimmed);
+  }
+
+  return {
+    valid: true,
+    preference,
+    reason: null,
+  };
+}
+
+/**
+ * Apply a family preference to an already-resolved member set.
+ *
+ * THE INVARIANT: this function NEVER widens the member set. It ONLY reorders
+ * the already-resolved members to put preferred families earlier in the list.
+ * If no member matches any preference, the original order is preserved.
+ *
+ * The 'free' special keyword matches members with cost_tier='free-remote'.
+ * The 'sovereign' special keyword matches members with trust_zone='sovereign'.
+ * Regular family names match against the top-level 'family' field on member.
+ *
+ * @param {Array<object>} members members already admitted by resolveBucket
+ * @param {Array<string>} preference ordered list of family names or 'free'/'sovereign'
+ * @returns {Array<object>} reordered members, same length as input
+ */
+export function applyFamilyPreference(members, preference) {
+  if (!Array.isArray(members) || members.length === 0) {
+    return members;
+  }
+
+  if (!preference || !Array.isArray(preference) || preference.length === 0) {
+    return members;
+  }
+
+  // Partition members into three buckets: matched, unmatched
+  const matched = [];
+  const unmatched = [];
+  const seenIds = new Set();
+
+  for (const rawPref of preference) {
+    // validateFamilyPreference() already lowercases, but applyFamilyPreference
+    // is exported and called directly (tests, and any future caller that has a
+    // preference from somewhere other than the header). Normalise here too so
+    // matching is case-insensitive regardless of who calls it.
+    const pref = typeof rawPref === 'string' ? rawPref.toLowerCase() : rawPref;
+    for (const member of members) {
+      if (seenIds.has(member.id)) continue;
+
+      let isMatch = false;
+
+      if (pref === 'free') {
+        // Special case: 'free' matches the free-remote cost tier
+        isMatch = member.cost_tier === 'free-remote';
+      } else if (pref === 'sovereign') {
+        // Special case: 'sovereign' matches the sovereign trust zone
+        isMatch = member.trust_zone === 'sovereign';
+      } else {
+        // Regular family name matches against member.family (top-level field)
+        isMatch = member.family?.toLowerCase() === pref;
+      }
+
+      if (isMatch) {
+        matched.push(member);
+        seenIds.add(member.id);
+      }
+    }
+  }
+
+  // Collect all unmatched members in their original order
+  for (const member of members) {
+    if (!seenIds.has(member.id)) {
+      unmatched.push(member);
+    }
+  }
+
+  // Return preferred first, then the rest in original order
+  return [...matched, ...unmatched];
 }
 
 /** Cost preference, deliberately independent from trust-zone order. */
@@ -431,10 +582,28 @@ export function orderMembersByCost(members, counter = 0) {
  * tiers remain failover candidates through `orderMembersByCost()`, but are not
  * selected while an equally eligible cheaper tier exists.
  *
+ * An optional family preference is applied WITHIN the selected cost tier,
+ * allowing callers to prefer a family at the same cost level. The preference
+ * never widens the member set and never selects a costlier tier over a cheaper
+ * one. If no member in the cheapest tier matches the preference, the normal
+ * cost-tier rotation is used.
+ *
  * @param {Array<object>} members members already admitted by resolveBucket
  * @param {number} counter monotonically increasing per bucket
+ * @param {Array<string>|null} [familyPreference=null] ordered list of family names or 'free'/'sovereign'
  * @returns {object|null}
  */
-export function selectMember(members, counter = 0) {
-  return orderMembersByCost(members, counter)[0] || null;
+export function selectMember(members, counter = 0, familyPreference = null) {
+  const costOrdered = orderMembersByCost(members, counter);
+  if (costOrdered.length === 0) return null;
+
+  // Find all members in the cheapest cost tier
+  const cheapestTier = costOrdered[0].cost_tier;
+  const cheapestMembers = costOrdered.filter(m => m.cost_tier === cheapestTier);
+
+  // Apply family preference only within the cheapest tier
+  const preferredInCheapest = applyFamilyPreference(cheapestMembers, familyPreference);
+
+  // Return the first preferred member in the cheapest tier
+  return preferredInCheapest[0] || null;
 }

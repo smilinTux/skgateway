@@ -71,8 +71,16 @@
 #
 # A `providers:` top-level block (sibling of `overrides:`, see the bottom of
 # this file) carries per-PROVIDER data_retention posture, each with a dated
-# verification. Per-model `data_retention` overrides belong on the model's
-# own override entry (design 4.3) and win over the provider default.
+# verification, and a separately declared cost_tier. Per-model data_retention
+# and cost_tier overrides belong on the model's own entry and win over provider
+# defaults. Family is declared per card or assigned by the reviewed broad-family
+# map in src/discovery/routing-metadata.mjs. Unmapped live ids are retained with
+# family: null and an unfamilied_reason rather than guessed.
+#
+# Cost and trust are intentionally separate. In particular, free-remote is not
+# simply "cheap": provider records verified 2026-08-15 show that the free
+# NVIDIA, OpenRouter, and OpenCode routes correlate with trains-on-content.
+# deriveTrustZone remains exclusively authoritative for where data may go.
 
 overrides:
 
@@ -437,8 +445,10 @@ overrides:
     min_output_tokens: 8192
     notes: "Current registry sk-default target on .100:8082; qualified 2026-08-21 at live n_ctx=65536 with 32K/48K/60K prompt generation gates."
 
-  # qwen38 = Huihui Qwen3.8 27B abliterated Q4_K_M on chiap08 :11439
-  # (registry backend `qwen38`). The server reports the full Huihui id. The
+  # qwen38 = one canonical Huihui Qwen3.8 27B abliterated Q4_K_M model served
+  # by independent replicas on chiap01 :18810 and chiap08 :11439. Registry
+  # backend `qwen38` currently materializes through chiap08. Both servers report
+  # the full Huihui id. The
   # former UD-Q5 id, short id, and qwen38-abliterated are compatibility request
   # aliases; llama.cpp serves all four name-agnostically from the same loaded
   # Huihui weights. Every card below therefore describes the ACTUAL Q4_K_M
@@ -446,9 +456,9 @@ overrides:
   # It has the same <think>-starvation trait as the Ornith models above
   # (registry.yaml backends.qwen38.min_output_tokens: 8192).
   qwen3.8-27b-huihui-abliterated-q4_k_m:
-    display_name: "Huihui Qwen3.8 27B Abliterated Q4_K_M (chiap08)"
+    display_name: "Huihui Qwen3.8 27B Abliterated Q4_K_M"
     org: "Huihui AI / Qwen (self-hosted)"
-    summary: "Exact model served on chiap08 :11439; sovereign abliterated reasoning, tool use, and vision."
+    summary: "Canonical model served by independent chiap01 and chiap08 replicas; sovereign abliterated reasoning, tool use, and vision."
     good_at: [reasoning, coding, tool use, vision, uncensored/creative text, sovereign/private work]
     context_length: 262144
     max_output_tokens: 16384
@@ -464,12 +474,12 @@ overrides:
     latency_class: interactive
     reasoning: true
     min_output_tokens: 8192
-    notes: "Canonical served id for registry backend qwen38 and llama-qwen38.service; mmproj loaded and vision verified."
+    notes: "Canonical served id for chiap01-qwen38 and chiap08-qwen38. Compatibility ids below are request aliases, never replicas or capacity domains."
 
   qwen3.8-27b-ud-q5_k_xl:
     display_name: "Huihui Qwen3.8 27B (legacy UD-Q5 request alias)"
     org: "Huihui AI / Qwen (self-hosted)"
-    summary: "Pre-cutover request alias; chiap08 actually serves the Huihui abliterated Q4_K_M model."
+    summary: "Pre-cutover request alias; both physical replicas serve the canonical Huihui abliterated Q4_K_M model."
     good_at: [reasoning, coding, tool use, vision, uncensored/creative text, sovereign/private work]
     context_length: 262144
     max_output_tokens: 16384
@@ -490,7 +500,7 @@ overrides:
   qwen3.8-27b:
     display_name: "Qwen3.8 27B (short alias)"
     org: "Huihui AI / Qwen (self-hosted)"
-    summary: "Short request alias for the Huihui abliterated Q4_K_M model on chiap08."
+    summary: "Short request alias for the canonical Huihui abliterated Q4_K_M model."
     good_at: [reasoning, coding, tool use, vision, uncensored/creative text, sovereign/private work]
     context_length: 262144
     max_output_tokens: 16384
@@ -511,7 +521,7 @@ overrides:
   qwen38-abliterated:
     display_name: "Huihui Qwen3.8 27B (qwen38-abliterated alias)"
     org: "Huihui AI / Qwen (self-hosted)"
-    summary: "Custom abliterated request alias owned by chiap08-qwen38; serves the canonical Huihui Q4_K_M model."
+    summary: "Custom request alias claimed by both physical replicas; serves the canonical Huihui Q4_K_M model."
     good_at: [reasoning, coding, tool use, vision, uncensored/creative text, sovereign/private work]
     context_length: 262144
     max_output_tokens: 16384
@@ -647,6 +657,7 @@ providers:
   # or "ollama" (all our self-hosted backend keys).
   local:
     data_retention: local-only
+    cost_tier: local
 
   # Verified 2026-08-15 against Anthropic's commercial terms
   # (https://www.anthropic.com/legal/commercial-terms), Section B: "Anthropic
@@ -660,6 +671,7 @@ providers:
   # asserted here.
   anthropic:
     data_retention: contractual-zero
+    cost_tier: paid-cloud
     verified: "2026-08-15"
     ref: "https://www.anthropic.com/legal/commercial-terms, Section B"
 
@@ -673,6 +685,7 @@ providers:
   # which carry the identical restriction per the same page.
   nvidia:
     data_retention: trains
+    cost_tier: free-remote
     verified: "2026-08-15"
     ref: "https://opencode.ai/docs/zen (quoting NVIDIA's NIM free-tier trial banner)"
 
@@ -688,6 +701,7 @@ providers:
   # provider was individually confirmed to train.
   openrouter:
     data_retention: trains
+    cost_tier: free-remote
     verified: "2026-08-15"
     ref: "https://openrouter.ai/docs/features/privacy-and-logging (policy varies per routed provider; free tier assumed worst-case)"
 
@@ -701,6 +715,7 @@ providers:
   # (`discovery: free` in skgateway.yaml, opencode backend), the free tier.
   opencode:
     data_retention: trains
+    cost_tier: free-remote
     verified: "2026-08-15"
     ref: "https://opencode.ai/docs/zen (free-tier models: 'collected data may be used to improve the model')"
 
@@ -719,6 +734,7 @@ providers:
   # rule as every other entry in this block.
   codex:
     data_retention: trains
+    cost_tier: paid-cloud
     verified: "2026-08-22"
     ref: "https://help.openai.com/en/articles/5729567-how-your-data-is-used (ChatGPT consumer plans: training exclusion is conditional on per-account data controls, not contractual)"
 
@@ -727,5 +743,6 @@ providers:
   # fail-safe zone-2 boundary until the current terms are reviewed.
   zai:
     data_retention: unknown
+    cost_tier: paid-cloud
     verified: "2026-08-22"
     ref: "ZCode subscription entitlement observed locally; provider retention terms still require human review"
