@@ -2070,13 +2070,21 @@ function matchConfigEpoch() {
 function buildMatchCatalog() {
   let models;
   try {
-    const cfg = getConfig();
-    models = withoutExcludedModels(
-      buildServingCatalog({ cachePath: MATCH_CATALOG_CACHE_PATH }),
-      excludedModelIds(cfg),
-    );
+    models = buildServingCatalog({ cachePath: MATCH_CATALOG_CACHE_PATH });
   } catch {
     models = [];
+  }
+  // Exclusions are a config-driven NARROWING, so they are applied separately
+  // and never gate the catalog itself. Calling getConfig() as the first
+  // statement of the try above put the whole build behind a loaded config:
+  // getConfig() throws when none is loaded, the catch returned [], and the
+  // documented fail-closed behaviour (an unreadable config yields the
+  // discovery cache ALONE, never nothing) silently became an empty catalog.
+  // buildServingCatalog() already degrades correctly on its own.
+  try {
+    models = withoutExcludedModels(models, excludedModelIds(getConfig()));
+  } catch {
+    // No config loaded: there is nothing to exclude. Keep the catalog as-is.
   }
   return buildCapabilityCatalog(models, { getLifecycleFn: getLifecycle });
 }
