@@ -38,15 +38,20 @@ pooling:
   default_max_concurrent: 20    # Max concurrent requests per backend
   default_max_queue: 1000        # Max queue depth per backend
   queue_timeout_ms: 300000        # Max time a request waits in queue (5 min)
-  # A capacity domain joins every logical route to one physical service. The
-  # direct aliases below route as chiap08-qwen38, while sk-creative/sk-vision
-  # materialize as reg:qwen38; both consume the same four llama.cpp slots.
+  # Each physical Qwen3.8 replica has an independent admission domain. Registry
+  # traffic currently materializes through chiap08-qwen38 and consumes that
+  # host's domain. Request aliases identify one canonical model, not capacity.
   capacity_domains:
     chiap08-qwen38:
       members: [chiap08-qwen38, "reg:qwen38"]
-      max: 4
-      maxQueue: 4
+      max: 3                       # Preserve one physical slot for direct consumers
+      maxQueue: 8
       queueTimeoutMs: 30000       # Return retryable 503 before 60s clients give up
+    chiap01-qwen38:
+      members: [chiap01-qwen38]
+      max: 2                       # Independent B70 card 1 parallel slots
+      maxQueue: 4
+      queueTimeoutMs: 30000
   per_backend:                   # Per-backend overrides
     nvidia:
       max: 20                     # NVIDIA NIM: 20 concurrent
@@ -90,8 +95,21 @@ backends:
       - ornith-1.0-35b
       - ornith-big            # short alias -> same backend (llama.cpp serves name-agnostically)
     priority: 4
-  ## Qwen3.8 27B Huihui abliterated Q4_K_M — llama.cpp (llama-server :11439)
-  ## on chiap08, 262144 ctx, reasoning model, VISION-capable (mmproj is loaded
+  ## Qwen3.8 27B Huihui abliterated Q4_K_M canonical model. chiap01 B70 card 1
+  ## is an independent replica at :18810. It claims exactly the same canonical
+  ## id and three compatibility aliases as chiap08, with no additional alias.
+  chiap01-qwen38:
+    url: http://chiap01:18810/v1
+    auth_type: none
+    models:
+      - qwen3.8-27b-huihui-abliterated-q4_k_m
+      - qwen3.8-27b-ud-q5_k_xl
+      - qwen3.8-27b
+      - qwen38-abliterated
+    priority: 3
+
+  ## The chiap08 replica is llama.cpp (llama-server :11439), 262144 ctx,
+  ## reasoning model, VISION-capable (mmproj is loaded
   ## by ~skuser01/bin/launch-chiap08-llama-qwen38.sh, unit
   ## `llama-qwen38.service`). The server reports the full Huihui id below; the
   ## other three ids are retained request aliases for the same loaded weights.
