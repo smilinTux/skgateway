@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Model catalog rows now carry broad family and separately declared cost-tier
+  metadata. Bucket administration exposes family on each member, while trust
+  zones remain derived only from sovereignty and provider retention posture.
+  Free remote tiers are documented with the trains-on-content correlation from
+  provider records verified 2026-08-15 rather than described as merely cheap.
+
 - Requires Node 22. Node 20 left security support in April 2026, and the repo
   still declared , pinned  to 20, and tested a 20/22
   matrix while the deployment unit executed 20. Three runtimes were reachable on
@@ -17,6 +23,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   disabling all request telemetry. CI now tests 22 only.
 
 ### Fixed
+
+- The CapAuth authorization service now accepts systemd's exact credential file
+  mode. `LoadCredential=` installs credentials `0400` root-owned into
+  `$CREDENTIALS_DIRECTORY`, and the stricter-or-equal check rejected that exact
+  mode, so the PDP failed to load its own credential under the unit that
+  provisions it (card d9a5ea28).
+
+- Added the chiap01 B70 Qwen3.8 server as an independent replica of the canonical
+  chiap08 logical model, with separate admission limits of two and three. The
+  same-model router now uses an eligible replica with free capacity before
+  queueing, without changing trust-zone or sensitivity ceilings.
 
 - A metrics collector that is explicitly enabled in config and then fails to load
   is now reported as a degradation instead of being logged as `(optional)` at info
@@ -52,6 +69,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   healthy, and one failing data source degrades only its own condition.
 
 ### Fixed
+
+- Made a declared `backends` mapping authoritative instead of deep-merging
+  omitted built-in backends back into service. Operators can also use the
+  schema-valid `enabled: false` tombstone. Removed backends are excluded from
+  discovery, advertisement, and bucket inputs, while orphan direct or
+  `reg:<backend>` pooling references now fail startup validation.
 
 - Cost-rank bucket members only after capability and trust eligibility, rotate
   equal-cost peers, and bound bucket completion liveness so a listed but hung
