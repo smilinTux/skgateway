@@ -41,6 +41,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Codex-named direct targets, roles, aliases, buckets, contexts, fallback chains,
+  and runtime candidate chains now fail closed unless every member is an official
+  OpenAI GPT route. Missing Codex dispatch credentials and foreign-provider
+  candidates are rejected before transport, while Qwen remains separate and the
+  checked-in OpenRouter backend and discovery source remain disabled.
 - Dead Ornith model claims are purged from the serving config and from every
   catalog and bucket projection, and repeated fast failures (404, 410, 502,
   connection refused) now quarantine the exact backend-model claim rather than
