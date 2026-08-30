@@ -17,6 +17,7 @@
 // and because parseNvidia/parseOpenRouterFree below are the pre-adapter
 // functions whose output shape those tests pin.
 import { isChatModelId } from './discovery/classify.mjs';
+import { isCatalogDisabledBackend } from './proxy/advertise.mjs';
 
 /** Kept as a named export: tests/discovery.test.mjs pins this exact behavior. */
 export const isChatModel = isChatModelId;
@@ -467,6 +468,7 @@ export function servingConfigModels(backends = {}) {
   const out = [];
   if (!backends || typeof backends !== 'object') return out;
   for (const [name, b] of Object.entries(backends)) {
+    if (isCatalogDisabledBackend(b)) continue;
     const paidBackend = isAnthropicBackend(b) || isCodexBackend(b) || isZaiBackend(b);
     for (const id of (b && b.models) || []) {
       if (typeof id !== 'string' || id.includes('*')) continue;
