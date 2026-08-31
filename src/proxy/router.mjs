@@ -3418,11 +3418,14 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         // A client which leaves while queued is the same neutral 499 as one
         // which leaves after dispatch: no failover and no backend-health write.
         if (err instanceof PoolAdmissionError && err.code === "client_closed") {
-          const queueWaitMs = Date.now() - queueStart;
+          const queueWaitMs = err.queueWaitMs;
           await emitSiem("response", {
             status: 499,
             latency_ms: queueWaitMs,
             queue_wait_ms: queueWaitMs,
+            inflight_concurrency: err.inflightConcurrency,
+            admission_outcome: err.admissionOutcome,
+            backoff_classification: "cancellation",
             failover: false,
             cancelled: true,
           }, { backend: backendId });
@@ -3438,6 +3441,9 @@ export async function routeAndSend(router, request, upstreamPath, method, client
             backendId,
             capacityDomain: err.capacityDomain,
             queueWaitMs,
+            inflightConcurrency: err.inflightConcurrency,
+            admissionOutcome: err.admissionOutcome,
+            backoffClassification: "cancellation",
             failover: false,
             cancelled: true,
           };
@@ -3463,11 +3469,26 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           retry_after_seconds: retryAfterSeconds,
           message: err.message,
         }, { backend: backendId });
-        const queueWaitMs = Date.now() - queueStart;
+        const queueWaitMs = err instanceof PoolAdmissionError
+          ? err.queueWaitMs
+          : Math.max(0, Date.now() - queueStart);
+        const inflightConcurrency = err instanceof PoolAdmissionError
+          ? err.inflightConcurrency
+          : 0;
+        const admissionOutcome = err instanceof PoolAdmissionError
+          ? err.admissionOutcome
+          : "denied";
+        const backoffClassification = code === "queue_timeout"
+          ? "timeout"
+          : "local_admission_denial";
         await emitSiem("response", {
           status: 503,
           latency_ms: queueWaitMs,
           queue_wait_ms: queueWaitMs,
+          inflight_concurrency: inflightConcurrency,
+          admission_outcome: admissionOutcome,
+          backoff_classification: backoffClassification,
+          retry_after_seconds: retryAfterSeconds,
           failover: false,
           admission_rejected: true,
           code,
@@ -3493,13 +3514,22 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           })),
           backendId,
           capacityDomain,
-          queueWaitMs: Date.now() - queueStart,
+          queueWaitMs,
+          inflightConcurrency,
+          admissionOutcome,
+          backoffClassification,
+          retryAfterSeconds,
           failover: didFailover,
         };
       }
     }
 
-    const queueWaitMs = Date.now() - queueStart;
+    // Pool tickets carry the admission snapshot. This avoids sampling after a
+    // concurrent release or promotion and bounds queue wait to the configured
+    // queue SLA. The no-pool path remains an admitted, zero-wait attempt.
+    const queueWaitMs = slot?.queueWaitMs ?? 0;
+    const inflightConcurrency = slot?.inflightConcurrency ?? 1;
+    const admissionOutcome = slot?.admissionOutcome ?? "admitted";
 
     // Meter read is per attempt, not per request: a failover attempt must be
     // attributed to the backend that actually served it. Fail-open, so a slow
@@ -3647,6 +3677,9 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         servedModel: candidateModel,
         failover: didFailover,
         queueWaitMs,
+        inflightConcurrency,
+        admissionOutcome: "cancelled",
+        backoffClassification: "cancellation",
         cancelled: true,
       };
       if (isBucketChain) {
@@ -3657,6 +3690,9 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         status: 499,
         latency_ms: latencyMs,
         queue_wait_ms: queueWaitMs,
+        inflight_concurrency: inflightConcurrency,
+        admission_outcome: "cancelled",
+        backoff_classification: "cancellation",
         failover: false,
         cancelled: true,
       }, { backend: backendId });
@@ -3809,6 +3845,9 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       discoveryRevision: backend.discoveryRevision,
       failover: didFailover,
       queueWaitMs,
+      inflightConcurrency,
+      admissionOutcome,
+      backoffClassification: "nonterminal",
     };
     if (isBucketChain) {
       lastResult.bucket = bucketAddr.bucket;
@@ -3852,6 +3891,9 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         status: res.status,
         latency_ms: latencyMs,
         queue_wait_ms: queueWaitMs,
+        inflight_concurrency: inflightConcurrency,
+        admission_outcome: admissionOutcome,
+        backoff_classification: "nonterminal",
         failover: didFailover,
         requested_model: lastResult.requestedModel,
         chosen_backend: backendId,
@@ -3876,10 +3918,18 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         `cooldown=${cooldownMs}ms` +
         (i < candidates.length - 1 ? " (trying next door)" : " (no more candidates)")
       );
+      lastResult.backoffClassification = res.status === 429
+        ? "provider_429"
+        : "provider_backoff";
+      lastResult.retryAfterMs = cooldownMs;
       await emitSiem("anomaly", {
         type: "rate_limited",
         backend: backendId,
         status_code: res.status,
+        queue_wait_ms: queueWaitMs,
+        inflight_concurrency: inflightConcurrency,
+        admission_outcome: admissionOutcome,
+        backoff_classification: lastResult.backoffClassification,
         cooldown_ms: cooldownMs,
       }, { backend: backendId, severity: "info" });
       continue;
@@ -3922,6 +3972,11 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     );
     await emitSiem("response", {
       status: 429,
+      queue_wait_ms: lastResult?.queueWaitMs ?? 0,
+      inflight_concurrency: lastResult?.inflightConcurrency ?? 0,
+      admission_outcome: lastResult?.admissionOutcome ?? "admitted",
+      backoff_classification: "provider_429",
+      retry_after_seconds: retryAfterSec,
       failover: didFailover,
       all_backends_failed: true,
       all_throttled: true,
@@ -3931,6 +3986,11 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       headers: { "content-type": "application/json", "retry-after": String(retryAfterSec) },
       body: Buffer.from(payload, "utf-8"),
       backendId: lastResult?.backendId ?? null,
+      queueWaitMs: lastResult?.queueWaitMs ?? 0,
+      inflightConcurrency: lastResult?.inflightConcurrency ?? 0,
+      admissionOutcome: lastResult?.admissionOutcome ?? "admitted",
+      backoffClassification: "provider_429",
+      retryAfterSeconds: retryAfterSec,
       failover: didFailover,
     };
   }

@@ -225,6 +225,11 @@ describe("router 429/402 rate-limit failover (card 9e28de88)", () => {
     const r = await routeAndSend(router, { model: modelId, agentId: "test" }, "/chat/completions", "POST", HEADERS, bodyFor(modelId), false);
 
     assert.equal(r.status, 429);
+    assert.equal(r.admissionOutcome, "admitted");
+    assert.equal(r.backoffClassification, "provider_429");
+    assert.ok(r.inflightConcurrency >= 1);
+    assert.ok(r.queueWaitMs >= 0);
+    assert.ok(r.retryAfterSeconds >= 1);
     const payload = JSON.parse(r.body.toString("utf-8"));
     assert.equal(payload.error.type, "rate_limited_all_candidates");
     assert.equal(payload.attempted.length, 2, "both throttled doors are attributed");
