@@ -54,6 +54,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Queue telemetry now preserves `provider_backoff` when every upstream returns
+  402 and records cooldown-only requests as denied with zero inflight work.
+
 - Codex-named direct targets, roles, aliases, buckets, contexts, fallback chains,
   and runtime candidate chains now fail closed unless every member is an official
   OpenAI GPT route. Missing Codex dispatch credentials and foreign-provider

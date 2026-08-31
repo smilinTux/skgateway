@@ -401,11 +401,11 @@ describe("router backoff and cooldown admission truth (card e7c2b4a9)", () => {
     );
 
     assert.equal(r.status, 429, "final response is 429 for all throttled candidates");
-    assert.equal(r.backoffClassification, "provider_backoff", 
+    assert.equal(r.backoffClassification, "provider_backoff",
       "all-402 chain must preserve provider_backoff, not overwrite to provider_429");
     assert.equal(r.admissionOutcome, "admitted", "first attempt was admitted before 402");
     assert.equal(r.inflightConcurrency, 1, "inflight concurrency reflects admission");
-    
+
     const payload = JSON.parse(r.body.toString("utf-8"));
     assert.equal(payload.error.type, "rate_limited_all_candidates");
     assert.equal(payload.attempted.length, 2, "both attempts are attributed");
@@ -440,7 +440,7 @@ describe("router backoff and cooldown admission truth (card e7c2b4a9)", () => {
     assert.equal(r1.status, 429);
     assert.equal(r1.admissionOutcome, "admitted", "first request was admitted");
     assert.equal(r1.inflightConcurrency, 1);
-    
+
     // Verify cooldowns are armed
     const primaryState = _throttleStateForTests("primary", modelId);
     const secondaryState = _throttleStateForTests("secondary", modelId);
@@ -461,18 +461,18 @@ describe("router backoff and cooldown admission truth (card e7c2b4a9)", () => {
     );
 
     assert.equal(r2.status, 429, "cooldown-only rejection returns 429");
-    assert.equal(r2.admissionOutcome, "denied", 
+    assert.equal(r2.admissionOutcome, "denied",
       "cooldown-only request must report denied, not admitted with zero inflight");
-    assert.equal(r2.inflightConcurrency, 0, 
+    assert.equal(r2.inflightConcurrency, 0,
       "no inflight concurrency when no admission occurred");
     assert.equal(r2.backoffClassification, "provider_backoff",
       "cooldown-only rejection preserves the underlying backoff classification");
-    
+
     // Verify both attempts were skipped without network calls
     const payload2 = JSON.parse(r2.body.toString("utf-8"));
     assert.equal(payload2.error.type, "rate_limited_all_candidates");
     assert.equal(payload2.attempted.length, 2);
-    assert.ok(payload2.attempted.every((a) => a.skipped === true), 
+    assert.ok(payload2.attempted.every((a) => a.skipped === true),
       "all attempts were skipped due to cooldown");
   });
 
@@ -503,7 +503,7 @@ describe("router backoff and cooldown admission truth (card e7c2b4a9)", () => {
 
     assert.equal(r1.status, 429);
     assert.equal(r1.admissionOutcome, "admitted");
-    
+
     // Second request while cooling
     const r2 = await routeAndSend(
       router,

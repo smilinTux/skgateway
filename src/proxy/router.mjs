@@ -3958,13 +3958,13 @@ export async function routeAndSend(router, request, upstreamPath, method, client
   if (candidates.length > 0 && throttledAttempts.length === candidates.length) {
     const waitsMs = throttledAttempts.map((t) => t.cooldownMs ?? DEFAULT_429_COOLDOWN_MS);
     const retryAfterSec = Math.max(1, Math.ceil(Math.min(...waitsMs) / 1000));
-    
+
     // Card e7c2b4a9 repair #1: derive final backoff classification from attempts.
     // If ALL throttled attempts are 402, preserve provider_backoff. Only if
     // ANY attempt was a 429 should we classify as provider_429.
     const all402 = throttledAttempts.every((t) => t.status === 402);
     const backoffClassification = all402 ? "provider_backoff" : "provider_429";
-    
+
     // Card e7c2b4a9 repair #2: detect cooldown-only rejections (no admission occurred).
     // When ALL doors were skipped via cooldown, lastResult is null and no pool
     // admission ever happened. Report a truthful no-admission outcome rather
@@ -3974,7 +3974,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     const inflightConcurrency = allSkipped ? 0 : (lastResult?.inflightConcurrency ?? 0);
     const queueWaitMs = lastResult?.queueWaitMs ?? 0;
     const backendId = lastResult?.backendId ?? null;
-    
+
     const payload = JSON.stringify({
       error: {
         message: "All candidate models are currently rate limited",
