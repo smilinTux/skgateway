@@ -214,7 +214,7 @@ CREATE TABLE IF NOT EXISTS request_log (
   output_tokens INTEGER,            -- NULL means unobserved, never zero by default
   cost_usd      REAL,               -- actual/estimated value; NULL when unknown
   cost_truth    TEXT,               -- actual | estimated | unknown
-  generation_tps REAL               -- output tokens / (total_ms-first_byte_ms)
+  generation_tps REAL               -- output tokens / measured post-first-byte seconds
 );
 
 CREATE TABLE IF NOT EXISTS token_usage (
@@ -779,6 +779,7 @@ export function createMetricsCollector(config) {
    * @param {string}  meta.reqId        ID returned by `recordRequest()`
    * @param {number}  [meta.statusCode] HTTP status code from upstream
    * @param {number}  [meta.firstByteMs] ms from request start to first upstream byte
+   * @param {number}  [meta.generationMs] measured ms from first upstream byte to completion
    * @param {number}  [meta.totalMs]    Total round-trip ms (arrival → response complete)
    * @param {string}  [meta.errorMsg]   Error message if the request failed
    * @param {number}  [meta.actualCostUsd] Provider-reported charge for this request
@@ -799,6 +800,7 @@ export function createMetricsCollector(config) {
     reqId,
     statusCode,
     firstByteMs,
+    generationMs,
     totalMs,
     errorMsg,
     actualCostUsd,
@@ -916,8 +918,8 @@ export function createMetricsCollector(config) {
     }
     if (cfg.cost_tracking && pricing.unpriced) counters.unpricedRequests++;
 
-    const generationInterval = total !== null && firstByte !== null
-      ? total - firstByte
+    const generationInterval = Number.isFinite(generationMs) && generationMs > 0
+      ? generationMs
       : null;
     const generationTps = tokens.output_tokens !== null && generationInterval > 0
       ? tokens.output_tokens / (generationInterval / 1000)

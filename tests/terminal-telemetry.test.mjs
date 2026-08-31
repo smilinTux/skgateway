@@ -1,11 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
+import http from "node:http";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import Database from "better-sqlite3";
 import { createMetricsCollector } from "../src/metrics/collector.mjs";
 import { loadConfig } from "../src/config.mjs";
+import { sendUpstream } from "../src/proxy/upstream.mjs";
 
 await loadConfig({ configPath: "/nonexistent/skgw-terminal-telemetry.yaml", silent: true });
 
@@ -39,6 +41,7 @@ test("terminal row persists observed status, outcome, timings, tokens, and estim
       statusCode: 201,
       firstByteMs: 250,
       totalMs: 1250,
+      generationMs: 1000,
       responseBody: { usage: { prompt_tokens: 1000, completion_tokens: 20 } },
     });
 
@@ -77,9 +80,9 @@ test("missing usage, status, first byte, and pricing stay unknown rather than ze
 test("generation throughput requires output tokens and a positive generation interval", () => {
   withCollector((collector) => {
     const cases = [
-      ["no-output", { firstByteMs: 10, totalMs: 20, responseBody: { usage: { prompt_tokens: 3 } } }],
-      ["no-first-byte", { totalMs: 20, responseBody: { usage: { completion_tokens: 4 } } }],
-      ["zero-interval", { firstByteMs: 20, totalMs: 20, responseBody: { usage: { completion_tokens: 4 } } }],
+      ["no-output", { generationMs: 10, responseBody: { usage: { prompt_tokens: 3 } } }],
+      ["no-generation-interval", { responseBody: { usage: { completion_tokens: 4 } } }],
+      ["zero-interval", { generationMs: 0, responseBody: { usage: { completion_tokens: 4 } } }],
     ];
     const ids = [];
     for (const [name, values] of cases) {
@@ -90,6 +93,76 @@ test("generation throughput requires output tokens and a positive generation int
     const rows = new Map(collector.getTerminalRequests().map((row) => [row.id, row]));
     for (const [name, reqId] of ids) assert.equal(rows.get(reqId).generation_tps, null, name);
   });
+});
+
+test("generation throughput uses the measured post-first-byte interval only", () => {
+  withCollector((collector) => {
+    const reqId = collector.recordRequest({ model: "timing-origin" });
+    collector.recordResponse({
+      reqId,
+      statusCode: 200,
+      firstByteMs: 54,
+      totalMs: 206,
+      generationMs: 52,
+      responseBody: { usage: { completion_tokens: 200 } },
+    });
+
+    const row = collector.getTerminalRequests().find((candidate) => candidate.id === reqId);
+    assert.equal(row.generation_tps, 200 / 0.052);
+  });
+});
+
+test("post-header cancellation preserves known first-byte timing without token or cost values", async () => {
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.flushHeaders();
+    setTimeout(() => res.end(JSON.stringify({ usage: { completion_tokens: 999 } })), 200);
+  });
+  await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+
+  const controller = new AbortController();
+  const address = upstream.address();
+  const pending = sendUpstream(
+    "/v1/chat/completions",
+    "POST",
+    { "content-type": "application/json" },
+    Buffer.from("{}"),
+    new URL(`http://127.0.0.1:${address.port}`),
+    0,
+    controller.signal,
+  );
+  setTimeout(() => controller.abort(), 50);
+
+  const dir = mkdtempSync(join(tmpdir(), "skgw-terminal-cancel-"));
+  let collector;
+  try {
+    const result = await pending;
+    assert.equal(result.status, 499);
+    assert.equal(result.cancelled, true);
+    assert.equal(Number.isFinite(result.firstByteMs), true);
+
+    collector = createMetricsCollector(cfg(dir));
+    const reqId = collector.recordRequest({ model: "cancelled" });
+    collector.recordResponse({
+      reqId,
+      statusCode: result.status,
+      firstByteMs: result.firstByteMs,
+      generationMs: result.generationMs,
+      responseBody: JSON.parse(result.body.toString("utf8")),
+    });
+    const row = collector.getTerminalRequests().find((candidate) => candidate.id === reqId);
+    assert.equal(row.terminal_state, "cancelled");
+    assert.equal(row.first_byte_ms, result.firstByteMs);
+    assert.equal(row.input_tokens, null);
+    assert.equal(row.output_tokens, null);
+    assert.equal(row.cost_usd, null);
+    assert.equal(row.cost_truth, "unknown");
+    assert.equal(row.generation_tps, null);
+  } finally {
+    collector?.close();
+    rmSync(dir, { recursive: true, force: true });
+    await new Promise((resolve) => upstream.close(resolve));
+  }
 });
 
 test("additive migration leaves legacy values null and reader reports unknown truth", () => {

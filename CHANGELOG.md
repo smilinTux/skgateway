@@ -54,6 +54,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Terminal request telemetry now preserves an already observed first-byte
+  timing when a downstream client cancels, and generation throughput uses the
+  measured post-first-byte interval instead of subtracting differently based
+  request and dispatch clocks (card f0a1c2d3).
+
 - Codex-named direct targets, roles, aliases, buckets, contexts, fallback chains,
   and runtime candidate chains now fail closed unless every member is an official
   OpenAI GPT route. Missing Codex dispatch credentials and foreign-provider
