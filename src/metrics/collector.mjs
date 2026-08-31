@@ -207,7 +207,14 @@ CREATE TABLE IF NOT EXISTS request_log (
   -- "same as requested"; see recordResponse() for why that distinction is the
   -- entire value of the column. Declared LAST on purpose so a database created
   -- fresh and one migrated by ensureColumn() below have the same column order.
-  model_served  TEXT
+  model_served  TEXT,
+  status_class  TEXT,               -- 1xx..5xx; NULL means no status observed
+  terminal_state TEXT,              -- succeeded | failed | cancelled | unknown
+  input_tokens  INTEGER,            -- NULL means unobserved, never zero by default
+  output_tokens INTEGER,            -- NULL means unobserved, never zero by default
+  cost_usd      REAL,               -- actual/estimated value; NULL when unknown
+  cost_truth    TEXT,               -- actual | estimated | unknown
+  generation_tps REAL               -- output tokens / measured post-first-byte seconds
 );
 
 CREATE TABLE IF NOT EXISTS token_usage (
@@ -220,10 +227,10 @@ CREATE TABLE IF NOT EXISTS token_usage (
   ts              INTEGER NOT NULL,  -- Unix ms
   hour_bucket     TEXT NOT NULL,     -- YYYY-MM-DDTHH (UTC)
   day_bucket      TEXT NOT NULL,     -- YYYY-MM-DD    (UTC)
-  input_tokens    INTEGER DEFAULT 0,
-  output_tokens   INTEGER DEFAULT 0,
-  cache_read_tokens   INTEGER DEFAULT 0,
-  cache_write_tokens  INTEGER DEFAULT 0
+  input_tokens    INTEGER,
+  output_tokens   INTEGER,
+  cache_read_tokens   INTEGER,
+  cache_write_tokens  INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS cost_log (
@@ -333,6 +340,13 @@ function migrate(db) {
   // recorded what actually answered, so a silent substitution and an ordinary
   // call produced identical rows.
   ensureColumn(db, 'request_log', 'model_served', 'TEXT');
+  ensureColumn(db, 'request_log', 'status_class', 'TEXT');
+  ensureColumn(db, 'request_log', 'terminal_state', 'TEXT');
+  ensureColumn(db, 'request_log', 'input_tokens', 'INTEGER');
+  ensureColumn(db, 'request_log', 'output_tokens', 'INTEGER');
+  ensureColumn(db, 'request_log', 'cost_usd', 'REAL');
+  ensureColumn(db, 'request_log', 'cost_truth', 'TEXT');
+  ensureColumn(db, 'request_log', 'generation_tps', 'REAL');
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -375,11 +389,12 @@ function pad(n) { return String(n).padStart(2, '0'); }
  * @param {object} opts
  * @param {Record<string, string>} [opts.headers]  Response headers
  * @param {object}                 [opts.body]     Parsed response body
- * @returns {{ input_tokens: number, output_tokens: number,
- *             cache_read_tokens: number, cache_write_tokens: number }}
+ * @returns {{ input_tokens: number|null, output_tokens: number|null,
+ *             cache_read_tokens: number|null, cache_write_tokens: number|null }}
  */
 function extractTokens({ headers = {}, body = {} } = {}) {
-  let input = 0, output = 0, cacheRead = 0, cacheWrite = 0;
+  const observedCount = (value) => Number.isInteger(value) && value >= 0 ? value : null;
+  let input = null, output = null, cacheRead = null, cacheWrite = null;
 
   // ── Anthropic header format ──────────────────────────────────────────────
   // x-usage: {"input_tokens":100,"output_tokens":50}
@@ -387,30 +402,26 @@ function extractTokens({ headers = {}, body = {} } = {}) {
   if (hdr) {
     try {
       const u = JSON.parse(hdr);
-      input      = u.input_tokens       ?? 0;
-      output     = u.output_tokens      ?? 0;
-      cacheRead  = u.cache_read_tokens  ?? 0;
-      cacheWrite = u.cache_write_tokens ?? 0;
-    } catch { /* ignore */ }
+      input      = observedCount(u.input_tokens);
+      output     = observedCount(u.output_tokens);
+      cacheRead  = observedCount(u.cache_read_tokens);
+      cacheWrite = observedCount(u.cache_write_tokens);
+    } catch { /* malformed usage is unobserved */ }
   }
 
   // ── OpenAI-compatible body.usage ──────────────────────────────────────────
   const u = body?.usage;
   if (u && typeof u === 'object') {
-    if (!input  && (u.input_tokens  || u.prompt_tokens))
-      input  = u.input_tokens  ?? u.prompt_tokens  ?? 0;
-    if (!output && (u.output_tokens || u.completion_tokens))
-      output = u.output_tokens ?? u.completion_tokens ?? 0;
-    if (!cacheRead  && u.cache_read_input_tokens)
-      cacheRead  = u.cache_read_input_tokens ?? 0;
-    if (!cacheWrite && u.cache_creation_input_tokens)
-      cacheWrite = u.cache_creation_input_tokens ?? 0;
+    input      ??= observedCount(u.input_tokens ?? u.prompt_tokens);
+    output     ??= observedCount(u.output_tokens ?? u.completion_tokens);
+    cacheRead  ??= observedCount(u.cache_read_input_tokens);
+    cacheWrite ??= observedCount(u.cache_creation_input_tokens);
   }
 
   return {
-    input_tokens:       input,
-    output_tokens:      output,
-    cache_read_tokens:  cacheRead,
+    input_tokens: input,
+    output_tokens: output,
+    cache_read_tokens: cacheRead,
     cache_write_tokens: cacheWrite,
   };
 }
@@ -428,10 +439,10 @@ function extractTokens({ headers = {}, body = {} } = {}) {
 function calcCost(tokens, pricing) {
   const M = 1_000_000;
   return {
-    input_cost:       (tokens.input_tokens        / M) * (pricing.input       ?? 0),
-    output_cost:      (tokens.output_tokens       / M) * (pricing.output      ?? 0),
-    cache_read_cost:  (tokens.cache_read_tokens   / M) * (pricing.cache_read  ?? 0),
-    cache_write_cost: (tokens.cache_write_tokens  / M) * (pricing.cache_write ?? 0),
+    input_cost:       ((tokens.input_tokens ?? 0)       / M) * (pricing.input       ?? 0),
+    output_cost:      ((tokens.output_tokens ?? 0)      / M) * (pricing.output      ?? 0),
+    cache_read_cost:  ((tokens.cache_read_tokens ?? 0)  / M) * (pricing.cache_read  ?? 0),
+    cache_write_cost: ((tokens.cache_write_tokens ?? 0) / M) * (pricing.cache_write ?? 0),
   };
 }
 
@@ -480,8 +491,15 @@ export function createMetricsCollector(config) {
       updateRequest: db.prepare(`
         UPDATE request_log
         SET status_code = @status_code,
+            status_class = @status_class,
+            terminal_state = @terminal_state,
             first_byte_ms = @first_byte_ms,
             total_ms = @total_ms,
+            input_tokens = @input_tokens,
+            output_tokens = @output_tokens,
+            cost_usd = @cost_usd,
+            cost_truth = @cost_truth,
+            generation_tps = @generation_tps,
             error_msg = @error_msg,
             backend = COALESCE(@backend, backend),
             model_served = COALESCE(@model_served, model_served)
@@ -761,8 +779,10 @@ export function createMetricsCollector(config) {
    * @param {string}  meta.reqId        ID returned by `recordRequest()`
    * @param {number}  [meta.statusCode] HTTP status code from upstream
    * @param {number}  [meta.firstByteMs] ms from request start to first upstream byte
+   * @param {number}  [meta.generationMs] measured ms from first upstream byte to completion
    * @param {number}  [meta.totalMs]    Total round-trip ms (arrival → response complete)
    * @param {string}  [meta.errorMsg]   Error message if the request failed
+   * @param {number}  [meta.actualCostUsd] Provider-reported charge for this request
    * @param {Record<string, string>} [meta.responseHeaders]  Raw upstream response headers
    * @param {object}  [meta.responseBody]  Parsed upstream response body
    * @param {string}  [meta.agentId]    Override agent (if not known at recordRequest time)
@@ -780,8 +800,10 @@ export function createMetricsCollector(config) {
     reqId,
     statusCode,
     firstByteMs,
+    generationMs,
     totalMs,
     errorMsg,
+    actualCostUsd,
     responseHeaders,
     responseBody,
     agentId: agentOverride,
@@ -797,35 +819,50 @@ export function createMetricsCollector(config) {
     const model     = modelOverride   ?? orig.model;
     const backend   = backendOverride ?? orig.backend;
     const sessionId = sessionOverride ?? orig.sessionId;
-    const startedAt = orig.startedAt  ?? Date.now();
-    const total     = totalMs ?? (Date.now() - startedAt);
     const ts        = Date.now();
+    const startedAt = orig.startedAt;
+    const suppliedTotal = Number.isFinite(totalMs) && totalMs >= 0 ? totalMs : null;
+    const total = suppliedTotal ?? (Number.isFinite(startedAt) ? ts - startedAt : null);
+    const firstByte = Number.isFinite(firstByteMs) && firstByteMs >= 0 ? firstByteMs : null;
+    const status = Number.isInteger(statusCode) && statusCode >= 100 && statusCode <= 599
+      ? statusCode
+      : null;
+    const statusClass = status === null ? null : `${Math.floor(status / 100)}xx`;
+    const terminalState = status === 499
+      ? 'cancelled'
+      : ((status !== null && status < 400 && !errorMsg)
+          ? 'succeeded'
+          : ((status !== null || errorMsg) ? 'failed' : 'unknown'));
 
     counters.activeRequests = Math.max(0, counters.activeRequests - 1);
 
-    const isError = statusCode >= 400 || !!errorMsg;
+    const isError = (status !== null && status >= 400) || !!errorMsg;
     if (isError) {
       counters.errorCount++;
       counters.recentErrors.add();
     }
 
-    // Latency estimators (percentiles) + running stats (3-sigma anomaly check)
-    const est = getEstimator(backend, model);
-    est.p50.update(total);
-    est.p95.update(total);
-    est.p99.update(total);
-    const anomaly = recordLatencyStat(latencyKey(backend, model), backend ?? null, model ?? null, total, ts);
+    // Missing latency is not a zero-duration observation.
+    let anomaly = null;
+    if (total !== null) {
+      const est = getEstimator(backend, model);
+      est.p50.update(total);
+      est.p95.update(total);
+      est.p99.update(total);
+      anomaly = recordLatencyStat(latencyKey(backend, model), backend ?? null, model ?? null, total, ts);
+    }
 
     // Token extraction & cost
     let tokenRow = null;
     let costRow  = null;
 
-    if (cfg.token_tracking && (responseHeaders || responseBody)) {
-      const tokens = extractTokens({ headers: responseHeaders, body: responseBody });
-      const totalTok = tokens.input_tokens + tokens.output_tokens;
+    const tokens = extractTokens({ headers: responseHeaders, body: responseBody });
+    const hasTokens = Object.values(tokens).some((value) => value !== null);
+    if (cfg.token_tracking && hasTokens) {
+      const totalTok = (tokens.input_tokens ?? 0) + (tokens.output_tokens ?? 0);
 
-      counters.totalInputTokens  += tokens.input_tokens;
-      counters.totalOutputTokens += tokens.output_tokens;
+      counters.totalInputTokens  += tokens.input_tokens ?? 0;
+      counters.totalOutputTokens += tokens.output_tokens ?? 0;
       counters.recentTokens.add(totalTok);
 
       tokenRow = {
@@ -835,32 +872,74 @@ export function createMetricsCollector(config) {
         ...tokens,
       };
 
-      if (cfg.cost_tracking) {
-        const pricing = getPricing(model ?? '');
-        const cost = calcCost(tokens, pricing);
-        const totalCost = cost.input_cost + cost.output_cost + cost.cache_read_cost + cost.cache_write_cost;
-        counters.totalCostUsd += totalCost;
-        if (pricing.unpriced) counters.unpricedRequests++;
-        // Bounded in-memory breakdown (per verified agent + per model) for /status.
-        bumpCost(counters.costByAgent, agentId ?? 'anonymous', totalCost, pricing.unpriced);
-        bumpCost(counters.costByModel, model   ?? 'unknown',   totalCost, pricing.unpriced);
-        costRow = {
-          req_id: reqId, agent_id: agentId ?? null, model: model ?? null,
-          backend: backend ?? null, session_id: sessionId ?? null,
-          ts, day_bucket: dayBucket(ts),
-          ...cost,
-        };
-      }
     }
+
+    const reportedCost = Number.isFinite(actualCostUsd) && actualCostUsd >= 0
+      ? actualCostUsd
+      : null;
+    const pricing = getPricing(model ?? '');
+    const canEstimateCost = cfg.cost_tracking && !pricing.unpriced &&
+      tokens.input_tokens !== null && tokens.output_tokens !== null;
+    let costTruth = 'unknown';
+    let totalCost = null;
+    if (cfg.cost_tracking && reportedCost !== null) {
+      costTruth = 'actual';
+      totalCost = reportedCost;
+    } else if (canEstimateCost) {
+      costTruth = 'estimated';
+      const cost = calcCost(tokens, pricing);
+      totalCost = cost.input_cost + cost.output_cost + cost.cache_read_cost + cost.cache_write_cost;
+      costRow = {
+        req_id: reqId, agent_id: agentId ?? null, model: model ?? null,
+        backend: backend ?? null, session_id: sessionId ?? null,
+        ts, day_bucket: dayBucket(ts),
+        ...cost,
+      };
+    }
+    // Keep the legacy cost aggregate complete for consumers that already use
+    // it, while the terminal row tells the truth: fallback zero pricing is not
+    // an estimate and therefore remains cost_truth=unknown with cost_usd=NULL.
+    if (cfg.cost_tracking && tokens.input_tokens !== null && tokens.output_tokens !== null && !costRow) {
+      const legacyCost = calcCost(tokens, pricing);
+      costRow = {
+        req_id: reqId, agent_id: agentId ?? null, model: model ?? null,
+        backend: backend ?? null, session_id: sessionId ?? null,
+        ts, day_bucket: dayBucket(ts),
+        ...legacyCost,
+      };
+    }
+    const aggregateCost = totalCost ?? (costRow
+      ? costRow.input_cost + costRow.output_cost + costRow.cache_read_cost + costRow.cache_write_cost
+      : null);
+    if (cfg.cost_tracking && aggregateCost !== null) {
+      counters.totalCostUsd += aggregateCost;
+      bumpCost(counters.costByAgent, agentId ?? 'anonymous', aggregateCost, pricing.unpriced);
+      bumpCost(counters.costByModel, model ?? 'unknown', aggregateCost, pricing.unpriced);
+    }
+    if (cfg.cost_tracking && pricing.unpriced) counters.unpricedRequests++;
+
+    const generationInterval = Number.isFinite(generationMs) && generationMs > 0
+      ? generationMs
+      : null;
+    const generationTps = tokens.output_tokens !== null && generationInterval > 0
+      ? tokens.output_tokens / (generationInterval / 1000)
+      : null;
 
     if (db) {
       writeBuffer.push({
         _type: 'response',
         id: reqId,
-        status_code:   statusCode    ?? null,
-        first_byte_ms: firstByteMs   ?? null,
-        total_ms:      total,
-        error_msg:     errorMsg      ?? null,
+        status_code: status,
+        status_class: statusClass,
+        terminal_state: terminalState,
+        first_byte_ms: firstByte,
+        total_ms: total,
+        input_tokens: tokens.input_tokens,
+        output_tokens: tokens.output_tokens,
+        cost_usd: totalCost,
+        cost_truth: costTruth,
+        generation_tps: generationTps,
+        error_msg: errorMsg ?? null,
         // The serving backend, which is only knowable AFTER dispatch. The
         // insert above runs before routing resolves and can only write NULL
         // here, so without this update request_log.backend was NULL for every
@@ -895,7 +974,7 @@ export function createMetricsCollector(config) {
         _cost:   costRow,
         _latency: {
           req_id: reqId, model: model ?? null, backend: backend ?? null,
-          ts, first_byte_ms: firstByteMs ?? null, total_ms: total,
+          ts, first_byte_ms: firstByte, total_ms: total,
         },
       });
       maybeFlush();
@@ -1104,6 +1183,30 @@ export function createMetricsCollector(config) {
    * @param {'day'|'month'} [filters.groupBy='day']
    * @returns {object[]}
    */
+  /**
+   * Read terminal request rows with a stable truth contract. Columns absent
+   * from legacy rows are returned as null and cost truth becomes "unknown".
+   *
+   * @param {{limit?:number}} [filters]
+   * @returns {object[]}
+   */
+  function getTerminalRequests({ limit = 100 } = {}) {
+    if (!db) return [];
+    maybeFlush(true);
+    const bounded = Number.isInteger(limit) ? Math.max(1, Math.min(limit, 1000)) : 100;
+    return db.prepare(`
+      SELECT id, agent_id, model, model_served, backend, session_id, started_at,
+             status_code, status_class,
+             COALESCE(terminal_state, 'unknown') AS terminal_state,
+             first_byte_ms, total_ms, input_tokens, output_tokens, cost_usd,
+             COALESCE(cost_truth, 'unknown') AS cost_truth, generation_tps,
+             error_msg
+      FROM request_log
+      ORDER BY started_at DESC
+      LIMIT ?
+    `).all(bounded);
+  }
+
   function getCosts(filters = {}) {
     if (!db) return [];
     maybeFlush(true);
@@ -1164,6 +1267,7 @@ export function createMetricsCollector(config) {
     getStats,
     getAnomalies,
     getTokenUsage,
+    getTerminalRequests,
     getCosts,
     close,
     /** Force a synchronous flush of the write buffer. Mainly for tests. */

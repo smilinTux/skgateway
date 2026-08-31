@@ -3680,6 +3680,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         inflightConcurrency,
         admissionOutcome: "cancelled",
         backoffClassification: "cancellation",
+        firstByteMs: Number.isFinite(res?.firstByteMs) ? queueWaitMs + res.firstByteMs : null,
         cancelled: true,
       };
       if (isBucketChain) {
@@ -3848,6 +3849,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       inflightConcurrency,
       admissionOutcome,
       backoffClassification: "nonterminal",
+      firstByteMs: Number.isFinite(res?.firstByteMs) ? queueWaitMs + res.firstByteMs : null,
     };
     if (isBucketChain) {
       lastResult.bucket = bucketAddr.bucket;

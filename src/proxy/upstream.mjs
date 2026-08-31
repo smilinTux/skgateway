@@ -121,6 +121,13 @@ export function sendUpstream(reqUrl, method, headers, body, targetUrl, timeoutMs
     };
     let timedOut = false;
     let cancelled = false;
+    const startedAt = Date.now();
+    let firstByteAt = null;
+    let firstByteMs = null;
+    const terminalTiming = () => ({
+      firstByteMs,
+      generationMs: firstByteAt === null ? null : Math.max(0, Date.now() - firstByteAt),
+    });
     const cancellationResult = () => ({
       status: 499,
       headers: {},
@@ -130,6 +137,7 @@ export function sendUpstream(reqUrl, method, headers, body, targetUrl, timeoutMs
           code: "client_closed",
         },
       })),
+      ...terminalTiming(),
       cancelled: true,
     });
 
@@ -152,6 +160,11 @@ export function sendUpstream(reqUrl, method, headers, body, targetUrl, timeoutMs
         agent: upstream.protocol === "https:" ? httpsAgent : httpAgent,
       },
       (upstreamRes) => {
+        // The response callback fires when upstream headers arrive. This is the
+        // first byte boundary available to Node and remains truthful for empty
+        // bodies, unlike waiting for a data event that may never fire.
+        firstByteAt = Date.now();
+        firstByteMs = firstByteAt - startedAt;
         const chunks = [];
         upstreamRes.on("data", (chunk) => chunks.push(chunk));
         upstreamRes.on("end", () => {
@@ -159,6 +172,7 @@ export function sendUpstream(reqUrl, method, headers, body, targetUrl, timeoutMs
             status: upstreamRes.statusCode,
             headers: upstreamRes.headers,
             body: Buffer.concat(chunks),
+            ...terminalTiming(),
           });
         });
       },
@@ -197,6 +211,7 @@ export function sendUpstream(reqUrl, method, headers, body, targetUrl, timeoutMs
               : (timedOut ? "upstream_timeout" : "upstream_unreachable"),
           },
         })),
+        ...terminalTiming(),
         ...(cancelled ? { cancelled: true } : {}),
       });
     });

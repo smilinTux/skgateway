@@ -56,6 +56,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Queue telemetry now preserves `provider_backoff` when every upstream returns
   402 and records cooldown-only requests as denied with zero inflight work.
+- Terminal request telemetry now preserves an already observed first-byte
+  timing when a downstream client cancels, and generation throughput uses the
+  measured post-first-byte interval instead of subtracting differently based
+  request and dispatch clocks (card f0a1c2d3).
 
 - Codex-named direct targets, roles, aliases, buckets, contexts, fallback chains,
   and runtime candidate chains now fail closed unless every member is an official

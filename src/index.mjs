@@ -2080,7 +2080,7 @@ export const server = http.createServer(async (req, res) => {
     // failure here must not become a second, fabricated error stacked on top
     // of whatever the request path already did.
     let metricsClosed = false;
-    function closeMetrics({ statusCode, responseHeaders, responseBody, backend, modelServed, errorMsg, energy, energyAttempts } = {}) {
+    function closeMetrics({ statusCode, firstByteMs, generationMs, responseHeaders, responseBody, backend, modelServed, errorMsg, energy, energyAttempts } = {}) {
       if (!metrics || !metricsReqId || metricsClosed) return;
       metricsClosed = true;
       try {
@@ -2088,6 +2088,8 @@ export const server = http.createServer(async (req, res) => {
           reqId: metricsReqId,
           statusCode,
           totalMs: Date.now() - startTime,
+          firstByteMs,
+          generationMs,
           responseHeaders: responseHeaders ?? {},
           responseBody: responseBody ?? null,
           agentId: metricsAgentId,
@@ -2407,6 +2409,8 @@ export const server = http.createServer(async (req, res) => {
         // missing row.
         closeMetrics({
           statusCode: res.headersSent ? (res.statusCode || 502) : 502,
+          firstByteMs: result?.firstByteMs,
+          generationMs: result?.generationMs,
           responseHeaders: {},
           responseBody: null,
           backend: result?.backendId,
@@ -2423,6 +2427,8 @@ export const server = http.createServer(async (req, res) => {
         }
         closeMetrics({
           statusCode: result?.status ?? res.statusCode,
+          firstByteMs: result?.firstByteMs,
+          generationMs: result?.generationMs,
           responseHeaders: result?.headers ?? {},
           responseBody: parsedBody,
           backend: result?.backendId,
