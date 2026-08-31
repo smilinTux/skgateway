@@ -300,6 +300,54 @@ function throttleKey(backendId, model) {
 }
 
 /**
+ * Infer provider name from backend ID (card e19f88db / SKGW-ATTRIBUTION-01).
+ * Uses discovery backend flag if set, otherwise infers from known patterns.
+ *
+ * @param {string} backendId
+ * @returns {string|null} provider name or null if unknown
+ */
+function inferProviderFromBackend(backendId) {
+  if (!backendId) return null;
+  const id = String(backendId).toLowerCase();
+  if (id.includes('nvidia')) return 'nvidia';
+  if (id.includes('anthropic')) return 'anthropic';
+  if (id.includes('ollama')) return 'ollama';
+  if (id.includes('openrouter')) return 'openrouter';
+  if (id.includes('zai')) return 'zai';
+  if (id.includes('codex')) return 'codex';
+  // Local sovereign backends (chiap08-qwen38, chiap08-ornith, etc.)
+  if (id.includes('chiap') || id.includes('ornith') || id.includes('qwen') || id === 'local') {
+    return 'local';
+  }
+  return null; // Unknown provider
+}
+
+/**
+ * Infer rail type from backend (card e19f88db / SKGW-ATTRIBUTION-01).
+ * Rail describes whether the request served from local, cloud, or hybrid infrastructure.
+ *
+ * @param {string} backendId
+ * @param {string} backendUrl
+ * @param {Function} isLocalUrlFn
+ * @param {string|null} provider  Pre-computed provider value
+ * @returns {string|null} 'local', 'cloud', 'hybrid', or null if unknown
+ */
+function inferRailFromBackend(backendId, backendUrl, isLocalUrlFn, provider) {
+  if (!backendId) return null;
+  const resolvedProvider = provider || inferProviderFromBackend(backendId);
+  if (resolvedProvider === 'local') return 'local';
+  if (resolvedProvider === 'nvidia' || resolvedProvider === 'anthropic' || resolvedProvider === 'openrouter' || resolvedProvider === 'zai') {
+    return 'cloud';
+  }
+  // Check if URL is local for hybrid detection
+  if (backendUrl && typeof isLocalUrlFn === 'function' && isLocalUrlFn(backendUrl)) {
+    return 'local';
+  }
+  // Default to cloud for known providers, null for unknown
+  return resolvedProvider ? 'cloud' : null;
+}
+
+/**
  * Parse a `Retry-After` header value (delta-seconds or an HTTP-date) into
  * milliseconds. Returns null when absent/unparseable so the caller falls
  * back to a status-specific default.
@@ -3842,6 +3890,8 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     lastResult = {
       ...res,
       backendId,
+      servedModel: candidateModel,
+      requestedModel,
       readinessRevision: backend.readinessRevision,
       discoveryRevision: backend.discoveryRevision,
       failover: didFailover,
@@ -3855,6 +3905,14 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       lastResult.bucket = bucketAddr.bucket;
       lastResult.bucketMember = candidateModel;
     }
+    // Provider-neutral rail attribution (card e19f88db / SKGW-ATTRIBUTION-01)
+    // Populate only facts known by the request path. NULL when unknown.
+    const inferredProvider = backend.discovery || inferProviderFromBackend(backendId);
+    lastResult.provider = inferredProvider;
+    lastResult.rail = inferRailFromBackend(backendId, backendUrl, isLocalUrl, inferredProvider);
+    lastResult.logicalRoute = isBucketChain ? bucketAddr.bucket : (isRegistryRouted(request) ? request.model : null);
+    // Runtime revision combines readiness and discovery for tracking
+    lastResult.runtimeRevision = `${backend.readinessRevision}:${backend.discoveryRevision}`;
     if (attemptEnergy) lastResult.energy = attemptEnergy;
     // Only attached when something was actually observed, so the disabled
     // path returns a result whose shape is unchanged, field for field.

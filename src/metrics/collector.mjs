@@ -214,7 +214,18 @@ CREATE TABLE IF NOT EXISTS request_log (
   output_tokens INTEGER,            -- NULL means unobserved, never zero by default
   cost_usd      REAL,               -- actual/estimated value; NULL when unknown
   cost_truth    TEXT,               -- actual | estimated | unknown
-  generation_tps REAL               -- output tokens / measured post-first-byte seconds
+  generation_tps REAL,              -- output tokens / measured post-first-byte seconds
+  -- Provider-neutral rail attribution (card e19f88db / SKGW-ATTRIBUTION-01).
+  -- All fields are NULL when unknown; presence means we observed the value.
+  client           TEXT,            -- from x-app header
+  application      TEXT,            -- from user-agent header
+  logical_route    TEXT,            -- registry routing (context/service/role)
+  rail             TEXT,            -- local | cloud | hybrid
+  provider         TEXT,            -- inferred from backend (nvidia, anthropic, local, etc.)
+  backend_node     TEXT,            -- backend ID (e.g., chiap08-qwen38)
+  requested_model  TEXT,            -- model the caller asked for (same as model)
+  served_model     TEXT,            -- model the upstream actually served (same as model_served)
+  runtime_revision TEXT             -- readiness:discovery revision tuple
 );
 
 CREATE TABLE IF NOT EXISTS token_usage (
@@ -347,6 +358,17 @@ function migrate(db) {
   ensureColumn(db, 'request_log', 'cost_usd', 'REAL');
   ensureColumn(db, 'request_log', 'cost_truth', 'TEXT');
   ensureColumn(db, 'request_log', 'generation_tps', 'REAL');
+  // Provider-neutral rail attribution (card e19f88db / SKGW-ATTRIBUTION-01).
+  // All are NULL when unknown; presence means we observed the value.
+  ensureColumn(db, 'request_log', 'client', 'TEXT');
+  ensureColumn(db, 'request_log', 'application', 'TEXT');
+  ensureColumn(db, 'request_log', 'logical_route', 'TEXT');
+  ensureColumn(db, 'request_log', 'rail', 'TEXT');
+  ensureColumn(db, 'request_log', 'provider', 'TEXT');
+  ensureColumn(db, 'request_log', 'backend_node', 'TEXT');
+  ensureColumn(db, 'request_log', 'requested_model', 'TEXT');
+  ensureColumn(db, 'request_log', 'served_model', 'TEXT');
+  ensureColumn(db, 'request_log', 'runtime_revision', 'TEXT');
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -500,6 +522,15 @@ export function createMetricsCollector(config) {
             cost_usd = @cost_usd,
             cost_truth = @cost_truth,
             generation_tps = @generation_tps,
+            client = COALESCE(@client, client),
+            application = COALESCE(@application, application),
+            logical_route = COALESCE(@logical_route, logical_route),
+            rail = COALESCE(@rail, rail),
+            provider = COALESCE(@provider, provider),
+            backend_node = COALESCE(@backend_node, backend_node),
+            requested_model = COALESCE(@requested_model, requested_model),
+            served_model = COALESCE(@served_model, served_model),
+            runtime_revision = COALESCE(@runtime_revision, runtime_revision),
             error_msg = @error_msg,
             backend = COALESCE(@backend, backend),
             model_served = COALESCE(@model_served, model_served)
@@ -793,6 +824,16 @@ export function createMetricsCollector(config) {
    *   It MUST NOT be defaulted to `model`.
    * @param {string}  [meta.backend]    Override backend
    * @param {string}  [meta.sessionId]  Override sessionId
+   * @param {object}  [meta.attribution] Provider-neutral rail attribution (card e19f88db)
+   * @param {string}  [meta.attribution.client]           from x-app header
+   * @param {string}  [meta.attribution.application]      from user-agent header
+   * @param {string}  [meta.attribution.logicalRoute]    registry routing (context/service/role)
+   * @param {string}  [meta.attribution.rail]             local | cloud | hybrid
+   * @param {string}  [meta.attribution.provider]         inferred from backend
+   * @param {string}  [meta.attribution.backendNode]     backend ID
+   * @param {string}  [meta.attribution.requestedModel]  model caller asked for
+   * @param {string}  [meta.attribution.servedModel]     model upstream served
+   * @param {string}  [meta.attribution.runtimeRevision] readiness:discovery revision
    * @returns {object|null} anomaly record if this request was a ≥3-sigma latency
    *   outlier for its backend/model, else null.
    */
@@ -811,6 +852,7 @@ export function createMetricsCollector(config) {
     modelServed,
     backend: backendOverride,
     sessionId: sessionOverride,
+    attribution,
   } = {}) {
     const orig = pending.get(reqId) ?? {};
     pending.delete(reqId);
@@ -939,6 +981,17 @@ export function createMetricsCollector(config) {
         cost_usd: totalCost,
         cost_truth: costTruth,
         generation_tps: generationTps,
+        // Provider-neutral rail attribution (card e19f88db / SKGW-ATTRIBUTION-01).
+        // NULL when unknown; presence means we observed the value.
+        client:           (typeof attribution?.client === 'string' && attribution.client) ? attribution.client : null,
+        application:      (typeof attribution?.application === 'string' && attribution.application) ? attribution.application : null,
+        logical_route:    (typeof attribution?.logicalRoute === 'string' && attribution.logicalRoute) ? attribution.logicalRoute : null,
+        rail:             (typeof attribution?.rail === 'string' && attribution.rail) ? attribution.rail : null,
+        provider:         (typeof attribution?.provider === 'string' && attribution.provider) ? attribution.provider : null,
+        backend_node:     (typeof attribution?.backendNode === 'string' && attribution.backendNode) ? attribution.backendNode : null,
+        requested_model:  (typeof model === 'string' && model) ? model : null,
+        served_model:     (typeof modelServed === 'string' && modelServed) ? modelServed : null,
+        runtime_revision: (typeof attribution?.runtimeRevision === 'string' && attribution.runtimeRevision) ? attribution.runtimeRevision : null,
         error_msg: errorMsg ?? null,
         // The serving backend, which is only knowable AFTER dispatch. The
         // insert above runs before routing resolves and can only write NULL
@@ -1200,7 +1253,8 @@ export function createMetricsCollector(config) {
              COALESCE(terminal_state, 'unknown') AS terminal_state,
              first_byte_ms, total_ms, input_tokens, output_tokens, cost_usd,
              COALESCE(cost_truth, 'unknown') AS cost_truth, generation_tps,
-             error_msg
+             client, application, logical_route, rail, provider, backend_node,
+             requested_model, served_model, runtime_revision, error_msg
       FROM request_log
       ORDER BY started_at DESC
       LIMIT ?
