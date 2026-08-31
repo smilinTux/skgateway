@@ -22,9 +22,14 @@ import { tmpdir } from "node:os";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
+import { createMetricsCollector } from "../src/metrics/collector.mjs";
+import { loadConfig } from "../src/config.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const INDEX = resolve(__dirname, "..", "src", "index.mjs");
+
+// Load config silently for tests
+await loadConfig({ configPath: '/nonexistent/skgw-rail-attrib-test.yaml', silent: true });
 
 // ─── helpers ──────────────────────────────────────────────────────────────
 
@@ -134,11 +139,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // ─── schema tests ──────────────────────────────────────────────────────────
 
 describe("rail attribution schema", () => {
-  let dbDir, dbPath;
+  let dbDir, dbPath, metrics;
 
   before(() => {
     dbDir = mkdtempSync(join(tmpdir(), "skgw-rail-attrib-db-"));
     dbPath = join(dbDir, "metrics.db");
+    // Initialize collector to create schema
+    metrics = createMetricsCollector({ enabled: true, db_path: dbPath });
   });
 
   after(() => {
