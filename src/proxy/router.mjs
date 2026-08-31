@@ -3647,6 +3647,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         servedModel: candidateModel,
         failover: didFailover,
         queueWaitMs,
+        firstByteMs: Number.isFinite(res?.firstByteMs) ? queueWaitMs + res.firstByteMs : null,
         cancelled: true,
       };
       if (isBucketChain) {
@@ -3809,6 +3810,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       discoveryRevision: backend.discoveryRevision,
       failover: didFailover,
       queueWaitMs,
+      firstByteMs: Number.isFinite(res?.firstByteMs) ? queueWaitMs + res.firstByteMs : null,
     };
     if (isBucketChain) {
       lastResult.bucket = bucketAddr.bucket;
