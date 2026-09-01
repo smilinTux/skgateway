@@ -3413,7 +3413,16 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     let slot = null;
     if (pool) {
       try {
-        slot = await pool.acquire(backendId, { signal: abortSignal });
+        // Only the FINAL candidate may queue. Every earlier one fails fast
+        // so a full door defers to the next candidate instead of waiting out
+        // queueTimeoutMs on a door that is already saturated. Without this the
+        // admission failover below is unreachable whenever maxQueue > 0, which
+        // is every production configuration on the estate.
+        const mayQueue = i === candidates.length - 1;
+        slot = await pool.acquire(backendId, {
+          signal: abortSignal,
+          nonBlocking: !mayQueue,
+        });
       } catch (err) {
         // A client which leaves while queued is the same neutral 499 as one
         // which leaves after dispatch: no failover and no backend-health write.
