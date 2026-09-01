@@ -3359,7 +3359,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       ? bucketLivenessTimeoutMs(backend.timeout_ms)
       : backend.timeout_ms;
 
-    // Check again at the candidate boundary before writing a failover event.
+    // Check again at the candidate boundary before reserving another door.
     // If cancellation arrived after the previous denial's awaited SIEM write,
     // it remains a terminal 499 and is never misreported as another attempt.
     if (pool && abortSignal?.aborted) {
@@ -3377,30 +3377,6 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         }
         throw err;
       }
-    }
-
-    if (i > 0) {
-      didFailover = true;
-      // SIEM failover event written to stdout as a JSON line
-      process.stdout.write(JSON.stringify({
-        ts: new Date().toISOString(),
-        event: "failover",
-        source: "router",
-        from: candidates[i - 1].backendId,
-        to: backendId,
-        model: request.model,
-        agentId: request.agentId,
-        previousStatus: lastResult?.status ?? (admissionDeniedCount > 0 ? 503 : undefined),
-      }) + "\n");
-      console.warn(
-        `[router] FAILOVER: ${candidates[i - 1].backendId} → ${backendId}` +
-        ` (prev_status=${lastResult?.status ?? (admissionDeniedCount > 0 ? 503 : "error")})`
-      );
-      await emitSiem("failover", {
-        from_backend: candidates[i - 1].backendId,
-        to_backend: backendId,
-        reason: `previous_status_${lastResult?.status ?? (admissionDeniedCount > 0 ? 503 : "error")}`,
-      }, { backend: backendId });
     }
 
     // Model-granular throttle cooldown (card 9e28de88 fix #2): this exact
@@ -3600,6 +3576,51 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           failover: didFailover,
         };
       }
+    }
+
+    if (i > 0) {
+      const previousBackendId = candidates[i - 1].backendId;
+      const previousStatus = lastResult?.status ?? (admissionDeniedCount > 0 ? 503 : "error");
+      const cancelReservedAdmission = () => {
+        const reserved = slot;
+        if (pool && reserved) {
+          pool.release(reserved);
+          slot = null;
+        }
+        return clientClosedResult({
+          backendId,
+          capacityDomain: reserved?.id ?? backendId,
+          queueWaitMs: reserved?.queueWaitMs ?? 0,
+          inflightConcurrency: reserved?.inflightConcurrency ?? 0,
+        });
+      };
+
+      // Immediate admission is the first truthful transition point. Check
+      // cancellation on both sides of the fail-closed audit write and release
+      // the reservation before returning one terminal 499.
+      if (abortSignal?.aborted) return cancelReservedAdmission();
+      await emitSiem("failover", {
+        from_backend: previousBackendId,
+        to_backend: backendId,
+        reason: `previous_status_${previousStatus}`,
+      }, { backend: backendId });
+      if (abortSignal?.aborted) return cancelReservedAdmission();
+
+      didFailover = true;
+      process.stdout.write(JSON.stringify({
+        ts: new Date().toISOString(),
+        event: "failover",
+        source: "router",
+        from: previousBackendId,
+        to: backendId,
+        model: request.model,
+        agentId: request.agentId,
+        previousStatus,
+      }) + "\n");
+      console.warn(
+        `[router] FAILOVER: ${previousBackendId} → ${backendId}` +
+        ` (prev_status=${previousStatus})`
+      );
     }
 
     // Pool tickets carry the admission snapshot. This avoids sampling after a
@@ -4034,6 +4055,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
   if (candidates.length > 0 && admissionDeniedCount === candidates.length) {
     const lastAdmission = lastAdmissionAttempt ?? {};
     const retryAfterSeconds = admissionRetryAfterSeconds ?? 1;
+    const capacityFailover = didFailover || admissionDeniedCount > 1;
     const payload = JSON.stringify({
       error: {
         message: "All eligible candidates are at local admission capacity.",
@@ -4055,7 +4077,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       admission_outcome: "denied",
       backoff_classification: "local_admission_denial",
       retry_after_seconds: retryAfterSeconds,
-      failover: didFailover,
+      failover: capacityFailover,
       admission_rejected: true,
       all_backends_failed: true,
       attempted: admissionAttempts,
@@ -4078,7 +4100,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       retryAfterSeconds,
       admissionAttempts,
       admissionAttemptCount: admissionDeniedCount,
-      failover: didFailover,
+      failover: capacityFailover,
     };
   }
 

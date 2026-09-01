@@ -221,6 +221,71 @@ describe("policy-bounded admission failover", () => {
     pool.release(holder);
   });
 
+  test("external cancellation during delayed failover audit releases admission without committing failover", async () => {
+    const fixtures = await Promise.all([startServer("primary"), startServer("fallback")]);
+    const ids = ["primary", "fallback"];
+    const pool = getPool(poolConfig(ids));
+    const holder = pool.tryAcquire("primary");
+    const controller = new AbortController();
+    const events = [];
+    let auditStarted;
+    let finishAudit;
+    const started = new Promise((resolve) => { auditStarted = resolve; });
+    const finish = new Promise((resolve) => { finishAudit = resolve; });
+    const siem = async (event) => {
+      if (event.event_type === "failover") {
+        auditStarted();
+        await finish;
+        if (controller.signal.aborted) return;
+      }
+      events.push(event);
+    };
+
+    const pending = send(
+      makeRouter(ids.map((id, index) => ({ id, url: fixtures[index].url }))),
+      { siem, signal: controller.signal },
+    );
+    await started;
+    assert.equal(pool.getStats("fallback").active, 1, "fallback admission is reserved before audit");
+    controller.abort();
+    finishAudit();
+    const result = await pending;
+
+    assert.equal(result.status, 499);
+    assert.equal(result.failover, false);
+    assert.deepEqual(fixtures.map((fixture) => fixture.state.calls), [0, 0]);
+    assert.equal(pool.getStats("fallback").active, 0);
+    assert.equal(events.filter((event) => event.event_type === "failover").length, 0);
+    assert.equal(events.filter((event) => event.event_type === "response").length, 1);
+    pool.release(holder);
+  });
+
+  test("callback-caused abort preserves its observed event but releases admission before one 499", async () => {
+    const fixtures = await Promise.all([startServer("primary"), startServer("fallback")]);
+    const ids = ["primary", "fallback"];
+    const pool = getPool(poolConfig(ids));
+    const holder = pool.tryAcquire("primary");
+    const controller = new AbortController();
+    const events = [];
+    const siem = async (event) => {
+      events.push(event);
+      if (event.event_type === "failover") controller.abort();
+    };
+
+    const result = await send(
+      makeRouter(ids.map((id, index) => ({ id, url: fixtures[index].url }))),
+      { siem, signal: controller.signal },
+    );
+
+    assert.equal(result.status, 499);
+    assert.equal(result.failover, false);
+    assert.deepEqual(fixtures.map((fixture) => fixture.state.calls), [0, 0]);
+    assert.equal(pool.getStats("fallback").active, 0);
+    assert.equal(events.filter((event) => event.event_type === "failover").length, 1);
+    assert.equal(events.filter((event) => event.event_type === "response").length, 1);
+    pool.release(holder);
+  });
+
   test("all-saturated returns one attributed 503 without health or cooldown mutation", async () => {
     const fixtures = await Promise.all([
       startServer("chiap08"),
