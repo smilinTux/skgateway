@@ -113,7 +113,10 @@ function startHoldingServer() {
         releaseAll() {
           for (const release of state.pending.splice(0)) release();
         },
-        close: () => new Promise((done) => server.close(done)),
+        close: () => new Promise((done) => {
+          server.closeAllConnections();
+          server.close(done);
+        }),
       });
     });
   });
@@ -200,7 +203,7 @@ describe("chiap08 Qwen shared capacity domain", () => {
     getPool({
       capacityDomains: {
         "chiap08-qwen38": {
-          members: ["chiap08-qwen38", "reg:qwen38"],
+          members: ["chiap08-qwen38", "reg:qwen38", "fallback"],
           max: 1,
           maxQueue: 1,
           queueTimeoutMs: 30,
@@ -251,7 +254,7 @@ describe("chiap08 Qwen shared capacity domain", () => {
     getPool({
       capacityDomains: {
         "chiap08-qwen38": {
-          members: ["chiap08-qwen38", "reg:qwen38"],
+          members: ["chiap08-qwen38", "reg:qwen38", "fallback"],
           max: 1,
           maxQueue: 1,
           queueTimeoutMs: 1000,

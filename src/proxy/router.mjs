@@ -3305,17 +3305,20 @@ export async function routeAndSend(router, request, upstreamPath, method, client
   // True when some LATER candidate sits in a different capacity domain, i.e.
   // there is a genuinely different door to try. Candidates sharing a domain
   // are the same door and must not be treated as failover targets.
-  const hasDifferentDomainLater = (idx, backendId) => {
-    const dom = (bid) => {
-      try {
-        return pool?.getStats(bid)?.capacityDomain ?? null;
-      } catch {
-        return null;
-      }
-    };
-    const mine = dom(backendId);
-    return candidates.slice(idx + 1).some((c) => dom(c.backendId) !== mine);
+  const capacityDomainOf = (bid) => {
+    try {
+      return pool?.getStats(bid)?.capacityDomain ?? null;
+    } catch {
+      return null;
+    }
   };
+  const hasDifferentDomainLater = (idx, backendId) => {
+    const mine = capacityDomainOf(backendId);
+    return candidates.slice(idx + 1).some((c) => capacityDomainOf(c.backendId) !== mine);
+  };
+  const primaryCapacityDomain = capacityDomainOf(candidates[0]?.backendId);
+  let primaryAdmissionDeferred = false;
+  let primaryQueueFallbackAdded = false;
   // Every candidate that ended in a throttle (429/402), whether an actual
   // upstream response or a still-cooling-down door skipped without a
   // network call (card 9e28de88 fix #3/#6). Drives the attributable-429
@@ -3324,7 +3327,18 @@ export async function routeAndSend(router, request, upstreamPath, method, client
   const throttledAttempts = [];
 
   for (let i = 0; i < candidates.length; i++) {
-    const { backendId, backendUrl, authHeaders, backend } = candidates[i];
+    const { backendId, backendUrl, authHeaders, backend, queuePrimaryFallback = false } = candidates[i];
+    // Once the primary has deferred on capacity, aliases in that same capacity
+    // domain are not another place to send the request. Probe only distinct
+    // domains, then return to the primary queue if none admits immediately.
+    if (
+      primaryAdmissionDeferred &&
+      !queuePrimaryFallback &&
+      i > 0 &&
+      capacityDomainOf(backendId) === primaryCapacityDomain
+    ) {
+      continue;
+    }
     // A candidate may carry a per-attempt body (e.g. the cloud-fallback
     // candidate rewrites the model to a cloud-served id). Default to the shared
     // body when no override is present.
@@ -3339,35 +3353,6 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     const attemptTimeoutMs = isBucketChain
       ? bucketLivenessTimeoutMs(backend.timeout_ms)
       : backend.timeout_ms;
-
-    if (i > 0) {
-      didFailover = true;
-      // SIEM failover event written to stdout as a JSON line
-      process.stdout.write(JSON.stringify({
-        ts: new Date().toISOString(),
-        event: "failover",
-        source: "router",
-        from: candidates[i - 1].backendId,
-        to: backendId,
-        model: request.model,
-        agentId: request.agentId,
-        previousStatus: lastResult?.status,
-      }) + "\n");
-      console.warn(
-        `[router] FAILOVER: ${candidates[i - 1].backendId} → ${backendId}` +
-        ` (prev_status=${lastResult?.status})`
-      );
-      await emitSiem("failover", {
-        from_backend: candidates[i - 1].backendId,
-        to_backend: backendId,
-        reason: `previous_status_${lastResult?.status ?? "error"}`,
-        // Capacity detail for a rejection that no longer emits its own
-        // response event. Without this the failover would record THAT it
-        // happened but not the queue wait or admission outcome behind it.
-        ...(admissionRejectionDetail || {}),
-      }, { backend: backendId });
-      admissionRejectionDetail = null;
-    }
 
     // Model-granular throttle cooldown (card 9e28de88 fix #2): this exact
     // door threw a 429/402 for this exact model recently enough that it is
@@ -3454,7 +3439,13 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         // members ["chiap08-qwen38", "reg:qwen38"]. Treating those as separate
         // doors made a request that should have queued skip through both and
         // never queue at all, which hung that test rather than failing it.
-        const mayQueue = !hasDifferentDomainLater(i, backendId);
+        const mayQueue = queuePrimaryFallback
+          ? true
+          : i === 0
+            ? false
+            : primaryAdmissionDeferred
+              ? false
+              : !hasDifferentDomainLater(i, backendId);
         slot = await pool.acquire(backendId, {
           signal: abortSignal,
           nonBlocking: !mayQueue,
@@ -3534,7 +3525,16 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         // lie, is worse than no telemetry: it makes admission failover look
         // like a 503 rate in every dashboard reading these events.
         // Terminal in the same sense: nowhere else to send it.
-        const admissionIsTerminal = !hasDifferentDomainLater(i, backendId);
+        if (i === 0 && !queuePrimaryFallback) primaryAdmissionDeferred = true;
+        const distinctDomainRemains = candidates.slice(i + 1).some(
+          (candidate) => capacityDomainOf(candidate.backendId) !== primaryCapacityDomain,
+        );
+        const shouldQueuePrimary =
+          primaryAdmissionDeferred &&
+          !queuePrimaryFallback &&
+          !distinctDomainRemains;
+        const admissionIsTerminal = queuePrimaryFallback ||
+          (!primaryAdmissionDeferred && !hasDifferentDomainLater(i, backendId));
 
         // ABORT RACE: FIXED BY REMOVING THE EMIT, NOT BY A GUARD.
         //
@@ -3668,6 +3668,12 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         }
         admissionRejection.admissionAttempts = admissionAttempts;
 
+        if (shouldQueuePrimary && !primaryQueueFallbackAdded) {
+          primaryQueueFallbackAdded = true;
+          candidates.push({ ...candidates[0], queuePrimaryFallback: true });
+          lastResult = admissionRejection;
+          continue;
+        }
         if (i < candidates.length - 1) {
           console.warn(
             `[routeAndSend] admission ${code} on backend=${backendId} ` +
@@ -3679,6 +3685,37 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         }
         return admissionRejection;
       }
+    }
+
+    // Admission failover becomes real only after the next capacity domain
+    // actually grants a slot. Probing a full alternate and returning to the
+    // primary queue is not failover and must not emit a false transition.
+    if (i > 0 && !queuePrimaryFallback) {
+      const failoverFromBackend = primaryAdmissionDeferred
+        ? candidates[0].backendId
+        : candidates[i - 1].backendId;
+      didFailover = true;
+      process.stdout.write(JSON.stringify({
+        ts: new Date().toISOString(),
+        event: "failover",
+        source: "router",
+        from: failoverFromBackend,
+        to: backendId,
+        model: request.model,
+        agentId: request.agentId,
+        previousStatus: lastResult?.status,
+      }) + "\n");
+      console.warn(
+        `[router] FAILOVER: ${failoverFromBackend} → ${backendId}` +
+        ` (prev_status=${lastResult?.status})`
+      );
+      await emitSiem("failover", {
+        from_backend: failoverFromBackend,
+        to_backend: backendId,
+        reason: `previous_status_${lastResult?.status ?? "error"}`,
+        ...(admissionRejectionDetail || {}),
+      }, { backend: backendId });
+      admissionRejectionDetail = null;
     }
 
     // Pool tickets carry the admission snapshot. This avoids sampling after a

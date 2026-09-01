@@ -240,7 +240,131 @@ describe("non-blocking admission on every candidate but the last", () => {
     const r = await pending;
 
     assert.equal(r.status, 200, "the final candidate waited for a slot rather than failing fast");
-    assert.equal(pool.getStats("only").totalDeferred, 0, "the final candidate never defers");
+    assert.equal(pool.getStats("only").totalDeferred, 1, "the primary probes once before queueing");
+  });
+
+  test("when every distinct door is full, the request queues on the primary", async () => {
+    const modelId = `admission-option-c-primary-${Date.now()}`;
+    const pool = getPool({
+      capacityDomains: {
+        primaryDomain: { members: ["primary"], max: 1, maxQueue: 2, queueTimeoutMs: 1000 },
+        secondaryDomain: { members: ["secondary"], max: 1, maxQueue: 2, queueTimeoutMs: 1000 },
+      },
+    });
+    const primaryHolder = await pool.acquire("primary");
+    const secondaryHolder = await pool.acquire("secondary");
+    const router = createRouter({
+      backends: {
+        primary: { url: full.base, auth_type: "none", models: [modelId], priority: 1 },
+        secondary: { url: idle.base, auth_type: "none", models: [modelId], priority: 2 },
+      },
+    });
+
+    const beforeSecondary = idle.requestCount;
+    const pending = routeAndSend(
+      router, { model: modelId, agentId: "test" },
+      "/chat/completions", "POST", HEADERS, bodyFor(modelId), true,
+    );
+    setTimeout(() => pool.release(primaryHolder), 100);
+    const result = await pending;
+
+    assert.equal(result.status, 200);
+    assert.equal(result.backendId, "primary");
+    assert.equal(result.failover, false, "returning to the primary queue is not failover");
+    assert.equal(idle.requestCount, beforeSecondary, "a full secondary receives no request");
+    assert.equal(pool.getStats("secondary").queued, 0, "probing never joins the secondary queue");
+    pool.release(secondaryHolder);
+  });
+
+  test("primary queue-full remains distinct after every alternate door defers", async () => {
+    const modelId = `admission-option-c-full-${Date.now()}`;
+    const pool = getPool({
+      capacityDomains: {
+        primaryDomain: { members: ["primary"], max: 1, maxQueue: 0, queueTimeoutMs: 1000 },
+        secondaryDomain: { members: ["secondary"], max: 1, maxQueue: 0, queueTimeoutMs: 1000 },
+      },
+    });
+    const primaryHolder = await pool.acquire("primary");
+    const secondaryHolder = await pool.acquire("secondary");
+    const router = createRouter({
+      backends: {
+        primary: { url: full.base, auth_type: "none", models: [modelId], priority: 1 },
+        secondary: { url: idle.base, auth_type: "none", models: [modelId], priority: 2 },
+      },
+    });
+
+    const result = await routeAndSend(
+      router, { model: modelId, agentId: "test" },
+      "/chat/completions", "POST", HEADERS, bodyFor(modelId), true,
+    );
+    assert.equal(result.status, 503);
+    assert.equal(result.backendId, "primary");
+    assert.equal(JSON.parse(result.body).error.code, "capacity_exceeded");
+    pool.release(primaryHolder);
+    pool.release(secondaryHolder);
+  });
+
+  test("primary queue-timeout remains distinct after every alternate door defers", async () => {
+    const modelId = `admission-option-c-timeout-${Date.now()}`;
+    const pool = getPool({
+      capacityDomains: {
+        primaryDomain: { members: ["primary"], max: 1, maxQueue: 1, queueTimeoutMs: 30 },
+        secondaryDomain: { members: ["secondary"], max: 1, maxQueue: 0, queueTimeoutMs: 1000 },
+      },
+    });
+    const primaryHolder = await pool.acquire("primary");
+    const secondaryHolder = await pool.acquire("secondary");
+    const router = createRouter({
+      backends: {
+        primary: { url: full.base, auth_type: "none", models: [modelId], priority: 1 },
+        secondary: { url: idle.base, auth_type: "none", models: [modelId], priority: 2 },
+      },
+    });
+
+    const result = await routeAndSend(
+      router, { model: modelId, agentId: "test" },
+      "/chat/completions", "POST", HEADERS, bodyFor(modelId), true,
+    );
+    assert.equal(result.status, 503);
+    assert.equal(result.backendId, "primary");
+    assert.equal(JSON.parse(result.body).error.code, "queue_timeout");
+    assert.equal(pool.getStats("primary").queued, 0, "timed-out primary waiter is removed");
+    pool.release(primaryHolder);
+    pool.release(secondaryHolder);
+  });
+
+  test("abort while back on the primary queue removes the waiter and returns 499", async () => {
+    const modelId = `admission-option-c-abort-${Date.now()}`;
+    const pool = getPool({
+      capacityDomains: {
+        primaryDomain: { members: ["primary"], max: 1, maxQueue: 1, queueTimeoutMs: 1000 },
+        secondaryDomain: { members: ["secondary"], max: 1, maxQueue: 0, queueTimeoutMs: 1000 },
+      },
+    });
+    const primaryHolder = await pool.acquire("primary");
+    const secondaryHolder = await pool.acquire("secondary");
+    const controller = new AbortController();
+    const router = createRouter({
+      backends: {
+        primary: { url: full.base, auth_type: "none", models: [modelId], priority: 1 },
+        secondary: { url: idle.base, auth_type: "none", models: [modelId], priority: 2 },
+      },
+    });
+
+    const pending = routeAndSend(
+      router, { model: modelId, agentId: "test" },
+      "/chat/completions", "POST", HEADERS, bodyFor(modelId), true,
+      null, controller.signal,
+    );
+    setTimeout(() => controller.abort(), 20);
+    const result = await pending;
+
+    assert.equal(result.status, 499);
+    assert.equal(result.backendId, "primary");
+    assert.equal(pool.getStats("primary").queued, 0);
+    assert.equal(pool.getStats("primary").active, 1, "the original holder remains exact");
+    pool.release(primaryHolder);
+    pool.release(secondaryHolder);
   });
 
   test("nonBlocking acquire rejects at once and leaves the queue empty", async () => {
