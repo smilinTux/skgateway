@@ -453,6 +453,12 @@ provider routing, bucket, and admission work recorded below.
 
 ### Fixed
 
+- Saturated local admission now continues through the existing policy-filtered
+  candidate chain without entering a backend queue. Shared capacity aliases
+  keep one ceiling, cancellation remains a single terminal 499, and an
+  all-saturated chain returns one retryable 503 with bounded attempt
+  attribution (card f5c7022b).
+
 - `sampleTokenRatio()` now counts the FULL prompt on Anthropic responses:
   `input_tokens`/`prompt_tokens` plus `cache_read_input_tokens` plus
   `cache_creation_input_tokens` when present, instead of `input_tokens`
