@@ -3299,6 +3299,9 @@ export async function routeAndSend(router, request, upstreamPath, method, client
   // misconfigured fan-out should not be able to grow this without limit.
   const admissionAttempts = [];
   const MAX_ADMISSION_ATTEMPTS = 16;
+  // Detail of the rejection that caused the NEXT candidate to be tried.
+  // It rides on the failover event instead of a second response event.
+  let admissionRejectionDetail = null;
   // Every candidate that ended in a throttle (429/402), whether an actual
   // upstream response or a still-cooling-down door skipped without a
   // network call (card 9e28de88 fix #3/#6). Drives the attributable-429
@@ -3344,7 +3347,12 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         from_backend: candidates[i - 1].backendId,
         to_backend: backendId,
         reason: `previous_status_${lastResult?.status ?? "error"}`,
+        // Capacity detail for a rejection that no longer emits its own
+        // response event. Without this the failover would record THAT it
+        // happened but not the queue wait or admission outcome behind it.
+        ...(admissionRejectionDetail || {}),
       }, { backend: backendId });
+      admissionRejectionDetail = null;
     }
 
     // Model-granular throttle cooldown (card 9e28de88 fix #2): this exact
@@ -3497,19 +3505,6 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         const backoffClassification = code === "queue_timeout"
           ? "timeout"
           : "local_admission_denial";
-        // ABORT RACE, NOT REPRODUCED, deliberately not guarded here.
-        // The reconciliation named a 503-then-499 false failover: a client
-        // that leaves during a capacity rejection supposedly emits both a
-        // capacity event and a cancellation for one request. I added a guard
-        // and then could not make any test fail with it removed, because
-        // pool.acquire() checks signal.aborted BEFORE the capacity branch, so
-        // a gone client already gets a single 499 from the existing
-        // client_closed path and no 503 is emitted at all. Shipping an
-        // unreachable branch and calling it a fix would be worse than leaving
-        // the defect open, so it is left open with the reasoning attached.
-        // If you have a reproduction, the guard belongs immediately below,
-        // BEFORE the telemetry emit, because the defect is a double COUNT and
-        // a guard placed after the emit cannot prevent one.
         // Whether this rejection is TERMINAL is knowable here, so say it
         // truthfully. This used to hardcode failover:false and emit before the
         // decision, so a request that failed over successfully still wrote a
@@ -3518,7 +3513,60 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         // lie, is worse than no telemetry: it makes admission failover look
         // like a 503 rate in every dashboard reading these events.
         const admissionIsTerminal = i === candidates.length - 1;
-        await emitSiem("response", {
+
+        // ABORT RACE: FIXED BY REMOVING THE EMIT, NOT BY A GUARD.
+        //
+        // Review 2927a814 reproduced [503, 499] for one cancelled request by
+        // aborting during the admission_rejected emission. The prescribed
+        // repair was a guard before that emit. I implemented both a pre-emit
+        // and a post-emit guard and then proved BOTH unreachable: deleting
+        // either fails no test, and the reasoning holds beyond the tests.
+        //
+        //   pool.acquire() checks signal.aborted FIRST and returns
+        //   client_closed, so a client that has already left never reaches
+        //   the capacity branch at all.
+        //
+        //   After the rejection, a non-final candidate now has NO await
+        //   before the failover decision, so that window is synchronous and
+        //   nothing can abort inside it.
+        //
+        //   For the FINAL candidate the 503 IS the correct terminal response.
+        //   A guard there would emit a 499 after it and produce the very
+        //   [503, 499] this was meant to prevent.
+        //
+        // Two dead guards would be the same defect the review caught in the
+        // attribution test: code that looks like a fix and is never executed.
+        //
+        // A NON-TERMINAL rejection emits NO "response" event.
+        //
+        // Reproduced by review 2927a814: aborting during the admission_rejected
+        // emission produced the terminal sequence [503, 499] for ONE cancelled
+        // request. No guard placement fixes that, because a guard before the
+        // emit cannot see an abort that lands inside it, and a guard after it
+        // cannot unsend what was already sent.
+        //
+        // The emit itself was the defect. A rejection on a non-final candidate
+        // is not a response to the client, it is an internal step, and the
+        // router ALREADY records it: the failover event below carries
+        // previous_status 503 with the backend and model. Emitting a second
+        // "response" for the same step double-counted it, and made every
+        // capacity failover look like a 503 downstream.
+        //
+        // So intermediate detail rides on the failover event, and only the
+        // FINAL candidate emits a terminal response. One request, one response.
+        if (!admissionIsTerminal) {
+          admissionRejectionDetail = {
+            queue_wait_ms: queueWaitMs,
+            inflight_concurrency: inflightConcurrency,
+            admission_outcome: admissionOutcome,
+            backoff_classification: backoffClassification,
+            retry_after_seconds: retryAfterSeconds,
+            admission_rejected: true,
+            code,
+            capacity_domain: capacityDomain,
+          };
+        }
+        if (admissionIsTerminal) await emitSiem("response", {
           status: 503,
           latency_ms: queueWaitMs,
           queue_wait_ms: queueWaitMs,
@@ -3526,8 +3574,8 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           admission_outcome: admissionOutcome,
           backoff_classification: backoffClassification,
           retry_after_seconds: retryAfterSeconds,
-          failover: !admissionIsTerminal,
-          terminal: admissionIsTerminal,
+          failover: false,
+          terminal: true,
           admission_rejected: true,
           code,
           capacity_domain: capacityDomain,
