@@ -3494,7 +3494,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           code,
           capacity_domain: capacityDomain,
         }, { backend: backendId });
-        return {
+        const admissionRejection = {
           status: 503,
           headers: {
             "content-type": "application/json",
@@ -3521,6 +3521,44 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           retryAfterSeconds,
           failover: didFailover,
         };
+
+        // An admission rejection is a CAPACITY outcome on THIS door, not
+        // evidence that the model or the backend is unhealthy. The code above
+        // already says so, and deliberately does not write a health outcome.
+        // It is therefore failover-eligible in exactly the way an upstream 5xx
+        // is: try the next candidate, which may be completely idle.
+        //
+        // Until now this returned immediately with failover:false, so a full
+        // pool killed the request even when a sibling door had free slots.
+        // Measured on the chi cluster 2026-09-01: chiap08-qwen38 was admitting
+        // against a vLLM engine that sustains 2 to 3 concurrent, while
+        // chiap01-qwen38 sat at totalProcessed=0 for its entire lifetime. In
+        // the first hour after the admission cap was corrected, 49 of 103
+        // admitted requests timed out with an idle door one position down the
+        // candidate list. The config comment in skgateway-codex.yaml records
+        // the same conclusion and says the only safe setting was to WAIT
+        // rather than die, because dying could not fail over.
+        //
+        // Only the LAST candidate returns. Anything earlier hands the 503 to
+        // lastResult and continues, so the existing i > 0 branch at the top of
+        // the loop emits the failover audit with previous_status_503. No new
+        // SIEM event type is introduced, which matters because that emitter is
+        // a fail-closed boundary where an unknown type would throw into the
+        // request path.
+        //
+        // route() already trims candidates to a single entry when failover is
+        // disabled, so config with failover:false keeps returning immediately
+        // and its behaviour is unchanged.
+        if (i < candidates.length - 1) {
+          console.warn(
+            `[routeAndSend] admission ${code} on backend=${backendId} ` +
+            `(domain=${capacityDomain}) — trying next backend ` +
+            `${candidates[i + 1].backendId}`
+          );
+          lastResult = admissionRejection;
+          continue;
+        }
+        return admissionRejection;
       }
     }
 
