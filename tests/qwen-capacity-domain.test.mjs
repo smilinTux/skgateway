@@ -174,18 +174,19 @@ describe("chiap08 Qwen shared capacity domain", () => {
     ];
     await waitFor(() => upstream.state.totalCalls === 4, "four admitted upstream calls");
 
-    const fifth = request("sk-creative");
     const pool = getPool();
-    await waitFor(() => pool.getStats("reg:qwen38").queued === 1, "one queued request");
+    const fifth = await request("sk-creative");
     assert.equal(upstream.state.totalCalls, 4, "the fifth request stays at the gateway");
+    assert.equal(fifth.status, 503);
+    assert.equal(JSON.parse(fifth.body).error.type, "all_candidates_at_capacity");
     assert.equal(upstream.state.maxActive, 4);
     assert.equal(pool.getStats("chiap08-qwen38").active, 4);
     assert.equal(pool.getStats("reg:qwen38").active, 4);
+    assert.equal(pool.getStats("reg:qwen38").queued, 0);
+    assert.equal(pool.getStats("reg:qwen38").totalDropped, 0);
 
-    upstream.releaseOne();
-    await waitFor(() => upstream.state.totalCalls === 5, "queued request promotion");
     upstream.releaseAll();
-    const results = await Promise.all([...firstFour, fifth]);
+    const results = await Promise.all(firstFour);
     assert.ok(results.every((result) => result.status === 200));
     assert.ok(results.every((result) => result.admissionOutcome === "admitted"));
     assert.ok(results.every((result) => result.backoffClassification === "nonterminal"));
@@ -196,7 +197,7 @@ describe("chiap08 Qwen shared capacity domain", () => {
     assert.equal(pool.getStats("chiap08-qwen38").queued, 0);
   });
 
-  test("queue-full and queue-timeout return distinct retryable 503 responses", async () => {
+  test("route admission fails over or returns immediately instead of entering the queue", async () => {
     getPool({
       capacityDomains: {
         "chiap08-qwen38": {
@@ -209,37 +210,18 @@ describe("chiap08 Qwen shared capacity domain", () => {
     });
     const holder = request("qwen3.8-27b");
     await waitFor(() => upstream.state.totalCalls === 1, "active holder");
-    const queued = request("sk-creative");
-    await waitFor(() => getPool().getStats("reg:qwen38").queued === 1, "queued request");
-
-    const full = await request("qwen3.8-27b");
-    assert.equal(full.status, 503);
-    assert.equal(full.headers["retry-after"], "1");
-    assert.equal(full.queueWaitMs, 0);
-    assert.equal(full.inflightConcurrency, 1);
-    assert.equal(full.admissionOutcome, "denied");
-    assert.equal(full.backoffClassification, "local_admission_denial");
-    assert.equal(full.retryAfterSeconds, 1);
-    assert.deepEqual(JSON.parse(full.body).error, {
-      message: "Capacity domain chiap08-qwen38 queue is full.",
-      code: "capacity_exceeded",
-      backend: "chiap08-qwen38",
-      capacity_domain: "chiap08-qwen38",
-      retryable: true,
-      retry_after_seconds: 1,
-    });
-
-    const timedOut = await queued;
-    assert.equal(timedOut.status, 503);
-    assert.equal(timedOut.headers["retry-after"], "1");
-    assert.equal(JSON.parse(timedOut.body).error.code, "queue_timeout");
-    assert.equal(JSON.parse(timedOut.body).error.capacity_domain, "chiap08-qwen38");
-    assert.equal(timedOut.queueWaitMs, 30);
-    assert.equal(timedOut.inflightConcurrency, 1);
-    assert.equal(timedOut.admissionOutcome, "timeout");
-    assert.equal(timedOut.backoffClassification, "timeout");
-    assert.equal(getPool().getStats("chiap08-qwen38").totalDropped, 1);
-    assert.equal(getPool().getStats("chiap08-qwen38").totalTimedOut, 1);
+    const denied = await request("sk-creative");
+    assert.equal(denied.status, 503);
+    assert.equal(denied.headers["retry-after"], "1");
+    assert.equal(denied.queueWaitMs, 0);
+    assert.equal(denied.inflightConcurrency, 1);
+    assert.equal(denied.admissionOutcome, "denied");
+    assert.equal(denied.backoffClassification, "local_admission_denial");
+    assert.equal(denied.retryAfterSeconds, 1);
+    assert.equal(JSON.parse(denied.body).error.type, "all_candidates_at_capacity");
+    assert.equal(getPool().getStats("chiap08-qwen38").queued, 0);
+    assert.equal(getPool().getStats("chiap08-qwen38").totalDropped, 0);
+    assert.equal(getPool().getStats("chiap08-qwen38").totalTimedOut, 0);
 
     upstream.releaseAll();
     assert.equal((await holder).status, 200);
@@ -247,7 +229,7 @@ describe("chiap08 Qwen shared capacity domain", () => {
     assert.equal(getPool().getStats("chiap08-qwen38").queued, 0);
   });
 
-  test("queued client cancellation remains 499 and never reaches fallback or upstream", async () => {
+  test("pre-admission client cancellation remains 499 and never reaches fallback or upstream", async () => {
     getPool({
       capacityDomains: {
         "chiap08-qwen38": {
@@ -261,6 +243,7 @@ describe("chiap08 Qwen shared capacity domain", () => {
     const holder = request("qwen3.8-27b");
     await waitFor(() => upstream.state.totalCalls === 1, "active holder");
     const controller = new AbortController();
+    controller.abort();
     const cancelled = routeAndSend(
       router,
       { model: "qwen3.8-27b", agentId: "capacity-test" },
@@ -272,14 +255,12 @@ describe("chiap08 Qwen shared capacity domain", () => {
       null,
       controller.signal,
     );
-    await waitFor(() => getPool().getStats("chiap08-qwen38").queued === 1, "queued request");
-    controller.abort();
 
     const result = await cancelled;
     assert.equal(result.status, 499);
     assert.equal(result.cancelled, true);
     assert.equal(result.failover, false);
-    assert.ok(result.queueWaitMs >= 0 && result.queueWaitMs <= 1000);
+    assert.equal(result.queueWaitMs, 0);
     assert.equal(result.inflightConcurrency, 1);
     assert.equal(result.admissionOutcome, "cancelled");
     assert.equal(result.backoffClassification, "cancellation");

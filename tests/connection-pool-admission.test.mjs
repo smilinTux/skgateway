@@ -154,6 +154,63 @@ describe("ConnectionPool capacity domains", () => {
     assert.equal(pool.getStats("one").queued, 0);
   });
 
+  test("tryAcquire reserves immediate capacity without queue or drop accounting", () => {
+    const pool = new ConnectionPool({
+      capacityDomains: {
+        shared: {
+          members: ["primary", "alias"],
+          max: 1,
+          maxQueue: 3,
+          queueTimeoutMs: 2500,
+        },
+      },
+    });
+
+    const ticket = pool.tryAcquire("primary");
+    assert.equal(ticket.id, "shared");
+    assert.throws(
+      () => pool.tryAcquire("alias"),
+      (error) => {
+        assert.ok(error instanceof PoolAdmissionError);
+        assert.equal(error.code, "capacity_exceeded");
+        assert.equal(error.capacityDomain, "shared");
+        assert.equal(error.queueWaitMs, 0);
+        assert.equal(error.inflightConcurrency, 1);
+        assert.equal(error.admissionOutcome, "denied");
+        assert.equal(error.queued, 0);
+        assert.equal(error.maxConcurrency, 1);
+        assert.equal(error.retryAfterSeconds, 3);
+        return true;
+      },
+    );
+    assert.equal(pool.getStats("shared").queued, 0);
+    assert.equal(pool.getStats("shared").totalDropped, 0);
+    assert.equal(pool.getStats("shared").totalProcessed, 1);
+
+    assert.equal(pool.release(ticket), true);
+    assert.equal(pool.getStats("shared").active, 0);
+  });
+
+  test("tryAcquire cancellation is terminal and creates no slot or waiter", () => {
+    const pool = new ConnectionPool({ defaultMaxConcurrent: 1 });
+    const controller = new AbortController();
+    controller.abort();
+
+    assert.throws(
+      () => pool.tryAcquire("backend", { signal: controller.signal }),
+      (error) => {
+        assert.ok(error instanceof PoolAdmissionError);
+        assert.equal(error.code, "client_closed");
+        assert.equal(error.admissionOutcome, "cancelled");
+        assert.equal(error.queueWaitMs, 0);
+        return true;
+      },
+    );
+    assert.equal(pool.getStats("backend").active, 0);
+    assert.equal(pool.getStats("backend").queued, 0);
+    assert.equal(pool.getStats("backend").totalCancelled, 1);
+  });
+
   test("maxQueue zero means no waiting, never an unbounded queue", async () => {
     const pool = new ConnectionPool({
       capacityDomains: {

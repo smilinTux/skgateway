@@ -54,6 +54,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Saturated local admission now continues through the existing policy-filtered
+  candidate chain without entering a backend queue. Shared capacity aliases
+  keep one ceiling, cancellation remains a single terminal 499, and an
+  all-saturated chain returns one retryable 503 with bounded attempt
+  attribution (card f5c7022b).
+
 - Queue telemetry now preserves `provider_backoff` when every upstream returns
   402 and records cooldown-only requests as denied with zero inflight work.
 - Terminal request telemetry now preserves an already observed first-byte

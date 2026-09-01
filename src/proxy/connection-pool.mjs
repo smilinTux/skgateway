@@ -18,6 +18,7 @@
  *                       └───────────────┘
  *
  * Public API:
+ *   pool.tryAcquire(backendId)   → ticket now or typed capacity denial
  *   pool.acquire(backendId)      → Promise<ticket> - wait for slot
  *   pool.release(ticket)         → return slot
  *   pool.getStats(backendId?)    → { active, queued, max }
@@ -55,6 +56,8 @@ export class PoolAdmissionError extends Error {
     this.queueWaitMs = telemetry.queueWaitMs ?? 0;
     this.inflightConcurrency = telemetry.inflightConcurrency ?? 0;
     this.admissionOutcome = telemetry.admissionOutcome ?? "denied";
+    this.queued = telemetry.queued ?? 0;
+    this.maxConcurrency = telemetry.maxConcurrency ?? 0;
   }
 }
 
@@ -201,9 +204,70 @@ export class ConnectionPool {
     return ticket;
   }
 
+  _tryIssueTicket(state, backendId) {
+    if (state.active >= state.max) return null;
+    state.active++;
+    state.totalProcessed++;
+    if (state.active > state.peakActive) state.peakActive = state.active;
+    return this._issueTicket(state, backendId);
+  }
+
   // -----------------------------------------------------------------------
   // Core API
   // -----------------------------------------------------------------------
+
+  /**
+   * Atomically acquire a slot only when capacity is available now.
+   *
+   * This method never queues and never changes queue-drop accounting. A
+   * capacity denial carries the same bounded admission telemetry as acquire()
+   * so the router can try the next already-eligible candidate and, if every
+   * candidate is full, return one attributable retryable response.
+   *
+   * @param {string} backendId
+   * @param {{signal?:AbortSignal|null}} [options]
+   * @returns {{id: string, backendId: string, acquiredAt: number, ticketId: string}}
+   * @throws {PoolAdmissionError} on cancellation or immediate capacity denial
+   */
+  tryAcquire(backendId, { signal = null } = {}) {
+    const state = this._getOrCreate(backendId);
+    const retryAfterSeconds = Math.max(1, Math.ceil(state.queueTimeoutMs / 1000));
+
+    if (signal?.aborted) {
+      state.totalCancelled++;
+      throw new PoolAdmissionError(
+        "client_closed",
+        state.id,
+        `[connection-pool] backend=${backendId} client disconnected before admission`,
+        retryAfterSeconds,
+        {
+          queueWaitMs: 0,
+          inflightConcurrency: Math.min(state.max, Math.max(0, state.active)),
+          admissionOutcome: "cancelled",
+          queued: state.queue.length,
+          maxConcurrency: state.max,
+        },
+      );
+    }
+
+    const ticket = this._tryIssueTicket(state, backendId);
+    if (ticket) return ticket;
+
+    throw new PoolAdmissionError(
+      "capacity_exceeded",
+      state.id,
+      `[connection-pool] domain=${state.id} has no immediate capacity ` +
+        `(${state.active}/${state.max} active, ${state.queue.length} queued).`,
+      retryAfterSeconds,
+      {
+        queueWaitMs: 0,
+        inflightConcurrency: Math.min(state.max, Math.max(0, state.active)),
+        admissionOutcome: "denied",
+        queued: state.queue.length,
+        maxConcurrency: state.max,
+      },
+    );
+  }
 
   /**
    * Acquire a connection slot for the given backend.
@@ -237,11 +301,9 @@ export class ConnectionPool {
       }
 
       // Fast path: slot available right now
-      if (state.active < state.max) {
-        state.active++;
-        state.totalProcessed++;
-        if (state.active > state.peakActive) state.peakActive = state.active;
-        resolve(this._issueTicket(state, backendId));
+      const ticket = this._tryIssueTicket(state, backendId);
+      if (ticket) {
+        resolve(ticket);
         return;
       }
 

@@ -3298,6 +3298,49 @@ export async function routeAndSend(router, request, upstreamPath, method, client
   // synthesis at the bottom of the loop, and is the attribution payload
   // itself: {backendId, model, status, cooldownMs, skipped?}.
   const throttledAttempts = [];
+  // Local admission denial is routing evidence, not backend-health evidence.
+  // Keep only a bounded set for the terminal response and SIEM record.
+  const admissionAttempts = [];
+  let admissionDeniedCount = 0;
+  let lastAdmissionAttempt = null;
+  let admissionRetryAfterSeconds = null;
+  const MAX_ADMISSION_ATTEMPTS = 20;
+  const clientClosedResult = async ({
+    backendId,
+    capacityDomain = backendId,
+    queueWaitMs = 0,
+    inflightConcurrency = 0,
+    admissionOutcome = "cancelled",
+  }) => {
+    await emitSiem("response", {
+      status: 499,
+      latency_ms: queueWaitMs,
+      queue_wait_ms: queueWaitMs,
+      inflight_concurrency: inflightConcurrency,
+      admission_outcome: admissionOutcome,
+      backoff_classification: "cancellation",
+      failover: false,
+      cancelled: true,
+    }, { backend: backendId });
+    return {
+      status: 499,
+      headers: {},
+      body: Buffer.from(JSON.stringify({
+        error: {
+          message: "downstream client disconnected",
+          code: "client_closed",
+        },
+      })),
+      backendId,
+      capacityDomain,
+      queueWaitMs,
+      inflightConcurrency,
+      admissionOutcome,
+      backoffClassification: "cancellation",
+      failover: false,
+      cancelled: true,
+    };
+  };
 
   for (let i = 0; i < candidates.length; i++) {
     const { backendId, backendUrl, authHeaders, backend } = candidates[i];
@@ -3316,6 +3359,26 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       ? bucketLivenessTimeoutMs(backend.timeout_ms)
       : backend.timeout_ms;
 
+    // Check again at the candidate boundary before writing a failover event.
+    // If cancellation arrived after the previous denial's awaited SIEM write,
+    // it remains a terminal 499 and is never misreported as another attempt.
+    if (pool && abortSignal?.aborted) {
+      try {
+        pool.tryAcquire(backendId, { signal: abortSignal });
+      } catch (err) {
+        if (err instanceof PoolAdmissionError && err.code === "client_closed") {
+          return clientClosedResult({
+            backendId,
+            capacityDomain: err.capacityDomain,
+            queueWaitMs: err.queueWaitMs,
+            inflightConcurrency: err.inflightConcurrency,
+            admissionOutcome: err.admissionOutcome,
+          });
+        }
+        throw err;
+      }
+    }
+
     if (i > 0) {
       didFailover = true;
       // SIEM failover event written to stdout as a JSON line
@@ -3327,16 +3390,16 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         to: backendId,
         model: request.model,
         agentId: request.agentId,
-        previousStatus: lastResult?.status,
+        previousStatus: lastResult?.status ?? (admissionDeniedCount > 0 ? 503 : undefined),
       }) + "\n");
       console.warn(
         `[router] FAILOVER: ${candidates[i - 1].backendId} → ${backendId}` +
-        ` (prev_status=${lastResult?.status})`
+        ` (prev_status=${lastResult?.status ?? (admissionDeniedCount > 0 ? 503 : "error")})`
       );
       await emitSiem("failover", {
         from_backend: candidates[i - 1].backendId,
         to_backend: backendId,
-        reason: `previous_status_${lastResult?.status ?? "error"}`,
+        reason: `previous_status_${lastResult?.status ?? (admissionDeniedCount > 0 ? 503 : "error")}`,
       }, { backend: backendId });
     }
 
@@ -3409,48 +3472,63 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     const targetUrl = new URL(backendUrl);
     const queueStart = Date.now();
 
-    // Acquire a connection pool slot (waits if at capacity)
+    // Reserve immediate capacity without queueing. A local capacity denial is
+    // not a backend failure, so it advances through the already-authorized
+    // candidate chain without touching health, lifecycle, or cooldown state.
     let slot = null;
     if (pool) {
       try {
-        slot = await pool.acquire(backendId, { signal: abortSignal });
+        slot = pool.tryAcquire(backendId, { signal: abortSignal });
       } catch (err) {
-        // A client which leaves while queued is the same neutral 499 as one
-        // which leaves after dispatch: no failover and no backend-health write.
+        // Cancellation wins over failover. Keeping this inside the exact
+        // tryAcquire catch closes the between-candidates abort race and keeps
+        // cancellation terminal, slot-free, and health-neutral.
         if (err instanceof PoolAdmissionError && err.code === "client_closed") {
-          const queueWaitMs = err.queueWaitMs;
-          await emitSiem("response", {
-            status: 499,
-            latency_ms: queueWaitMs,
-            queue_wait_ms: queueWaitMs,
-            inflight_concurrency: err.inflightConcurrency,
-            admission_outcome: err.admissionOutcome,
-            backoff_classification: "cancellation",
-            failover: false,
-            cancelled: true,
-          }, { backend: backendId });
-          return {
-            status: 499,
-            headers: {},
-            body: Buffer.from(JSON.stringify({
-              error: {
-                message: "downstream client disconnected",
-                code: "client_closed",
-              },
-            })),
+          return clientClosedResult({
             backendId,
             capacityDomain: err.capacityDomain,
-            queueWaitMs,
+            queueWaitMs: err.queueWaitMs,
             inflightConcurrency: err.inflightConcurrency,
             admissionOutcome: err.admissionOutcome,
-            backoffClassification: "cancellation",
-            failover: false,
-            cancelled: true,
-          };
+          });
         }
 
-        // Queue-full and queue-timeout are distinct retryable admission
-        // outcomes. Neither is evidence that the model/backend is unhealthy.
+        if (err instanceof PoolAdmissionError && err.code === "capacity_exceeded") {
+          admissionDeniedCount++;
+          const attempt = {
+            backend: backendId,
+            model: candidateModel,
+            capacity_domain: err.capacityDomain,
+            queue_wait_ms: err.queueWaitMs,
+            inflight_concurrency: err.inflightConcurrency,
+            queued: err.queued,
+            max_concurrency: err.maxConcurrency,
+            admission_outcome: err.admissionOutcome,
+            retry_after_seconds: err.retryAfterSeconds,
+          };
+          lastAdmissionAttempt = attempt;
+          admissionRetryAfterSeconds = admissionRetryAfterSeconds === null
+            ? err.retryAfterSeconds
+            : Math.min(admissionRetryAfterSeconds, err.retryAfterSeconds);
+          if (admissionAttempts.length < MAX_ADMISSION_ATTEMPTS) {
+            admissionAttempts.push(attempt);
+          }
+          console.warn(
+            `[routeAndSend] admission denied backend=${backendId} ` +
+            `domain=${err.capacityDomain} active=${err.inflightConcurrency}/${err.maxConcurrency}; ` +
+            (i < candidates.length - 1 ? "trying next candidate" : "no candidates remain"),
+          );
+          await emitSiem("error", {
+            type: "pool_capacity_exceeded",
+            status_code: 503,
+            ...attempt,
+            attempt: admissionDeniedCount,
+          }, { backend: backendId });
+          continue;
+        }
+
+        // Unexpected pool failures remain fail closed. Only the typed local
+        // capacity denial above may advance to another candidate.
         const code = err instanceof PoolAdmissionError
           ? err.code
           : "capacity_exceeded";
@@ -3948,6 +4026,60 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       backend: backendId,
       retry_count: i,
     }, { backend: backendId });
+  }
+
+  // Every policy-eligible candidate was locally saturated. Return one
+  // retryable response carrying bounded attribution and the existing queue
+  // telemetry fields. No request was queued and no upstream was contacted.
+  if (candidates.length > 0 && admissionDeniedCount === candidates.length) {
+    const lastAdmission = lastAdmissionAttempt ?? {};
+    const retryAfterSeconds = admissionRetryAfterSeconds ?? 1;
+    const payload = JSON.stringify({
+      error: {
+        message: "All eligible candidates are at local admission capacity.",
+        code: "capacity_exceeded",
+        type: "all_candidates_at_capacity",
+        retryable: true,
+        retry_after_seconds: retryAfterSeconds,
+      },
+      attempted: admissionAttempts,
+      attempted_count: admissionDeniedCount,
+      attribution_truncated: admissionDeniedCount > admissionAttempts.length,
+    });
+    await emitSiem("response", {
+      status: 503,
+      code: "capacity_exceeded",
+      capacity_domain: lastAdmission.capacity_domain ?? null,
+      queue_wait_ms: 0,
+      inflight_concurrency: lastAdmission.inflight_concurrency ?? 0,
+      admission_outcome: "denied",
+      backoff_classification: "local_admission_denial",
+      retry_after_seconds: retryAfterSeconds,
+      failover: didFailover,
+      admission_rejected: true,
+      all_backends_failed: true,
+      attempted: admissionAttempts,
+      attempted_count: admissionDeniedCount,
+      attribution_truncated: admissionDeniedCount > admissionAttempts.length,
+    }, { backend: lastAdmission.backend ?? null });
+    return {
+      status: 503,
+      headers: {
+        "content-type": "application/json",
+        "retry-after": String(retryAfterSeconds),
+      },
+      body: Buffer.from(payload, "utf-8"),
+      backendId: lastAdmission.backend ?? null,
+      capacityDomain: lastAdmission.capacity_domain ?? null,
+      queueWaitMs: 0,
+      inflightConcurrency: lastAdmission.inflight_concurrency ?? 0,
+      admissionOutcome: "denied",
+      backoffClassification: "local_admission_denial",
+      retryAfterSeconds,
+      admissionAttempts,
+      admissionAttemptCount: admissionDeniedCount,
+      failover: didFailover,
+    };
   }
 
   // Card 9e28de88 fix #3: every candidate ended in a throttle, whether a
