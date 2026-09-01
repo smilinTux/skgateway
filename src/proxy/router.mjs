@@ -3890,7 +3890,6 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     lastResult = {
       ...res,
       backendId,
-      servedModel: candidateModel,
       requestedModel,
       readinessRevision: backend.readinessRevision,
       discoveryRevision: backend.discoveryRevision,
