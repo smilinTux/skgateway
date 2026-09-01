@@ -373,14 +373,17 @@ function bootGateway({ port, dashPort, upstreamUrl, dbPath, storePath, identity 
 
   return new Promise((resolveBoot, rejectBoot) => {
     let out = "";
+    const timer = setTimeout(() => rejectBoot(new Error(`gateway did not start in time:\n${out}`)), 20000);
+    const cleanup = () => clearTimeout(timer);
+    const resolve = (value) => { cleanup(); return resolveBoot(value); };
+    const reject = (reason) => { cleanup(); return rejectBoot(reason); };
     const onData = (buf) => {
       out += buf.toString();
-      if (/\[skgateway\] listening/.test(out)) resolveBoot({ child, dir, cfgPath });
+      if (/\[skgateway\] listening/.test(out)) resolve({ child, dir, cfgPath });
     };
     child.stdout.on("data", onData);
     child.stderr.on("data", onData);
-    child.on("exit", (code) => rejectBoot(new Error(`gateway exited early (${code}):\n${out}`)));
-    setTimeout(() => rejectBoot(new Error(`gateway did not start in time:\n${out}`)), 20000);
+    child.on("exit", (code) => reject(new Error(`gateway exited early (${code}):\n${out}`)));
   });
 }
 
