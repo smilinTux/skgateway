@@ -64,6 +64,10 @@ describe("ConnectionPool capacity domains", () => {
       queueTimeoutMs: 30_000,
       totalProcessed: 0,
       totalDropped: 0,
+      // Additive: a non-blocking acquire that defers to the next candidate is
+      // counted here and deliberately NOT in totalDropped, because a deferral
+      // that fails over successfully is a served request, not a loss.
+      totalDeferred: 0,
       totalTimedOut: 0,
       totalCancelled: 0,
       peakActive: 0,
