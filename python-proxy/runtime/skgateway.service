@@ -1,0 +1,16 @@
+[Unit]
+Description=SKGateway CHI Python OpenAI-compatible model router
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=PYTHONDONTWRITEBYTECODE=1
+EnvironmentFile=%h/.config/skgateway/skgateway.env
+ExecStart=/opt/skgateway-python-proxy/current/venv/bin/uvicorn skgateway:app --app-dir /opt/skgateway-python-proxy/current/src --host 127.0.0.1 --port 18780 --no-access-log
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target
