@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The unversioned chiap04 Python proxy is captured byte-for-byte as a separately
+  built, content-addressed artifact with pinned dependencies, non-secret runtime
+  and configuration manifests, deterministic build receipts, and rollback
+  instructions. Its ambiguous pre-Git ancestry remains explicit (card 2d4a7c8e).
+
 - The sanitizer and model-limit stages are now wired into the live `/v1` path.
   `trimSystemMessages()`, `trimConversationHistory()` and `sanitizeResponse()`
   existed and were unit-tested but were never invoked by `index.mjs`, so the
