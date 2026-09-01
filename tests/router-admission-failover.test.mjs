@@ -269,20 +269,9 @@ describe("non-blocking admission on every candidate but the last", () => {
 describe("admission telemetry, attribution and the abort race", () => {
   let full, idle;
 
-  before(async () => {
-    full = await startUpstream();
-    idle = await startUpstream();
-  });
-
-  after(async () => {
-    await full.close();
-    await idle.close();
-    resetPool();
-  });
-
-  beforeEach(() => {
-    resetPool();
-  });
+  before(async () => { full = await startUpstream(); idle = await startUpstream(); });
+  after(async () => { await full.close(); await idle.close(); resetPool(); });
+  beforeEach(() => { resetPool(); });
 
   function twoDoors(modelId) {
     getPool({
@@ -298,16 +287,48 @@ describe("admission telemetry, attribution and the abort race", () => {
     });
   }
 
-  // DEFECT 1: the 503 emitted on a non-final candidate hardcoded failover:false
-  // and was emitted before the failover decision. A request that failed over
-  // successfully therefore wrote a 503 "response" claiming it had not, plus a
-  // later 200 "response": two terminal responses for one request, one of them
-  // false. Every dashboard reading these counts healthy failovers as 503s.
-  test("a 503 that fails over is marked failover, not terminal", async () => {
+  const detail = (e) => e.details || e;
+  const responses = (evts) =>
+    evts.filter((e) => (e.event_type || e.type) === "response").map(detail);
+
+  // DEFECT 1. The rejection used to emit its own "response" event on a
+  // NON-final candidate, so a request that failed over successfully produced
+  // TWO response events: a 503 and then the 200. Every dashboard counting
+  // response events read healthy capacity failover as a 503 rate.
+  test("a successful capacity failover emits exactly ONE response event", async () => {
     const modelId = `admission-telemetry-${Date.now()}`;
     const router = twoDoors(modelId);
-    const holder = await getPool().acquire("full");
-    assert.ok(holder);
+    assert.ok(await getPool().acquire("full"));
+
+    const events = [];
+    const r = await routeAndSend(
+      router, { model: modelId, agentId: "test" },
+      "/chat/completions", "POST", HEADERS, bodyFor(modelId), true,
+      async (e) => { events.push(e); },
+    );
+    assert.equal(r.status, 200, "served by the idle door");
+
+    const statuses = responses(events).map((d) => d.status);
+    assert.deepEqual(statuses, [200],
+      `one request, one response event, got ${JSON.stringify(statuses)}`);
+
+    // The capacity detail must not be LOST by removing that event. It rides
+    // on the failover event, which is where the step actually belongs.
+    const fo = events.filter((e) => (e.event_type || e.type) === "failover").map(detail);
+    assert.equal(fo.length, 1, "the failover itself is still recorded");
+    assert.equal(fo[0].admission_rejected, true, "carrying the admission detail");
+    assert.equal(fo[0].capacity_domain, "fullDomain");
+    assert.ok(fo[0].queue_wait_ms !== undefined, "and the queue wait");
+  });
+
+  // DEFECT 2. The previous version of this test allowed an EMPTY attribution
+  // list, so deleting the attribution code entirely still passed. Review
+  // 2927a814 caught that. It now requires a non-empty, bounded record naming
+  // the door that actually refused.
+  test("the refusing door is recorded, non-empty and bounded", async () => {
+    const modelId = `admission-attrib-${Date.now()}`;
+    const router = twoDoors(modelId);
+    assert.ok(await getPool().acquire("full"));
 
     const events = [];
     const r = await routeAndSend(
@@ -317,99 +338,49 @@ describe("admission telemetry, attribution and the abort race", () => {
     );
     assert.equal(r.status, 200);
 
-    const responses = events.filter((e) => e.event_type === "response" || e.type === "response");
-    const detail = (e) => e.details || e;
-    const rejected = responses.filter((e) => detail(e).admission_rejected === true);
-    assert.equal(rejected.length, 1, "exactly one admission rejection was emitted");
-    assert.equal(detail(rejected[0]).status, 503);
-    assert.equal(detail(rejected[0]).failover, true,
-      "a rejection that fails over must not claim failover:false");
-    assert.equal(detail(rejected[0]).terminal, false,
-      "and must not be marked terminal");
-
-    const terminal = responses.filter((e) => detail(e).terminal === true);
-    assert.ok(terminal.length <= 1, "at most one terminal response event per request");
+    const fo = events.filter((e) => (e.event_type || e.type) === "failover").map(detail);
+    assert.equal(fo.length, 1);
+    assert.equal(fo[0].code, "capacity_exceeded",
+      "the reason the door refused is attributed, not merely that it did");
+    assert.equal(fo[0].from_backend, "full", "and WHICH door refused");
+    assert.ok(fo[0].queue_wait_ms >= 0 && fo[0].queue_wait_ms < 3000,
+      "with a bounded queue wait, not an unbounded or absent one");
   });
 
-  // DEFECT 2: an admission rejection left no trace on the result, so a request
-  // served after two refusals was indistinguishable from one admitted straight
-  // away. Capacity failover was invisible in attribution.
-  test("refused doors are recorded on the result, and the record is bounded", async () => {
-    const modelId = `admission-attrib-${Date.now()}`;
-    const router = twoDoors(modelId);
-    const holder = await getPool().acquire("full");
-    assert.ok(holder);
-
-    const r = await routeAndSend(
-      router, { model: modelId, agentId: "test" },
-      "/chat/completions", "POST", HEADERS, bodyFor(modelId), true,
-    );
-    assert.equal(r.status, 200, "served by the idle door");
-    // the serving result carries no rejection list; the rejection object does.
-    // What must hold either way: the refusal was recorded somewhere with the
-    // door that refused, not silently dropped.
-    const seen = r.admissionAttempts || [];
-    if (seen.length) {
-      assert.equal(seen[0].backendId, "full", "names the door that refused");
-      assert.ok(seen.length <= 16, "attribution is bounded");
-    }
-  });
-
-  // DEFECT 3, NOT REPRODUCED. This is a CHARACTERISATION test, not a
-  // regression test, and the difference matters. It documents that a cancelled
-  // request emits exactly one response event today. It does NOT prove a fix,
-  // because it passes with and without the guard I wrote and then removed:
-  // pool.acquire() checks signal.aborted before the capacity branch, so a gone
-  // client already takes the existing client_closed path and no 503 is emitted.
-  // Keep it so a future change that reintroduces the double count goes red.
-  test("a client that aborts during admission gets 499 and does NOT fail over", async () => {
+  // DEFECT 3. Reproduced by review 2927a814: aborting during the admission
+  // emission produced the terminal sequence [503, 499] for ONE cancelled
+  // request, so a cancellation was counted downstream as a capacity event AND
+  // a cancellation. No guard placement alone fixes it, because a guard before
+  // the emit cannot see an abort landing inside it and a guard after cannot
+  // unsend it. The emit itself was the defect.
+  test("a cancelled request emits exactly ONE response event, and it is 499", async () => {
     const modelId = `admission-abortrace-${Date.now()}`;
     const router = twoDoors(modelId);
-    const holder = await getPool().acquire("full");
-    assert.ok(holder);
+    assert.ok(await getPool().acquire("full"));
 
     const ac = new AbortController();
+    const events = [];
     const before = idle.requestCount;
-    const seenEvents = [];
-    // Abort at the exact moment the race occurs: the rejection has been
-    // emitted and the failover decision has not been taken yet. A timer is
-    // useless here because the non-blocking rejection is immediate, so the
-    // window is sub-millisecond; driving it from the emitter makes the race
-    // deterministic instead of hoping to land inside it.
     const r = await routeAndSend(
       router, { model: modelId, agentId: "test" },
       "/chat/completions", "POST", HEADERS, bodyFor(modelId), true,
       async (e) => {
-        seenEvents.push(e);
-        const d = e.details || e;
-        // Abort on the request event, which fires BEFORE admission is decided.
-        // Triggering on the 503 itself is circular: the event that proves the
-        // defect cannot also be the thing that causes it.
-        if ((e.event_type || e.type) === "request") ac.abort();
+        events.push(e);
+        // Abort as soon as anything is emitted for this request. This is the
+        // window review 2927a814 used; driving it from the emitter makes the
+        // race deterministic rather than hoping a timer lands inside it.
+        ac.abort();
       },
       ac.signal,
     );
 
-    assert.equal(r.status, 499, "a gone client is a cancellation, not a capacity failover");
+    assert.equal(r.status, 499, "a gone client is a cancellation");
     assert.equal(r.failover, false);
     assert.equal(idle.requestCount, before,
-      "the idle door must NOT be dialled for a client that already left");
+      "the idle door must not be dialled for a client that already left");
 
-    // THE DEFECT IS IN THE TELEMETRY, not the status. Without the abort guard
-    // the request emits a 503 for the first door AND a 499 for the second, so
-    // one cancelled request is counted downstream as a capacity event plus a
-    // cancellation. The status alone cannot catch this: acquire() already
-    // returns 499 for the next candidate because it checks the signal first,
-    // so the status is 499 either way. Only the event stream shows the double
-    // count, which is why this assertion and not the status is the regression.
-    const detail = (e) => e.details || e;
-    const responses = seenEvents
-      .filter((e) => (e.event_type || e.type) === "response")
-      .map(detail);
-    const statuses = responses.map((d) => d.status);
-    assert.deepEqual(
-      statuses, [499],
-      `one cancelled request must emit exactly one response event, got ${JSON.stringify(statuses)}`,
-    );
+    const statuses = responses(events).map((d) => d.status);
+    assert.deepEqual(statuses, [499],
+      `one cancelled request must emit exactly one response event, got ${JSON.stringify(statuses)}`);
   });
 });
