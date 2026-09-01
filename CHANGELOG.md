@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Admission failover is reachable.** `pool.acquire()` takes `nonBlocking`; only the
+  FINAL routing candidate may queue, so a full door defers to the next candidate
+  instead of waiting out `queueTimeoutMs` on a saturated backend. The previous
+  change made an admission 503 failover-eligible but left it unreachable whenever
+  `maxQueue > 0`, which is every production capacity domain.
+- **Truthful admission telemetry.** The rejection event hardcoded `failover:false`
+  and was emitted before the failover decision, so a request that failed over
+  successfully still wrote a 503 `response` claiming it had not, followed by a 200.
+  It now states failover truthfully and carries an explicit `terminal` flag.
+- **Bounded attempt attribution.** Refused doors are recorded on the rejection with
+  an explicit cap, so capacity failover is visible in attribution.
+- `getStats()` gains `totalDeferred`, deliberately separate from `totalDropped`: a
+  deferral that fails over successfully is a served request, not a loss.
 
 - The sanitizer and model-limit stages are now wired into the live `/v1` path.
   `trimSystemMessages()`, `trimConversationHistory()` and `sanitizeResponse()`
