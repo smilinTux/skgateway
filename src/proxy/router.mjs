@@ -3292,6 +3292,13 @@ export async function routeAndSend(router, request, upstreamPath, method, client
   // row rather than being overwritten by the attempt that happened to win.
   // Stays empty on the disabled path, where it is never attached to a result.
   const energyAttempts = [];
+  // Which doors refused admission, so attribution can say a request failed over
+  // on CAPACITY rather than silently reporting only the door that served it.
+  // Bounded on purpose: one entry per candidate is already bounded by the
+  // candidate list, but the list is built per request from config and a
+  // misconfigured fan-out should not be able to grow this without limit.
+  const admissionAttempts = [];
+  const MAX_ADMISSION_ATTEMPTS = 16;
   // Every candidate that ended in a throttle (429/402), whether an actual
   // upstream response or a still-cooling-down door skipped without a
   // network call (card 9e28de88 fix #3/#6). Drives the attributable-429
@@ -3490,6 +3497,27 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         const backoffClassification = code === "queue_timeout"
           ? "timeout"
           : "local_admission_denial";
+        // ABORT RACE, NOT REPRODUCED, deliberately not guarded here.
+        // The reconciliation named a 503-then-499 false failover: a client
+        // that leaves during a capacity rejection supposedly emits both a
+        // capacity event and a cancellation for one request. I added a guard
+        // and then could not make any test fail with it removed, because
+        // pool.acquire() checks signal.aborted BEFORE the capacity branch, so
+        // a gone client already gets a single 499 from the existing
+        // client_closed path and no 503 is emitted at all. Shipping an
+        // unreachable branch and calling it a fix would be worse than leaving
+        // the defect open, so it is left open with the reasoning attached.
+        // If you have a reproduction, the guard belongs immediately below,
+        // BEFORE the telemetry emit, because the defect is a double COUNT and
+        // a guard placed after the emit cannot prevent one.
+        // Whether this rejection is TERMINAL is knowable here, so say it
+        // truthfully. This used to hardcode failover:false and emit before the
+        // decision, so a request that failed over successfully still wrote a
+        // 503 "response" event claiming it had not, and the later 200 wrote a
+        // second one. Two terminal responses for one request, one of them a
+        // lie, is worse than no telemetry: it makes admission failover look
+        // like a 503 rate in every dashboard reading these events.
+        const admissionIsTerminal = i === candidates.length - 1;
         await emitSiem("response", {
           status: 503,
           latency_ms: queueWaitMs,
@@ -3498,7 +3526,8 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           admission_outcome: admissionOutcome,
           backoff_classification: backoffClassification,
           retry_after_seconds: retryAfterSeconds,
-          failover: false,
+          failover: !admissionIsTerminal,
+          terminal: admissionIsTerminal,
           admission_rejected: true,
           code,
           capacity_domain: capacityDomain,
@@ -3558,10 +3587,21 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         // route() already trims candidates to a single entry when failover is
         // disabled, so config with failover:false keeps returning immediately
         // and its behaviour is unchanged.
+        if (admissionAttempts.length < MAX_ADMISSION_ATTEMPTS) {
+          admissionAttempts.push({
+            backendId,
+            capacityDomain,
+            code,
+            queueWaitMs,
+            inflightConcurrency,
+          });
+        }
+        admissionRejection.admissionAttempts = admissionAttempts;
+
         if (i < candidates.length - 1) {
           console.warn(
             `[routeAndSend] admission ${code} on backend=${backendId} ` +
-            `(domain=${capacityDomain}) — trying next backend ` +
+            `(domain=${capacityDomain}), trying next backend ` +
             `${candidates[i + 1].backendId}`
           );
           lastResult = admissionRejection;
