@@ -180,6 +180,13 @@ describe("disabled qualification startup", () => {
       "metrics:",
       "  enabled: false",
       `  db_path: ${dbPath}`,
+      "pooling:",
+      "  default_max_concurrent: 20",
+      "  per_backend:",
+      "    synthetic:",
+      "      max: 7",
+      "      maxQueue: 3",
+      "      queueTimeoutMs: 12000",
       "discovery:",
       "  enabled: false",
       "authz:",
@@ -232,6 +239,34 @@ describe("disabled qualification startup", () => {
     assert.equal((await request(dashboardPort, "/api/stats")).status, 200);
     assert.equal(await (await request(dashboardPort, "/api/stats")).text(), "guard-listener");
     assert.equal((await request(port, "/dashboard", { redirect: "manual" })).status, 404);
+  });
+
+  test("queue reports a configured per-backend pool before its first request", async () => {
+    const response = await request(port, "/queue");
+    assert.equal(response.status, 200);
+    const body = await response.json();
+
+    assert.deepEqual(body.pool, {
+      totalActive: 0,
+      totalQueued: 0,
+      totalCapacity: 7,
+      utilization: 0,
+    });
+    assert.deepEqual(body.backends.synthetic, {
+      capacityDomain: "synthetic",
+      members: ["synthetic"],
+      active: 0,
+      queued: 0,
+      max: 7,
+      maxQueue: 3,
+      queueTimeoutMs: 12_000,
+      totalProcessed: 0,
+      totalDropped: 0,
+      totalTimedOut: 0,
+      totalCancelled: 0,
+      peakActive: 0,
+      peakQueue: 0,
+    });
   });
 
   // SKW-AUTONOMY-E1 / card 1911481e: identity is disabled in this fixture
