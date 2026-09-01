@@ -3302,6 +3302,20 @@ export async function routeAndSend(router, request, upstreamPath, method, client
   // Detail of the rejection that caused the NEXT candidate to be tried.
   // It rides on the failover event instead of a second response event.
   let admissionRejectionDetail = null;
+  // True when some LATER candidate sits in a different capacity domain, i.e.
+  // there is a genuinely different door to try. Candidates sharing a domain
+  // are the same door and must not be treated as failover targets.
+  const hasDifferentDomainLater = (idx, backendId) => {
+    const dom = (bid) => {
+      try {
+        return pool?.getStats(bid)?.capacityDomain ?? null;
+      } catch {
+        return null;
+      }
+    };
+    const mine = dom(backendId);
+    return candidates.slice(idx + 1).some((c) => dom(c.backendId) !== mine);
+  };
   // Every candidate that ended in a throttle (429/402), whether an actual
   // upstream response or a still-cooling-down door skipped without a
   // network call (card 9e28de88 fix #3/#6). Drives the attributable-429
@@ -3428,12 +3442,19 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     let slot = null;
     if (pool) {
       try {
-        // Only the FINAL candidate may queue. Every earlier one fails fast
-        // so a full door defers to the next candidate instead of waiting out
-        // queueTimeoutMs on a door that is already saturated. Without this the
-        // admission failover below is unreachable whenever maxQueue > 0, which
-        // is every production configuration on the estate.
-        const mayQueue = i === candidates.length - 1;
+        // Only fail fast when there is somewhere ELSE to go.
+        //
+        // A candidate may queue if it is the last one, OR if every remaining
+        // candidate shares its capacity domain. Two backend ids in the same
+        // domain are the SAME DOOR: capacity domains exist precisely to pool
+        // them, so "failing over" between them buys nothing and costs the
+        // request its queue position.
+        //
+        // Found by tests/qwen-capacity-domain.test.mjs, whose domain declares
+        // members ["chiap08-qwen38", "reg:qwen38"]. Treating those as separate
+        // doors made a request that should have queued skip through both and
+        // never queue at all, which hung that test rather than failing it.
+        const mayQueue = !hasDifferentDomainLater(i, backendId);
         slot = await pool.acquire(backendId, {
           signal: abortSignal,
           nonBlocking: !mayQueue,
@@ -3512,7 +3533,8 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         // second one. Two terminal responses for one request, one of them a
         // lie, is worse than no telemetry: it makes admission failover look
         // like a 503 rate in every dashboard reading these events.
-        const admissionIsTerminal = i === candidates.length - 1;
+        // Terminal in the same sense: nowhere else to send it.
+        const admissionIsTerminal = !hasDifferentDomainLater(i, backendId);
 
         // ABORT RACE: FIXED BY REMOVING THE EMIT, NOT BY A GUARD.
         //
