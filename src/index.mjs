@@ -2353,14 +2353,28 @@ export const server = http.createServer(async (req, res) => {
         // caller requested, and a ratio filed under the requested alias would
         // blend every model that alias resolves to. sampleTokenRatio() already
         // returns null when neither name is present, so no fabrication risk.
+        //
+        // Samples cover NON-STREAMING JSON responses only: an SSE body is a
+        // stream of `data: {...}` frames, not a single JSON object, so
+        // JSON.parse on it throws and the sample would silently vanish into
+        // the catch below. Rather than let that failure mode masquerade as
+        // "nothing to measure", detect it up front from the content-type and
+        // emit a token_ratio.skipped event instead, so the skipped population
+        // is countable and B-Task 3 can report "N measured, M skipped
+        // (streaming)" rather than presenting an unrepresentative sample as
+        // if it covered all traffic.
         try {
-          const _parsed = JSON.parse(result.body.toString("utf-8"));
-          const _sample = sampleTokenRatio({
-            model: (typeof _parsed?.model === "string" && _parsed.model) ? _parsed.model : result?.servedModel,
-            bodyBytes: transformedBody?.length ?? 0,
-            usage: _parsed?.usage,
-          });
-          if (_sample) siemHook({ ts: new Date().toISOString(), event: "token_ratio.sample", ..._sample });
+          if (result.headers?.["content-type"]?.includes("text/event-stream")) {
+            siemHook({ ts: new Date().toISOString(), event: "token_ratio.skipped", reason: "streaming" });
+          } else {
+            const _parsed = JSON.parse(result.body.toString("utf-8"));
+            const _sample = sampleTokenRatio({
+              model: (typeof _parsed?.model === "string" && _parsed.model) ? _parsed.model : result?.servedModel,
+              bodyBytes: transformedBody?.length ?? 0,
+              usage: _parsed?.usage,
+            });
+            if (_sample) siemHook({ ts: new Date().toISOString(), event: "token_ratio.sample", ..._sample });
+          }
         } catch { /* a backend that reports no usage simply is not measured */ }
       }
 
