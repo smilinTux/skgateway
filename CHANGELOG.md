@@ -26,6 +26,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   median embed latency, overall and per category. Reports "no data" rather than
   a 0% hit rate when the cache has not run.
 
+- `scripts/token-ratio-report.mjs` prints measured median bytes-per-token per
+  model against the guard's 4.0 assumption, with a confidence marker so a model
+  with a handful of samples is not read as a measurement. The median matches
+  `p50()` in `src/proxy/router.mjs` (average of the two middle values on
+  even-length input, not the upper-middle) so the two figures in this system
+  are comparable. It also counts `token_ratio.skipped` events by reason and
+  prints the total prominently: streaming (SSE) responses cannot be measured,
+  so the reported medians cover non-streaming traffic only, and since
+  transport varies by caller and model (`auto_nonstream` config, the
+  `x-skgateway-nonstream` force header), that unmeasured slice is not
+  necessarily a random sample of all traffic.
+
 ### Changed
 
 - Removed `src/policy/engine.mjs` and `src/policy/ratelimit.mjs` (1,428 lines).
