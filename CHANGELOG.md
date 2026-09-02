@@ -546,6 +546,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   caller, and every path is fail-open: an embedder outage is emitted as a
   `semantic_cache.error` event and returned as a miss, never thrown into the
   live request path.
+- The semantic cache is wired into the live `/v1/chat/completions` path in
+  shadow mode. On an eligible request it embeds the user text, records whether a
+  cached answer would have matched, discards that answer, and dispatches
+  normally. It cannot change what a client receives while `mode: shadow`.
+  Disabled by default.
 
 ## [0.6.0] - 2026-08-15
 

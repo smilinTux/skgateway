@@ -56,6 +56,7 @@ import { loadRegistry, REGISTRY_PATH as _REGISTRY_PATH } from "./proxy/registry.
 import { policyFromRegistry } from "./policy/sensitivity.mjs";
 import { readFileSync } from "node:fs";
 import { load as yamlLoad } from "js-yaml";
+import { createShadowRecorder } from "./proxy/semantic-cache-shadow.mjs";
 
 // ─── Parse CLI args ───
 const args = process.argv.slice(2);
@@ -967,6 +968,19 @@ function siemHook(evt) {
   for (const out of esOutputs) {
     try { out.write(evt); } catch { /* never let ES break the hot path */ }
   }
+}
+
+/**
+ * One recorder for the process. Built lazily on first eligible request so a
+ * disabled cache costs nothing at boot and an unreachable embedder cannot stop
+ * the gateway starting.
+ */
+let _shadowCache = null;
+function shadowCache(config) {
+  const cfg = config.semantic_cache;
+  if (!cfg?.enabled) return null;
+  if (!_shadowCache) _shadowCache = createShadowRecorder(cfg, { emit: siemHook });
+  return _shadowCache;
 }
 
 // ─── Build per-model limit map from YAML model_limits section ───
@@ -1997,9 +2011,10 @@ export const server = http.createServer(async (req, res) => {
     // ── Prompt classification (P3.5) — PASSIVE observability into SIEM ──
     // Label the request's intent/risk/jailbreak/injection and emit it. Pure
     // heuristic (no network, sub-10ms), fail-open, and it NEVER changes routing.
+    let classification = null;
     if (config.classification?.enabled && Array.isArray(parsedMessages)) {
       try {
-        const classification = classifyRequest(parsedMessages, {
+        classification = classifyRequest(parsedMessages, {
           classifier: config.classification.classifier,
         });
         siemHook(toSiemEvent(classification, {
@@ -2241,6 +2256,20 @@ export const server = http.createServer(async (req, res) => {
     res.once("close", onClientClose);
     if (res.destroyed) onClientClose();
     try {
+      // Semantic cache, SHADOW ONLY. Records whether a cached answer would have
+      // matched and throws that answer away. It cannot change what is served.
+      // Guarded on eligible() first so ineligible traffic never spends an embed.
+      const _sc = shadowCache(config);
+      const _scText = _sc && Array.isArray(parsedMessages)
+        ? parsedMessages.filter((m) => m?.role === "user")
+            .map((m) => (typeof m.content === "string" ? m.content : "")).join("\n").trim()
+        : "";
+      const _scCategory = classification?.category;
+      const _scEligible = Boolean(_sc && _scText && _sc.eligible(_scCategory));
+      if (_scEligible) {
+        await _sc.observe({ text: _scText, agent: metricsAgentId, category: _scCategory });
+      }
+
       result = await routeAndSend(
         router, routeRequest, routePath, req.method, req.headers, transformedBody, true, siemHook,
         upstreamAbort.signal,
@@ -2286,6 +2315,17 @@ export const server = http.createServer(async (req, res) => {
             res.end(JSON.stringify({ error: { message: "Response sanitization failed", code: 500 } }));
           }
           return;
+        }
+
+        if (_scEligible && result?.status === 200 && result?.body) {
+          try {
+            _sc.record({
+              text: _scText,
+              response: JSON.parse(result.body.toString("utf-8")),
+              agent: metricsAgentId,
+              category: _scCategory,
+            });
+          } catch { /* not JSON, nothing to cache; never break the response */ }
         }
       }
 
