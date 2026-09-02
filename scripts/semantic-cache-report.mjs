@@ -23,12 +23,21 @@ export function summarise(events) {
     if (Number.isFinite(e.embed_ms)) embedTimes.push(e.embed_ms);
   }
   embedTimes.sort((a, b) => a - b);
+  // Compute median to match p50() in src/proxy/router.mjs so the two latency
+  // figures in this system are comparable: even-length arrays average their
+  // two middle values (with rounding), odd-length arrays take the middle value.
+  const mid = Math.floor(embedTimes.length / 2);
+  const median = embedTimes.length === 0
+    ? null
+    : embedTimes.length % 2 === 0
+      ? Math.round((embedTimes[mid - 1] + embedTimes[mid]) / 2)
+      : embedTimes[mid];
   return {
     observed: shadow.length,
     wouldHit,
     // null, not 0: "no data" and "never hits" are different answers.
     hitRate: shadow.length ? wouldHit / shadow.length : null,
-    medianEmbedMs: embedTimes.length ? embedTimes[Math.floor(embedTimes.length / 2)] : null,
+    medianEmbedMs: median,
     byCategory,
   };
 }
