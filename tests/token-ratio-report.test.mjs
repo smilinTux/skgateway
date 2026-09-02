@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
-import { summariseRatios } from "../scripts/token-ratio-report.mjs";
+import { summariseRatios, MIN_CONFIDENT_SAMPLES } from "../scripts/token-ratio-report.mjs";
 
 describe("token ratio report", () => {
   test("medians per model, and the drift from the 4.0 assumption", () => {
@@ -21,6 +21,35 @@ describe("token ratio report", () => {
   test("a model with too few samples is marked, not reported as fact", () => {
     const s = summariseRatios([{ event: "token_ratio.sample", model: "c", bytes_per_token: 9 }]);
     assert.equal(s.models.c.confident, false, "one sample is not a measurement");
+  });
+
+  test(`confidence gate boundary: MIN_CONFIDENT_SAMPLES-1 (${MIN_CONFIDENT_SAMPLES - 1}) samples is not confident, MIN_CONFIDENT_SAMPLES (${MIN_CONFIDENT_SAMPLES}) is`, () => {
+    const belowEvents = [];
+    for (let i = 0; i < MIN_CONFIDENT_SAMPLES - 1; i++) {
+      belowEvents.push({ event: "token_ratio.sample", model: "below", bytes_per_token: 4 });
+    }
+    const atEvents = [];
+    for (let i = 0; i < MIN_CONFIDENT_SAMPLES; i++) {
+      atEvents.push({ event: "token_ratio.sample", model: "at", bytes_per_token: 4 });
+    }
+    const below = summariseRatios(belowEvents);
+    const at = summariseRatios(atEvents);
+    assert.equal(below.models.below.samples, MIN_CONFIDENT_SAMPLES - 1);
+    assert.equal(below.models.below.confident, false, `${MIN_CONFIDENT_SAMPLES - 1} samples must not be confident`);
+    assert.equal(at.models.at.samples, MIN_CONFIDENT_SAMPLES);
+    assert.equal(at.models.at.confident, true, `${MIN_CONFIDENT_SAMPLES} samples must be confident`);
+  });
+
+  test("an event with no model field produces no row and does not throw", () => {
+    assert.doesNotThrow(() => {
+      const s = summariseRatios([
+        { event: "token_ratio.sample", bytes_per_token: 4 },
+        { event: "token_ratio.sample", model: "", bytes_per_token: 4 },
+        { event: "token_ratio.sample", model: 42, bytes_per_token: 4 },
+        { event: "token_ratio.sample", model: "real", bytes_per_token: 4 },
+      ]);
+      assert.deepEqual(Object.keys(s.models), ["real"], "no phantom \"undefined\"/empty/non-string-model row");
+    });
   });
 
   test("median on even-length array matches router.mjs p50(): average of the two middle values", () => {

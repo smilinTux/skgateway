@@ -40,6 +40,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   traffic only, and since transport varies by caller and model
   (`auto_nonstream` config, the `x-skgateway-nonstream` force header), that
   unmeasured slice is not necessarily a random sample of all traffic.
+  Printed drift is shown to one decimal place (e.g. "+12.5%"), not rounded to
+  the nearest whole percent, since the report's entire purpose is surfacing
+  how far the real ratio sits from the assumed 4.0. A sample event with a
+  missing, empty, or non-string `model` field is skipped rather than
+  producing a phantom `"undefined"` row in the table.
 
 ### Changed
 

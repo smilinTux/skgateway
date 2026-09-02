@@ -20,7 +20,7 @@
 import { readFileSync } from "node:fs";
 
 const ASSUMED_BYTES_PER_TOKEN = 4;
-const MIN_CONFIDENT_SAMPLES = 30;
+export const MIN_CONFIDENT_SAMPLES = 30;
 
 /** @param {Array<object>} events */
 export function summariseRatios(events) {
@@ -36,6 +36,12 @@ export function summariseRatios(events) {
     }
     if (e?.event !== "token_ratio.sample") continue;
     if (!Number.isFinite(e.bytes_per_token)) continue;
+    // A line lacking model would otherwise key a row literally "undefined",
+    // which a human reads as a real model name. Our own emitter cannot
+    // produce this (sampleTokenRatio() returns null on an empty model), but
+    // audit.jsonl is appended by multiple writers, so defend against a
+    // malformed or foreign log line here too.
+    if (typeof e.model !== "string" || !e.model) continue;
     (byModel[e.model] ||= []).push(e.bytes_per_token);
   }
   const models = {};
@@ -80,7 +86,7 @@ function main() {
   } else {
     console.log("model                                samples  median  drift vs 4.0  confident");
     for (const [m, v] of modelEntries) {
-      const drift = `${v.driftFrom4 >= 0 ? "+" : ""}${(v.driftFrom4 * 100).toFixed(0)}%`;
+      const drift = `${v.driftFrom4 >= 0 ? "+" : ""}${(v.driftFrom4 * 100).toFixed(1)}%`;
       console.log(
         `  ${m.slice(0, 34).padEnd(34)}${String(v.samples).padStart(7)}` +
         `${v.median.toFixed(2).padStart(8)}${drift.padStart(14)}${(v.confident ? "yes" : "NO").padStart(11)}`,
