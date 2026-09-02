@@ -143,6 +143,53 @@ Start here (entry-point files):
 - `src/metrics/collector.mjs` - SQLite metrics (`createMetricsCollector`).
 - `src/integration.mjs` - file-based SKCapstone bridge (PubSub alerts + job tree).
 
+### Two upstream lanes: subscription and pool
+
+The backends above are not one homogeneous set. They fall into two lanes that are
+governed differently, per
+[`INFERENCE_FEDERATION_STANDARD.md`](https://github.com/smilinTux/sk-standards/blob/main/standards/INFERENCE_FEDERATION_STANDARD.md).
+Read the standard before wiring any cross-estate upstream; the summary here is a
+pointer, not a restatement.
+
+| | Subscription lane | Pool lane |
+|---|---|---|
+| Backends in `config/skgateway.yaml` | `nvidia`, `anthropic`, `openrouter` | `chiap08-qwen38`, `chiap01-qwen38`, `ollama`, `reg:ornith` |
+| Credentials | `api_key_env` / `credentials_path` (§6) | none, ever |
+| Scope | estate-private | may be federated to a peer estate |
+| Billed to | the estate holding the key | nobody |
+
+The operative rule is one-directional: **a gateway process reachable by a peer estate
+holds no paid credential.** Not a key, not a token, not an inherited environment
+variable. The failure it prevents is silent and expensive, a peer spending another
+estate's subscription with no per-estate accounting and no receipt, and the standard
+prefers a separate process per lane so that this is a deployment property rather than
+a promise made in a config file.
+
+Three consequences that land in this repo:
+
+- **Federation is peer to peer, not a central pool.** Each estate's gateway adds each
+  peer's gateway as an upstream and sets its own `priority` values, because "exhaust
+  my own GPU before spending a peer's" is a local policy decision. A shared pool
+  gateway takes that decision away from the estate that has to live with it.
+- **A peer's gateway is a bridge node** in the sense of
+  [`SITE_AND_HOST_NAMING_STANDARD.md`](https://github.com/smilinTux/sk-standards/blob/main/standards/SITE_AND_HOST_NAMING_STANDARD.md)
+  rules 16 to 19: user-owned, enumerated in the registry, carrying one
+  application-layer exchange (inference) and no general reachability into the estate
+  behind it. Cross-estate traffic is still authorized at the PEP; arriving on the
+  bridge interface authenticates the network, not the caller.
+- **Pool membership is static; availability is runtime.** Declare a member under
+  `backends:` and leave it declared. A box that is powered off, busy or unreachable is
+  the health and quarantine layer's problem, not a config edit, and changing the
+  backend set needs a full restart rather than a `SIGHUP` reload (§5, §6), so dynamic
+  membership would bounce the gateway for every consumer every time any contributor's
+  box changed state.
+
+`openrouter` is an aggregator and is therefore subscription-lane only, and it is
+currently `enabled: false`. Before enabling it, note that the standard treats
+free-tier eligibility as a **data class** question rather than a cost question: a
+cost-ranked ladder that knows nothing about the payload will eventually route agent
+memory or client work through a provider that reserves the right to train on it.
+
 ### Front-end / Exposure
 
 - **Tier:** `0 Direct`. No reverse proxy in front of it; clients hit the port directly.
@@ -172,6 +219,14 @@ though it were met. It is not.
 - What that leaves: any host on the physical LAN, and any device on the tailnet, can
   reach the proxy and the SOC dashboard directly. Treat both as sensitive. The dashboard
   in particular exposes agent activity and metrics with no auth of its own.
+
+**The tailnet is not the estate boundary.** An estate is one control plane (one
+`~/.skcapstone`), one Syncthing ring, one PGP trust root, one operator, per
+[`SITE_AND_HOST_NAMING_STANDARD.md`](https://github.com/smilinTux/sk-standards/blob/main/standards/SITE_AND_HOST_NAMING_STANDARD.md).
+The tailnet is transport, and it additionally carries a client tenant, so "reachable on
+the tailnet" is a strictly larger set than "inside this estate". Do not read a
+tailnet-scoped bind as an estate-scoped one, and re-read the two-lane rule above before
+letting any tailnet-reachable gateway process hold a paid API key.
 
 **To close the deviation** on a host that does not need LAN reach, set `server.bind` to
 the tailnet IP (or `127.0.0.1`), or pass `SKGATEWAY_BIND`, and restart. This SOP will
@@ -438,6 +493,10 @@ Secrets sourcing (never inline a live secret):
   committed file. `.env` is gitignored.
 - Anthropic uses `credentials_path` (default `~/.claude/.credentials.json`), read from
   disk, never copied into config.
+- **Paid credentials are subscription-lane only** (§2). A gateway process that a peer
+  estate can reach must not load `NVIDIA_API_KEY`, `OPENROUTER_API_KEY`, the Anthropic
+  `credentials_path`, or any other paid credential, including one inherited from the
+  environment of a parent unit.
 - Env-var overrides (e.g. `SKGATEWAY_CONFIG`, `SKGATEWAY_NVIDIA_KEY_ENV`) are documented
   in `src/config.mjs`.
 
