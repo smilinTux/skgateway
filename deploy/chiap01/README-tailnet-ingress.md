@@ -8,6 +8,10 @@ This deployment provides governed tailnet-only ingress for the qualified shared 
 
 **Estate-wide tailnet access is intended** for qualified shared non-Matter SKGateway (profile 6073417e). This ingress provides controlled, supervised access across the estate tailnet while preserving the exact loopback backend profile.
 
+"Estate-wide" here means the operator's own estate, one control plane and one trust root, per [`SITE_AND_HOST_NAMING_STANDARD.md`](https://github.com/smilinTux/sk-standards/blob/main/standards/SITE_AND_HOST_NAMING_STANDARD.md). The tailnet is transport, not the estate boundary, and it also carries a client tenant, so reachability on `tailscale0` is not by itself evidence that a caller is inside this estate. Cross-estate access is a separate decision and goes through a bridge node (rules 16 to 19 of that standard) plus the pool-lane rules in [`INFERENCE_FEDERATION_STANDARD.md`](https://github.com/smilinTux/sk-standards/blob/main/standards/INFERENCE_FEDERATION_STANDARD.md); it is not granted by this ingress.
+
+Hostnames below (`chiap01`, `chiap08`) are the real machines this deployment runs on. Under the naming standard those are legacy site prefixes carried as registry aliases: they keep resolving and a host that is never renamed is not out of compliance, so nothing here needs to move.
+
 ## Architecture
 
 ```

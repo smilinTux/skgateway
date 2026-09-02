@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Docs: SOP.md now states the subscription/pool lane split from
+  `INFERENCE_FEDERATION_STANDARD` (paid credentials are estate-private and never
+  reachable from a peer estate; pool membership is static config with availability
+  handled by health and quarantine; federation is peer to peer through bridge nodes,
+  not a central pool), and records that the tailnet is transport rather than the
+  estate boundary. `deploy/chiap01/README-tailnet-ingress.md` gets the same framing.
+  No hostname was renamed: `chiap08-qwen38`, `pooling.capacity_domains.chiap08-qwen38`
+  and every `chiap*` host reference are literal identifiers and statements about real
+  machines, and legacy site prefixes stay valid as registry aliases.
+
 - Removed `src/policy/engine.mjs` and `src/policy/ratelimit.mjs` (1,428 lines).
   Neither was imported by any file in `src/`, `tests/`, `bin/` or `scripts/`:
   the only references were their own docstring examples. `ARCHITECTURE.md`
