@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `scripts/semantic-cache-report.mjs` reads `semantic_cache.shadow` events out
+  of the SIEM sink and prints observed count, would-hit count, hit rate and
+  median embed latency, overall and per category. Reports "no data" rather than
+  a 0% hit rate when the cache has not run.
+
 ### Changed
 
 - Removed `src/policy/engine.mjs` and `src/policy/ratelimit.mjs` (1,428 lines).
