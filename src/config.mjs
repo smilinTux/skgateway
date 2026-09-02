@@ -492,6 +492,32 @@ function disableOrphanDiscoveryProviders(cfg) {
   }
 }
 
+/**
+ * Normalise the semantic-cache section. Always present, always OFF by default.
+ * `shadow` records what WOULD have been served and serves nothing; `serve`
+ * returns cached responses to clients. Shadow is the only default because the
+ * hit rate on this fleet has never been measured.
+ */
+function normalizeSemanticCache(raw = {}) {
+  const sc = raw && typeof raw === "object" ? raw : {};
+  const mode = sc.mode === "serve" ? "serve" : "shadow";
+  return {
+    enabled: sc.enabled === true,
+    mode,
+    threshold: Number.isFinite(sc.threshold) ? sc.threshold : 0.92,
+    ttl_seconds: Number.isFinite(sc.ttl_seconds) ? sc.ttl_seconds : 3600,
+    max_entries: Number.isFinite(sc.max_entries) ? sc.max_entries : 2000,
+    embed_url: typeof sc.embed_url === "string" && sc.embed_url
+      ? sc.embed_url : "http://192.168.0.100:11438/v1/embeddings",
+    embed_model: typeof sc.embed_model === "string" && sc.embed_model
+      ? sc.embed_model : "mxbai-embed-large",
+    embed_timeout_ms: Number.isFinite(sc.embed_timeout_ms) ? sc.embed_timeout_ms : 5000,
+    categories: Array.isArray(sc.categories) && sc.categories.length
+      ? sc.categories.filter((c) => typeof c === "string")
+      : ["administrative", "system", "data_query"],
+  };
+}
+
 // ─── env overrides ────────────────────────────────────────────────────────────
 
 /**
@@ -1149,6 +1175,7 @@ function _readAndBuild(filePath, silent) {
   }
 
   disableOrphanDiscoveryProviders(base);
+  base.semantic_cache = normalizeSemanticCache(base.semantic_cache);
   applyEnvOverrides(base);
   resolvePaths(base);
   validate(base, removedBackendIds);   // throws ConfigError on bad values

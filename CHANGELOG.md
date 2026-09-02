@@ -534,6 +534,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without `routing.match_enabled`, since only the latter populates
   `request.requirements`. Enabling sensitivity first yields a gate that looks
   enforced and enforces nothing.
+- A `semantic_cache` config section, disabled by default and defaulting to
+  `mode: shadow`. Shadow records whether a cached response would have matched
+  and serves nothing, because the hit rate on this fleet has never been
+  measured: the gateway logs no prompt text and no prompt hash, so it cannot be
+  computed from existing data.
 
 ## [0.6.0] - 2026-08-15
 
