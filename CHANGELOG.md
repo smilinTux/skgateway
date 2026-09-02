@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `sampleTokenRatio()` computes bytes-per-token from a backend's reported usage,
+  accepting both the OpenAI (`prompt_tokens`) and Anthropic (`input_tokens`)
+  spellings. Returns null rather than a fabricated ratio when there is nothing
+  to measure.
+
 - `scripts/semantic-cache-report.mjs` reads `semantic_cache.shadow` events out
   of the SIEM sink and prints observed count, would-hit count, hit rate and
   median embed latency, overall and per category. Reports "no data" rather than
