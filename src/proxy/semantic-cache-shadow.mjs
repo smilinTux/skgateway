@@ -50,7 +50,7 @@ export function createShadowRecorder(cfg, { emit, embed, store } = {}) {
      * cached response: shadow mode's guarantee lives on this line.
      * @returns {Promise<{hit: boolean, similarity: number, ms: number}>}
      */
-    async observe({ text, agent, category }) {
+    async observe({ text, agent, category } = {}) {
       const started = Date.now();
       try {
         counters.observed++;
@@ -83,7 +83,7 @@ export function createShadowRecorder(cfg, { emit, embed, store } = {}) {
     },
 
     /** Store a completed prompt/response so later prompts can match it. */
-    async record({ text, response, agent, category }) {
+    async record({ text, response, agent, category } = {}) {
       try {
         await engine.put(text, response, { agent, category });
       } catch (err) {

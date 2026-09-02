@@ -60,4 +60,33 @@ describe("shadow recorder", () => {
     const otherCat = await r.observe({ text, agent: "lumina", category: "system" });
     assert.equal(otherCat.hit, false, "a system answer must not serve an administrative query");
   });
+
+  test("observe() called with no argument fails open instead of throwing", async () => {
+    const r = createShadowRecorder(CFG, { emit: () => {}, embed: fakeEmbed });
+    await assert.doesNotReject(async () => {
+      const out = await r.observe();
+      assert.equal(out.hit, false);
+    });
+  });
+
+  test("record() called with no argument fails open instead of throwing", async () => {
+    const r = createShadowRecorder(CFG, { emit: () => {}, embed: fakeEmbed });
+    await assert.doesNotReject(async () => {
+      await r.record();
+    });
+  });
+
+  test("a store insert failure during record() is swallowed and reported", async () => {
+    const events = [];
+    const brokenStore = {
+      search: async () => [],
+      insert: async () => { throw new Error("disk full"); },
+    };
+    const r = createShadowRecorder(CFG, { emit: (e) => events.push(e), embed: fakeEmbed, store: brokenStore });
+    await assert.doesNotReject(async () => {
+      await r.record({ text: "y", response: { a: 1 }, agent: "lumina", category: "system" });
+    });
+    const errs = events.filter((e) => e.event === "semantic_cache.error" && e.phase === "record");
+    assert.equal(errs.length, 1);
+  });
 });
