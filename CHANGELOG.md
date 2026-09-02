@@ -64,6 +64,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An empty `tool_calls: []` from an upstream is no longer treated as malformed
+  tool evidence. The response contract rejected any completion whose message
+  carried a `tool_calls` key that was not a valid non-empty call list, so every
+  provider that always emits the key failed with 502
+  `invalid_upstream_tool_calls`. NVIDIA's OpenAI-compatible endpoint does
+  exactly that: a plain chat turn returns
+  `{content: "OK", tool_calls: [], finish_reason: "stop"}`, and the whole
+  backend was unusable. Both the streaming and non-streaming paths now read an
+  empty or null `tool_calls` as the absence of tool calls, which is what it
+  means. A response with neither content nor calls is still rejected, and now
+  reports the accurate `empty_upstream_response` rather than blaming tool
+  evidence.
+
 - Queue telemetry now preserves `provider_backoff` when every upstream returns
   402 and records cooldown-only requests as denied with zero inflight work.
 - Terminal request telemetry now preserves an already observed first-byte

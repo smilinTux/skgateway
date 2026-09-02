@@ -144,8 +144,16 @@ function collectChoiceEvidence(chunk, states, ids, stream) {
     states.set(choiceIndex, state);
 
     if (!hasToolEvent) continue;
+    // `tool_calls: []` (or null) is the normal OpenAI shape for "this turn made
+    // no tool calls". It is the ABSENCE of tool evidence, not broken evidence.
+    // Counting it as evidence-seen-but-invalid rejected every provider that
+    // always emits the key: NVIDIA's OpenAI-compatible endpoint returns
+    // {content: "OK", tool_calls: [], finish_reason: "stop"} on a plain chat
+    // turn, and every one of those became a 502.
+    if (output.tool_calls == null
+        || (Array.isArray(output.tool_calls) && output.tool_calls.length === 0)) continue;
     state.sawToolEvidence = true;
-    if (!Array.isArray(output.tool_calls) || output.tool_calls.length === 0) {
+    if (!Array.isArray(output.tool_calls)) {
       state.validToolEvidence = false;
       continue;
     }
@@ -376,8 +384,14 @@ export function enforceResponseContract(response, requestedModel) {
         const choices = Array.isArray(clean.choices) ? clean.choices : [];
         const malformedTools = choices.some((choice) => {
           const message = choice?.message;
-          return message && Object.hasOwn(message, "tool_calls")
-            && !hasValidNonStreamToolCalls(message.tool_calls);
+          if (!message || !Object.hasOwn(message, "tool_calls")) return false;
+          // Same rule as the streaming path: an empty or null tool_calls means
+          // no tool calls were made, which is valid. Only a present, non-empty,
+          // structurally wrong tool_calls is malformed evidence. The emptyChoice
+          // check below still rejects a response with neither content nor calls.
+          const calls = message.tool_calls;
+          if (calls == null || (Array.isArray(calls) && calls.length === 0)) return false;
+          return !hasValidNonStreamToolCalls(calls);
         });
         const emptyChoice = choices.length === 0 || choices.some((choice) => {
           const message = choice?.message;
