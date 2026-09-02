@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Removed `src/policy/engine.mjs` and `src/policy/ratelimit.mjs` (1,428 lines).
+  Neither was imported by any file in `src/`, `tests/`, `bin/` or `scripts/`:
+  the only references were their own docstring examples. `ARCHITECTURE.md`
+  nonetheless listed both as live components, giving `ratelimit.mjs` a
+  participant in the request-flow sequence diagram and describing a
+  "Token-bucket + sliding-window limiter" as if it ran. Anyone reading the docs
+  to answer "are we rate limited?" got yes; the answer was no. The docs now
+  match the code. `tests/router-rate-limit-failover.test.mjs` is unaffected: it
+  covers the router's 429 backoff in `core.mjs`, which is live and unchanged.
+
 - The sanitizer and model-limit stages are now wired into the live `/v1` path.
   `trimSystemMessages()`, `trimConversationHistory()` and `sanitizeResponse()`
   existed and were unit-tested but were never invoked by `index.mjs`, so the
