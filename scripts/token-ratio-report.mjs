@@ -41,12 +41,18 @@ export function summariseRatios(events) {
   const models = {};
   for (const [model, values] of Object.entries(byModel)) {
     values.sort((a, b) => a - b);
-    // Median must match p50() in src/proxy/router.mjs:708-715 so the two
-    // figures in this system are comparable: Math.floor(n/2) alone returns
-    // the upper-middle value on even-length input, not a true median.
+    // Median matches p50() in src/proxy/router.mjs:708-715 in ALGORITHM:
+    // average the two middle values on even-length input, rather than
+    // Math.floor(n/2) alone, which returns the upper-middle value, not a
+    // true median. It deliberately does NOT round like p50() does: p50()
+    // measures integer milliseconds, where rounding costs nothing, but this
+    // measures a small ratio (typically 3-5 bytes/token) where rounding to
+    // an integer swamps the drift this report exists to surface. Do not
+    // "restore consistency" with p50()'s rounding; that would reintroduce
+    // exactly the bug this comment is here to prevent.
     const mid = Math.floor(values.length / 2);
     const median = values.length % 2 === 0
-      ? Math.round((values[mid - 1] + values[mid]) / 2)
+      ? (values[mid - 1] + values[mid]) / 2
       : values[mid];
     models[model] = {
       samples: values.length,

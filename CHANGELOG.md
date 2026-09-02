@@ -29,14 +29,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `scripts/token-ratio-report.mjs` prints measured median bytes-per-token per
   model against the guard's 4.0 assumption, with a confidence marker so a model
   with a handful of samples is not read as a measurement. The median matches
-  `p50()` in `src/proxy/router.mjs` (average of the two middle values on
-  even-length input, not the upper-middle) so the two figures in this system
-  are comparable. It also counts `token_ratio.skipped` events by reason and
-  prints the total prominently: streaming (SSE) responses cannot be measured,
-  so the reported medians cover non-streaming traffic only, and since
-  transport varies by caller and model (`auto_nonstream` config, the
-  `x-skgateway-nonstream` force header), that unmeasured slice is not
-  necessarily a random sample of all traffic.
+  `p50()` in `src/proxy/router.mjs` in algorithm only (average the two middle
+  values on even-length input, not the upper-middle), and deliberately does
+  NOT round like `p50()` does: `p50()` measures integer milliseconds, where
+  rounding costs nothing, but this measures a small ratio (typically 3-5
+  bytes/token) where rounding to an integer would roughly double the reported
+  drift from 4.0 on even-length samples. It also counts `token_ratio.skipped`
+  events by reason and prints the total prominently: streaming (SSE)
+  responses cannot be measured, so the reported medians cover non-streaming
+  traffic only, and since transport varies by caller and model
+  (`auto_nonstream` config, the `x-skgateway-nonstream` force header), that
+  unmeasured slice is not necessarily a random sample of all traffic.
 
 ### Changed
 
