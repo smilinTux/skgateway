@@ -51,6 +51,7 @@ import { buildCapabilityCatalog } from "./ranking/catalog.mjs";
 import { REGISTRY_PATH } from "./proxy/registry.mjs";
 import { energyRowsFrom, energyHeaders } from "./metrics/energy.mjs";
 import { attributionHeaders } from "./metrics/attribution.mjs";
+import { sampleTokenRatio } from "./metrics/token-ratio.mjs";
 import { allBuckets, resolveBucket } from "./policy/buckets.mjs";
 import { loadRegistry, REGISTRY_PATH as _REGISTRY_PATH } from "./proxy/registry.mjs";
 import { policyFromRegistry } from "./policy/sensitivity.mjs";
@@ -2333,6 +2334,34 @@ export const server = http.createServer(async (req, res) => {
             });
           } catch { /* not JSON, nothing to cache; never break the response */ }
         }
+
+        // Measure bytes-per-token against what the backend actually reported, so
+        // the context guard's byte budget can eventually stop guessing at ~4.
+        // Sampling only: nothing here changes trimming, routing, response bytes,
+        // or status codes. Never throws.
+        //
+        // bodyBytes is transformedBody, NOT routeBody: transformedBody is what
+        // was actually sent to the backend after model-limit trimming (see
+        // ~line 2165), and the backend's reported prompt_tokens describes
+        // exactly that payload. Measuring the pre-trim routeBody against those
+        // tokens would overstate bytes-per-token on every trimmed request.
+        //
+        // model is read from the response body the backend named, NOT
+        // result.servedModel and NEVER parsedModel/the requested alias. Same
+        // reasoning as the modelServed comment below (~line 2490): the backend
+        // can answer a different model than the router dispatched or the
+        // caller requested, and a ratio filed under the requested alias would
+        // blend every model that alias resolves to. sampleTokenRatio() already
+        // returns null when neither name is present, so no fabrication risk.
+        try {
+          const _parsed = JSON.parse(result.body.toString("utf-8"));
+          const _sample = sampleTokenRatio({
+            model: (typeof _parsed?.model === "string" && _parsed.model) ? _parsed.model : result?.servedModel,
+            bodyBytes: transformedBody?.length ?? 0,
+            usage: _parsed?.usage,
+          });
+          if (_sample) siemHook({ ts: new Date().toISOString(), event: "token_ratio.sample", ..._sample });
+        } catch { /* a backend that reports no usage simply is not measured */ }
       }
 
       // The socket is already gone. routeAndSend has released the upstream

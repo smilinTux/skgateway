@@ -14,6 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   spellings. Returns null rather than a fabricated ratio when there is nothing
   to measure.
 
+- Every response that reports usage now emits a `token_ratio.sample` SIEM event
+  carrying the request's byte size and the backend's reported prompt tokens.
+  The context guard budgets by bytes using a hardcoded ~4 bytes-per-token
+  guess that nothing has ever checked; the request byte size was not recorded
+  anywhere, so the guess could not be verified. This measures it per model.
+  Sampling only, no trimming behaviour changes.
+
 - `scripts/semantic-cache-report.mjs` reads `semantic_cache.shadow` events out
   of the SIEM sink and prints observed count, would-hit count, hit rate and
   median embed latency, overall and per category. Reports "no data" rather than
