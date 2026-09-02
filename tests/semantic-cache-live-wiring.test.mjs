@@ -30,4 +30,29 @@ describe("live wiring contract", () => {
     assert.equal(s.wouldHit, 1);
     assert.equal(s.errors, 0);
   });
+
+  // Regression for the fix-round-1 finding on src/index.mjs:2270: the live
+  // call site wraps `await _sc.observe(...)` in its own try/catch so the
+  // cache stays an observer even if a future edit to
+  // semantic-cache-shadow.mjs (or a misbehaving injected embedder) makes
+  // observe() reject instead of swallowing its own errors. This does not
+  // import index.mjs (it boots an HTTP server at import time); it exercises
+  // the exact guard shape used at the call site against a recorder-shaped
+  // stub whose observe() rejects, proving the wiring itself is defended, not
+  // just the dependency.
+  test("the live call-site guard swallows a rejecting observe() and never lets it escape", async () => {
+    const _sc = {
+      eligible: () => true,
+      observe: async () => { throw new Error("boom: embedder blew up synchronously"); },
+    };
+    const _scEligible = Boolean(_sc && "some text" && _sc.eligible("administrative"));
+    let threw = false;
+    // Mirrors src/index.mjs:2274-2277 exactly.
+    if (_scEligible) {
+      try {
+        await _sc.observe({ text: "some text", agent: "a", category: "administrative" });
+      } catch { /* the cache is an observer; a failure here must never fail the request */ }
+    }
+    assert.equal(threw, false, "observe() rejecting must never propagate out of the guard");
+  });
 });

@@ -973,7 +973,11 @@ function siemHook(evt) {
 /**
  * One recorder for the process. Built lazily on first eligible request so a
  * disabled cache costs nothing at boot and an unreachable embedder cannot stop
- * the gateway starting.
+ * the gateway starting. A disabled→enabled config transition (e.g. via a
+ * SIGHUP reload that mutates the same config object) takes effect on the next
+ * eligible request, since _shadowCache is still null until then; but once
+ * built, later changes to threshold/categories/embed settings on an
+ * already-enabled cache are NOT picked up until process restart.
  */
 let _shadowCache = null;
 function shadowCache(config) {
@@ -2267,7 +2271,9 @@ export const server = http.createServer(async (req, res) => {
       const _scCategory = classification?.category;
       const _scEligible = Boolean(_sc && _scText && _sc.eligible(_scCategory));
       if (_scEligible) {
-        await _sc.observe({ text: _scText, agent: metricsAgentId, category: _scCategory });
+        try {
+          await _sc.observe({ text: _scText, agent: metricsAgentId, category: _scCategory });
+        } catch { /* the cache is an observer; a failure here must never fail the request */ }
       }
 
       result = await routeAndSend(
