@@ -539,6 +539,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and serves nothing, because the hit rate on this fleet has never been
   measured: the gateway logs no prompt text and no prompt hash, so it cannot be
   computed from existing data.
+- `src/proxy/semantic-cache-shadow.mjs`: the shadow recorder that composes the
+  stage-1 engine (`createSemanticCache` + `createMemoryStore` +
+  `createMxbaiEmbedder`) behind `eligible()/observe()/record()/stats()`. It
+  measures would-hits without ever handing the cached response back to its
+  caller, and every path is fail-open: an embedder outage is emitted as a
+  `semantic_cache.error` event and returned as a miss, never thrown into the
+  live request path.
 
 ## [0.6.0] - 2026-08-15
 
