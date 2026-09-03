@@ -7,7 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
+### Fixed
+
+- Request classifier input is bounded (8K head + 2K tail per message).
+  A single 420KB message drove catastrophic regex behavior in the heuristic
+  classifier and froze the entire gateway event loop, including unrelated
+  requests (reproduced on pristine main, live incident 2026-09-03).
+  Classification signals live at prompt head/tail; the bound changes no
+  classification outcome for real prompts.
+
 
 - `sampleTokenRatio()` computes bytes-per-token from a backend's reported usage,
   accepting both the OpenAI (`prompt_tokens`) and Anthropic (`input_tokens`)
