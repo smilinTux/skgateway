@@ -489,8 +489,21 @@ function truncateLargeToolResults(parsed) {
 export function trimConversationHistory(parsed, cfg) {
   if (!Array.isArray(parsed.messages) || parsed.messages.length < 6) return;
 
-  // Pass 1: truncate large tool results
-  truncateLargeToolResults(parsed);
+  // Pass 1: truncate large tool results - ONLY over budget. This used to run
+  // unconditionally for every 6+ message conversation, silently cutting tool
+  // results to 1500 chars even when the body was far under maxBodyBytes
+  // (found 2026-09-03: deterministic, so retries sent the same cut context).
+  const size = Buffer.byteLength(JSON.stringify(parsed), "utf-8");
+  if (size > cfg.maxBodyBytes) {
+    const bigTools = parsed.messages.filter(
+      (m) => (m.role === "tool" || m.role === "toolResult")
+        && typeof m.content === "string" && m.content.length > 1500,
+    ).length;
+    if (bigTools > 0) {
+      truncateLargeToolResults(parsed);
+      cfg.logger.log(`truncated ${bigTools} large tool result(s) to 1500 chars (body ${size} > ${cfg.maxBodyBytes})`);
+    }
+  }
 
   // Passes 2-5: delegate to the canonical history-trim algorithm in
   // sanitizer.mjs. Single source of truth — fixes to the trim/repair logic
