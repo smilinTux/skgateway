@@ -3502,17 +3502,22 @@ export async function routeAndSend(router, request, upstreamPath, method, client
   // True when some LATER candidate sits in a different capacity domain, i.e.
   // there is a genuinely different door to try. Candidates sharing a domain
   // are the same door and must not be treated as failover targets.
-  const hasDifferentDomainLater = (idx, backendId) => {
-    const dom = (bid) => {
-      try {
-        return pool?.getStats(bid)?.capacityDomain ?? null;
-      } catch {
-        return null;
-      }
-    };
-    const mine = dom(backendId);
-    return candidates.slice(idx + 1).some((c) => dom(c.backendId) !== mine);
+  const capacityDomainOf = (backendId) => {
+    try {
+      return pool?.getStats(backendId)?.capacityDomain ?? null;
+    } catch {
+      return null;
+    }
   };
+  const nextDifferentDomainIndex = (idx, backendId) => {
+    const mine = capacityDomainOf(backendId);
+    const offset = candidates
+      .slice(idx + 1)
+      .findIndex((candidate) => capacityDomainOf(candidate.backendId) !== mine);
+    return offset < 0 ? -1 : idx + offset + 1;
+  };
+  const hasDifferentDomainLater = (idx, backendId) =>
+    nextDifferentDomainIndex(idx, backendId) >= 0;
   // Every candidate that ended in a throttle (429/402), whether an actual
   // upstream response or a still-cooling-down door skipped without a
   // network call (card 9e28de88 fix #3/#6). Drives the attributable-429
@@ -3764,7 +3769,8 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         // lie, is worse than no telemetry: it makes admission failover look
         // like a 503 rate in every dashboard reading these events.
         // Terminal in the same sense: nowhere else to send it.
-        const admissionIsTerminal = !hasDifferentDomainLater(i, backendId);
+        const differentDomainIndex = nextDifferentDomainIndex(i, backendId);
+        const admissionIsTerminal = differentDomainIndex < 0;
 
         // ABORT RACE: FIXED BY REMOVING THE EMIT, NOT BY A GUARD.
         //
@@ -3898,7 +3904,11 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         }
         admissionRejection.admissionAttempts = admissionAttempts;
 
-        if (i < candidates.length - 1) {
+        if (!admissionIsTerminal) {
+          // Consecutive aliases in this capacity domain are the same physical
+          // door. Skip them so one rejection creates one attempt and the
+          // failover event names the door that actually refused admission.
+          candidates.splice(i + 1, differentDomainIndex - i - 1);
           console.warn(
             `[routeAndSend] admission ${code} on backend=${backendId} ` +
             `(domain=${capacityDomain}), trying next backend ` +

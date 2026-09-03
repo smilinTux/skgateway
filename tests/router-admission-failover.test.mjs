@@ -33,13 +33,13 @@ process.env.SKGATEWAY_MODEL_CATALOG_CACHE_PATH = join(FIX_DIR, "cache.json");
 const { createRouter, routeAndSend } = await import("../src/proxy/router.mjs");
 const { getPool, resetPool } = await import("../src/proxy/connection-pool.mjs");
 
-function startUpstream() {
+function startUpstream(status = 200) {
   let requestCount = 0;
   const server = http.createServer((req, res) => {
     requestCount++;
     req.on("data", () => {});
     req.on("end", () => {
-      res.writeHead(200, { "content-type": "application/json" });
+      res.writeHead(status, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true }));
     });
   });
@@ -137,6 +137,32 @@ describe("pool admission rejection is failover-eligible", () => {
     assert.equal(r.capacityDomain, "onlyDomain");
     const err = JSON.parse(r.body.toString()).error;
     assert.equal(err.retryable, true);
+  });
+
+  test("a terminal upstream error does not spray to another provider", async () => {
+    const terminal = await startUpstream(400);
+    try {
+      const modelId = `admission-terminal-upstream-${Date.now()}`;
+      const router = createRouter({
+        backends: {
+          terminal: { url: terminal.base, auth_type: "none", models: [modelId], priority: 1 },
+          idle: { url: idle.base, auth_type: "none", models: [modelId], priority: 2 },
+        },
+      });
+      const idleBefore = idle.requestCount;
+
+      const r = await routeAndSend(
+        router, { model: modelId, agentId: "test" },
+        "/chat/completions", "POST", HEADERS, bodyFor(modelId), true,
+      );
+
+      assert.equal(r.status, 400);
+      assert.equal(r.backendId, "terminal");
+      assert.equal(r.failover, false);
+      assert.equal(idle.requestCount, idleBefore, "terminal errors must not reach another provider");
+    } finally {
+      await terminal.close();
+    }
   });
 });
 
@@ -263,6 +289,70 @@ describe("non-blocking admission on every candidate but the last", () => {
     assert.equal(stats.queued, 0);
     assert.equal(stats.totalDeferred, 1);
     assert.equal(stats.totalDropped, 0);
+  });
+
+  test("same-domain aliases produce one terminal rejection, not a retry on the same door", async () => {
+    const modelId = `admission-same-domain-terminal-${Date.now()}`;
+    const pool = getPool({
+      capacityDomains: {
+        shared: { members: ["alias-a", "alias-b"], max: 1, maxQueue: 0, queueTimeoutMs: 1000 },
+      },
+    });
+    assert.ok(await pool.acquire("alias-a"));
+
+    const router = createRouter({
+      backends: {
+        "alias-a": { url: full.base, auth_type: "none", models: [modelId], priority: 1 },
+        "alias-b": { url: full.base, auth_type: "none", models: [modelId], priority: 2 },
+      },
+    });
+    const events = [];
+    const r = await routeAndSend(
+      router, { model: modelId, agentId: "test" },
+      "/chat/completions", "POST", HEADERS, bodyFor(modelId), true,
+      async (event) => events.push(event),
+    );
+
+    assert.equal(r.status, 503);
+    assert.equal(r.backendId, "alias-a");
+    assert.equal(r.admissionAttempts.length, 1);
+    assert.equal(pool.getStats("alias-a").totalDropped, 1);
+    assert.equal(
+      events.filter((event) => (event.event_type || event.type) === "response").length,
+      1,
+    );
+  });
+
+  test("same-domain aliases are skipped before failing over to a different door", async () => {
+    const modelId = `admission-same-domain-skip-${Date.now()}`;
+    const pool = getPool({
+      capacityDomains: {
+        shared: { members: ["alias-a", "alias-b"], max: 1, maxQueue: 24, queueTimeoutMs: 3000 },
+      },
+    });
+    assert.ok(await pool.acquire("alias-a"));
+
+    const router = createRouter({
+      backends: {
+        "alias-a": { url: full.base, auth_type: "none", models: [modelId], priority: 1 },
+        "alias-b": { url: full.base, auth_type: "none", models: [modelId], priority: 2 },
+        idle: { url: idle.base, auth_type: "none", models: [modelId], priority: 3 },
+      },
+    });
+    const events = [];
+    const r = await routeAndSend(
+      router, { model: modelId, agentId: "test" },
+      "/chat/completions", "POST", HEADERS, bodyFor(modelId), true,
+      async (event) => events.push(event),
+    );
+
+    assert.equal(r.status, 200);
+    assert.equal(r.backendId, "idle");
+    assert.equal(pool.getStats("alias-a").totalDeferred, 1);
+    const failovers = events.filter((event) => (event.event_type || event.type) === "failover");
+    assert.equal(failovers.length, 1);
+    assert.equal((failovers[0].details || failovers[0]).from_backend, "alias-a");
+    assert.equal((failovers[0].details || failovers[0]).to_backend, "idle");
   });
 });
 

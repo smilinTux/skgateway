@@ -110,6 +110,7 @@ describe("ConnectionPool capacity domains", () => {
       queueTimeoutMs: 12_000,
       totalProcessed: 0,
       totalDropped: 0,
+      totalDeferred: 0,
       totalTimedOut: 0,
       totalCancelled: 0,
       peakActive: 0,

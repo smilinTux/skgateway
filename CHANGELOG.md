@@ -111,6 +111,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   It now states failover truthfully and carries an explicit `terminal` flag.
 - **Bounded attempt attribution.** Refused doors are recorded on the rejection with
   an explicit cap, so capacity failover is visible in attribution.
+- **Shared-domain admission stays single-door.** Consecutive backend aliases in one
+  capacity domain now queue or reject once, then skip directly to the next distinct
+  domain instead of retrying the same physical pool and duplicating telemetry.
 - `getStats()` gains `totalDeferred`, deliberately separate from `totalDropped`: a
   deferral that fails over successfully is a served request, not a loss.
 
