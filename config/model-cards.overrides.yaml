@@ -601,13 +601,13 @@ overrides:
   # ── Context-window facts for other live NVIDIA models (from the 2026-07-15
   #    validated model_limits, kept honest; add dex fields as you verify them) ──
   qwen/qwen3.5-397b-a17b:
-    context_length: 131072
+    context_length: 262144
     tier: free-remote
   mistralai/mistral-medium-3.5-128b:
-    context_length: 131072
+    context_length: 262144
     tier: free-remote
   mistralai/mistral-large-3-675b-instruct-2512:
-    context_length: 131072
+    context_length: 262144
     tier: free-remote
     # Card N2: locked explicitly (matches the design doc's own 4.2 worked
     # example verbatim for this exact model), even though the heuristic
