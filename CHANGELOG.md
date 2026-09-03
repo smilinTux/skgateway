@@ -103,6 +103,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `sampleTokenRatio()` now counts the FULL prompt on Anthropic responses:
+  `input_tokens`/`prompt_tokens` plus `cache_read_input_tokens` plus
+  `cache_creation_input_tokens` when present, instead of `input_tokens`
+  alone. Anthropic reports `input_tokens` for only the uncached portion of
+  the prompt; on a heavily prompt-cached request (e.g. a 200 KB body with
+  190 KB cached) that undercounted the true prompt size by two orders of
+  magnitude, driving `bytes_per_token` to ~400 instead of ~4. Claude traffic
+  is overwhelmingly cache-hit, so the contaminated median would cross the
+  30-sample confidence gate and could drive a 100x mis-sizing of
+  `max_body_bytes` if used to retune the context guard. `toOpenAIResponse()`
+  in `src/proxy/anthropic-adapter.mjs` also now preserves
+  `cache_read_input_tokens` and `cache_creation_input_tokens` on the
+  translated OpenAI-shaped usage object (additive; `prompt_tokens` /
+  `completion_tokens` / `total_tokens` keep their existing meaning) instead
+  of silently dropping them, so the same contamination no longer arrives
+  undetectably under the `prompt_tokens` spelling.
+
+- The token-ratio sampling block in `src/index.mjs` (the
+  `token_ratio.sample`/`token_ratio.skipped` emission after response
+  sanitization) is now gated on `siemEnabled`. With SIEM disabled,
+  `siemHook()` already no-ops, but the block still ran
+  `result.body.toString("utf-8")` + `JSON.parse` on every 200 non-streaming
+  response and threw the result away — a synchronous parse that blocked the
+  event loop for all concurrent requests, and one that ran even for
+  cancelled/destroyed responses since it executed before the
+  `result?.cancelled || res.destroyed` check. It is now a no-op unless SIEM
+  is actually active.
+
+- SKGateway now warns once at startup when `semantic_cache.enabled` is true
+  but `classification.enabled` is false. The shadow cache categorizes
+  requests using the classifier's output (`_scCategory` in `src/index.mjs`),
+  so with classification off `eligible()` is always called with `undefined`
+  and always returns false: zero shadow events are recorded with no error
+  anywhere on the request path, and `scripts/semantic-cache-report.mjs`
+  could only report "No semantic_cache.shadow events. Is
+  semantic_cache.enabled true?", pointing at the wrong knob.
+
+- Documented (without changing) three known biases in the shadow cache key
+  built in `src/index.mjs`: the system prompt is excluded (only
+  `role === "user"` content is hashed), non-string/multimodal content maps
+  to `""`, and `createShadowRecorder()` passes no `maxChars` so
+  `embedders/mxbai.mjs` truncates at 1100 characters. All three make
+  distinct requests embed identically, inflating the measured would-hit
+  rate above what serving would ever achieve. `scripts/semantic-cache-report.mjs`
+  now prints a CAVEAT alongside the hit rate stating it is an upper bound,
+  mirroring the existing streaming caveat in `scripts/token-ratio-report.mjs`.
+  The key-building logic itself is left as-is; fixing it is a design
+  decision for whoever enables serving.
+
 - An empty `tool_calls: []` from an upstream is no longer treated as malformed
   tool evidence. The response contract rejected any completion whose message
   carried a `tool_calls` key that was not a valid non-empty call list, so every
@@ -196,8 +245,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deployed unit actually executes. Three different Node versions were resolvable
   on the deployment host (unit v20, shell v22, npm v26), which is what produced
   the ABI mismatch above.
-
-### Added
 
 - SKGateway now serves its own operator facet on the daemon's existing port:
   `GET /operator/v1/{healthz,readyz,explain,observe}` and a reserved

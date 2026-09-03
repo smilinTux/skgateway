@@ -6,6 +6,16 @@
  *
  * This is the whole point of shadow mode: turn "we do not know the hit rate"
  * into a number, so enabling `mode: serve` is arithmetic rather than a guess.
+ *
+ * IMPORTANT — the printed hit rate is an UPPER BOUND, not the rate serving
+ * would achieve: the shadow cache key (src/index.mjs, ~line 2268) covers
+ * user-role string content only, truncated to 1100 characters, and excludes
+ * the system prompt. Two requests that differ only in system prompt, in a
+ * non-string (multimodal) turn, or past the 1100-char truncation point
+ * embed identically and count as a would-hit even though a real cache would
+ * treat them as distinct. This report surfaces that caveat alongside the hit
+ * rate so a reader cannot mistake "measured shadow hit rate" for "hit rate
+ * serving would achieve".
  */
 import { readFileSync } from "node:fs";
 
@@ -64,6 +74,15 @@ function main() {
     const rate = ((v.wouldHit / v.observed) * 100).toFixed(1);
     console.log(`  ${c.padEnd(18)}${String(v.observed).padStart(8)}${String(v.wouldHit).padStart(11)}${(rate + "%").padStart(7)}`);
   }
+  console.log(
+    "\nCAVEAT: this hit rate is an UPPER BOUND. The cache key covers user-role\n" +
+    "string content only, truncated to 1100 characters, and excludes the\n" +
+    "system prompt. Requests that differ only in system prompt, in a\n" +
+    "non-string (multimodal) turn, or past the truncation point embed\n" +
+    "identically and count as a would-hit here even though serving would\n" +
+    "treat them as distinct. Actual hit rate under `mode: serve` will be\n" +
+    "at or below this number.",
+  );
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) main();

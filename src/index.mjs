@@ -2265,6 +2265,22 @@ export const server = http.createServer(async (req, res) => {
       // matched and throws that answer away. It cannot change what is served.
       // Guarded on eligible() first so ineligible traffic never spends an embed.
       const _sc = shadowCache(config);
+      // KNOWN BIASES — all three inflate the measured shadow hit rate above
+      // what serving would ever achieve, because they make distinct requests
+      // hash/embed identically. Deliberately left as-is here (fixing them is
+      // a design decision for whoever enables serving, not this shadow-only
+      // measurement pass); see the CAVEAT emitted alongside the hit rate in
+      // scripts/semantic-cache-report.mjs.
+      //   1. Only role==="user" content is included: the system prompt is
+      //      excluded from the key. Two requests with identical user text but
+      //      different system prompts embed identically and count as a
+      //      would-hit, even though namespacing (agent:category) does not
+      //      isolate them.
+      //   2. Non-string content (multimodal/array turns, e.g. images) maps to
+      //      "": two requests differing only by an image embed identically.
+      //   3. createShadowRecorder() below passes no maxChars, so
+      //      embedders/mxbai.mjs truncates at 1100 chars: two long
+      //      conversations sharing a prefix become the same vector.
       const _scText = _sc && Array.isArray(parsedMessages)
         ? parsedMessages.filter((m) => m?.role === "user")
             .map((m) => (typeof m.content === "string" ? m.content : "")).join("\n").trim()
@@ -2363,7 +2379,14 @@ export const server = http.createServer(async (req, res) => {
         // is countable and B-Task 3 can report "N measured, M skipped
         // (streaming)" rather than presenting an unrepresentative sample as
         // if it covered all traffic.
-        try {
+        //
+        // Gated on siemEnabled: with SIEM off, siemHook() no-ops at line 959
+        // anyway, so the JSON.parse below (and the streaming content-type
+        // check) would run on every 200 response purely to throw the result
+        // away. That parse is synchronous and blocks the event loop for
+        // every concurrent request; skip the work entirely rather than pay
+        // it for a sink that is not listening.
+        if (siemEnabled) try {
           if (result.headers?.["content-type"]?.includes("text/event-stream")) {
             siemHook({ ts: new Date().toISOString(), event: "token_ratio.skipped", reason: "streaming" });
           } else {
@@ -2593,6 +2616,20 @@ server.listen(port, bind, () => {
     const backendNames = Object.keys(config.backends || {});
     console.log("[skgateway] backends: " + (backendNames.join(", ") || "default"));
     console.log("[skgateway] metrics: " + (metrics ? "enabled" : "disabled"));
+    // Semantic cache (shadow mode) categorizes requests using the classifier's
+    // output (_scCategory, ~line 2272) and eligible() gates on that category.
+    // With classification off, classification is never assigned, _scCategory
+    // is always undefined, eligible(undefined) is always false, and the cache
+    // silently records zero events with no error anywhere on the request
+    // path. Warn once at startup so the operator finds the right knob instead
+    // of concluding semantic_cache.enabled itself is broken.
+    if (config.semantic_cache?.enabled && !config.classification?.enabled) {
+      console.warn(
+        "[skgateway] semantic_cache.enabled is true but classification.enabled is false: " +
+        "the semantic cache categorizes requests using the classifier's output, so with " +
+        "classification off it will record zero shadow events for every request.",
+      );
+    }
     if (dashboard) {
       const dashPort = config.dashboard?.port || config.server?.dashboard_port || 18781;
       console.log("[skgateway] dashboard: port " + dashPort);
