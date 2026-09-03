@@ -215,8 +215,50 @@ test("fromCodexResponse: stream client gets an OpenAI SSE byte stream", () => {
     .filter((l) => l.startsWith("data: ") && l !== "data: [DONE]")
     .map((l) => JSON.parse(l.slice(6)));
   assert.equal(chunks[0].choices[0].delta.role, "assistant");
-  assert.equal(chunks[chunks.length - 1].choices[0].finish_reason, "stop");
-  assert.deepEqual(chunks[chunks.length - 1].usage, { prompt_tokens: 11, completion_tokens: 5, total_tokens: 16 });
+  const finishChunk = chunks.find((c) => c.choices?.[0]?.finish_reason);
+  assert.equal(finishChunk.choices[0].finish_reason, "stop");
+  const usageChunk = chunks[chunks.length - 1];
+  assert.deepEqual(usageChunk.choices, [], "usage chunk must carry an empty choices array");
+  assert.deepEqual(usageChunk.usage, { prompt_tokens: 11, completion_tokens: 5, total_tokens: 16 });
+});
+
+test("fromCodexResponse: streamed tool_calls fragments carry a per-fragment index (card fc22572b follow-up)", () => {
+  // Regression, incident 2026-09-03: the stream branch emitted tool_calls
+  // fragments WITHOUT index, so the response contract rejected every
+  // streamed Codex tool call as invalid tool-call evidence (502).
+  const res = fromCodexResponse(
+    { status: 200, headers: {}, body: Buffer.from(TOOL_SSE) },
+    "gpt-5.6-sol",
+    true,
+  );
+  const text = res.body.toString("utf-8");
+  const chunks = text.split("\n\n")
+    .filter((l) => l.startsWith("data: ") && l !== "data: [DONE]")
+    .map((l) => JSON.parse(l.slice(6)));
+  const toolChunk = chunks.find((c) => Array.isArray(c.choices?.[0]?.delta?.tool_calls));
+  assert.ok(toolChunk, "a tool_calls delta chunk must exist");
+  for (const [i, fragment] of toolChunk.choices[0].delta.tool_calls.entries()) {
+    assert.equal(
+      fragment.index, i,
+      `stream tool_calls fragment ${i} must carry its integer index for the response contract`,
+    );
+    assert.equal(fragment.type, "function");
+    assert.ok(fragment.id, "fragment id preserved");
+    assert.ok(fragment.function?.name, "fragment function name preserved");
+  }
+});
+
+test("end to end: streamed Codex tool call passes the response contract (no 502)", async () => {
+  const { enforceResponseContract } = await import("../src/proxy/response-contract.mjs");
+  const res = enforceResponseContract(
+    fromCodexResponse(
+      { status: 200, headers: {}, body: Buffer.from(TOOL_SSE) },
+      "gpt-5.6-sol",
+      true,
+    ),
+    "gpt-5.6-sol",
+  );
+  assert.equal(res.status, 200, `contract must accept the streamed tool call, got ${res.status}: ${res.body?.toString("utf-8")?.slice(0, 200)}`);
 });
 
 test("fromCodexResponse: non-2xx FastAPI detail is reshaped into an OpenAI error, status preserved", () => {

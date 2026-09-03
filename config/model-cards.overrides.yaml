@@ -346,14 +346,79 @@ overrides:
   # those fields remain absent until independently verified. This prevents an
   # attractive but unsupported size claim from placing a model in an XL bucket.
   glm-4.5:       { display_name: "GLM-4.5",       org: Z.ai, tier: paid-cloud }
-  glm-4.5-air:   { display_name: "GLM-4.5 Air",   org: Z.ai, tier: paid-cloud }
-  glm-4.6:       { display_name: "GLM-4.6",       org: Z.ai, tier: paid-cloud }
-  glm-4.7:       { display_name: "GLM-4.7",       org: Z.ai, tier: paid-cloud }
+  glm-4.5-air:   { display_name: "GLM-4.5 Air",   org: Z.ai, tier: paid-cloud, size_class: S, notes: "light/fast z.ai lane" }
+  glm-4.6:       { display_name: "GLM-4.6",       org: Z.ai, tier: paid-cloud, size_class: M, context_length: 200000, supported_parameters: [tools, tool_choice, reasoning], reasoning: true, notes: "fleet GLM S/M workhorse; account ceiling 10 concurrent" }
+  glm-4.7:       { display_name: "GLM-4.7",       org: Z.ai, tier: paid-cloud, size_class: L, context_length: 200000, supported_parameters: [tools, tool_choice, reasoning], reasoning: true, notes: "fleet GLM L level" }
   glm-5:         { display_name: "GLM-5",         org: Z.ai, tier: paid-cloud }
   glm-5-turbo:   { display_name: "GLM-5 Turbo",   org: Z.ai, tier: paid-cloud }
   glm-5.1:       { display_name: "GLM-5.1",       org: Z.ai, tier: paid-cloud }
   glm-5.2:       { display_name: "GLM-5.2",       org: Z.ai, tier: paid-cloud }
-  glm-5.3:       { display_name: "GLM-5.3",       org: Z.ai, tier: paid-cloud }
+  glm-5.3:       { display_name: "GLM-5.3",       org: Z.ai, tier: paid-cloud, size_class: XL, context_length: 200000, supported_parameters: [tools, tool_choice, reasoning], reasoning: true, notes: "fleet GLM XL level" }
+  glm-5.3-flash: { display_name: "GLM-5.3 Flash", org: Z.ai, tier: paid-cloud, size_class: S, notes: "fast z.ai lane; size left S pending measurement" }
+
+  # ───────────── KIMI CODE SUBSCRIPTION (kimi_oauth backend, 2026-09-03) ──────
+  # Ranked by capability and account family structure. Concurrency ceilings
+  # measured 2026-09-03 by stepped burst ramp: coding family 30, k3 family 16.
+  kimi-for-coding:
+    display_name: "Kimi K2.7 Coding"
+    org: Moonshot AI
+    summary: "Subscription coding workhorse of the Kimi Code plan."
+    good_at: [agentic coding, tool use]
+    context_length: 262144
+    supported_parameters: [tools, tool_choice, reasoning]
+    modality: "text+image->text"
+    tier: paid-cloud
+    speed: "standard coding lane; family ceiling 30 concurrent"
+    license: proprietary
+    size_class: M
+    latency_class: interactive
+    reasoning: true
+    notes: "kimi_oauth subscription. Emits reasoning_content interleaved; thinking-type only per /v1/models. Gateway cap 28."
+
+  kimi-for-coding-highspeed:
+    display_name: "Kimi K2.7 Coding Highspeed"
+    org: Moonshot AI
+    summary: "Fast lane of the Kimi coding subscription."
+    good_at: [quick edits, boilerplate, high-volume small tasks]
+    context_length: 262144
+    supported_parameters: [tools, tool_choice, reasoning]
+    modality: "text+image->text"
+    tier: paid-cloud
+    speed: "fastest in-plan; same 30-concurrent family ceiling"
+    license: proprietary
+    size_class: S
+    latency_class: interactive
+    reasoning: true
+
+  k3-256k:
+    display_name: "Kimi K3 256K"
+    org: Moonshot AI
+    summary: "K3 reasoning tier at 256K context."
+    good_at: [deep reasoning, long-context analysis, tool use]
+    context_length: 262144
+    supported_parameters: [tools, tool_choice, reasoning]
+    modality: "text+image->text"
+    tier: paid-cloud
+    license: proprietary
+    size_class: L
+    latency_class: interactive
+    reasoning: true
+    notes: "k3 family ceiling 16 concurrent; gateway cap 14."
+
+  k3:
+    display_name: "Kimi K3"
+    org: Moonshot AI
+    summary: "Flagship K3 reasoning model, 1M context."
+    good_at: [hardest reasoning, very-long-context synthesis, agentic coding]
+    context_length: 1048576
+    supported_parameters: [tools, tool_choice, reasoning]
+    modality: "text+image->text"
+    tier: paid-cloud
+    license: proprietary
+    size_class: XL
+    latency_class: interactive
+    reasoning: true
+    notes: "Fleet XL overflow target. k3 family ceiling 16 concurrent; gateway cap 14."
 
   # ──────────────────────── OUR ORNITH FLEET (local, sovereign) ───────────────
   # DeepReinforce Ornith 1.0, self-hosted on our own GPUs. Cloud-free, private.
