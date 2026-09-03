@@ -7,7 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
+### Fixed
+
+- Request classifier input is bounded (8K head + 2K tail per message).
+  A single 420KB message drove catastrophic regex behavior in the heuristic
+  classifier and froze the entire gateway event loop, including unrelated
+  requests (reproduced on pristine main, live incident 2026-09-03).
+  Classification signals live at prompt head/tail; the bound changes no
+  classification outcome for real prompts.
+
 
 - `kimi_oauth` backend auth type: Kimi Code subscription through SKGateway,
   read-only credential file contract like codex_oauth (mtime re-read, never
