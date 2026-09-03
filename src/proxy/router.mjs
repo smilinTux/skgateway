@@ -799,6 +799,14 @@ export class Backend {
     this._zaiAuth = null;
     this._zaiAuthMtime = -1;
     this._zaiAuthPath = this._credentials_file;
+    // Kimi Code subscription auth follows the same read-only file contract:
+    // the kimi CLI owns OAuth refresh and writes
+    // ~/.kimi-code/credentials/<env>.json. Access tokens are short lived
+    // (observed 900s), so a keepalive timer runs the CLI on the gateway
+    // host and this gateway re-reads the file on mtime change only.
+    this._kimiAuth = null;
+    this._kimiAuthMtime = -1;
+    this._kimiAuthPath = this._credentials_file;
 
     // Agent-level restrictions — set of agent IDs allowed to use this backend.
     // Empty set = no restrictions.
@@ -1182,6 +1190,23 @@ export class Backend {
         return headers;
       }
 
+      case "kimi_oauth": {
+        // Kimi Code subscription auth: bearer access token read read-only
+        // from the kimi CLI credentials file. The CLI on the gateway host
+        // owns refresh (tokens live ~15 minutes; a keepalive timer drives
+        // it), so this gateway never refreshes and never writes the file.
+        const headers = this._getKimiAuthHeaders();
+        if (!headers) {
+          console.warn(
+            `[router] backend=${this.id} kimi_oauth auth but no usable credentials at ` +
+              `${this._kimiAuthPath || "(no credentials_path/file set)"}. ` +
+              `Sending UNAUTHENTICATED (expect 401). Sync kimi CLI credentials there.`,
+          );
+          return {};
+        }
+        return headers;
+      }
+
       case "none":
       default:
         return {};
@@ -1257,6 +1282,38 @@ export class Backend {
     } catch (err) {
       console.error(
         `[router] backend=${this.id} failed to load codex credentials ${this._codexAuthPath}: ${err.message}`,
+      );
+      return null;
+    }
+  }
+
+  /**
+   * Return the z.ai subscription auth headers, re-reading the ZCode
+   * credentials file when its mtime changes. Never writes or refreshes.
+   *
+   * @returns {Record<string, string>|null}
+   */
+  _getKimiAuthHeaders() {
+    if (!this._kimiAuthPath) return null;
+    try {
+      const filePath = this._kimiAuthPath.replace(/^~/, process.env.HOME || "");
+      const mtime = statSync(filePath).mtimeMs;
+      if (!this._kimiAuth || mtime !== this._kimiAuthMtime) {
+        const raw = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+        const accessToken = raw && (raw.access_token || raw.accessToken);
+        if (!accessToken) {
+          console.warn(
+            `[router] backend=${this.id} kimi credentials file has no access token: ${filePath}`,
+          );
+          return null;
+        }
+        this._kimiAuth = { authorization: `Bearer ${accessToken}` };
+        this._kimiAuthMtime = mtime;
+      }
+      return this._kimiAuth;
+    } catch (err) {
+      console.error(
+        `[router] backend=${this.id} failed to load kimi credentials ${this._kimiAuthPath}: ${err.message}`,
       );
       return null;
     }
