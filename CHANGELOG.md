@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `kimi_oauth` backend auth type: Kimi Code subscription through SKGateway,
+  read-only credential file contract like codex_oauth (mtime re-read, never
+  refreshes, never writes; a keepalive timer drives the CLI on the gateway
+  host). Backend config validation accepts kimi_oauth and requires
+  credentials_path.
+- Kimi backend split into two capacity domains over one subscription: the
+  coding family (kimi-for-coding, kimi-for-coding-highspeed, account ceiling
+  30, gateway cap 28) and the k3 family (k3, k3-256k, ceiling 16, cap 14),
+  measured by stepped burst ramp.
+- Opt-in provider purity: a backend may set `provider_purity: true`; a model
+  id it declares fails closed with 503 model_owner_backend_down while every
+  declaring backend is in transient error-cooldown, instead of spraying to
+  unrelated providers. Terminal lifecycle verdicts, claim-quarantined
+  declarers, and total outages keep the historic behavior (card fc22572b).
+
+### Fixed
+
+- Streamed Codex tool calls: delta.tool_calls fragments now carry the
+  per-fragment integer index, and the usage tail is its own choices-empty
+  chunk per the canonical OpenAI shape; both violations 502'd every streamed
+  Codex completion through the response contract.
+- Model cards: kimi models ranked and scoped into bucket classes (highspeed
+  S, kimi-for-coding M, k3-256k L, k3 XL at 1M context) and the routed GLM
+  ladder given matching classes instead of all-S defaults.
+
+
 - `sampleTokenRatio()` computes bytes-per-token from a backend's reported usage,
   accepting both the OpenAI (`prompt_tokens`) and Anthropic (`input_tokens`)
   spellings. Returns null rather than a fabricated ratio when there is nothing
