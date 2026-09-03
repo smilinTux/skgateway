@@ -447,12 +447,10 @@ overrides:
 
   # qwen38 = one canonical Huihui Qwen3.8 27B abliterated Q4_K_M model served
   # by independent replicas on chiap01 :18810 and chiap08 :11439. Registry
-  # backend `qwen38` currently materializes through chiap08. Both servers report
-  # the full Huihui id. The
-  # former UD-Q5 id, short id, and qwen38-abliterated are compatibility request
-  # aliases; llama.cpp serves all four name-agnostically from the same loaded
-  # Huihui weights. Every card below therefore describes the ACTUAL Q4_K_M
-  # served model rather than inferring model identity from the requested alias.
+  # backend `qwen38` currently materializes through chiap08. chiap01 reports
+  # only the canonical id. chiap08 also reports qwen3.8-chiap08 and
+  # qwen3.8-vllm. The former UD-Q5, short, and qwen38-abliterated cards remain
+  # provider metadata but are not local backend claims.
   # It has the same <think>-starvation trait as the Ornith models above
   # (registry.yaml backends.qwen38.min_output_tokens: 8192).
   qwen3.8-27b-huihui-abliterated-q4_k_m:
@@ -474,12 +472,54 @@ overrides:
     latency_class: interactive
     reasoning: true
     min_output_tokens: 8192
-    notes: "Canonical served id for chiap01-qwen38 and chiap08-qwen38. Compatibility ids below are request aliases, never replicas or capacity domains. context_length is the strongest replica (chiap08 vLLM --max-model-len 131072); chiap01 llama.cpp serves 32768 and is enforced per door by backend context_limit preflight, card 9ed4a9f7."
+    notes: "Canonical served id for chiap01-qwen38 and chiap08-qwen38. context_length is the strongest replica (chiap08 vLLM --max-model-len 131072); chiap01 llama.cpp serves 32768 and is enforced per door by backend context_limit preflight, card 9ed4a9f7."
+
+  qwen3.8-chiap08:
+    display_name: "Huihui Qwen3.8 27B (chiap08 upstream id)"
+    org: "Huihui AI / Qwen (self-hosted)"
+    summary: "Exact model id reported and served by the chiap08 vLLM upstream."
+    good_at: [reasoning, coding, tool use, vision, uncensored/creative text, sovereign/private work]
+    context_length: 131072
+    max_output_tokens: 16384
+    supported_parameters: [tools, tool_choice, reasoning]
+    modality: "text+image->text"
+    vision: true
+    params: "27B"
+    quant: "Q4_K_M"
+    tier: local
+    speed: "fast"
+    params_b: 27
+    size_class: L
+    latency_class: interactive
+    reasoning: true
+    min_output_tokens: 8192
+    notes: "Exact chiap08 upstream id. The gateway forwards it unchanged."
+
+  qwen3.8-vllm:
+    display_name: "Huihui Qwen3.8 27B (vLLM upstream id)"
+    org: "Huihui AI / Qwen (self-hosted)"
+    summary: "Exact model id reported and served by the chiap08 vLLM upstream."
+    good_at: [reasoning, coding, tool use, vision, uncensored/creative text, sovereign/private work]
+    context_length: 131072
+    max_output_tokens: 16384
+    supported_parameters: [tools, tool_choice, reasoning]
+    modality: "text+image->text"
+    vision: true
+    params: "27B"
+    quant: "Q4_K_M"
+    tier: local
+    speed: "fast"
+    params_b: 27
+    size_class: L
+    latency_class: interactive
+    reasoning: true
+    min_output_tokens: 8192
+    notes: "Exact chiap08 upstream id. The gateway forwards it unchanged."
 
   qwen3.8-27b-ud-q5_k_xl:
     display_name: "Huihui Qwen3.8 27B (legacy UD-Q5 request alias)"
     org: "Huihui AI / Qwen (self-hosted)"
-    summary: "Pre-cutover request alias; both physical replicas serve the canonical Huihui abliterated Q4_K_M model."
+    summary: "Legacy provider metadata; neither local Qwen backend claims this id."
     good_at: [reasoning, coding, tool use, vision, uncensored/creative text, sovereign/private work]
     context_length: 131072
     max_output_tokens: 16384
@@ -495,12 +535,12 @@ overrides:
     latency_class: interactive
     reasoning: true
     min_output_tokens: 8192
-    notes: "Alias only: response.model is qwen3.8-27b-huihui-abliterated-q4_k_m. Do not treat this id as evidence that UD-Q5 weights are loaded."
+    notes: "Not a local backend claim. Do not treat this id as evidence that UD-Q5 weights are loaded."
 
   qwen3.8-27b:
     display_name: "Qwen3.8 27B (short alias)"
     org: "Huihui AI / Qwen (self-hosted)"
-    summary: "Short request alias for the canonical Huihui abliterated Q4_K_M model."
+    summary: "Legacy provider metadata; neither local Qwen backend claims this id."
     good_at: [reasoning, coding, tool use, vision, uncensored/creative text, sovereign/private work]
     context_length: 131072
     max_output_tokens: 16384
@@ -516,12 +556,12 @@ overrides:
     latency_class: interactive
     reasoning: true
     min_output_tokens: 8192
-    notes: "Alias only: response.model is qwen3.8-27b-huihui-abliterated-q4_k_m."
+    notes: "Not a local backend claim."
 
   qwen38-abliterated:
     display_name: "Huihui Qwen3.8 27B (qwen38-abliterated alias)"
     org: "Huihui AI / Qwen (self-hosted)"
-    summary: "Custom request alias claimed by both physical replicas; serves the canonical Huihui Q4_K_M model."
+    summary: "Legacy provider metadata; neither local Qwen backend claims this id."
     good_at: [reasoning, coding, tool use, vision, uncensored/creative text, sovereign/private work]
     context_length: 131072
     max_output_tokens: 16384
@@ -537,7 +577,7 @@ overrides:
     latency_class: interactive
     reasoning: true
     min_output_tokens: 8192
-    notes: "Alias only and locally claimed; foreign provider lifecycle verdicts cannot retire it while chiap08-qwen38 serves it."
+    notes: "Not a local backend claim."
 
   # ───────────────────────── OUR VISION MODEL (local) ─────────────────────────
   qwen3.6-27b-abliterated:

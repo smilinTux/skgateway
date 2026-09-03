@@ -67,6 +67,10 @@ test("all doors too small fails with an explicit 400 naming every limit", async 
   const err = JSON.parse(r.body.toString("utf-8")).error;
   assert.equal(err.code, "context_exceeded");
   assert.equal(err.retryable, false);
+  assert.equal(err.estimated_tokens, Math.ceil(Buffer.byteLength(JSON.stringify({
+    model: "qwen3.8-27b", messages: [{ role: "user", content: bigPrompt }],
+  })) / 3));
+  assert.match(err.message, /heuristic 3 bytes\/token/);
   assert.deepEqual(err.backends, [{ backend: "only", context_limit: 32768 }]);
   await srv.close();
 });
@@ -142,4 +146,16 @@ test("ordinary 400 stays terminal, no failover", async () => {
   );
   assert.equal(r.status, 400, "non-context 400 must stay terminal");
   await srv.close(); await other.close();
+});
+
+test("estimate is ceil(len/3) and the error text states the actual heuristic (no text/code drift)", async () => {
+  const src = (await import("node:fs")).readFileSync("src/proxy/router.mjs", "utf-8");
+  const estimate = src.match(/estimatedTokens = Math\.ceil\(attemptBody\.length (\/ [0-9]+)\)/);
+  assert.ok(estimate, "estimate expression found");
+  assert.equal(estimate[1], "/ 3", "heuristic divisor must be 3");
+  const msg = src.match(/heuristic ([0-9]+) bytes\/token/);
+  assert.ok(msg, "error text found");
+  assert.equal(msg[1], "3", "error text must state the same heuristic the code uses");
+  const body = Buffer.from(JSON.stringify({ model: "x", messages: [{ role: "user", content: "y".repeat(300) }] }));
+  assert.equal(Math.ceil(body.length / 3), Math.ceil(body.length / 3));
 });

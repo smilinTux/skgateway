@@ -3324,7 +3324,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // capable replica, instead of sending and letting the engine truncate or
     // error. Never silently truncate: if every door is too small the request
     // fails with an explicit 400 naming each limit. The estimate is a
-    // documented heuristic (~4 bytes per token for JSON chat payloads),
+    // documented heuristic (~3 bytes per token for JSON chat payloads),
     // deliberately coarse because it gates only obvious overflows.
     if (backend && Number.isFinite(backend.context_limit) && backend.context_limit > 0) {
       // ponytail: /3 heuristic over-estimates plain text ~25 percent; measured
@@ -4104,7 +4104,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       error: {
         message: `prompt exceeds every candidate backend context limit: `
           + contextRejections.map((r) => `${r.backendId}=${r.context_limit}`).join(", ")
-          + ` (estimated ${contextRejections[0].estimatedTokens} tokens, heuristic 4 bytes/token)`,
+          + ` (estimated ${contextRejections[0].estimatedTokens} tokens, heuristic 3 bytes/token)`,
         code: "context_exceeded",
         type: "invalid_request_error",
         estimated_tokens: contextRejections[0].estimatedTokens,

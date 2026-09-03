@@ -16,11 +16,10 @@ import { load as loadYaml } from 'js-yaml';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const SERVED_ID = 'qwen3.8-27b-huihui-abliterated-q4_k_m';
-const MODEL_IDS = [
+const CHIAP08_MODEL_IDS = [
   SERVED_ID,
-  'qwen3.8-27b-ud-q5_k_xl',
-  'qwen3.8-27b',
-  'qwen38-abliterated',
+  'qwen3.8-chiap08',
+  'qwen3.8-vllm',
 ];
 
 const config = loadYaml(readFileSync(join(ROOT, 'config/skgateway.yaml'), 'utf8'));
@@ -28,36 +27,34 @@ const cards = loadYaml(
   readFileSync(join(ROOT, 'config/model-cards.overrides.yaml'), 'utf8'),
 ).overrides;
 
-test('both Qwen3.8 replicas claim the same canonical id and compatibility aliases', () => {
+test('each Qwen3.8 backend claims exactly the ids its upstream serves', () => {
   const chiap01 = config.backends['chiap01-qwen38'];
   const chiap08 = config.backends['chiap08-qwen38'];
 
   assert.equal(chiap01.url, 'http://chiap01:18810/v1');
   assert.equal(chiap08.url, 'http://TAILNET_HOST:11439/v1');
+  assert.deepEqual(chiap01.models, [SERVED_ID]);
+  assert.deepEqual(chiap08.models, CHIAP08_MODEL_IDS);
+  assert.equal(chiap01.context_limit, 32768);
+  assert.equal(chiap08.context_limit, 131072);
   for (const backend of [chiap01, chiap08]) {
     assert.equal(backend.auth_type, 'none');
     assert.equal(backend.priority, 3);
-    assert.deepEqual(backend.models, MODEL_IDS);
   }
-  assert.equal(
-    new Set([...chiap01.models, ...chiap08.models]).size,
-    MODEL_IDS.length,
-    'a replica must not create a fifth request alias',
-  );
 });
 
 test('the replicas retain separate bounded capacity domains', () => {
   assert.deepEqual(config.pooling.capacity_domains['chiap08-qwen38'], {
     members: ['chiap08-qwen38', 'reg:qwen38'],
-    max: 3,
-    maxQueue: 8,
-    queueTimeoutMs: 30_000,
+    max: 2,
+    maxQueue: 2,
+    queueTimeoutMs: 10_000,
   });
   assert.deepEqual(config.pooling.capacity_domains['chiap01-qwen38'], {
     members: ['chiap01-qwen38'],
-    max: 2,
-    maxQueue: 4,
-    queueTimeoutMs: 30_000,
+    max: 1,
+    maxQueue: 1,
+    queueTimeoutMs: 10_000,
   });
 });
 
@@ -76,8 +73,8 @@ test('either physical replica can route the canonical logical model', async () =
   ]);
 });
 
-test('every qwen38 id has the same bounded context and truthful served-model card', () => {
-  for (const id of MODEL_IDS) {
+test('every locally served qwen38 id has the same bounded context and truthful served-model card', () => {
+  for (const id of CHIAP08_MODEL_IDS) {
     assert.deepEqual(
       config.model_limits[id],
       { max_body_bytes: 800000, max_system_bytes: 320000 },
@@ -91,6 +88,7 @@ test('every qwen38 id has the same bounded context and truthful served-model car
     assert.equal(cards[id].reasoning, true);
   }
   assert.match(cards[SERVED_ID].display_name, /Huihui/);
-  assert.match(cards['qwen3.8-27b-ud-q5_k_xl'].notes, new RegExp(SERVED_ID));
-  assert.match(cards['qwen38-abliterated'].notes, /locally claimed/);
+  assert.match(cards['qwen3.8-chiap08'].notes, /forwards it unchanged/);
+  assert.match(cards['qwen3.8-vllm'].notes, /forwards it unchanged/);
+  assert.match(cards['qwen38-abliterated'].notes, /Not a local backend claim/);
 });

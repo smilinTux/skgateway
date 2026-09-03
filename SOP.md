@@ -457,20 +457,20 @@ in-repo `config/skgateway.yaml` is the pre-migration fallback and is almost cert
 - Local aliases are declarations by their local backend. A foreign provider catalog
   cannot retire them: probes exclude ids declared elsewhere, completion EOL evidence is
   claimer-aware, and routing/catalog visibility both use `isEffectivelyRoutable()`.
-  Thus NVIDIA's lack of `qwen38-abliterated` is not evidence that chiap08's local alias
-  is EOL. Backend reachability is still a separate prerequisite.
-- `chiap08-qwen38` serves
-  `qwen3.8-27b-huihui-abliterated-q4_k_m`. The ids
-  `qwen3.8-27b-ud-q5_k_xl`, `qwen3.8-27b`, and `qwen38-abliterated` are request
-  aliases for those same Huihui Q4_K_M weights; the former UD-Q5 id does not prove
-  that the old quant is loaded. The checked-in fallback config must declare the exact
-  served id first, and every id must have the same model limit plus a truthful Q4_K_M
-  model card. Run `node --test --import ./tests/_setup.mjs
-  tests/qwen38-source-config.test.mjs` after changing this backend.
+  Backend reachability is still a separate prerequisite.
+- `chiap01-qwen38` serves only
+  `qwen3.8-27b-huihui-abliterated-q4_k_m`. `chiap08-qwen38` serves that id plus
+  `qwen3.8-chiap08` and `qwen3.8-vllm`. The gateway forwards each exact request id
+  unchanged. The checked-in fallback config must match the upstream model lists and
+  every served id must have the same model limit plus a truthful Q4_K_M model card.
+  Run `node --test --import ./tests/_setup.mjs tests/qwen38-source-config.test.mjs`
+  after changing either backend.
 - The direct `chiap08-qwen38` route and registry materialization `reg:qwen38`
-  address the same four-slot llama.cpp service, so they MUST remain members of
+  address the same two-slot vLLM service, so they MUST remain members of
   the single `pooling.capacity_domains.chiap08-qwen38` admission domain. Its
-  qualified limits are `max: 4`, `maxQueue: 4`, and `queueTimeoutMs: 30000`.
+  qualified limits are `max: 2`, `maxQueue: 2`, and `queueTimeoutMs: 10000`.
+  The independent chiap01 domain is `max: 1`, `maxQueue: 1`, and
+  `queueTimeoutMs: 10000`.
   `maxQueue: 0` means fail fast, never an unbounded queue. Changing a capacity
   domain requires a gateway restart; validate the domain under `GET /queue`
   and run `tests/connection-pool-admission.test.mjs` plus
@@ -537,8 +537,8 @@ canonical check that metrics are recording (non-null object once enabled).
 | Buckets absent from `/v1/models` | Confirm the **serving** config has `routing.buckets_enabled: true`; then compare `GET /admin/buckets`. Remember the live unit normally reads `~/.skcapstone/gateway/skgateway.yaml`, not the repo fallback. |
 | A bucket is visible but has no members | Inspect `/admin/buckets` rejection reasons. Membership requires the class floor, trust-zone ceiling, provider posture, an available serving backend, and effective lifecycle routability. Do not add a hardcoded member to conceal the rejected condition. |
 | Valid bucket returns 503 | `bucket_no_eligible_member` is fail-closed. Restore an eligible backend or correct its model card/lifecycle claim; do not fall back to `sk-default`. |
-| `qwen38-abliterated` reports EOL despite a local declaration | Run the claim-aware tests and inspect the lifecycle record's provider attribution. A non-claiming NVIDIA 404/410 must neither accumulate EOL nor preempt `chiap08-qwen38`; separately verify `TAILNET_HOST:11439` is reachable. |
-| Mixed Qwen traffic stalls or returns `capacity_exceeded` / `queue_timeout` | Inspect `GET /queue` at key `chiap08-qwen38`. `active` and `queued` must never exceed four. A full queue returns retryable `503 capacity_exceeded`; a waiter older than 30 seconds returns retryable `503 queue_timeout`; both include `Retry-After`. Do not raise the four-slot ceiling without separately qualifying the llama.cpp service. |
+| A Qwen id reports EOL despite a local declaration | Run the claim-aware tests and inspect the lifecycle record's provider attribution. A non-claiming provider 404/410 must not preempt a local claimer; separately verify `TAILNET_HOST:11439` is reachable. |
+| Mixed Qwen traffic stalls or returns `capacity_exceeded` / `queue_timeout` | Inspect `GET /queue` at key `chiap08-qwen38`. `active` and `queued` must never exceed two. A full queue returns retryable `503 capacity_exceeded`; a waiter older than 10 seconds returns retryable `503 queue_timeout`; both include `Retry-After`. Do not raise the two-slot ceiling without separately qualifying the vLLM service. |
 | Restart succeeds but code/config appears stale | Compare the listener PID (`ss -ltnp`) with `systemctl --user show skgateway -p MainPID`. A second unmanaged Node process can own `:18780` while the managed unit crash-loops. Stop the duplicate, then restart and probe the unit. |
 | `better-sqlite3` fails to load (`Could not locate the bindings file`) | The native addon was not built. Most often the install ran with `--ignore-scripts`, which skips it and fails 19 metrics/energy/SIEM tests. Re-run plain `npm ci` or `npm install` (needs a `node-gyp` toolchain). |
 | Config edits not taking effect | Two causes, check both. (a) Config is read once at startup and only re-read on `SIGHUP`: `systemctl --user kill -s HUP skgateway`. (b) **You probably edited the wrong file.** The effective command passes no `--config`, so the service loads `~/.skcapstone/gateway/skgateway.yaml`, not the in-repo `config/skgateway.yaml`. Confirm with `systemctl --user show skgateway -p ExecStart` (§5, §6). |
@@ -616,10 +616,10 @@ checks:
     run: grep -qF 'out["x-sk-bucket"] = result.bucket' src/metrics/attribution.mjs && grep -qF 'out["x-sk-bucket-member"] = result.bucketMember' src/metrics/attribution.mjs && grep -qF 'req.url === "/admin/buckets"' src/index.mjs
   - name: custom aliases are protected from foreign lifecycle verdicts
     run: grep -qF 'export function isEffectivelyRoutable' src/discovery/lifecycle.mjs && grep -qF 'export function declaredModelsElsewhere' src/discovery.mjs && test -f tests/model-claimer-lifecycle.test.mjs
-  - name: qwen38 source config binds the exact Huihui served id and all compatibility aliases
-    run: grep -qF 'qwen3.8-27b-huihui-abliterated-q4_k_m' config/skgateway.yaml && grep -qF 'qwen3.8-27b-ud-q5_k_xl' config/skgateway.yaml && grep -qF 'qwen38-abliterated' config/skgateway.yaml && grep -qF 'qwen3.8-27b-huihui-abliterated-q4_k_m:' config/model-cards.overrides.yaml && test -f tests/qwen38-source-config.test.mjs
+  - name: qwen38 source config binds only exact upstream ids
+    run: grep -qF 'qwen3.8-27b-huihui-abliterated-q4_k_m' config/skgateway.yaml && grep -qF 'qwen3.8-chiap08' config/skgateway.yaml && grep -qF 'qwen3.8-vllm' config/skgateway.yaml && grep -qF 'qwen3.8-27b-huihui-abliterated-q4_k_m:' config/model-cards.overrides.yaml && test -f tests/qwen38-source-config.test.mjs
   - name: qwen direct and registry routes share the qualified bounded admission domain
-    run: grep -qF 'members: [chiap08-qwen38, "reg:qwen38"]' config/skgateway.yaml && grep -qF 'queueTimeoutMs: 30000' config/skgateway.yaml && test -f tests/connection-pool-admission.test.mjs && test -f tests/qwen-capacity-domain.test.mjs
+    run: grep -qF 'members: [chiap08-qwen38, "reg:qwen38"]' config/skgateway.yaml && grep -qF 'queueTimeoutMs: 10000' config/skgateway.yaml && test -f tests/connection-pool-admission.test.mjs && test -f tests/qwen-capacity-domain.test.mjs
   - name: node100 Ornith launcher is reproducible and advertises only the verified context
     run: grep -qF -- '--alias ornith-1.5-9b' scripts/nodes/node100/run-ornith-1.5.sh && grep -qF -- '--parallel 3 --ctx-size 196608' scripts/nodes/node100/run-ornith-1.5.sh && grep -qF 'scripts/nodes/node100/run-ornith-1.5.sh' scripts/nodes/node100/skai-beellama.service
   - name: the stale hardcoded /status version documented in section 9 is still stale (fix it and update section 9)
