@@ -828,6 +828,10 @@ export class Backend {
     this._quarantined = false;
     /** @type {number} epoch ms (when quarantine started / cooldown last re-armed) */
     this._quarantinedSince = 0;
+    /** @type {number|null} true serving-engine token ceiling (card 9ed4a9f7) */
+    this.context_limit = Number.isFinite(config.context_limit) && config.context_limit > 0
+      ? config.context_limit
+      : null;
 
     this._totalRequests = 0;
     this._totalErrors = 0;
@@ -3286,6 +3290,10 @@ export async function routeAndSend(router, request, upstreamPath, method, client
 
   let lastResult = null;
   let didFailover = false;
+  // Doors that refused the context preflight (card 9ed4a9f7), bounded one
+  // entry per candidate, used to synthesize the explicit 400 when EVERY
+  // door is too small for the request.
+  const contextRejections = [];
   // Every attempt that produced an energy observation, in attempt order.
   // Reads are per attempt (spec 4.5), so writes must be too: a local metered
   // attempt that burned real joules and then failed over to cloud gets its own
@@ -3305,6 +3313,35 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // candidate rewrites the model to a cloud-served id). Default to the shared
     // body when no override is present.
     const attemptBody = candidates[i].bodyOverride || body;
+
+    // Context preflight (card 9ed4a9f7): a backend may declare context_limit,
+    // the true serving-engine token ceiling (e.g. llama.cpp --ctx-size 32768
+    // behind a shared model id whose vLLM replica serves 131072). Estimate
+    // the request size and SKIP doors that cannot hold it, failing over to a
+    // capable replica, instead of sending and letting the engine truncate or
+    // error. Never silently truncate: if every door is too small the request
+    // fails with an explicit 400 naming each limit. The estimate is a
+    // documented heuristic (~4 bytes per token for JSON chat payloads),
+    // deliberately coarse because it gates only obvious overflows.
+    if (backend && Number.isFinite(backend.context_limit) && backend.context_limit > 0) {
+      const estimatedTokens = Math.ceil(attemptBody.length / 4);
+      if (estimatedTokens > backend.context_limit) {
+        console.warn(
+          `[routeAndSend] context preflight rejected backend=${backendId}: ` +
+            `estimated ${estimatedTokens} tokens exceeds context_limit ${backend.context_limit}; ` +
+            `deferring to the next candidate`,
+        );
+        await emitSiem("error", {
+          type: "context_preflight_rejected",
+          backend: backendId,
+          estimated_tokens: estimatedTokens,
+          context_limit: backend.context_limit,
+          model: candidates[i].model || request.model,
+        }, { backend: backendId });
+        contextRejections.push({ backendId, estimatedTokens, context_limit: backend.context_limit });
+        continue;
+      }
+    }
     // The model THIS door actually serves. Only differs from request.model
     // for candidates that carry an explicit tag (the @match chain, card
     // 9e28de88 fix #5, and the cloud-fallback/local-registry candidates);
@@ -4012,6 +4049,37 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       backoffClassification,
       retryAfterSeconds: retryAfterSec,
       failover: didFailover,
+    };
+  }
+
+  // Context preflight rejected every door (card 9ed4a9f7): the request can
+  // never fit. Fail EXPLICITLY instead of attempting, truncating, or
+  // returning a misleading upstream error. Never silently truncate.
+  if (!lastResult && contextRejections.length > 0) {
+    const payload = JSON.stringify({
+      error: {
+        message: `prompt exceeds every candidate backend context limit: `
+          + contextRejections.map((r) => `${r.backendId}=${r.context_limit}`).join(", ")
+          + ` (estimated ${contextRejections[0].estimatedTokens} tokens, heuristic 4 bytes/token)`,
+        code: "context_exceeded",
+        type: "invalid_request_error",
+        estimated_tokens: contextRejections[0].estimatedTokens,
+        backends: contextRejections.map((r) => ({ backend: r.backendId, context_limit: r.context_limit })),
+        retryable: false,
+      },
+    });
+    await emitSiem("response", {
+      status: 400,
+      failover: false,
+      context_exceeded: true,
+      backends: contextRejections.map((r) => r.backendId),
+    }, {});
+    return {
+      status: 400,
+      headers: { "content-type": "application/json" },
+      body: Buffer.from(payload, "utf-8"),
+      backendId: null,
+      failover: false,
     };
   }
 

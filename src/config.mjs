@@ -758,6 +758,9 @@ export function assertProviderRoutes(
     if (auth === 'oauth' && !backend.credentials_path && !backend.credentials_file) {
       errs.push(`backends.${name}.auth_type is "oauth" but no credentials_path/credentials_file is set`);
     }
+    if ('context_limit' in backend && (!Number.isFinite(backend.context_limit) || backend.context_limit <= 0)) {
+      errs.push(`backends.${name}.context_limit must be a positive number of tokens`);
+    }
     if (auth === 'codex_oauth' && !backend.credentials_path && !backend.credentials_file) {
       errs.push(`backends.${name}.auth_type is "codex_oauth" but no credentials_path/credentials_file is set`);
     }

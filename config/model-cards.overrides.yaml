@@ -460,7 +460,7 @@ overrides:
     org: "Huihui AI / Qwen (self-hosted)"
     summary: "Canonical model served by independent chiap01 and chiap08 replicas; sovereign abliterated reasoning, tool use, and vision."
     good_at: [reasoning, coding, tool use, vision, uncensored/creative text, sovereign/private work]
-    context_length: 262144
+    context_length: 131072
     max_output_tokens: 16384
     supported_parameters: [tools, tool_choice, reasoning]
     modality: "text+image->text"
@@ -474,7 +474,7 @@ overrides:
     latency_class: interactive
     reasoning: true
     min_output_tokens: 8192
-    notes: "Canonical served id for chiap01-qwen38 and chiap08-qwen38. Compatibility ids below are request aliases, never replicas or capacity domains."
+    notes: "Canonical served id for chiap01-qwen38 and chiap08-qwen38. Compatibility ids below are request aliases, never replicas or capacity domains. context_length is the strongest replica (chiap08 vLLM --max-model-len 131072); chiap01 llama.cpp serves 32768 and is enforced per door by backend context_limit preflight, card 9ed4a9f7."
 
   qwen3.8-27b-ud-q5_k_xl:
     display_name: "Huihui Qwen3.8 27B (legacy UD-Q5 request alias)"
