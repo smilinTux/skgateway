@@ -113,7 +113,10 @@ function startHoldingServer() {
         releaseAll() {
           for (const release of state.pending.splice(0)) release();
         },
-        close: () => new Promise((done) => server.close(done)),
+        close: () => new Promise((done) => {
+          server.close(done);
+          server.closeAllConnections();
+        }),
       });
     });
   });
@@ -164,6 +167,15 @@ afterEach(async () => {
 
 
 describe("chiap08 Qwen shared capacity domain", () => {
+  test("fixture teardown closes a retained upstream socket", { timeout: 1000 }, async () => {
+    const retained = request("qwen3.8-27b");
+    await waitFor(() => upstream.state.active === 1, "retained upstream request");
+
+    await upstream.close();
+    upstream = null;
+    await retained;
+  });
+
   test("mixed direct and registry traffic never exceeds four combined upstream calls", async () => {
     getPool({ capacityDomains: DOMAIN });
     const firstFour = [
