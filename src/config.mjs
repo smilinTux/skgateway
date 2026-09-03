@@ -761,6 +761,9 @@ export function assertProviderRoutes(
     if (auth === 'codex_oauth' && !backend.credentials_path && !backend.credentials_file) {
       errs.push(`backends.${name}.auth_type is "codex_oauth" but no credentials_path/credentials_file is set`);
     }
+    if ('provider_purity' in backend && typeof backend.provider_purity !== 'boolean') {
+      errs.push(`backends.${name}.provider_purity must be a boolean`);
+    }
     if (auth === 'kimi_oauth' && !backend.credentials_path && !backend.credentials_file) {
       errs.push(`backends.${name}.auth_type is "kimi_oauth" but no credentials_path/credentials_file is set`);
     }

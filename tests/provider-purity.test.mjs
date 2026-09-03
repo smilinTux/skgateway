@@ -24,6 +24,7 @@ function buildBackends() {
       auth_type: "none",
       models: ["glm-4.6", "glm-4.7", "glm-5.3"],
       priority: 2,
+      provider_purity: true,
     },
     codex: {
       id: "codex",
@@ -76,6 +77,19 @@ test("ownerDownResponse shape: 503, retryable, names the declaring backends", as
   await assert.rejects(router.route({ model: "glm-5.3" }), { name: "ModelOwnerDownError" });
 });
 
+test("unflagged backends keep the legacy fall-through (purity is opt-in)", async () => {
+  const router = createRouter({ backends: {
+    zai: { url: "http://127.0.0.1:9/v1", auth_type: "none", models: ["glm-4.6"], priority: 2 },
+    codex: buildBackends().codex,
+  } });
+  const zai = router.getBackend("zai");
+  zai._status = "down";
+  zai._downSince = Date.now();
+  const candidates = await router.route({ model: "glm-4.6" });
+  const ids = candidates.map((c) => c.backendId).sort();
+  assert.deepEqual(ids, ["codex"], "unflagged owner down falls through to legacy doors");
+});
+
 test("undeclared model ids keep the historic fall-through to all backends", async () => {
   const router = createRouter({ backends: buildBackends() });
   const candidates = await router.route({ model: "totally-unknown-model" });
@@ -83,16 +97,18 @@ test("undeclared model ids keep the historic fall-through to all backends", asyn
   assert.deepEqual(ids, ["codex", "zai"]);
 });
 
-test("agent-restricted owner also fails closed instead of spraying", async () => {
+test("agent-restricted pure owner does not serve the restricted agent", async () => {
   const router = createRouter({
     backends: {
       ...buildBackends(),
       zai: { ...buildBackends().zai, allowed_agents: ["worker-a"] },
     },
   });
-  await assertRejectsOwnerDown(
-    router.route({ model: "glm-4.6", agentId: "worker-b" }),
-    "glm-4.6",
-    ["zai"],
-  );
+  // Restriction is policy, not outage: the owner is AVAILABLE for allowed
+  // agents, so the request falls through to the other legacy door for this
+  // agent and the owner never serves it.
+  const candidates = await router.route({ model: "glm-4.6", agentId: "worker-b" });
+  assert.ok(Array.isArray(candidates) && candidates.length > 0);
+  assert.ok(!candidates.some((c) => c.backendId === "zai"),
+    "the restricted owner must not serve the restricted agent");
 });

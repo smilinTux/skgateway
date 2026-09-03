@@ -849,6 +849,13 @@ export class Backend {
     this._consecutiveFailures = 0;
     /** @type {boolean} true = out of rotation (skipped by selection) */
     this._quarantined = false;
+    // Provider purity (card fc22572b): when true, a model id this backend
+    // DECLARES fails closed with 503 model_owner_backend_down while every
+    // declaring backend is unavailable, instead of the legacy fall-through
+    // spray to unrelated providers. Opt-in: pinned contracts (lifecycle
+    // 410 attribution, fast-failure quarantine) keep the legacy behavior
+    // unless a backend explicitly claims purity.
+    this._providerPurity = config.provider_purity === true;
     /** @type {number} epoch ms (when quarantine started / cooldown last re-armed) */
     this._quarantinedSince = 0;
 
@@ -1687,10 +1694,35 @@ export function createRouter(config = {}) {
     // the retry loop backs off instead of burning a codex 400 on every
     // attempt. Undeclared ids keep the historic fall-through.
     if (declared.length > 0 && expand !== true) {
-      const ownerDown = [];
-      ownerDown.ownerDown = true;
-      ownerDown.declaredBy = declared.map((b) => b.id);
-      return ownerDown;
+      // Precedence rules (independent review of PR108, 2026-09-03):
+      //   1. A known eol|dead id keeps its terminal lifecycle verdict even
+      //      when its declarer is down.
+      //   2. Claim-quarantined declarers keep the legacy fall-through: the
+      //      410-lifecycle and fast-failure quarantine machinery needs real
+      //      attempts to real doors.
+      //   3. A total outage (no available backends at all) keeps the legacy
+      //      attempt-all path so callers see the owner's own terminal
+      //      502/410 instead of a pre-emptive 503.
+      //   4. Purity is OPT-IN per backend (provider_purity: true): only
+      //      flagged backends' declared ids fail closed on transient
+      //      error-cooldown down. Unflagged backends keep the historic
+      //      fall-through contract everywhere.
+      const lcDeclared = getLifecycle(model);
+      if (!isRoutable(lcDeclared)) {
+        const gated = [];
+        gated.eolGated = true;
+        gated.eolReason = lcDeclared.eol_reason;
+        return gated;
+      }
+      const transientDown = available.length > 0
+        && declared.some((b) => b._providerPurity)
+        && declared.every((b) => !b.isAvailable() && !b._quarantined);
+      if (transientDown) {
+        const ownerDown = [];
+        ownerDown.ownerDown = true;
+        ownerDown.declaredBy = declared.map((b) => b.id);
+        return ownerDown;
+      }
     }
 
     // No backend explicitly claims this model. A KNOWN eol|dead id (per the
