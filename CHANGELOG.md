@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- History trim no longer leaves orphan assistant tool_calls: the final
+  assembled candidate (head slice + notice + repaired tail) now passes
+  through repairToolPairing in all three trim passes. Fleet incident
+  2026-09-03: cards 364a5f47 and 54cb62db failed with OpenAI 400
+  "No tool output found for function call" when a head-slice assistant
+  tool_call lost its reply to the dropped middle.
+- Large tool results are truncated to 1500 chars ONLY when the body is over
+  maxBodyBytes, and the truncation logs. Previously it ran unconditionally
+  for every 6+ message conversation, silently and deterministically cutting
+  tool output even far under budget.
+
+
+### Fixed
+
 - Request classifier input is bounded (8K head + 2K tail per message).
   A single 420KB message drove catastrophic regex behavior in the heuristic
   classifier and froze the entire gateway event loop, including unrelated
