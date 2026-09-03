@@ -211,6 +211,21 @@ export class ModelClaimQuarantinedError extends Error {
   }
 }
 
+export class ModelOwnerDownError extends Error {
+  /** Fail closed when a declared model's owning backend is down (purity). */
+  constructor(model, declaredBy) {
+    super(
+      `model "${model}" is declared by [${(declaredBy || []).join(", ")}] ` +
+        `but every owner backend is currently unavailable; refusing to route ` +
+        `to unrelated backends`,
+    );
+    this.name = "ModelOwnerDownError";
+    this.model = model;
+    this.declaredBy = declaredBy || [];
+    this.status = 503;
+  }
+}
+
 /**
  * Dead-alias auto-quarantine (card 2d1f3a2c).
  *
@@ -1574,7 +1589,7 @@ export function createRouter(config = {}) {
    * @param {string|undefined} agentId
    * @returns {Backend[]}
    */
-  function candidatesFor(model, agentId) {
+  function candidatesFor(model, agentId, expand = false) {
     const available = availableByPriority().filter((b) => b.allowsAgent(agentId));
 
     if (!model) return available;
@@ -1661,6 +1676,23 @@ export function createRouter(config = {}) {
       return claimQuarantined;
     }
 
+    // Provider purity (card f361407c, incident 2026-09-03): a model id that
+    // some backend DECLARES must never spray to unrelated backends when the
+    // declaring backend is merely DOWN (error cooldown) or agent-restricted.
+    // Observed live: during a z.ai cooldown, glm-4.6 and glm-4.7 fell through
+    // to primary=codex, which can only answer "model not supported"; and a
+    // fresh kimi backend's first empty-content failure marked it DOWN, so k3
+    // requests sprayed to codex the same way. Requests for a declared id
+    // fail closed here so the client sees the owner backend's real state and
+    // the retry loop backs off instead of burning a codex 400 on every
+    // attempt. Undeclared ids keep the historic fall-through.
+    if (declared.length > 0 && expand !== true) {
+      const ownerDown = [];
+      ownerDown.ownerDown = true;
+      ownerDown.declaredBy = declared.map((b) => b.id);
+      return ownerDown;
+    }
+
     // No backend explicitly claims this model. A KNOWN eol|dead id (per the
     // lifecycle store, card P1.6) is gated here instead of falling through:
     // tag an empty result so route() can answer with a clean 404 +
@@ -1741,7 +1773,7 @@ export function createRouter(config = {}) {
       throw new Error("[router] No backends registered — cannot route request");
     }
 
-    const candidates = candidatesFor(model, agentId);
+    const candidates = candidatesFor(model, agentId, request.expand === true);
 
     if (candidates.eolGated) {
       siemEvent("model_eol_gated", { model, agentId, eol_reason: candidates.eolReason });
@@ -1750,6 +1782,12 @@ export function createRouter(config = {}) {
     if (candidates.claimQuarantined) {
       siemEvent("model_claims_quarantined", { model, agentId });
       throw new ModelClaimQuarantinedError(model);
+    }
+    if (candidates.ownerDown) {
+      siemEvent("model_owner_backend_down", {
+        model, agentId, declared_by: candidates.declaredBy,
+      });
+      throw new ModelOwnerDownError(model, candidates.declaredBy);
     }
 
     if (candidates.length === 0) {
@@ -2300,6 +2338,25 @@ function claimQuarantinedResponse(err) {
   };
 }
 
+function ownerDownResponse(err) {
+  return {
+    status: 503,
+    headers: { "content-type": "application/json", "retry-after": "30" },
+    body: Buffer.from(JSON.stringify({
+      error: {
+        message: err.message,
+        code: 503,
+        type: "model_owner_backend_down",
+        model: err.model,
+        declared_by: err.declaredBy,
+        retryable: true,
+      },
+    }), "utf-8"),
+    backendId: null,
+    failover: false,
+  };
+}
+
 /**
  * High-level helper used by the proxy request handler.
  * Tries each candidate backend in order, acquires a pool slot, sends the
@@ -2733,6 +2790,43 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
         }, {});
         continue;
       }
+      // Provider purity in a bucket chain: a member whose declaring backend
+      // is down is retried as an expansion route (the bucket tier treats
+      // members as fungible across sibling backends, health-aware expansion).
+      // If expansion still yields nothing servable, the member is skipped and
+      // the next live member serves. Direct (non-bucket) requests never take
+      // this path: for them ModelOwnerDownError fails closed at route().
+      if (err instanceof ModelOwnerDownError) {
+        try {
+          results = await router.route({
+            ...request, model: member.id, agentId: request.agentId, expand: true,
+          });
+        } catch (expandErr) {
+          skipped.push(member.id);
+          await emitSiem(EventType.ANOMALY, {
+            type: "bucket_member_skipped",
+            outcome: "skipped",
+            bucket: addr.bucket,
+            member: member.id,
+            eol_reason: expandErr instanceof Error ? expandErr.message : String(expandErr),
+          }, {});
+          continue;
+        }
+        const list2 = Array.isArray(results) ? results : results ? [results] : [];
+        for (const result of list2) {
+          const key = `${result.backendId}:${member.id}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          candidates.push({
+            ...result,
+            bodyOverride: rewriteBodyModel(body, member.id),
+            model: member.id,
+            bucket: addr.bucket,
+            bucketMember: member.id,
+          });
+        }
+        continue;
+      }
       throw err;
     }
     const list = Array.isArray(results) ? results : results ? [results] : [];
@@ -3016,6 +3110,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         } catch (err) {
           if (err instanceof ModelEolError) return eolGatedResponse(err);
           if (err instanceof ModelClaimQuarantinedError) return claimQuarantinedResponse(err);
+          if (err instanceof ModelOwnerDownError) return ownerDownResponse(err);
           throw err;
         }
         if (!candidates || candidates.length === 0) {
@@ -3278,6 +3373,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         } catch (err) {
           if (err instanceof ModelEolError) return eolGatedResponse(err);
           if (err instanceof ModelClaimQuarantinedError) return claimQuarantinedResponse(err);
+          if (err instanceof ModelOwnerDownError) return ownerDownResponse(err);
           throw err;
         }
       }
@@ -3298,6 +3394,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     } catch (err) {
       if (err instanceof ModelEolError) return eolGatedResponse(err);
       if (err instanceof ModelClaimQuarantinedError) return claimQuarantinedResponse(err);
+      if (err instanceof ModelOwnerDownError) return ownerDownResponse(err);
       throw err;
     }
   }
