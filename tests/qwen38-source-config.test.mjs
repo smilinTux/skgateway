@@ -84,7 +84,7 @@ test('every qwen38 id has the same bounded context and truthful served-model car
       `${id} must retain the qualified 256K sanitizer limit`,
     );
     assert.ok(cards[id], `${id} must have a committed model card`);
-    assert.equal(cards[id].context_length, 262144);
+    assert.equal(cards[id].context_length, 131072); // card 9ed4a9f7: strongest real engine (vLLM 131072); per-door truth via backend context_limit
     assert.equal(cards[id].quant, 'Q4_K_M');
     assert.equal(cards[id].size_class, 'L');
     assert.equal(cards[id].vision, true);

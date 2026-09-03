@@ -365,7 +365,7 @@ overrides:
     org: DeepReinforce (self-hosted)
     summary: "Our sovereign 35B reasoning model on chiap08. The cloud-free brain behind sk-default."
     good_at: [reasoning, coding, tool use, sovereign/private work]
-    context_length: 262144
+    context_length: 131072
     max_output_tokens: 32768
     supported_parameters: [tools, tool_choice, reasoning]
     modality: "text->text"
@@ -392,7 +392,7 @@ overrides:
     org: DeepReinforce (self-hosted)
     summary: "Registry alias for the 35B, routed across chiap08 (primary) + standby with 5xx failover."
     good_at: [reasoning, coding, tool use, sovereign/private work]
-    context_length: 262144
+    context_length: 131072
     max_output_tokens: 32768
     supported_parameters: [tools, tool_choice, reasoning]
     modality: "text->text"
@@ -481,7 +481,7 @@ overrides:
     org: "Huihui AI / Qwen (self-hosted)"
     summary: "Pre-cutover request alias; both physical replicas serve the canonical Huihui abliterated Q4_K_M model."
     good_at: [reasoning, coding, tool use, vision, uncensored/creative text, sovereign/private work]
-    context_length: 262144
+    context_length: 131072
     max_output_tokens: 16384
     supported_parameters: [tools, tool_choice, reasoning]
     modality: "text+image->text"
@@ -502,7 +502,7 @@ overrides:
     org: "Huihui AI / Qwen (self-hosted)"
     summary: "Short request alias for the canonical Huihui abliterated Q4_K_M model."
     good_at: [reasoning, coding, tool use, vision, uncensored/creative text, sovereign/private work]
-    context_length: 262144
+    context_length: 131072
     max_output_tokens: 16384
     supported_parameters: [tools, tool_choice, reasoning]
     modality: "text+image->text"
@@ -523,7 +523,7 @@ overrides:
     org: "Huihui AI / Qwen (self-hosted)"
     summary: "Custom request alias claimed by both physical replicas; serves the canonical Huihui Q4_K_M model."
     good_at: [reasoning, coding, tool use, vision, uncensored/creative text, sovereign/private work]
-    context_length: 262144
+    context_length: 131072
     max_output_tokens: 16384
     supported_parameters: [tools, tool_choice, reasoning]
     modality: "text+image->text"
@@ -601,13 +601,13 @@ overrides:
   # ── Context-window facts for other live NVIDIA models (from the 2026-07-15
   #    validated model_limits, kept honest; add dex fields as you verify them) ──
   qwen/qwen3.5-397b-a17b:
-    context_length: 262144
+    context_length: 131072
     tier: free-remote
   mistralai/mistral-medium-3.5-128b:
-    context_length: 262144
+    context_length: 131072
     tier: free-remote
   mistralai/mistral-large-3-675b-instruct-2512:
-    context_length: 262144
+    context_length: 131072
     tier: free-remote
     # Card N2: locked explicitly (matches the design doc's own 4.2 worked
     # example verbatim for this exact model), even though the heuristic

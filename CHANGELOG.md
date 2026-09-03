@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Per-backend `context_limit` (card 9ed4a9f7): the true serving-engine token
+  ceiling declared per door. routeAndSend preflights request size (heuristic
+  4 bytes/token), skips doors that cannot hold the request and fails over to
+  a capable replica, and returns an explicit 400 context_exceeded naming every
+  limit when none fits. Never silently truncates. The shared qwen3.8 catalog
+  cards now advertise 131072 (the strongest replica, chiap08 vLLM); the
+  chiap01 llama.cpp door serves 32768 and is enforced by preflight.
+
+
 - `sampleTokenRatio()` computes bytes-per-token from a backend's reported usage,
   accepting both the OpenAI (`prompt_tokens`) and Anthropic (`input_tokens`)
   spellings. Returns null rather than a fabricated ratio when there is nothing
