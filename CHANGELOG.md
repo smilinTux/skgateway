@@ -7,6 +7,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Request classifier input is bounded (8K head + 2K tail per message).
+  A single 420KB message drove catastrophic regex behavior in the heuristic
+  classifier and froze the entire gateway event loop, including unrelated
+  requests (reproduced on pristine main, live incident 2026-09-03).
+  Classification signals live at prompt head/tail; the bound changes no
+  classification outcome for real prompts.
+
+
+- `kimi_oauth` backend auth type: Kimi Code subscription through SKGateway,
+  read-only credential file contract like codex_oauth (mtime re-read, never
+  refreshes, never writes; a keepalive timer drives the CLI on the gateway
+  host). Backend config validation accepts kimi_oauth and requires
+  credentials_path.
+- Kimi backend split into two capacity domains over one subscription: the
+  coding family (kimi-for-coding, kimi-for-coding-highspeed, account ceiling
+  30, gateway cap 28) and the k3 family (k3, k3-256k, ceiling 16, cap 14),
+  measured by stepped burst ramp.
+- Opt-in provider purity: a backend may set `provider_purity: true`; a model
+  id it declares fails closed with 503 model_owner_backend_down while every
+  declaring backend is in transient error-cooldown, instead of spraying to
+  unrelated providers. Terminal lifecycle verdicts, claim-quarantined
+  declarers, and total outages keep the historic behavior (card fc22572b).
+
+### Fixed
+
+- Streamed Codex tool calls: delta.tool_calls fragments now carry the
+  per-fragment integer index, and the usage tail is its own choices-empty
+  chunk per the canonical OpenAI shape; both violations 502'd every streamed
+  Codex completion through the response contract.
+- Model cards: kimi models ranked and scoped into bucket classes (highspeed
+  S, kimi-for-coding M, k3-256k L, k3 XL at 1M context) and the routed GLM
+  ladder given matching classes instead of all-S defaults.
+
+
+- Narrow context-overflow failover (9ed4a9f7 amendment): a 400 whose parsed
+  body is `exceed_context_size_error` advances to a same-model candidate with
+  a strictly larger `context_limit` with no backend health penalty; all other
+  400s stay terminal. Token estimate tightened to 3 bytes/token after
+  measured structured prompts slipped past the 4-byte estimate.
+
+- Per-backend `context_limit` (card 9ed4a9f7): the true serving-engine token
+  ceiling declared per door. routeAndSend preflights request size (heuristic
+  3 bytes/token), skips doors that cannot hold the request and fails over to
+  a capable replica, and returns an explicit 400 context_exceeded naming every
+  limit when none fits. Never silently truncates. The shared qwen3.8 catalog
+  cards now advertise 131072 (the strongest replica, chiap08 vLLM); the
+  chiap01 llama.cpp door serves 32768 and is enforced by preflight.
+
+- Qwen backend declarations now match upstream `/v1/models` exactly. chiap01
+  claims only the canonical Huihui id; chiap08 additionally claims
+  `qwen3.8-chiap08` and `qwen3.8-vllm`. No request id is translated.
+
+
+- `sampleTokenRatio()` computes bytes-per-token from a backend's reported usage,
+  accepting both the OpenAI (`prompt_tokens`) and Anthropic (`input_tokens`)
+  spellings. Returns null rather than a fabricated ratio when there is nothing
+  to measure.
+
+- Every response that reports usage now emits a `token_ratio.sample` SIEM event
+  carrying the request's byte size and the backend's reported prompt tokens.
+  The context guard budgets by bytes using a hardcoded ~4 bytes-per-token
+  guess that nothing has ever checked; the request byte size was not recorded
+  anywhere, so the guess could not be verified. This measures it per model.
+  Sampling only, no trimming behaviour changes.
+
+- `scripts/semantic-cache-report.mjs` reads `semantic_cache.shadow` events out
+  of the SIEM sink and prints observed count, would-hit count, hit rate and
+  median embed latency, overall and per category. Reports "no data" rather than
+  a 0% hit rate when the cache has not run.
+
+- `scripts/token-ratio-report.mjs` prints measured median bytes-per-token per
+  model against the guard's 4.0 assumption, with a confidence marker so a model
+  with a handful of samples is not read as a measurement. The median matches
+  `p50()` in `src/proxy/router.mjs` in algorithm only (average the two middle
+  values on even-length input, not the upper-middle), and deliberately does
+  NOT round like `p50()` does: `p50()` measures integer milliseconds, where
+  rounding costs nothing, but this measures a small ratio (typically 3-5
+  bytes/token) where rounding to an integer would roughly double the reported
+  drift from 4.0 on even-length samples. It also counts `token_ratio.skipped`
+  events by reason and prints the total prominently: streaming (SSE)
+  responses cannot be measured, so the reported medians cover non-streaming
+  traffic only, and since transport varies by caller and model
+  (`auto_nonstream` config, the `x-skgateway-nonstream` force header), that
+  unmeasured slice is not necessarily a random sample of all traffic.
+  Printed drift is shown to one decimal place (e.g. "+12.5%"), not rounded to
+  the nearest whole percent, since the report's entire purpose is surfacing
+  how far the real ratio sits from the assumed 4.0. A sample event with a
+  missing, empty, or non-string `model` field is skipped rather than
+  producing a phantom `"undefined"` row in the table.
+
 ### Changed
 - **Admission failover is reachable.** `pool.acquire()` takes `nonBlocking`; only the
   FINAL routing candidate may queue, so a full door defers to the next candidate
@@ -21,6 +113,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an explicit cap, so capacity failover is visible in attribution.
 - `getStats()` gains `totalDeferred`, deliberately separate from `totalDropped`: a
   deferral that fails over successfully is a served request, not a loss.
+
+- Docs: SOP.md now states the subscription/pool lane split from
+  `INFERENCE_FEDERATION_STANDARD` (paid credentials are estate-private and never
+  reachable from a peer estate; pool membership is static config with availability
+  handled by health and quarantine; federation is peer to peer through bridge nodes,
+  not a central pool), and records that the tailnet is transport rather than the
+  estate boundary. `deploy/chiap01/README-tailnet-ingress.md` gets the same framing.
+  No hostname was renamed: `chiap08-qwen38`, `pooling.capacity_domains.chiap08-qwen38`
+  and every `chiap*` host reference are literal identifiers and statements about real
+  machines, and legacy site prefixes stay valid as registry aliases.
+
+- Removed `src/policy/engine.mjs` and `src/policy/ratelimit.mjs` (1,428 lines).
+  Neither was imported by any file in `src/`, `tests/`, `bin/` or `scripts/`:
+  the only references were their own docstring examples. `ARCHITECTURE.md`
+  nonetheless listed both as live components, giving `ratelimit.mjs` a
+  participant in the request-flow sequence diagram and describing a
+  "Token-bucket + sliding-window limiter" as if it ran. Anyone reading the docs
+  to answer "are we rate limited?" got yes; the answer was no. The docs now
+  match the code. `tests/router-rate-limit-failover.test.mjs` is unaffected: it
+  covers the router's 429 backoff in `core.mjs`, which is live and unchanged.
 
 - The sanitizer and model-limit stages are now wired into the live `/v1` path.
   `trimSystemMessages()`, `trimConversationHistory()` and `sanitizeResponse()`
@@ -66,6 +178,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   disabling all request telemetry. CI now tests 22 only.
 
 ### Fixed
+
+- `sampleTokenRatio()` now counts the FULL prompt on Anthropic responses:
+  `input_tokens`/`prompt_tokens` plus `cache_read_input_tokens` plus
+  `cache_creation_input_tokens` when present, instead of `input_tokens`
+  alone. Anthropic reports `input_tokens` for only the uncached portion of
+  the prompt; on a heavily prompt-cached request (e.g. a 200 KB body with
+  190 KB cached) that undercounted the true prompt size by two orders of
+  magnitude, driving `bytes_per_token` to ~400 instead of ~4. Claude traffic
+  is overwhelmingly cache-hit, so the contaminated median would cross the
+  30-sample confidence gate and could drive a 100x mis-sizing of
+  `max_body_bytes` if used to retune the context guard. `toOpenAIResponse()`
+  in `src/proxy/anthropic-adapter.mjs` also now preserves
+  `cache_read_input_tokens` and `cache_creation_input_tokens` on the
+  translated OpenAI-shaped usage object (additive; `prompt_tokens` /
+  `completion_tokens` / `total_tokens` keep their existing meaning) instead
+  of silently dropping them, so the same contamination no longer arrives
+  undetectably under the `prompt_tokens` spelling.
+
+- The token-ratio sampling block in `src/index.mjs` (the
+  `token_ratio.sample`/`token_ratio.skipped` emission after response
+  sanitization) is now gated on `siemEnabled`. With SIEM disabled,
+  `siemHook()` already no-ops, but the block still ran
+  `result.body.toString("utf-8")` + `JSON.parse` on every 200 non-streaming
+  response and threw the result away — a synchronous parse that blocked the
+  event loop for all concurrent requests, and one that ran even for
+  cancelled/destroyed responses since it executed before the
+  `result?.cancelled || res.destroyed` check. It is now a no-op unless SIEM
+  is actually active.
+
+- SKGateway now warns once at startup when `semantic_cache.enabled` is true
+  but `classification.enabled` is false. The shadow cache categorizes
+  requests using the classifier's output (`_scCategory` in `src/index.mjs`),
+  so with classification off `eligible()` is always called with `undefined`
+  and always returns false: zero shadow events are recorded with no error
+  anywhere on the request path, and `scripts/semantic-cache-report.mjs`
+  could only report "No semantic_cache.shadow events. Is
+  semantic_cache.enabled true?", pointing at the wrong knob.
+
+- Documented (without changing) three known biases in the shadow cache key
+  built in `src/index.mjs`: the system prompt is excluded (only
+  `role === "user"` content is hashed), non-string/multimodal content maps
+  to `""`, and `createShadowRecorder()` passes no `maxChars` so
+  `embedders/mxbai.mjs` truncates at 1100 characters. All three make
+  distinct requests embed identically, inflating the measured would-hit
+  rate above what serving would ever achieve. `scripts/semantic-cache-report.mjs`
+  now prints a CAVEAT alongside the hit rate stating it is an upper bound,
+  mirroring the existing streaming caveat in `scripts/token-ratio-report.mjs`.
+  The key-building logic itself is left as-is; fixing it is a design
+  decision for whoever enables serving.
+
+- An empty `tool_calls: []` from an upstream is no longer treated as malformed
+  tool evidence. The response contract rejected any completion whose message
+  carried a `tool_calls` key that was not a valid non-empty call list, so every
+  provider that always emits the key failed with 502
+  `invalid_upstream_tool_calls`. NVIDIA's OpenAI-compatible endpoint does
+  exactly that: a plain chat turn returns
+  `{content: "OK", tool_calls: [], finish_reason: "stop"}`, and the whole
+  backend was unusable. Both the streaming and non-streaming paths now read an
+  empty or null `tool_calls` as the absence of tool calls, which is what it
+  means. A response with neither content nor calls is still rejected, and now
+  reports the accurate `empty_upstream_response` rather than blaming tool
+  evidence.
 
 - Queue telemetry now preserves `provider_backoff` when every upstream returns
   402 and records cooldown-only requests as denied with zero inflight work.
@@ -147,8 +321,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deployed unit actually executes. Three different Node versions were resolvable
   on the deployment host (unit v20, shell v22, npm v26), which is what produced
   the ABI mismatch above.
-
-### Added
 
 - SKGateway now serves its own operator facet on the daemon's existing port:
   `GET /operator/v1/{healthz,readyz,explain,observe}` and a reserved
@@ -524,6 +696,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without `routing.match_enabled`, since only the latter populates
   `request.requirements`. Enabling sensitivity first yields a gate that looks
   enforced and enforces nothing.
+- A `semantic_cache` config section, disabled by default and defaulting to
+  `mode: shadow`. Shadow records whether a cached response would have matched
+  and serves nothing, because the hit rate on this fleet has never been
+  measured: the gateway logs no prompt text and no prompt hash, so it cannot be
+  computed from existing data.
+- `src/proxy/semantic-cache-shadow.mjs`: the shadow recorder that composes the
+  stage-1 engine (`createSemanticCache` + `createMemoryStore` +
+  `createMxbaiEmbedder`) behind `eligible()/observe()/record()/stats()`. It
+  measures would-hits without ever handing the cached response back to its
+  caller, and every path is fail-open: an embedder outage is emitted as a
+  `semantic_cache.error` event and returned as a miss, never thrown into the
+  live request path.
+- The semantic cache is wired into the live `/v1/chat/completions` path in
+  shadow mode. On an eligible request it embeds the user text, records whether a
+  cached answer would have matched, discards that answer, and dispatches
+  normally. It cannot change what a client receives while `mode: shadow`.
+  Disabled by default.
 
 ## [0.6.0] - 2026-08-15
 

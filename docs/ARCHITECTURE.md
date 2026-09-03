@@ -103,8 +103,6 @@ sequenceDiagram
     participant C as Client
     participant CORE as proxy/core.mjs
     participant ID as "identity (capauth · session)"
-    participant PE as policy/engine.mjs
-    participant RL as policy/ratelimit.mjs
     participant CL as classifiers/classifier.mjs
     participant TR as proxy/tools.mjs
     participant RO as proxy/router.mjs
@@ -170,20 +168,6 @@ Zero ML dependencies — pure regex/keyword scoring compiled at module load to m
 `scoreRisk` (0–10), `detectJailbreak` (pattern families, multi-turn escalation via read-only
 history), `detectInjection` (prompt-injection signatures). All return structured findings;
 none block — the policy engine decides.
-
-### Policy engine (`policy/engine.mjs`)
-
-YAML rules evaluated in declaration order, `O(rules × conditions)`, typically sub-millisecond.
-Each rule is `name` + `condition` (all conditions AND together) + `action`. String conditions
-match exactly or by glob (`claude-opus-*`); numeric conditions use operator prefixes
-(`">= 8"`); booleans are literal. The five actions and four transforms map exactly to the
-README's policy table.
-
-### Rate limiting (`policy/ratelimit.mjs`)
-
-A **Token Bucket** (burst control) combined with **sliding-window counters** (sustained
-1 min / 1 hr / 1 day rates), all in-process and memory-bounded via fixed-size ring buffers.
-Agent, model, and tenant limits are checked together and the **tightest limit wins**.
 
 ---
 
@@ -366,8 +350,6 @@ the payload `event` field, not the topic suffix. `info`-level events are dropped
 | `src/proxy/retry.mjs` | 4-layer retry/failover, backoff+jitter, per-backend circuit breakers |
 | `src/identity/capauth.mjs` | Agent identity extraction (header / PGP sig / token), registry, enrichment middleware |
 | `src/identity/session.mjs` | Session lifecycle, per-agent indexing, idle-timeout sweep |
-| `src/policy/engine.mjs` | YAML rule evaluation: allow / deny / transform / rate_limit / alert |
-| `src/policy/ratelimit.mjs` | Token-bucket + sliding-window limiter; agent/model/tenant; tightest wins |
 | `src/classifiers/classifier.mjs` | Intent / risk(0–10) / jailbreak / injection — regex, <5 ms, flag-not-block |
 | `src/metrics/collector.mjs` | Token/cost/latency aggregation, P² percentiles, batched SQLite persistence |
 | `src/siem/events.mjs` | Event bus + factory + CEF formatter; pluggable output adapters |

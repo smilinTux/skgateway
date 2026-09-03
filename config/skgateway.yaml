@@ -53,14 +53,14 @@ pooling:
   capacity_domains:
     chiap08-qwen38:
       members: [chiap08-qwen38, "reg:qwen38"]
-      max: 3                       # Preserve one physical slot for direct consumers
-      maxQueue: 8
-      queueTimeoutMs: 30000       # Return retryable 503 before 60s clients give up
+      max: 2
+      maxQueue: 2
+      queueTimeoutMs: 10000
     chiap01-qwen38:
       members: [chiap01-qwen38]
-      max: 2                       # Independent B70 card 1 parallel slots
-      maxQueue: 4
-      queueTimeoutMs: 30000
+      max: 1
+      maxQueue: 1
+      queueTimeoutMs: 10000
   per_backend:                   # Per-backend overrides
     nvidia:
       max: 20                     # NVIDIA NIM: 20 concurrent
@@ -78,23 +78,18 @@ backends:
   # completion qualification for every declared id.
 
   ## Qwen3.8 27B Huihui abliterated Q4_K_M canonical model. chiap01 B70 card 1
-  ## is an independent replica at :18810. It claims exactly the same canonical
-  ## id and three compatibility aliases as chiap08, with no additional alias.
+  ## is an independent replica at :18810. It claims only the exact model id
+  ## reported by its upstream.
   chiap01-qwen38:
     url: http://chiap01:18810/v1
     auth_type: none
     models:
       - qwen3.8-27b-huihui-abliterated-q4_k_m
-      - qwen3.8-27b-ud-q5_k_xl
-      - qwen3.8-27b
-      - qwen38-abliterated
+    context_limit: 32768
     priority: 3
 
-  ## The chiap08 replica is llama.cpp (llama-server :11439), 262144 ctx,
-  ## reasoning model, VISION-capable (mmproj is loaded
-  ## by ~skuser01/bin/launch-chiap08-llama-qwen38.sh, unit
-  ## `llama-qwen38.service`). The server reports the full Huihui id below; the
-  ## other three ids are retained request aliases for the same loaded weights.
+  ## The chiap08 replica is vLLM with a 131072-token context. Its model list
+  ## exactly matches the ids reported by the upstream.
   ##
   ## 2026-08-14: added as the then-current sk-default target. `ornith-aeon.service` on chiap08
   ## (the 35B behind :11436) is inactive/dead, so :11436 is connection-REFUSED and
@@ -111,17 +106,10 @@ backends:
     url: http://TAILNET_HOST:11439/v1
     auth_type: none
     models:
-      - qwen3.8-27b-huihui-abliterated-q4_k_m   # exact llama-server --alias / served id
-      - qwen3.8-27b-ud-q5_k_xl   # retained pre-cutover request alias; serves Huihui Q4_K_M
-      - qwen3.8-27b              # short alias -> same backend (llama.cpp is name-agnostic)
-      # 2026-08-18 (incident inc-2026-08-18-qwen38-eol): custom alias re-added
-      # after the discovery fix. Declaring it here is what the discovery fix
-      # trusts: a claimer's declaration beats an unattributed EOL verdict
-      # (router gate + advertised catalog) and 404/410s from non-claiming
-      # backends no longer count toward its lifecycle (recordModelOutcome
-      # claimer-awareness). llama.cpp serves name-agnostically, so the alias
-      # is as good as the canonical id on this backend.
-      - qwen38-abliterated       # custom alias -> same backend (llama.cpp is name-agnostic)
+      - qwen3.8-27b-huihui-abliterated-q4_k_m
+      - qwen3.8-chiap08
+      - qwen3.8-vllm
+    context_limit: 131072
     priority: 3
   nvidia:
     url: https://integrate.api.nvidia.com/v1
@@ -253,9 +241,11 @@ model_limits:
   ## 256K context (Huihui Qwen3.8 27B on chiap08 :11439, CTX_SIZE=262144) —
   ## the exact served id and all compatibility aliases carry the same limits.
   qwen3.8-27b-huihui-abliterated-q4_k_m:      { max_body_bytes: 800000,   max_system_bytes: 320000  }
+  qwen3.8-chiap08:                            { max_body_bytes: 800000,   max_system_bytes: 320000  }
+  qwen3.8-vllm:                               { max_body_bytes: 800000,   max_system_bytes: 320000  }
   qwen3.8-27b-ud-q5_k_xl:                     { max_body_bytes: 800000,   max_system_bytes: 320000  }
   qwen3.8-27b:                                { max_body_bytes: 800000,   max_system_bytes: 320000  }  # short alias of the Huihui served id
-  qwen38-abliterated:                         { max_body_bytes: 800000,   max_system_bytes: 320000  }  # 2026-08-18: custom alias of the same chiap08 :11439 model (incident inc-2026-08-18-qwen38-eol)
+  qwen38-abliterated:                         { max_body_bytes: 800000,   max_system_bytes: 320000  }
   ## 256K context (kimi-k2.6)
   moonshotai/kimi-k2.6:                       { max_body_bytes: 800000,   max_system_bytes: 320000  }
   ## 262K context (Qwen3 family, Mistral family, Gemma 4)
@@ -367,3 +357,28 @@ discovery:
     anthropic:  { enabled: true, free_only: false, chat_only: true }
     nvidia:     { enabled: true, free_only: true, chat_only: true }
     openrouter: { enabled: false, free_only: true, chat_only: true }
+
+## Semantic cache (card: semantic-cache stage 2).
+## SHADOW MODE: embeds each eligible prompt, records whether a cached answer
+## WOULD have matched, then throws that away and dispatches normally. It never
+## serves a cached response to a client while mode is `shadow`.
+##
+## Off by default. The hit rate on this fleet has never been measured: the
+## gateway logs no prompt text and no prompt hash, so there is no way to
+## compute it retroactively. Run shadow for a week, read
+## `semantic_cache.shadow` events out of the SIEM sink, then decide.
+##
+## Eligible categories are deliberately narrow. Measured over 10,755 classified
+## prompts: tool_use is 49.0% of wall clock but has side effects, conversation
+## is memory-grounded, code_generation produces novel output. What is left is
+## 26.9% of wall clock, about 2.4 hours per week.
+semantic_cache:
+  enabled: false
+  mode: shadow
+  threshold: 0.92
+  ttl_seconds: 3600
+  max_entries: 2000
+  embed_url: http://192.168.0.100:11438/v1/embeddings
+  embed_model: mxbai-embed-large
+  embed_timeout_ms: 5000
+  categories: [administrative, system, data_query]

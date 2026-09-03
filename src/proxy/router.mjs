@@ -211,6 +211,21 @@ export class ModelClaimQuarantinedError extends Error {
   }
 }
 
+export class ModelOwnerDownError extends Error {
+  /** Fail closed when a declared model's owning backend is down (purity). */
+  constructor(model, declaredBy) {
+    super(
+      `model "${model}" is declared by [${(declaredBy || []).join(", ")}] ` +
+        `but every owner backend is currently unavailable; refusing to route ` +
+        `to unrelated backends`,
+    );
+    this.name = "ModelOwnerDownError";
+    this.model = model;
+    this.declaredBy = declaredBy || [];
+    this.status = 503;
+  }
+}
+
 /**
  * Dead-alias auto-quarantine (card 2d1f3a2c).
  *
@@ -799,6 +814,14 @@ export class Backend {
     this._zaiAuth = null;
     this._zaiAuthMtime = -1;
     this._zaiAuthPath = this._credentials_file;
+    // Kimi Code subscription auth follows the same read-only file contract:
+    // the kimi CLI owns OAuth refresh and writes
+    // ~/.kimi-code/credentials/<env>.json. Access tokens are short lived
+    // (observed 900s), so a keepalive timer runs the CLI on the gateway
+    // host and this gateway re-reads the file on mtime change only.
+    this._kimiAuth = null;
+    this._kimiAuthMtime = -1;
+    this._kimiAuthPath = this._credentials_file;
 
     // Agent-level restrictions — set of agent IDs allowed to use this backend.
     // Empty set = no restrictions.
@@ -826,8 +849,19 @@ export class Backend {
     this._consecutiveFailures = 0;
     /** @type {boolean} true = out of rotation (skipped by selection) */
     this._quarantined = false;
+    // Provider purity (card fc22572b): when true, a model id this backend
+    // DECLARES fails closed with 503 model_owner_backend_down while every
+    // declaring backend is unavailable, instead of the legacy fall-through
+    // spray to unrelated providers. Opt-in: pinned contracts (lifecycle
+    // 410 attribution, fast-failure quarantine) keep the legacy behavior
+    // unless a backend explicitly claims purity.
+    this._providerPurity = config.provider_purity === true;
     /** @type {number} epoch ms (when quarantine started / cooldown last re-armed) */
     this._quarantinedSince = 0;
+    /** @type {number|null} true serving-engine token ceiling (card 9ed4a9f7) */
+    this.context_limit = Number.isFinite(config.context_limit) && config.context_limit > 0
+      ? config.context_limit
+      : null;
 
     this._totalRequests = 0;
     this._totalErrors = 0;
@@ -1182,6 +1216,23 @@ export class Backend {
         return headers;
       }
 
+      case "kimi_oauth": {
+        // Kimi Code subscription auth: bearer access token read read-only
+        // from the kimi CLI credentials file. The CLI on the gateway host
+        // owns refresh (tokens live ~15 minutes; a keepalive timer drives
+        // it), so this gateway never refreshes and never writes the file.
+        const headers = this._getKimiAuthHeaders();
+        if (!headers) {
+          console.warn(
+            `[router] backend=${this.id} kimi_oauth auth but no usable credentials at ` +
+              `${this._kimiAuthPath || "(no credentials_path/file set)"}. ` +
+              `Sending UNAUTHENTICATED (expect 401). Sync kimi CLI credentials there.`,
+          );
+          return {};
+        }
+        return headers;
+      }
+
       case "none":
       default:
         return {};
@@ -1257,6 +1308,38 @@ export class Backend {
     } catch (err) {
       console.error(
         `[router] backend=${this.id} failed to load codex credentials ${this._codexAuthPath}: ${err.message}`,
+      );
+      return null;
+    }
+  }
+
+  /**
+   * Return the z.ai subscription auth headers, re-reading the ZCode
+   * credentials file when its mtime changes. Never writes or refreshes.
+   *
+   * @returns {Record<string, string>|null}
+   */
+  _getKimiAuthHeaders() {
+    if (!this._kimiAuthPath) return null;
+    try {
+      const filePath = this._kimiAuthPath.replace(/^~/, process.env.HOME || "");
+      const mtime = statSync(filePath).mtimeMs;
+      if (!this._kimiAuth || mtime !== this._kimiAuthMtime) {
+        const raw = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+        const accessToken = raw && (raw.access_token || raw.accessToken);
+        if (!accessToken) {
+          console.warn(
+            `[router] backend=${this.id} kimi credentials file has no access token: ${filePath}`,
+          );
+          return null;
+        }
+        this._kimiAuth = { authorization: `Bearer ${accessToken}` };
+        this._kimiAuthMtime = mtime;
+      }
+      return this._kimiAuth;
+    } catch (err) {
+      console.error(
+        `[router] backend=${this.id} failed to load kimi credentials ${this._kimiAuthPath}: ${err.message}`,
       );
       return null;
     }
@@ -1517,7 +1600,7 @@ export function createRouter(config = {}) {
    * @param {string|undefined} agentId
    * @returns {Backend[]}
    */
-  function candidatesFor(model, agentId) {
+  function candidatesFor(model, agentId, expand = false) {
     const available = availableByPriority().filter((b) => b.allowsAgent(agentId));
 
     if (!model) return available;
@@ -1604,6 +1687,48 @@ export function createRouter(config = {}) {
       return claimQuarantined;
     }
 
+    // Provider purity (card f361407c, incident 2026-09-03): a model id that
+    // some backend DECLARES must never spray to unrelated backends when the
+    // declaring backend is merely DOWN (error cooldown) or agent-restricted.
+    // Observed live: during a z.ai cooldown, glm-4.6 and glm-4.7 fell through
+    // to primary=codex, which can only answer "model not supported"; and a
+    // fresh kimi backend's first empty-content failure marked it DOWN, so k3
+    // requests sprayed to codex the same way. Requests for a declared id
+    // fail closed here so the client sees the owner backend's real state and
+    // the retry loop backs off instead of burning a codex 400 on every
+    // attempt. Undeclared ids keep the historic fall-through.
+    if (declared.length > 0 && expand !== true) {
+      // Precedence rules (independent review of PR108, 2026-09-03):
+      //   1. A known eol|dead id keeps its terminal lifecycle verdict even
+      //      when its declarer is down.
+      //   2. Claim-quarantined declarers keep the legacy fall-through: the
+      //      410-lifecycle and fast-failure quarantine machinery needs real
+      //      attempts to real doors.
+      //   3. A total outage (no available backends at all) keeps the legacy
+      //      attempt-all path so callers see the owner's own terminal
+      //      502/410 instead of a pre-emptive 503.
+      //   4. Purity is OPT-IN per backend (provider_purity: true): only
+      //      flagged backends' declared ids fail closed on transient
+      //      error-cooldown down. Unflagged backends keep the historic
+      //      fall-through contract everywhere.
+      const lcDeclared = getLifecycle(model);
+      if (!isRoutable(lcDeclared)) {
+        const gated = [];
+        gated.eolGated = true;
+        gated.eolReason = lcDeclared.eol_reason;
+        return gated;
+      }
+      const transientDown = available.length > 0
+        && declared.some((b) => b._providerPurity)
+        && declared.every((b) => !b.isAvailable() && !b._quarantined);
+      if (transientDown) {
+        const ownerDown = [];
+        ownerDown.ownerDown = true;
+        ownerDown.declaredBy = declared.map((b) => b.id);
+        return ownerDown;
+      }
+    }
+
     // No backend explicitly claims this model. A KNOWN eol|dead id (per the
     // lifecycle store, card P1.6) is gated here instead of falling through:
     // tag an empty result so route() can answer with a clean 404 +
@@ -1684,7 +1809,7 @@ export function createRouter(config = {}) {
       throw new Error("[router] No backends registered — cannot route request");
     }
 
-    const candidates = candidatesFor(model, agentId);
+    const candidates = candidatesFor(model, agentId, request.expand === true);
 
     if (candidates.eolGated) {
       siemEvent("model_eol_gated", { model, agentId, eol_reason: candidates.eolReason });
@@ -1693,6 +1818,12 @@ export function createRouter(config = {}) {
     if (candidates.claimQuarantined) {
       siemEvent("model_claims_quarantined", { model, agentId });
       throw new ModelClaimQuarantinedError(model);
+    }
+    if (candidates.ownerDown) {
+      siemEvent("model_owner_backend_down", {
+        model, agentId, declared_by: candidates.declaredBy,
+      });
+      throw new ModelOwnerDownError(model, candidates.declaredBy);
     }
 
     if (candidates.length === 0) {
@@ -2243,6 +2374,25 @@ function claimQuarantinedResponse(err) {
   };
 }
 
+function ownerDownResponse(err) {
+  return {
+    status: 503,
+    headers: { "content-type": "application/json", "retry-after": "30" },
+    body: Buffer.from(JSON.stringify({
+      error: {
+        message: err.message,
+        code: 503,
+        type: "model_owner_backend_down",
+        model: err.model,
+        declared_by: err.declaredBy,
+        retryable: true,
+      },
+    }), "utf-8"),
+    backendId: null,
+    failover: false,
+  };
+}
+
 /**
  * High-level helper used by the proxy request handler.
  * Tries each candidate backend in order, acquires a pool slot, sends the
@@ -2676,6 +2826,43 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
         }, {});
         continue;
       }
+      // Provider purity in a bucket chain: a member whose declaring backend
+      // is down is retried as an expansion route (the bucket tier treats
+      // members as fungible across sibling backends, health-aware expansion).
+      // If expansion still yields nothing servable, the member is skipped and
+      // the next live member serves. Direct (non-bucket) requests never take
+      // this path: for them ModelOwnerDownError fails closed at route().
+      if (err instanceof ModelOwnerDownError) {
+        try {
+          results = await router.route({
+            ...request, model: member.id, agentId: request.agentId, expand: true,
+          });
+        } catch (expandErr) {
+          skipped.push(member.id);
+          await emitSiem(EventType.ANOMALY, {
+            type: "bucket_member_skipped",
+            outcome: "skipped",
+            bucket: addr.bucket,
+            member: member.id,
+            eol_reason: expandErr instanceof Error ? expandErr.message : String(expandErr),
+          }, {});
+          continue;
+        }
+        const list2 = Array.isArray(results) ? results : results ? [results] : [];
+        for (const result of list2) {
+          const key = `${result.backendId}:${member.id}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          candidates.push({
+            ...result,
+            bodyOverride: rewriteBodyModel(body, member.id),
+            model: member.id,
+            bucket: addr.bucket,
+            bucketMember: member.id,
+          });
+        }
+        continue;
+      }
       throw err;
     }
     const list = Array.isArray(results) ? results : results ? [results] : [];
@@ -2959,6 +3146,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         } catch (err) {
           if (err instanceof ModelEolError) return eolGatedResponse(err);
           if (err instanceof ModelClaimQuarantinedError) return claimQuarantinedResponse(err);
+          if (err instanceof ModelOwnerDownError) return ownerDownResponse(err);
           throw err;
         }
         if (!candidates || candidates.length === 0) {
@@ -3221,6 +3409,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         } catch (err) {
           if (err instanceof ModelEolError) return eolGatedResponse(err);
           if (err instanceof ModelClaimQuarantinedError) return claimQuarantinedResponse(err);
+          if (err instanceof ModelOwnerDownError) return ownerDownResponse(err);
           throw err;
         }
       }
@@ -3241,6 +3430,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     } catch (err) {
       if (err instanceof ModelEolError) return eolGatedResponse(err);
       if (err instanceof ModelClaimQuarantinedError) return claimQuarantinedResponse(err);
+      if (err instanceof ModelOwnerDownError) return ownerDownResponse(err);
       throw err;
     }
   }
@@ -3286,6 +3476,13 @@ export async function routeAndSend(router, request, upstreamPath, method, client
 
   let lastResult = null;
   let didFailover = false;
+  // Doors that refused the context preflight (card 9ed4a9f7), bounded one
+  // entry per candidate, used to synthesize the explicit 400 when EVERY
+  // door is too small for the request.
+  const contextRejections = [];
+  // Doors whose engine returned exceed_context_size_error (preflight missed
+  // it), advanced without health penalty.
+  const contextOverflows = [];
   // Every attempt that produced an energy observation, in attempt order.
   // Reads are per attempt (spec 4.5), so writes must be too: a local metered
   // attempt that burned real joules and then failed over to cloud gets its own
@@ -3329,6 +3526,39 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // candidate rewrites the model to a cloud-served id). Default to the shared
     // body when no override is present.
     const attemptBody = candidates[i].bodyOverride || body;
+
+    // Context preflight (card 9ed4a9f7): a backend may declare context_limit,
+    // the true serving-engine token ceiling (e.g. llama.cpp --ctx-size 32768
+    // behind a shared model id whose vLLM replica serves 131072). Estimate
+    // the request size and SKIP doors that cannot hold it, failing over to a
+    // capable replica, instead of sending and letting the engine truncate or
+    // error. Never silently truncate: if every door is too small the request
+    // fails with an explicit 400 naming each limit. The estimate is a
+    // documented heuristic (~3 bytes per token for JSON chat payloads),
+    // deliberately coarse because it gates only obvious overflows.
+    if (backend && Number.isFinite(backend.context_limit) && backend.context_limit > 0) {
+      // ponytail: /3 heuristic over-estimates plain text ~25 percent; measured
+      // structured Pi prompts ran 3.0-3.5 bytes/token, so /4 undercounted and
+      // slipped real 16.6K-18.5K prompts past a 16384 slot. Upgrade path: a
+      // tokenizer when preflight false-negatives matter.
+      const estimatedTokens = Math.ceil(attemptBody.length / 3);
+      if (estimatedTokens > backend.context_limit) {
+        console.warn(
+          `[routeAndSend] context preflight rejected backend=${backendId}: ` +
+            `estimated ${estimatedTokens} tokens exceeds context_limit ${backend.context_limit}; ` +
+            `deferring to the next candidate`,
+        );
+        await emitSiem("error", {
+          type: "context_preflight_rejected",
+          backend: backendId,
+          estimated_tokens: estimatedTokens,
+          context_limit: backend.context_limit,
+          model: candidates[i].model || request.model,
+        }, { backend: backendId });
+        contextRejections.push({ backendId, estimatedTokens, context_limit: backend.context_limit });
+        continue;
+      }
+    }
     // The model THIS door actually serves. Only differs from request.model
     // for candidates that carry an explicit tag (the @match chain, card
     // 9e28de88 fix #5, and the cloud-fallback/local-registry candidates);
@@ -4025,6 +4255,43 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       (isBucketChain && (res.status === 404 || res.status === 410));
     const throttled = isThrottleStatus(res.status);
 
+    // Narrow context-overflow failover (card 9ed4a9f7 amendment): a 400 whose
+    // parsed body is the engine's exceed_context_size_error is a DOOR limit,
+    // not a payload defect. Advance to a same-model candidate with a strictly
+    // larger context_limit (or no limit) WITHOUT a health penalty. Every other
+    // 400 stays terminal; nothing blanket-fails-over.
+    if (res.status === 400) {
+      let ctxOverflow = false;
+      try {
+        const parsedErr = JSON.parse(res.body?.toString("utf-8") || "{}");
+        const err = parsedErr?.error || parsedErr;
+        ctxOverflow = err?.type === "exceed_context_size_error"
+          || err?.code === "exceed_context_size_error";
+      } catch { /* not JSON: terminal 400 */ }
+      if (ctxOverflow) {
+        const currentLimit = Number.isFinite(backend?.context_limit) ? backend.context_limit : 0;
+        const larger = candidates.slice(i + 1).some((c) => {
+          if (c.model && c.model !== candidateModel) return false;
+          const lim = Number.isFinite(c.backend?.context_limit) ? c.backend.context_limit : Infinity;
+          return lim > currentLimit;
+        });
+        console.warn(
+          `[router] 400 context overflow backend=${backendId} model=${candidateModel}; ` +
+          `${larger ? "advancing to a larger-context same-model candidate" : "no larger door, terminal"}`,
+        );
+        await emitSiem("error", {
+          type: "context_overflow",
+          backend: backendId,
+          model: candidateModel,
+          advanced: larger,
+        }, { backend: backendId });
+        if (larger) {
+          contextOverflows.push({ backendId, model: candidateModel });
+          continue;  // no health write: the door is fine, the prompt is just big
+        }
+      }
+    }
+
     if (!retryElsewhere) {
       console.log(
         `[router] ${res.status} OK backend=${backendId} latency=${latencyMs}ms` +
@@ -4169,6 +4436,37 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       backoffClassification,
       retryAfterSeconds: retryAfterSec,
       failover: didFailover,
+    };
+  }
+
+  // Context preflight rejected every door (card 9ed4a9f7): the request can
+  // never fit. Fail EXPLICITLY instead of attempting, truncating, or
+  // returning a misleading upstream error. Never silently truncate.
+  if (!lastResult && contextRejections.length > 0) {
+    const payload = JSON.stringify({
+      error: {
+        message: `prompt exceeds every candidate backend context limit: `
+          + contextRejections.map((r) => `${r.backendId}=${r.context_limit}`).join(", ")
+          + ` (estimated ${contextRejections[0].estimatedTokens} tokens, heuristic 3 bytes/token)`,
+        code: "context_exceeded",
+        type: "invalid_request_error",
+        estimated_tokens: contextRejections[0].estimatedTokens,
+        backends: contextRejections.map((r) => ({ backend: r.backendId, context_limit: r.context_limit })),
+        retryable: false,
+      },
+    });
+    await emitSiem("response", {
+      status: 400,
+      failover: false,
+      context_exceeded: true,
+      backends: contextRejections.map((r) => r.backendId),
+    }, {});
+    return {
+      status: 400,
+      headers: { "content-type": "application/json" },
+      body: Buffer.from(payload, "utf-8"),
+      backendId: null,
+      failover: false,
     };
   }
 

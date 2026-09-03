@@ -51,11 +51,13 @@ import { buildCapabilityCatalog } from "./ranking/catalog.mjs";
 import { REGISTRY_PATH } from "./proxy/registry.mjs";
 import { energyRowsFrom, energyHeaders } from "./metrics/energy.mjs";
 import { attributionHeaders } from "./metrics/attribution.mjs";
+import { sampleTokenRatio } from "./metrics/token-ratio.mjs";
 import { allBuckets, resolveBucket } from "./policy/buckets.mjs";
 import { loadRegistry, REGISTRY_PATH as _REGISTRY_PATH } from "./proxy/registry.mjs";
 import { policyFromRegistry } from "./policy/sensitivity.mjs";
 import { readFileSync } from "node:fs";
 import { load as yamlLoad } from "js-yaml";
+import { createShadowRecorder } from "./proxy/semantic-cache-shadow.mjs";
 
 // ─── Parse CLI args ───
 const args = process.argv.slice(2);
@@ -967,6 +969,23 @@ function siemHook(evt) {
   for (const out of esOutputs) {
     try { out.write(evt); } catch { /* never let ES break the hot path */ }
   }
+}
+
+/**
+ * One recorder for the process. Built lazily on first eligible request so a
+ * disabled cache costs nothing at boot and an unreachable embedder cannot stop
+ * the gateway starting. A disabled→enabled config transition (e.g. via a
+ * SIGHUP reload that mutates the same config object) takes effect on the next
+ * eligible request, since _shadowCache is still null until then; but once
+ * built, later changes to threshold/categories/embed settings on an
+ * already-enabled cache are NOT picked up until process restart.
+ */
+let _shadowCache = null;
+function shadowCache(config) {
+  const cfg = config.semantic_cache;
+  if (!cfg?.enabled) return null;
+  if (!_shadowCache) _shadowCache = createShadowRecorder(cfg, { emit: siemHook });
+  return _shadowCache;
 }
 
 // ─── Build per-model limit map from YAML model_limits section ───
@@ -1997,9 +2016,10 @@ export const server = http.createServer(async (req, res) => {
     // ── Prompt classification (P3.5) — PASSIVE observability into SIEM ──
     // Label the request's intent/risk/jailbreak/injection and emit it. Pure
     // heuristic (no network, sub-10ms), fail-open, and it NEVER changes routing.
+    let classification = null;
     if (config.classification?.enabled && Array.isArray(parsedMessages)) {
       try {
-        const classification = classifyRequest(parsedMessages, {
+        classification = classifyRequest(parsedMessages, {
           classifier: config.classification.classifier,
         });
         siemHook(toSiemEvent(classification, {
@@ -2241,6 +2261,38 @@ export const server = http.createServer(async (req, res) => {
     res.once("close", onClientClose);
     if (res.destroyed) onClientClose();
     try {
+      // Semantic cache, SHADOW ONLY. Records whether a cached answer would have
+      // matched and throws that answer away. It cannot change what is served.
+      // Guarded on eligible() first so ineligible traffic never spends an embed.
+      const _sc = shadowCache(config);
+      // KNOWN BIASES — all three inflate the measured shadow hit rate above
+      // what serving would ever achieve, because they make distinct requests
+      // hash/embed identically. Deliberately left as-is here (fixing them is
+      // a design decision for whoever enables serving, not this shadow-only
+      // measurement pass); see the CAVEAT emitted alongside the hit rate in
+      // scripts/semantic-cache-report.mjs.
+      //   1. Only role==="user" content is included: the system prompt is
+      //      excluded from the key. Two requests with identical user text but
+      //      different system prompts embed identically and count as a
+      //      would-hit, even though namespacing (agent:category) does not
+      //      isolate them.
+      //   2. Non-string content (multimodal/array turns, e.g. images) maps to
+      //      "": two requests differing only by an image embed identically.
+      //   3. createShadowRecorder() below passes no maxChars, so
+      //      embedders/mxbai.mjs truncates at 1100 chars: two long
+      //      conversations sharing a prefix become the same vector.
+      const _scText = _sc && Array.isArray(parsedMessages)
+        ? parsedMessages.filter((m) => m?.role === "user")
+            .map((m) => (typeof m.content === "string" ? m.content : "")).join("\n").trim()
+        : "";
+      const _scCategory = classification?.category;
+      const _scEligible = Boolean(_sc && _scText && _sc.eligible(_scCategory));
+      if (_scEligible) {
+        try {
+          await _sc.observe({ text: _scText, agent: metricsAgentId, category: _scCategory });
+        } catch { /* the cache is an observer; a failure here must never fail the request */ }
+      }
+
       result = await routeAndSend(
         router, routeRequest, routePath, req.method, req.headers, transformedBody, true, siemHook,
         upstreamAbort.signal,
@@ -2287,6 +2339,66 @@ export const server = http.createServer(async (req, res) => {
           }
           return;
         }
+
+        if (_scEligible && result?.status === 200 && result?.body) {
+          try {
+            _sc.record({
+              text: _scText,
+              response: JSON.parse(result.body.toString("utf-8")),
+              agent: metricsAgentId,
+              category: _scCategory,
+            });
+          } catch { /* not JSON, nothing to cache; never break the response */ }
+        }
+
+        // Measure bytes-per-token against what the backend actually reported, so
+        // the context guard's byte budget can eventually stop guessing at ~4.
+        // Sampling only: nothing here changes trimming, routing, response bytes,
+        // or status codes. Never throws.
+        //
+        // bodyBytes is transformedBody, NOT routeBody: transformedBody is what
+        // was actually sent to the backend after model-limit trimming (see
+        // ~line 2165), and the backend's reported prompt_tokens describes
+        // exactly that payload. Measuring the pre-trim routeBody against those
+        // tokens would overstate bytes-per-token on every trimmed request.
+        //
+        // model is read from the response body the backend named, NOT
+        // result.servedModel and NEVER parsedModel/the requested alias. Same
+        // reasoning as the modelServed comment below (~line 2490): the backend
+        // can answer a different model than the router dispatched or the
+        // caller requested, and a ratio filed under the requested alias would
+        // blend every model that alias resolves to. sampleTokenRatio() already
+        // returns null when neither name is present, so no fabrication risk.
+        //
+        // Samples cover NON-STREAMING JSON responses only: an SSE body is a
+        // stream of `data: {...}` frames, not a single JSON object, so
+        // JSON.parse on it throws and the sample would silently vanish into
+        // the catch below. Rather than let that failure mode masquerade as
+        // "nothing to measure", detect it up front from the content-type and
+        // emit a token_ratio.skipped event instead, so the skipped population
+        // is countable and B-Task 3 can report "N measured, M skipped
+        // (streaming)" rather than presenting an unrepresentative sample as
+        // if it covered all traffic.
+        //
+        // Gated on siemEnabled: with SIEM off, siemHook() no-ops at line 959
+        // anyway, so the JSON.parse below (and the streaming content-type
+        // check) would run on every 200 response purely to throw the result
+        // away. That parse is synchronous and blocks the event loop for
+        // every concurrent request; skip the work entirely rather than pay
+        // it for a sink that is not listening.
+        if (siemEnabled) try {
+          if (result.headers?.["content-type"]?.includes("text/event-stream")) {
+            siemHook({ ts: new Date().toISOString(), event: "token_ratio.skipped", reason: "streaming" });
+          } else {
+            const _parsed = JSON.parse(result.body.toString("utf-8"));
+            const _sample = sampleTokenRatio({
+              model: (typeof _parsed?.model === "string" && _parsed.model) ? _parsed.model : result?.servedModel,
+              bodyBytes: transformedBody?.length ?? 0,
+              usage: _parsed?.usage,
+            });
+            if (_sample) siemHook({ ts: new Date().toISOString(), event: "token_ratio.sample", ..._sample });
+          }
+        } catch { /* a backend that reports no usage simply is not measured */ }
       }
 
       // The socket is already gone. routeAndSend has released the upstream
@@ -2504,6 +2616,20 @@ server.listen(port, bind, () => {
     const backendNames = Object.keys(config.backends || {});
     console.log("[skgateway] backends: " + (backendNames.join(", ") || "default"));
     console.log("[skgateway] metrics: " + (metrics ? "enabled" : "disabled"));
+    // Semantic cache (shadow mode) categorizes requests using the classifier's
+    // output (_scCategory, ~line 2272) and eligible() gates on that category.
+    // With classification off, classification is never assigned, _scCategory
+    // is always undefined, eligible(undefined) is always false, and the cache
+    // silently records zero events with no error anywhere on the request
+    // path. Warn once at startup so the operator finds the right knob instead
+    // of concluding semantic_cache.enabled itself is broken.
+    if (config.semantic_cache?.enabled && !config.classification?.enabled) {
+      console.warn(
+        "[skgateway] semantic_cache.enabled is true but classification.enabled is false: " +
+        "the semantic cache categorizes requests using the classifier's output, so with " +
+        "classification off it will record zero shadow events for every request.",
+      );
+    }
     if (dashboard) {
       const dashPort = config.dashboard?.port || config.server?.dashboard_port || 18781;
       console.log("[skgateway] dashboard: port " + dashPort);
