@@ -269,6 +269,11 @@ export class ConnectionPool {
             `(${state.active}/${state.max}); deferred to the next candidate ` +
             `without queueing.`,
           retryAfterSeconds,
+          {
+            queueWaitMs: 0,
+            inflightConcurrency: Math.min(state.max, Math.max(0, state.active)),
+            admissionOutcome: "denied",
+          },
         ));
         return;
       }

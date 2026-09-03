@@ -280,7 +280,12 @@ describe("non-blocking admission on every candidate but the last", () => {
     const started = Date.now();
     await assert.rejects(
       () => pool.acquire("b", { nonBlocking: true }),
-      (err) => err.code === "capacity_exceeded",
+      (err) => {
+        assert.equal(err.code, "capacity_exceeded");
+        assert.equal(err.inflightConcurrency, 1,
+          "the rejection reports the saturated one-slot domain as active=1");
+        return true;
+      },
       "a full door under non-blocking admission rejects rather than queueing",
     );
     assert.ok(Date.now() - started < 500, "the rejection is immediate");
@@ -289,6 +294,36 @@ describe("non-blocking admission on every candidate but the last", () => {
     assert.equal(stats.queued, 0);
     assert.equal(stats.totalDeferred, 1);
     assert.equal(stats.totalDropped, 0);
+  });
+
+  test("admissionAttempts preserves exact bounded concurrency for every refused door", async () => {
+    const modelId = `admission-attempt-concurrency-${Date.now()}`;
+    const pool = getPool({
+      capacityDomains: {
+        firstDomain: { members: ["first"], max: 1, maxQueue: 24, queueTimeoutMs: 3000 },
+        lastDomain: { members: ["last"], max: 1, maxQueue: 0, queueTimeoutMs: 3000 },
+      },
+    });
+    assert.ok(await pool.acquire("first"));
+    assert.ok(await pool.acquire("last"));
+    const router = createRouter({
+      backends: {
+        first: { url: full.base, auth_type: "none", models: [modelId], priority: 1 },
+        last: { url: full.base, auth_type: "none", models: [modelId], priority: 2 },
+      },
+    });
+
+    const r = await routeAndSend(
+      router, { model: modelId, agentId: "test" },
+      "/chat/completions", "POST", HEADERS, bodyFor(modelId), true,
+    );
+
+    assert.equal(r.status, 503);
+    assert.deepEqual(
+      r.admissionAttempts.map((attempt) => attempt.inflightConcurrency),
+      [1, 1],
+      "both the nonblocking first door and terminal last door report active=1",
+    );
   });
 
   test("same-domain aliases produce one terminal rejection, not a retry on the same door", async () => {
@@ -409,6 +444,8 @@ describe("admission telemetry, attribution and the abort race", () => {
     assert.equal(fo[0].admission_rejected, true, "carrying the admission detail");
     assert.equal(fo[0].capacity_domain, "fullDomain");
     assert.ok(fo[0].queue_wait_ms !== undefined, "and the queue wait");
+    assert.equal(fo[0].inflight_concurrency, 1,
+      "and the saturated one-slot door's exact bounded concurrency");
   });
 
   // DEFECT 2. The previous version of this test allowed an EMPTY attribution
