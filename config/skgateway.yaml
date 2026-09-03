@@ -367,3 +367,28 @@ discovery:
     anthropic:  { enabled: true, free_only: false, chat_only: true }
     nvidia:     { enabled: true, free_only: true, chat_only: true }
     openrouter: { enabled: false, free_only: true, chat_only: true }
+
+## Semantic cache (card: semantic-cache stage 2).
+## SHADOW MODE: embeds each eligible prompt, records whether a cached answer
+## WOULD have matched, then throws that away and dispatches normally. It never
+## serves a cached response to a client while mode is `shadow`.
+##
+## Off by default. The hit rate on this fleet has never been measured: the
+## gateway logs no prompt text and no prompt hash, so there is no way to
+## compute it retroactively. Run shadow for a week, read
+## `semantic_cache.shadow` events out of the SIEM sink, then decide.
+##
+## Eligible categories are deliberately narrow. Measured over 10,755 classified
+## prompts: tool_use is 49.0% of wall clock but has side effects, conversation
+## is memory-grounded, code_generation produces novel output. What is left is
+## 26.9% of wall clock, about 2.4 hours per week.
+semantic_cache:
+  enabled: false
+  mode: shadow
+  threshold: 0.92
+  ttl_seconds: 3600
+  max_entries: 2000
+  embed_url: http://192.168.0.100:11438/v1/embeddings
+  embed_model: mxbai-embed-large
+  embed_timeout_ms: 5000
+  categories: [administrative, system, data_query]
