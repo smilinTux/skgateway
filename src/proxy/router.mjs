@@ -3294,6 +3294,9 @@ export async function routeAndSend(router, request, upstreamPath, method, client
   // entry per candidate, used to synthesize the explicit 400 when EVERY
   // door is too small for the request.
   const contextRejections = [];
+  // Doors whose engine returned exceed_context_size_error (preflight missed
+  // it), advanced without health penalty.
+  const contextOverflows = [];
   // Every attempt that produced an energy observation, in attempt order.
   // Reads are per attempt (spec 4.5), so writes must be too: a local metered
   // attempt that burned real joules and then failed over to cloud gets its own
@@ -3324,7 +3327,11 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // documented heuristic (~4 bytes per token for JSON chat payloads),
     // deliberately coarse because it gates only obvious overflows.
     if (backend && Number.isFinite(backend.context_limit) && backend.context_limit > 0) {
-      const estimatedTokens = Math.ceil(attemptBody.length / 4);
+      // ponytail: /3 heuristic over-estimates plain text ~25 percent; measured
+      // structured Pi prompts ran 3.0-3.5 bytes/token, so /4 undercounted and
+      // slipped real 16.6K-18.5K prompts past a 16384 slot. Upgrade path: a
+      // tokenizer when preflight false-negatives matter.
+      const estimatedTokens = Math.ceil(attemptBody.length / 3);
       if (estimatedTokens > backend.context_limit) {
         console.warn(
           `[routeAndSend] context preflight rejected backend=${backendId}: ` +
@@ -3904,6 +3911,43 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     const retryElsewhere = isFailoverStatus(res.status) ||
       (isBucketChain && (res.status === 404 || res.status === 410));
     const throttled = isThrottleStatus(res.status);
+
+    // Narrow context-overflow failover (card 9ed4a9f7 amendment): a 400 whose
+    // parsed body is the engine's exceed_context_size_error is a DOOR limit,
+    // not a payload defect. Advance to a same-model candidate with a strictly
+    // larger context_limit (or no limit) WITHOUT a health penalty. Every other
+    // 400 stays terminal; nothing blanket-fails-over.
+    if (res.status === 400) {
+      let ctxOverflow = false;
+      try {
+        const parsedErr = JSON.parse(res.body?.toString("utf-8") || "{}");
+        const err = parsedErr?.error || parsedErr;
+        ctxOverflow = err?.type === "exceed_context_size_error"
+          || err?.code === "exceed_context_size_error";
+      } catch { /* not JSON: terminal 400 */ }
+      if (ctxOverflow) {
+        const currentLimit = Number.isFinite(backend?.context_limit) ? backend.context_limit : 0;
+        const larger = candidates.slice(i + 1).some((c) => {
+          if (c.model && c.model !== candidateModel) return false;
+          const lim = Number.isFinite(c.backend?.context_limit) ? c.backend.context_limit : Infinity;
+          return lim > currentLimit;
+        });
+        console.warn(
+          `[router] 400 context overflow backend=${backendId} model=${candidateModel}; ` +
+          `${larger ? "advancing to a larger-context same-model candidate" : "no larger door, terminal"}`,
+        );
+        await emitSiem("error", {
+          type: "context_overflow",
+          backend: backendId,
+          model: candidateModel,
+          advanced: larger,
+        }, { backend: backendId });
+        if (larger) {
+          contextOverflows.push({ backendId, model: candidateModel });
+          continue;  // no health write: the door is fine, the prompt is just big
+        }
+      }
+    }
 
     if (!retryElsewhere) {
       console.log(

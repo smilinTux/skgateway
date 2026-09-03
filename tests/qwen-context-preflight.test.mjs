@@ -99,3 +99,47 @@ test("small requests are never preflighted away", async () => {
   assert.equal(r.status, 200);
   await srv.close();
 });
+
+test("engine exceed_context_size_error 400 fails over to a larger same-model door, no health penalty", async () => {
+  const overflow = (_req, res) => {
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { type: "exceed_context_size_error", code: 400 } }));
+  };
+  const small = await startServer(overflow);
+  const big = await startServer(reply("served"));
+  const router = createRouter({ backends: {
+    "chiap01-qwen38": { url: small.base, auth_type: "none", models: ["qwen3.8-27b"], priority: 1, context_limit: 32768 },
+    "chiap08-qwen38": { url: big.base, auth_type: "none", models: ["qwen3.8-27b"], priority: 3, context_limit: 131072 },
+  } });
+  // Prefilter passes (small prompt), engine still rejects: narrow failover path.
+  const r = await routeAndSend(
+    router, { model: "qwen3.8-27b", agentId: "t" }, "/v1/chat/completions", "POST", HEADERS,
+    Buffer.from(JSON.stringify({ model: "qwen3.8-27b", messages: [{ role: "user", content: "hi" }] })),
+    true,
+  );
+  assert.equal(r.status, 200, `larger door must serve, got ${r.status}`);
+  assert.equal(r.backendId, "chiap08-qwen38");
+  assert.equal(router.getBackend("chiap01-qwen38").isAvailable(), true,
+    "context overflow must not penalize backend health");
+  await small.close(); await big.close();
+});
+
+test("ordinary 400 stays terminal, no failover", async () => {
+  const bad = (_req, res) => {
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { type: "invalid_request_error", message: "bad param" } }));
+  };
+  const other = await startServer(reply("served"));
+  const srv = await startServer(bad);
+  const router = createRouter({ backends: {
+    a: { url: srv.base, auth_type: "none", models: ["qwen3.8-27b"], priority: 1 },
+    b: { url: other.base, auth_type: "none", models: ["qwen3.8-27b"], priority: 3 },
+  } });
+  const r = await routeAndSend(
+    router, { model: "qwen3.8-27b", agentId: "t" }, "/v1/chat/completions", "POST", HEADERS,
+    Buffer.from(JSON.stringify({ model: "qwen3.8-27b", messages: [{ role: "user", content: "hi" }] })),
+    true,
+  );
+  assert.equal(r.status, 400, "non-context 400 must stay terminal");
+  await srv.close(); await other.close();
+});

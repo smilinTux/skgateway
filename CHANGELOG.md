@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Narrow context-overflow failover (9ed4a9f7 amendment): a 400 whose parsed
+  body is `exceed_context_size_error` advances to a same-model candidate with
+  a strictly larger `context_limit` with no backend health penalty; all other
+  400s stay terminal. Token estimate tightened to 3 bytes/token after
+  measured structured prompts slipped past the 4-byte estimate.
+
 - Per-backend `context_limit` (card 9ed4a9f7): the true serving-engine token
   ceiling declared per door. routeAndSend preflights request size (heuristic
   4 bytes/token), skips doors that cannot hold the request and fails over to
