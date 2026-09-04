@@ -271,8 +271,21 @@ export async function probeModels(store, opts = {}) {
     // uncapped by the tier-1 budget so selectCapabilityCandidates' own
     // never-assessed-first ordering decides, not the liveness sweep's
     // oldest-verified-first ordering.
+    // Retired records (eol, not_chat) are excluded from that pool even though
+    // tier 1 keeps probing them (they are only ever revived by a probe): a
+    // battery on a model the sweep already found gone is wasted budget, and
+    // because never-assessed ids sort first and alphabetically, three eol ids
+    // took every slot on the first live sweep (2026-09-04: 01-ai/yi-large,
+    // ai21labs/jamba-1.5-large-instruct, aisingapore/sea-lion-7b-instruct,
+    // all 404), failed liveness, recorded no assessment, and would have been
+    // re-picked every day while the active fleet stayed unmeasured. A retired
+    // id that a later probe revives to active becomes eligible again then.
     const tier2Pool = capabilityScope === 'provider'
       ? selectProbeCandidates(safeStore, { budget: Infinity, now: nowMs, trafficWindowMs: 0, provider, excludedIds })
+          .filter((id) => {
+            const st = safeStore[id] && safeStore[id].state;
+            return st !== LIFECYCLE_STATES.EOL && st !== LIFECYCLE_STATES.NOT_CHAT;
+          })
       : candidates;
     capabilityIds = new Set(selectCapabilityCandidates(safeStore, tier2Pool, { budget: capabilityBudget, now: nowMs, intervalMs: capabilityIntervalMs }));
     for (const id of capabilityIds) {
