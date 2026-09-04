@@ -99,6 +99,11 @@ class PoolState {
 
     /** Peak queue depth ever reached */
     this.peakQueue = 0;
+
+    // Bounded per-model counters for operator telemetry. Attribution is
+    // supplied by the router and never contains request content or secrets.
+    /** @type {Map<string, {provider: string, requestedModel: string|null, servedModel: string|null, totalProcessed: number, totalDropped: number, totalTimedOut: number, totalCancelled: number, totalErrors: number}>} */
+    this.attributions = new Map();
   }
 }
 
@@ -184,7 +189,7 @@ export class ConnectionPool {
     return this._pools.get(settings.domainId);
   }
 
-  _issueTicket(state, backendId, enqueuedAt = null, inflightConcurrency = state.active) {
+  _issueTicket(state, backendId, enqueuedAt = null, inflightConcurrency = state.active, attribution = {}) {
     const acquiredAt = Date.now();
     const ticket = Object.freeze({
       id: state.id,
@@ -196,9 +201,48 @@ export class ConnectionPool {
         : Math.min(state.queueTimeoutMs, Math.max(0, acquiredAt - enqueuedAt)),
       inflightConcurrency: Math.min(state.max, Math.max(1, inflightConcurrency)),
       admissionOutcome: "admitted",
+      attribution: Object.freeze({
+        provider: attribution.provider || "unknown",
+        requestedModel: attribution.requestedModel || null,
+        servedModel: attribution.servedModel || null,
+      }),
     });
     this._issuedTickets.set(ticket, state);
     return ticket;
+  }
+
+  _attributionKey(attribution = {}) {
+    const provider = typeof attribution.provider === "string" && attribution.provider
+      ? attribution.provider : "unknown";
+    const requestedModel = typeof attribution.requestedModel === "string" && attribution.requestedModel
+      ? attribution.requestedModel : null;
+    const servedModel = typeof attribution.servedModel === "string" && attribution.servedModel
+      ? attribution.servedModel : null;
+    return JSON.stringify([provider, requestedModel, servedModel]);
+  }
+
+  _attribution(state, attribution = {}) {
+    const key = this._attributionKey(attribution);
+    let row = state.attributions.get(key);
+    if (!row) {
+      const [provider, requestedModel, servedModel] = JSON.parse(key);
+      row = {
+        provider,
+        requestedModel,
+        servedModel,
+        totalProcessed: 0,
+        totalDropped: 0,
+        totalTimedOut: 0,
+        totalCancelled: 0,
+        totalErrors: 0,
+      };
+      state.attributions.set(key, row);
+    }
+    return row;
+  }
+
+  _recordAdmission(state, attribution, counter) {
+    this._attribution(state, attribution)[counter]++;
   }
 
   // -----------------------------------------------------------------------
@@ -215,13 +259,14 @@ export class ConnectionPool {
    *   Resolves with a ticket that MUST be passed to release().
    *   Rejects if the queue is full or the wait times out.
    */
-  acquire(backendId, { signal = null } = {}) {
+  acquire(backendId, { signal = null, attribution = {} } = {}) {
     const state = this._getOrCreate(backendId);
     const retryAfterSeconds = Math.max(1, Math.ceil(state.queueTimeoutMs / 1000));
 
     return new Promise((resolve, reject) => {
       if (signal?.aborted) {
         state.totalCancelled++;
+        this._recordAdmission(state, attribution, "totalCancelled");
         reject(new PoolAdmissionError(
           "client_closed",
           state.id,
@@ -240,8 +285,9 @@ export class ConnectionPool {
       if (state.active < state.max) {
         state.active++;
         state.totalProcessed++;
+        this._recordAdmission(state, attribution, "totalProcessed");
         if (state.active > state.peakActive) state.peakActive = state.active;
-        resolve(this._issueTicket(state, backendId));
+        resolve(this._issueTicket(state, backendId, null, state.active, attribution));
         return;
       }
 
@@ -249,6 +295,7 @@ export class ConnectionPool {
       // maxQueue=0 means fail fast. It must never mean "disable the cap".
       if (state.queue.length >= state.maxQueue) {
         state.totalDropped++;
+        this._recordAdmission(state, attribution, "totalDropped");
         reject(new PoolAdmissionError(
           "capacity_exceeded",
           state.id,
@@ -285,7 +332,10 @@ export class ConnectionPool {
           settled = true;
           cleanup();
           state.totalProcessed++;
-          resolve(this._issueTicket(state, backendId, waiter.enqueuedAt, state.active + 1));
+          this._recordAdmission(state, attribution, "totalProcessed");
+          resolve(this._issueTicket(
+            state, backendId, waiter.enqueuedAt, state.active + 1, attribution,
+          ));
           return true;
         },
         enqueuedAt: Date.now(),
@@ -299,6 +349,7 @@ export class ConnectionPool {
           settled = true;
           cleanup();
           state.totalTimedOut++;
+          this._recordAdmission(state, attribution, "totalTimedOut");
           reject(new PoolAdmissionError(
             "queue_timeout",
             state.id,
@@ -319,6 +370,7 @@ export class ConnectionPool {
           settled = true;
           cleanup();
           state.totalCancelled++;
+          this._recordAdmission(state, attribution, "totalCancelled");
           reject(new PoolAdmissionError(
             "client_closed",
             state.id,
@@ -382,6 +434,18 @@ export class ConnectionPool {
     return true;
   }
 
+  /** Record the terminal outcome for an admitted request without changing
+   * admission or capacity behavior. */
+  recordOutcome(ticket, { status } = {}) {
+    if (!ticket || typeof ticket !== "object") return false;
+    const state = this._issuedTickets.get(ticket);
+    if (!state) return false;
+    if (Number.isFinite(status) && status >= 400) {
+      this._attribution(state, ticket.attribution).totalErrors++;
+    }
+    return true;
+  }
+
   // -----------------------------------------------------------------------
   // Stats / Monitoring
   // -----------------------------------------------------------------------
@@ -389,7 +453,7 @@ export class ConnectionPool {
   /**
    * Get current stats for a specific backend pool.
    * @param {string} backendId
-   * @returns {{ capacityDomain: string, members: string[], active: number, queued: number, max: number, maxQueue: number, queueTimeoutMs: number, totalProcessed: number, totalDropped: number, totalTimedOut: number, totalCancelled: number, peakActive: number, peakQueue: number }}
+   * @returns {{ capacityDomain: string, members: string[], active: number, queued: number, max: number, maxQueue: number, queueTimeoutMs: number, totalProcessed: number, totalDropped: number, totalTimedOut: number, totalCancelled: number, peakActive: number, peakQueue: number, attributions: object[] }}
    */
   getStats(backendId) {
     const settings = this._settings(backendId);
@@ -425,6 +489,9 @@ export class ConnectionPool {
       totalCancelled: state.totalCancelled,
       peakActive: state.peakActive,
       peakQueue: state.peakQueue,
+      ...(state.attributions.size > 0
+        ? { attributions: [...state.attributions.values()].map((row) => ({ ...row })) }
+        : {}),
     };
   }
 
