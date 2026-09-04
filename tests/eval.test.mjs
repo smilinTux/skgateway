@@ -150,6 +150,13 @@ describe('runModelEval', () => {
     const persisted = JSON.parse(readFileSync(STORE, 'utf-8'));
     assert.ok(persisted['probe/model'].measured_capabilities.tool_call,
       'the record must survive in model_catalog_store.json, not just be returned');
+    // The loopback runner returns the raw wire body under `json`; until
+    // 2026-09-04 the battery only read a pre-extracted `message`, so this
+    // exact fixture was persisted as tool_call `fail` (no_matching_tool_call)
+    // and the test above still passed because it only checked truthiness.
+    assert.equal(persisted['probe/model'].measured_capabilities.tool_call.status, 'pass',
+      'a well-formed tool_call in the wire shape must be measured as a pass');
+    assert.equal(persisted['probe/model'].measured_capabilities.instruction_following.status, 'pass');
   });
 
   test('a run does not clobber unrelated models in the store', async () => {

@@ -355,8 +355,16 @@ discovery:
   refresh_seconds: 3600
   providers:
     anthropic:  { enabled: true, free_only: false, chat_only: true }
-    nvidia:     { enabled: true, free_only: true, chat_only: true }
-    openrouter: { enabled: false, free_only: true, chat_only: true }
+    nvidia:     { enabled: true, free_only: true, chat_only: true, capability_battery: true }
+    openrouter: { enabled: false, free_only: true, chat_only: true, capability_battery: true }
+  ## Capability battery (card 0e010400): see config/skgateway.yaml.example.
+  ## Measured, never inferred from a model name. Runs only where probe_seconds
+  ## is > 0 and the provider has a backends.<name> url + key.
+  probe_providers: [nvidia, openrouter]
+  capability_budget: 3
+  capability_interval_seconds: 2592000
+  capability_timeout_ms: 30000
+  capability_scope: provider
 
 ## Semantic cache (card: semantic-cache stage 2).
 ## SHADOW MODE: embeds each eligible prompt, records whether a cached answer

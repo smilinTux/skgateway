@@ -563,3 +563,123 @@ describe('discoverCatalog wires the probe sweep into the existing refresh cadenc
     assert.equal(record.measured_capabilities.tool_call, null);
   });
 });
+
+describe('probeModels: capabilityScope (card 0e010400)', () => {
+  const recent = () => lc({ last_verified_at: NOW - 1000, provider: 'nvidia', state: 'active' });
+
+  test("default 'sweep' scope: a recently-verified model is neither probed nor battered (original C9 shape)", async () => {
+    let probes = 0;
+    const next = await probeModels({ hot: recent() }, {
+      now: () => NOW,
+      runProbe: async () => { probes++; return { ok: true, status: 200 }; },
+      chatComplete: async () => ({ ok: true, status: 200, message: { content: 'x' } }),
+      runCapabilityAssessment: async () => ({ tool_call: { capability: 'measured', status: 'pass', assertion: 'x', measured_at: NOW, evidence: null } }),
+    });
+    assert.equal(probes, 0);
+    assert.equal(next.hot.measured_capabilities, undefined);
+  });
+
+  test("'provider' scope: a recently-verified, never-assessed model gets one liveness probe and then the battery", async () => {
+    let probes = 0;
+    let battered = null;
+    const next = await probeModels({ hot: recent() }, {
+      now: () => NOW,
+      capabilityScope: 'provider',
+      runProbe: async () => { probes++; return { ok: true, status: 200 }; },
+      chatComplete: async () => ({ ok: true, status: 200, message: { content: 'x' } }),
+      runCapabilityAssessment: async (id) => { battered = id; return { tool_call: { capability: 'measured', status: 'pass', assertion: 'x', measured_at: NOW, evidence: null } }; },
+    });
+    assert.equal(probes, 1, 'exactly one liveness probe, drawn before the battery');
+    assert.equal(battered, 'hot');
+    assert.equal(next.hot.measured_capabilities.liveness.status, 'pass');
+    assert.equal(next.hot.measured_capabilities.tool_call.status, 'pass');
+    assert.equal(next.hot.measured_capabilities.last_full_assessment_at, NOW);
+  });
+
+  test("'provider' scope still honours capabilityBudget, the provider filter, excludedIds and dead tombstones", async () => {
+    const store = {
+      a: recent(), b: recent(), c: recent(),
+      other: lc({ last_verified_at: NOW - 1000, provider: 'openrouter', state: 'active' }),
+      claimed: recent(),
+      dead: lc({ last_verified_at: NOW - 1000, provider: 'nvidia', state: 'dead' }),
+    };
+    const battered = [];
+    await probeModels(store, {
+      now: () => NOW,
+      capabilityScope: 'provider',
+      capabilityBudget: 2,
+      provider: 'nvidia',
+      excludedIds: new Set(['claimed']),
+      runProbe: async () => ({ ok: true, status: 200 }),
+      chatComplete: async () => ({ ok: true, status: 200, message: { content: 'x' } }),
+      runCapabilityAssessment: async (id) => { battered.push(id); return {}; },
+    });
+    assert.deepEqual(battered.sort(), ['a', 'b']);
+  });
+
+  test("'provider' scope: a model whose liveness probe fails this sweep is still not battered", async () => {
+    let battered = null;
+    await probeModels({ hot: recent() }, {
+      now: () => NOW,
+      capabilityScope: 'provider',
+      runProbe: async () => ({ ok: false, status: 429 }),
+      chatComplete: async () => ({ ok: true, status: 200, message: { content: 'x' } }),
+      runCapabilityAssessment: async (id) => { battered = id; return {}; },
+    });
+    assert.equal(battered, null);
+  });
+});
+
+describe('discoverCatalog: per-provider sweeps and battery gating (card 0e010400)', () => {
+  test('probeProviders runs one sweep per provider, each scoped to its own records, and capabilityProviders gates tier 2 per provider', async () => {
+    const path = freshPath();
+    const probed = [];
+    const battered = [];
+    await discoverCatalog({
+      localModels: [],
+      nvidiaFetch: async () => ({ data: [{ id: 'nvidia/nv-model' }] }),
+      openrouterFetch: async () => ({ data: [{ id: 'vendor/or-model:free', pricing: { prompt: '0', completion: '0' } }] }),
+      cache: {},
+      now: () => 0,
+      lifecycleStorePath: path,
+      probeSeconds: 1,
+      probeProviders: ['nvidia', 'openrouter'],
+      capabilityProviders: ['openrouter'],
+      probeRunProbe: async (id) => { probed.push(id); return { ok: true, status: 200 }; },
+      chatComplete: async () => ({ ok: true, status: 200, message: { content: 'x' } }),
+      probeRunCapabilityAssessment: async (id) => { battered.push(id); return {}; },
+    });
+    assert.ok(probed.includes('nvidia/nv-model'), 'nvidia sweep ran');
+    assert.ok(probed.includes('vendor/or-model:free'), 'openrouter sweep ran');
+    assert.deepEqual(battered, ['vendor/or-model:free'], 'only the provider with the battery enabled is battered');
+    _resetCacheForTests();
+    assert.equal(getLifecycle('nvidia/nv-model', path).measured_capabilities.liveness.status, 'pass');
+    assert.equal(getLifecycle('nvidia/nv-model', path).measured_capabilities.last_full_assessment_at, null);
+    assert.equal(getLifecycle('vendor/or-model:free', path).measured_capabilities.last_full_assessment_at, 0);
+  });
+
+  test('a provider with no resolvable backend (no url/key) is skipped, not probed with nothing', async () => {
+    const path = freshPath();
+    let fetches = 0;
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async () => { fetches++; return { ok: true, status: 200, json: async () => ({}) }; };
+    try {
+      await discoverCatalog({
+        localModels: [],
+        nvidiaFetch: async () => ({ data: [{ id: 'nvidia/nv-model' }] }),
+        openrouterFetch: async () => ({ data: [] }),
+        cache: {},
+        now: () => 0,
+        lifecycleStorePath: path,
+        probeSeconds: 1,
+        probeProviders: ['nvidia'],
+        capabilityProviders: ['nvidia'],
+        probeBackends: { nvidia: null },
+      });
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    assert.equal(fetches, 0);
+  });
+});
+
