@@ -19,6 +19,40 @@ const QWEN_DOMAIN = {
 
 
 describe("ConnectionPool capacity domains", () => {
+  test("records bounded Kimi counters with provider and model attribution", async () => {
+    const pool = new ConnectionPool({
+      capacityDomains: {
+        "kimi-coding": {
+          members: ["kimi-coding"], max: 1, maxQueue: 0, queueTimeoutMs: 1000,
+        },
+      },
+    });
+    const attribution = {
+      provider: "kimi",
+      requestedModel: "kimi-for-coding",
+      servedModel: "kimi-k2.7",
+    };
+    const ticket = await pool.acquire("kimi-coding", { attribution });
+    pool.recordOutcome(ticket, { status: 502 });
+    await assert.rejects(
+      pool.acquire("kimi-coding", { attribution }),
+      (error) => error.code === "capacity_exceeded",
+    );
+    pool.release(ticket);
+
+    const stats = pool.getStats("kimi-coding");
+    assert.deepEqual(stats.attributions, [{
+      provider: "kimi",
+      requestedModel: "kimi-for-coding",
+      servedModel: "kimi-k2.7",
+      totalProcessed: 1,
+      totalDropped: 1,
+      totalTimedOut: 0,
+      totalCancelled: 0,
+      totalErrors: 1,
+    }]);
+  });
+
   test("direct and registry aliases share one four-slot domain", async () => {
     const pool = new ConnectionPool({ capacityDomains: QWEN_DOMAIN });
     const tickets = await Promise.all([

@@ -3643,7 +3643,14 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     let slot = null;
     if (pool) {
       try {
-        slot = await pool.acquire(backendId, { signal: abortSignal });
+        slot = await pool.acquire(backendId, {
+          signal: abortSignal,
+          attribution: {
+            provider: backend?.provider || backendId,
+            requestedModel,
+            servedModel: candidateModel,
+          },
+        });
       } catch (err) {
         // A client which leaves while queued is the same neutral 499 as one
         // which leaves after dispatch: no failover and no backend-health write.
@@ -3885,6 +3892,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     } finally {
       // Always release the slot, even on error
       if (pool && slot) {
+        pool.recordOutcome(slot, { status: res?.status });
         pool.release(slot);
       }
       // Pair every enterMeter with an exit here, even on a thrown upstream,

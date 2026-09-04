@@ -1423,6 +1423,33 @@ export const server = http.createServer(async (req, res) => {
   if (req.url === "/queue") {
     const allStats = pool.getAllStats();
     const total = pool.getTotalStats();
+    // Keep configured Kimi models visible before their first request. Rows
+    // contain only provider/model names and numeric admission facts.
+    const kimiModels = Object.values(getConfig().backends || {})
+      .filter((backend) => Array.isArray(backend?.models))
+      .flatMap((backend) => backend.models)
+      .filter((model) => typeof model === "string" && /^kimi(?:[-_/]|$)/i.test(model));
+    for (const [poolId, stats] of Object.entries(allStats)) {
+      if (!/kimi/i.test(poolId) && !stats.members.some((member) => /kimi/i.test(member))) continue;
+      const existing = new Map((stats.attributions || []).map((row) => [
+        JSON.stringify([row.provider, row.requestedModel, row.servedModel]), row,
+      ]));
+      for (const model of kimiModels) {
+        const row = {
+          provider: poolId,
+          requestedModel: model,
+          servedModel: model,
+          totalProcessed: 0,
+          totalDropped: 0,
+          totalTimedOut: 0,
+          totalCancelled: 0,
+          totalErrors: 0,
+        };
+        const key = JSON.stringify([row.provider, row.requestedModel, row.servedModel]);
+        if (!existing.has(key)) existing.set(key, row);
+      }
+      stats.attributions = [...existing.values()];
+    }
     // In-flight requests with age: the discriminator between a WORKING
     // worker (fresh open request, ages cycling) and a HUNG one (a request
     // open for many minutes). Two fleet workers were mistaken for hung on
