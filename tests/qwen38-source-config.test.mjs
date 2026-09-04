@@ -32,7 +32,7 @@ test('each Qwen3.8 backend claims exactly the ids its upstream serves', () => {
   const chiap08 = config.backends['chiap08-qwen38'];
 
   assert.equal(chiap01.url, 'http://chiap01:18810/v1');
-  assert.equal(chiap08.url, 'http://TAILNET_HOST:11439/v1');
+  assert.equal(chiap08.url, 'http://chiap08:11439/v1');
   assert.deepEqual(chiap01.models, [SERVED_ID]);
   assert.deepEqual(chiap08.models, CHIAP08_MODEL_IDS);
   assert.equal(chiap01.context_limit, 32768);
