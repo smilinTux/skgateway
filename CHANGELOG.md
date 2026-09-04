@@ -19,6 +19,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Backend endpoints repaired (card 0e010200). `chiap08-qwen38` pointed at the
+  literal, never-substituted publication placeholder `http://TAILNET_HOST:11439/v1`
+  and was dead as written; it now uses the bare MagicDNS host name
+  `http://chiap08:11439/v1` (real host names are allowed by the publication
+  rule, only the tailnet address is stripped). The `ollama` backend
+  (.100:11434, `dolphin-*`, dead for two days, never requested) is replaced by
+  an `ornith` backend declaring `ornith-1.5-9b` on .100:8082, shipped
+  `enabled: false` with the probe record because the host did not answer.
+  `chiap01-qwen38` was confirmed live (model list plus a real completion).
 - History trim no longer leaves orphan assistant tool_calls: the final
   assembled candidate (head slice + notice + repaired tail) now passes
   through repairToolPairing in all three trim passes. Fleet incident
