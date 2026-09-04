@@ -229,12 +229,17 @@ backends:
       - ornith-1.5-9b
     priority: 3
 
+  ## OpenRouter free tier. Discovery-only, no static models list: the free
+  ## roster turns over and a hand-maintained list is what rotted on nvidia.
+  ## The key is OPENROUTER_API_KEY from the service EnvironmentFile, never
+  ## inlined here. Verified live 2026-09-04: 427 models, 26 free-tier.
   openrouter:
-    enabled: false
+    enabled: true
     url: https://openrouter.ai/api/v1
     auth_type: api_key
     api_key_env: OPENROUTER_API_KEY
     discovery: free
+    priority: 4
     max_concurrent: 10
 
 tools:
@@ -398,7 +403,7 @@ discovery:
   providers:
     anthropic:  { enabled: true, free_only: false, chat_only: true }
     nvidia:     { enabled: true, free_only: true, chat_only: true, capability_battery: true }
-    openrouter: { enabled: false, free_only: true, chat_only: true, capability_battery: true }
+    openrouter: { enabled: true, free_only: true, chat_only: true, capability_battery: true }
   ## Capability battery (card 0e010400): see config/skgateway.yaml.example.
   ## Measured, never inferred from a model name. Runs only where probe_seconds
   ## is > 0 and the provider has a backends.<name> url + key.
