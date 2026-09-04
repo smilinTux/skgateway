@@ -788,7 +788,7 @@ export class Backend {
     this.model_claim_quarantine_cooldown_ms = typeof config.model_claim_quarantine_cooldown_ms === "number"
       ? config.model_claim_quarantine_cooldown_ms
       : DEFAULT_MODEL_CLAIM_QUARANTINE_COOLDOWN_MS;
-    /** @type {Map<string,{failures:number,quarantinedAt:number,lastStatus:number}>} */
+    /** @type {Map<string,{failures:number,quarantinedAt:number,lastStatus:number,lastReason:?string,probing:boolean}>} */
     this._modelClaimFailures = new Map();
 
     // Auth credentials. credentials_path (the key the YAML schema and
@@ -901,8 +901,40 @@ export class Backend {
   /** Whether this exact declared backend-model claim is currently selectable. */
   isModelClaimAvailable(model) {
     const state = this._modelClaimFailures.get(model);
-    if (!state?.quarantinedAt) return true;
-    return Date.now() - state.quarantinedAt >= this.model_claim_quarantine_cooldown_ms;
+    return !state?.quarantinedAt;
+  }
+
+  /** Admit one half-open recovery probe after cooldown, never ordinary traffic. */
+  tryAcquireModelClaimProbe(model) {
+    const state = this._modelClaimFailures.get(model);
+    if (!state?.quarantinedAt || state.probing) return false;
+    if (Date.now() - state.quarantinedAt < this.model_claim_quarantine_cooldown_ms) return false;
+    state.probing = true;
+    return true;
+  }
+
+  /** Release a half-open lease when no upstream attempt was made. */
+  releaseModelClaimProbe(model) {
+    const state = this._modelClaimFailures.get(model);
+    if (state?.probing) state.probing = false;
+  }
+
+  /** Truthful, non-mutating claim state for health and catalog projections. */
+  getModelClaimHealth(model) {
+    const state = this._modelClaimFailures.get(model);
+    if (!state?.quarantinedAt) return null;
+    const retryAt = state.quarantinedAt + this.model_claim_quarantine_cooldown_ms;
+    return {
+      status: state.probing ? "half_open" : "quarantined",
+      quarantined: true,
+      probing: Boolean(state.probing),
+      consecutiveFailures: state.failures,
+      lastStatus: state.lastStatus,
+      lastFailureReason: state.lastReason || `http_${state.lastStatus}`,
+      quarantinedAt: state.quarantinedAt,
+      cooldownMs: this.model_claim_quarantine_cooldown_ms,
+      retryAt,
+    };
   }
 
   /**
@@ -910,19 +942,32 @@ export class Backend {
    * wrong answers quarantine. Success clears the exact claim. 504 and other
    * slow/ambiguous outcomes do not participate.
    */
-  recordModelClaimOutcome(model, status) {
+  recordModelClaimOutcome(model, status, reason = null) {
     if (!model || !this.supportsModel(model) || this.model_claim_quarantine_threshold <= 0) return null;
     if (status >= 200 && status < 300) {
       const prior = this._modelClaimFailures.get(model);
       this._modelClaimFailures.delete(model);
       return prior?.quarantinedAt ? { transition: "readmitted", model, failures: 0 } : null;
     }
-    if (!isFastModelClaimFailure(status)) return null;
+    if (!isFastModelClaimFailure(status)) {
+      const prior = this._modelClaimFailures.get(model);
+      if (prior?.probing) {
+        prior.probing = false;
+        prior.quarantinedAt = Date.now();
+        prior.lastStatus = status;
+        prior.lastReason = reason;
+      }
+      return null;
+    }
 
-    const prior = this._modelClaimFailures.get(model) || { failures: 0, quarantinedAt: 0, lastStatus: 0 };
+    const prior = this._modelClaimFailures.get(model) || {
+      failures: 0, quarantinedAt: 0, lastStatus: 0, lastReason: null, probing: false,
+    };
     const failures = prior.failures + 1;
     const quarantinedAt = failures >= this.model_claim_quarantine_threshold ? Date.now() : prior.quarantinedAt;
-    this._modelClaimFailures.set(model, { failures, quarantinedAt, lastStatus: status });
+    this._modelClaimFailures.set(model, {
+      failures, quarantinedAt, lastStatus: status, lastReason: reason, probing: false,
+    });
     if (!prior.quarantinedAt && quarantinedAt) {
       return { transition: "quarantined", model, failures, status };
     }
@@ -1003,6 +1048,11 @@ export class Backend {
       totalErrors: this._totalErrors,
       quarantined: this._quarantined,
       consecutiveFailures: this._consecutiveFailures,
+      modelClaims: Object.fromEntries(
+        [...this._modelClaimFailures.keys()]
+          .map((model) => [model, this.getModelClaimHealth(model)])
+          .filter(([, state]) => state),
+      ),
     };
   }
 
@@ -1612,6 +1662,12 @@ export function createRouter(config = {}) {
     const matched = available.filter(
       (b) => b.supportsModel(model) && b.isModelClaimAvailable(model),
     );
+    if (matched.length === 0) {
+      const probe = available.find(
+        (b) => b.supportsModel(model) && b.tryAcquireModelClaimProbe(model),
+      );
+      if (probe) matched.push(probe);
+    }
 
     // Balancing for equal-priority same-model replicas (card 786d9232).
     // Group backends by priority and apply round-robin within each group.
@@ -1852,6 +1908,7 @@ export function createRouter(config = {}) {
         backendUrl: b.url,
         authHeaders: await b.buildAuthHeaders(),
         backend: b,
+        modelClaimProbe: Boolean(b.getModelClaimHealth(model)?.probing),
       }))
     );
 
@@ -3497,7 +3554,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
   const throttledAttempts = [];
 
   for (let i = 0; i < candidates.length; i++) {
-    const { backendId, backendUrl, authHeaders, backend } = candidates[i];
+    const { backendId, backendUrl, authHeaders, backend, modelClaimProbe } = candidates[i];
     // A candidate may carry a per-attempt body (e.g. the cloud-fallback
     // candidate rewrites the model to a cloud-served id). Default to the shared
     // body when no override is present.
@@ -3519,6 +3576,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       // tokenizer when preflight false-negatives matter.
       const estimatedTokens = Math.ceil(attemptBody.length / 3);
       if (estimatedTokens > backend.context_limit) {
+        if (modelClaimProbe) backend.releaseModelClaimProbe(candidates[i].model || request.model);
         console.warn(
           `[routeAndSend] context preflight rejected backend=${backendId}: ` +
             `estimated ${estimatedTokens} tokens exceeds context_limit ${backend.context_limit}; ` +
@@ -3576,6 +3634,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // for a near-certain repeat 429, and record the skip as an attempt for
     // the attributable-429 synthesis below.
     if (isThrottled(backendId, candidateModel)) {
+      if (modelClaimProbe) backend.releaseModelClaimProbe(candidateModel);
       const state = _throttleCooldowns.get(throttleKey(backendId, candidateModel));
       const remainingMs = Math.max(0, (state?.untilMs ?? 0) - Date.now());
       console.warn(
@@ -3648,6 +3707,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         // A client which leaves while queued is the same neutral 499 as one
         // which leaves after dispatch: no failover and no backend-health write.
         if (err instanceof PoolAdmissionError && err.code === "client_closed") {
+          if (modelClaimProbe) backend.releaseModelClaimProbe(candidateModel);
           const queueWaitMs = err.queueWaitMs;
           await emitSiem("response", {
             status: 499,
@@ -3684,6 +3744,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         const code = err instanceof PoolAdmissionError
           ? err.code
           : "capacity_exceeded";
+        if (modelClaimProbe) backend.releaseModelClaimProbe(candidateModel);
         const capacityDomain = err instanceof PoolAdmissionError
           ? err.capacityDomain
           : backendId;
@@ -3901,6 +3962,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // Return immediately after releasing the pool/meter slot in `finally`,
     // before energy reads, health/lifecycle writes, or failover can run.
     if (res?.cancelled || res?.status === 499) {
+      if (modelClaimProbe) backend.releaseModelClaimProbe(candidateModel);
       lastResult = {
         ...res,
         backendId,
@@ -3982,7 +4044,18 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // backend health or lifecycle state.
     const healthy = res.status < 500;
     const qTransition = backend.recordOutcome(healthy, latencyMs);
-    const claimTransition = backend.recordModelClaimOutcome(candidateModel, res.status);
+    let claimFailureReason = null;
+    if (res.status >= 400) {
+      try {
+        const parsed = JSON.parse(res.body?.toString("utf-8") || "{}");
+        claimFailureReason = parsed?.error?.code || parsed?.error?.type || null;
+      } catch {
+        // Non-JSON upstream errors retain the deterministic HTTP fallback.
+      }
+    }
+    const claimTransition = backend.recordModelClaimOutcome(
+      candidateModel, res.status, claimFailureReason,
+    );
     if (claimTransition) {
       const quarantined = claimTransition.transition === "quarantined";
       process.stdout.write(JSON.stringify({
