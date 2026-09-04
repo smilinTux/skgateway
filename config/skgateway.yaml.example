@@ -509,6 +509,10 @@ discovery:
   # capability_budget:            3    # models battered per provider per
   #                                    # sweep (never-assessed first, then
   #                                    # oldest-assessed). Real completions.
+  #                                    # Chef's estate runs 8: a fleet of
+  #                                    # ~20 active ids per provider is
+  #                                    # covered in 3 days, and an id that
+  #                                    # 429'd stays eligible until measured.
   # capability_interval_seconds:  2592000  # re-assess an already-measured
   #                                    # model at most every 30 days.
   # capability_timeout_ms:        30000
