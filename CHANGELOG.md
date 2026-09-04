@@ -21,6 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only the 7-day long tail, so the most-routed models stop being the least
   measured). Capability is measured by a real completion, never inferred
   from a model name; a 429/timeout/5xx records unmeasured, never fail.
+- GET /queue now includes `inFlight`: live in-flight requests with agent,
+  model, backend, and age (oldest first, capped at 50). Two fleet workers
+  were mistaken for hung on ep_poll on 2026-09-03 while actively
+  streaming; a fresh open request means working, a many-minutes-old one
+  means hung. Also serves as the barrier-test quiesce signal (inFlight
+  must be empty before a maintenance window opens).
+
 
 ### Fixed
 

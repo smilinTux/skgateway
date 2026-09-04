@@ -1443,6 +1443,14 @@ export const server = http.createServer(async (req, res) => {
   if (req.url === "/queue") {
     const allStats = pool.getAllStats();
     const total = pool.getTotalStats();
+    // In-flight requests with age: the discriminator between a WORKING
+    // worker (fresh open request, ages cycling) and a HUNG one (a request
+    // open for many minutes). Two fleet workers were mistaken for hung on
+    // ep_poll on 2026-09-03; this ends that ambiguity for every consumer:
+    // ops, the barrier test (expects inFlight: []), and monitoring.
+    const inFlight = (typeof metrics?.inFlightRequests === "function"
+      ? metrics.inFlightRequests() : [])
+      .sort((a, b) => b.ageMs - a.ageMs).slice(0, 50);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
       pool: {
@@ -1451,6 +1459,7 @@ export const server = http.createServer(async (req, res) => {
         totalCapacity: total.totalCapacity,
         utilization: total.totalCapacity > 0 ? (total.totalActive / total.totalCapacity) : 0,
       },
+      inFlight,
       backends: allStats,
       timestamp: new Date().toISOString(),
     }));
