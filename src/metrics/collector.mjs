@@ -747,23 +747,6 @@ export function createMetricsCollector(config) {
 
     pending.set(id, { startedAt, agentId, model, backend, sessionId });
 
-  /**
-   * Live in-flight requests with age, oldest-first capped. Read-only view of
-   * the pending map: the working-vs-hung discriminator and the barrier
-   * signal (empty means quiesced). ponytail: linear scan of the pending map,
-   * bounded by concurrent requests; index it if fleets exceed hundreds.
-   */
-  function inFlightRequests() {
-    const now = Date.now();
-    return [...pending.entries()].map(([id, p]) => ({
-      id,
-      agentId: p.agentId ?? null,
-      model: p.model ?? null,
-      backend: p.backend ?? null,
-      ageMs: now - p.startedAt,
-    }));
-  }
-
     counters.totalRequests++;
     counters.activeRequests++;
     counters.recentRequests.add();
@@ -787,6 +770,23 @@ export function createMetricsCollector(config) {
     }
 
     return id;
+  }
+
+  /**
+   * Live in-flight requests with age, oldest-first capped. Read-only view of
+   * the pending map: the working-vs-hung discriminator and the barrier
+   * signal (empty means quiesced). ponytail: linear scan of the pending map,
+   * bounded by concurrent requests; index it if fleets exceed hundreds.
+   */
+  function inFlightRequests() {
+    const now = Date.now();
+    return [...pending.entries()].map(([id, p]) => ({
+      id,
+      agentId: p.agentId ?? null,
+      model: p.model ?? null,
+      backend: p.backend ?? null,
+      ageMs: now - p.startedAt,
+    }));
   }
 
   /**
