@@ -21,7 +21,7 @@ test("inFlightRequests returns live ages and empties on completion", () => {
   assert.equal(live[0].agentId, "worker-a");
   assert.equal(live[0].model, "sk-codex");
   assert.ok(live[0].ageMs >= 0);
-  c.recordResponse(id, { statusCode: 200, totalMs: 10 });
+  c.recordResponse({ reqId: id, statusCode: 200, totalMs: 10 });
   live = c.inFlightRequests();
   assert.equal(live.length, 0, "completed request leaves the in-flight view");
   c.close();
@@ -33,6 +33,6 @@ test("ages grow for still-open requests (the hung signal)", async () => {
   await new Promise((r) => setTimeout(r, 60));
   const live = c.inFlightRequests();
   assert.ok(live[0].ageMs >= 50, "age must advance while the request stays open");
-  c.recordResponse(id, { statusCode: 200, totalMs: 70 });
+  c.recordResponse({ reqId: id, statusCode: 200, totalMs: 70 });
   c.close();
 });
