@@ -573,3 +573,24 @@ describe("energy metering - response headers", () => {
     assert.deepEqual(energyHeaders(result.energy), {}, "spreading {} adds nothing to the relay");
   });
 });
+
+describe("energy attribution provenance", () => {
+  test("records explicit unknown and rejects invalid or negative measurements", () => {
+    const dir = mkdtempSync(join(tmpdir(), "skgw-energy-provenance-"));
+    const metrics = createMetricsCollector({ enabled: true, db_path: join(dir, "metrics.db") });
+    try {
+      const reqId = metrics.recordRequest({ agentId: "jarvis", model: "m" });
+      metrics.recordEnergy({ reqId, agentId: "jarvis", model: "m", joules: null });
+      metrics.recordEnergy({ reqId, agentId: "jarvis", model: "m", joules: 4, basis: "bogus" });
+      metrics.recordEnergy({ reqId, agentId: "jarvis", model: "m", joules: -1, basis: "measured_gpu" });
+      metrics.flush();
+      const rows = metrics.db.prepare(
+        "SELECT agent_id, joules, basis FROM energy_log WHERE req_id = ?"
+      ).all(reqId);
+      assert.deepEqual(rows, [{ agent_id: "jarvis", joules: null, basis: "unknown" }]);
+    } finally {
+      metrics.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

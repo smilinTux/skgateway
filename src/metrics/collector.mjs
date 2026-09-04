@@ -50,6 +50,24 @@ const PURGE_INTERVAL_MS  = 6 * 60 * 60 * 1000; // purge old rows every 6 h
 // into a single "_other" bucket. SQLite (cost_log) keeps full-fidelity history.
 const MAX_COST_KEYS      = 200;
 
+// Energy provenance is intentionally closed. A missing basis is an explicit
+// unknown observation, never an inferred cloud measurement. Invalid values
+// are rejected before they can become misleading ledger rows.
+const ENERGY_BASES = new Set([
+  'measured_gpu',
+  'imputed_local',
+  'imputed_cloud',
+  'unknown',
+]);
+
+function resolveObservedFact(original, override) {
+  if (override == null) return original ?? null;
+  if (original == null || original === override) return override;
+  // Conflicting lifecycle facts are unknown, never silently attributed to the
+  // response-side caller.
+  return null;
+}
+
 // ─── anomaly detection tunables ────────────────────────────────────────────────
 const ANOMALY_SIGMA       = 3;   // flag samples ≥ this many σ from the running mean
 const ANOMALY_MIN_SAMPLES = 30;  // require a stable baseline before flagging
@@ -832,10 +850,19 @@ export function createMetricsCollector(config) {
     const orig = pending.get(reqId) ?? {};
     pending.delete(reqId);
 
-    const agentId   = agentOverride   ?? orig.agentId;
-    const model     = modelOverride   ?? orig.model;
-    const backend   = backendOverride ?? orig.backend;
-    const sessionId = sessionOverride ?? orig.sessionId;
+    // The request identity owns the active-session lifecycle. A response
+    // override is an observation, not permission to leave the request's
+    // original session active forever or to move it into another seat.
+    if (orig.agentId && orig.sessionId) {
+      const sessions = counters.activeSessions.get(orig.agentId);
+      sessions?.delete(orig.sessionId);
+      if (sessions?.size === 0) counters.activeSessions.delete(orig.agentId);
+    }
+
+    const agentId   = resolveObservedFact(orig.agentId, agentOverride);
+    const model     = resolveObservedFact(orig.model, modelOverride);
+    const backend   = resolveObservedFact(orig.backend, backendOverride);
+    const sessionId = resolveObservedFact(orig.sessionId, sessionOverride);
     const ts        = Date.now();
     const startedAt = orig.startedAt;
     const suppliedTotal = Number.isFinite(totalMs) && totalMs >= 0 ? totalMs : null;
@@ -1032,6 +1059,10 @@ export function createMetricsCollector(config) {
     // the same window. A row that cannot be joined to a request is not worth
     // that risk, and we do not fabricate a synthetic reqId to route around it.
     if (!reqId) return;
+    const energyBasis = basis == null ? 'unknown' : String(basis).trim();
+    if (!ENERGY_BASES.has(energyBasis)) return;
+    const energyJoules = joules === null || joules === undefined ? null : Number(joules);
+    if (energyJoules !== null && (!Number.isFinite(energyJoules) || energyJoules < 0)) return;
     const when = ts ?? Date.now();
     writeBuffer.push({
       _type: 'energy',
@@ -1042,8 +1073,8 @@ export function createMetricsCollector(config) {
       card_id: cardId ?? null,
       ts: when,
       day_bucket: dayBucket(when),
-      joules: (joules === null || joules === undefined) ? null : Number(joules),
-      basis: basis ?? 'imputed_cloud',
+      joules: energyJoules,
+      basis: energyBasis,
       node: node ?? null,
       concurrency_n: concurrencyN ?? 1,
     });

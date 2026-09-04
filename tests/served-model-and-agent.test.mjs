@@ -265,6 +265,33 @@ describe("normalizeAgentId", () => {
   });
 });
 
+describe("request session attribution lifecycle", () => {
+  test("completion removes only the originating seat session", () => {
+    const dir = mkdtempSync(join(tmpdir(), "skgw-session-lifecycle-"));
+    const c = createMetricsCollector(metricsCfg(dir));
+    try {
+      const first = c.recordRequest({ agentId: "jarvis", model: "m", sessionId: "s1" });
+      const second = c.recordRequest({ agentId: "jarvis", model: "m", sessionId: "s2" });
+      assert.deepEqual(c.getStats().activeSessions, { jarvis: 2 });
+
+      c.recordResponse({ reqId: first, statusCode: 200, agentId: "other", sessionId: "spoof" });
+      assert.deepEqual(c.getStats().activeSessions, { jarvis: 1 });
+      c.flush();
+      assert.equal(
+        c.db.prepare("SELECT agent_id, session_id FROM request_log WHERE id = ?").get(first).agent_id,
+        null,
+        "conflicting response identity must remain unattributed",
+      );
+
+      c.recordResponse({ reqId: second, statusCode: 200 });
+      assert.deepEqual(c.getStats().activeSessions, {});
+    } finally {
+      c.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 // ─── live-server harness ────────────────────────────────────────────────────
 
 /** Ask the OS for a free loopback port, then release it. */
