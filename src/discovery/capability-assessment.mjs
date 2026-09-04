@@ -609,9 +609,24 @@ export function selectCapabilityCandidates(store, candidateIds, { budget = DEFAU
     const rec = safeStore[id] && safeStore[id].measured_capabilities;
     return rec ? rec.last_full_assessment_at : null;
   };
+  // A record whose last battery left any dimension undetermined (a 429, a
+  // timeout, a 5xx: an explicit status 'unmeasured') is not fully assessed,
+  // whatever last_full_assessment_at says, and stays eligible rather than
+  // hiding for intervalMs behind one unlucky call. Only an explicit
+  // 'unmeasured' counts: a field that is absent was never attempted by a
+  // battery at all (a battery writes all four), so absence says nothing.
+  // Observed 2026-09-04: deepseek-ai/deepseek-v4-flash-0731 got a 529 on the
+  // tool_call step, the rest of its battery passed, and the record would
+  // have sat with tool support unknown for 30 days.
+  const incomplete = (id) => {
+    const rec = safeStore[id] && safeStore[id].measured_capabilities;
+    if (!rec) return false;
+    return ['tool_call', 'structured_output', 'instruction_following', 'min_output_tokens']
+      .some((k) => rec[k] && rec[k].status === 'unmeasured');
+  };
   const eligible = (candidateIds || []).filter((id) => {
     const lastFull = lastFullOf(id);
-    return lastFull == null || now - lastFull >= intervalMs;
+    return lastFull == null || now - lastFull >= intervalMs || incomplete(id);
   });
   eligible.sort((a, b) => {
     const av = lastFullOf(a);

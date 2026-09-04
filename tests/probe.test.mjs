@@ -617,6 +617,51 @@ describe('probeModels: capabilityScope (card 0e010400)', () => {
     assert.deepEqual(battered.sort(), ['a', 'b']);
   });
 
+  test("'provider' scope: eol and not_chat records never take a tier-2 slot, even though tier 1 still probes them", async () => {
+    const store = {
+      '01-aaa': lc({ last_verified_at: null, provider: 'nvidia', state: 'eol' }),
+      '02-bbb': lc({ last_verified_at: null, provider: 'nvidia', state: 'not_chat' }),
+      'zzz-hot': recent(),
+    };
+    const probed = [];
+    const battered = [];
+    await probeModels(store, {
+      now: () => NOW,
+      capabilityScope: 'provider',
+      capabilityBudget: 1,
+      provider: 'nvidia',
+      runProbe: async (id) => { probed.push(id); return { ok: true, status: 200 }; },
+      chatComplete: async () => ({ ok: true, status: 200, message: { content: 'x' } }),
+      runCapabilityAssessment: async (id) => { battered.push(id); return {}; },
+    });
+    assert.ok(probed.includes('01-aaa') && probed.includes('02-bbb'), 'tier 1 still probes retired long-tail ids');
+    assert.deepEqual(battered, ['zzz-hot'], 'the single tier-2 slot goes to the live model, not the alphabetically-first retired one');
+  });
+
+  test('a record whose last battery left a dimension unmeasured stays tier-2 eligible inside capabilityIntervalMs', async () => {
+    const entry = (status) => ({ capability: 'measured', status, assertion: 'x', measured_at: NOW - 1000, evidence: null });
+    const store = {
+      partial: lc({ last_verified_at: null, measured_capabilities: {
+        liveness: entry('pass'), tool_call: entry('unmeasured'), structured_output: entry('pass'),
+        instruction_following: entry('pass'), min_output_tokens: { ...entry('measured'), value: 64, checked_levels: [] },
+        last_full_assessment_at: NOW - 1000,
+      } }),
+      complete: lc({ last_verified_at: null, measured_capabilities: {
+        liveness: entry('pass'), tool_call: entry('fail'), structured_output: entry('pass'),
+        instruction_following: entry('pass'), min_output_tokens: { ...entry('measured'), value: 64, checked_levels: [] },
+        last_full_assessment_at: NOW - 1000,
+      } }),
+    };
+    const battered = [];
+    await probeModels(store, {
+      now: () => NOW,
+      runProbe: async () => ({ ok: true, status: 200 }),
+      chatComplete: async () => ({ ok: true, status: 200, message: { content: 'x' } }),
+      runCapabilityAssessment: async (id) => { battered.push(id); return {}; },
+    });
+    assert.deepEqual(battered, ['partial'], 'unmeasured tool_call keeps it eligible; a determinate fail is a finished assessment');
+  });
+
   test("'provider' scope: a model whose liveness probe fails this sweep is still not battered", async () => {
     let battered = null;
     await probeModels({ hot: recent() }, {

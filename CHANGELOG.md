@@ -31,6 +31,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `capability_scope: provider` no longer offers tier-2 slots to retired
+  (`eol`, `not_chat`) records. Never-assessed ids sort first and
+  alphabetically, so on the first live sweep three 404 eol ids took every
+  slot, failed liveness, recorded nothing, and would have been re-picked
+  daily while the active fleet stayed unmeasured.
+- A record whose last battery left any dimension `unmeasured` (429, timeout,
+  5xx) stays tier-2 eligible instead of hiding behind
+  `last_full_assessment_at` for the full interval.
 - The battery now reads the OpenAI wire shape (`choices[0].message`). The
   loopback runner behind `POST /admin/models/eval` returns that shape, so
   every eval through it had recorded a tool-capable model as `fail` /
