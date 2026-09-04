@@ -223,8 +223,28 @@ async function safeCall(chatComplete, id, request, { timeoutMs } = {}) {
   }
 }
 
+/**
+ * Pull the assistant message out of a `chatComplete` result. Two shapes are
+ * accepted, because two kinds of runner feed this battery:
+ *   - `{message}`: a runner that already unwrapped the completion (the unit
+ *     tests, and any adapter that pre-extracts `choices[0].message`);
+ *   - `{json}` / a bare completion body: the raw OpenAI-compatible wire shape,
+ *     `{choices: [{message: {...}}]}`, which is what
+ *     src/ranking/eval.mjs's createLoopbackChatComplete returns verbatim and
+ *     what a direct provider call returns.
+ * Until 2026-09-04 only the first shape was read, so every battery run
+ * through the loopback runner saw an empty message and recorded a
+ * tool-capable model as `fail` / `no_matching_tool_call`. A measurement that
+ * cannot see the response is not a measurement; reading the wire shape here
+ * (rather than adapting every runner) keeps one definition of "what the model
+ * said" for every caller.
+ */
 function extractMessage(res) {
-  return (res && res.message) || {};
+  if (!res) return {};
+  if (res.message && typeof res.message === 'object') return res.message;
+  const body = res.json && typeof res.json === 'object' ? res.json : res;
+  const choice = Array.isArray(body.choices) ? body.choices[0] : null;
+  return (choice && choice.message && typeof choice.message === 'object') ? choice.message : {};
 }
 
 /**

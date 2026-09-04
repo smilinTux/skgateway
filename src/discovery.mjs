@@ -67,7 +67,6 @@ import {
   DEFAULT_PROBE_BUDGET,
   DEFAULT_PROBE_TIMEOUT_MS,
   DEFAULT_MAX_TOKENS as DEFAULT_PROBE_MAX_TOKENS,
-  DEFAULT_POOL_BACKEND_ID,
 } from './discovery/probe.mjs';
 import { getPool } from './proxy/connection-pool.mjs';
 import { getConfig } from './config.mjs';
@@ -692,24 +691,62 @@ function recordProvider(cache, name, { ok, count, at, error }) {
   cache.providers[name] = entry;
 }
 
+/** Default NVIDIA base URL, used only when the live config carries no `backends.nvidia.url` (the pre-multi-provider probe hardcoded this exact host). */
+const NVIDIA_DEFAULT_BASE_URL = 'https://integrate.api.nvidia.com/v1';
+
+/**
+ * Resolve `{url, apiKey}` for each provider the probe sweep will hit, from
+ * the live config's `backends.<name>` (url + api_key_env). A provider with no
+ * backend block, no url, or no key in the environment resolves to `null` and
+ * its sweep is skipped (never a throw: a misconfigured provider must not
+ * break the discovery cycle, and probing without a key would only collect
+ * 401s that look like model rejections). `nvidiaApiKey` keeps the pre-existing
+ * injectable override for the NVIDIA key (tests pass it directly).
+ *
+ * @param {string[]} names
+ * @param {{nvidiaApiKey?: string, backends?: object}} [opts]
+ * @returns {Record<string, {url: string, apiKey: string}|null>}
+ */
+export function resolveProbeBackends(names, { nvidiaApiKey, backends } = {}) {
+  if (backends === undefined) {
+    try {
+      backends = getConfig()?.backends;
+    } catch {
+      backends = undefined;
+    }
+  }
+  const out = {};
+  for (const name of names || []) {
+    const b = (backends || {})[name] || {};
+    const url = String(b.url || (name === 'nvidia' ? NVIDIA_DEFAULT_BASE_URL : '')).replace(/\/+$/, '');
+    const apiKey = name === 'nvidia' && nvidiaApiKey !== undefined
+      ? nvidiaApiKey
+      : process.env[b.api_key_env || `${name.toUpperCase()}_API_KEY`];
+    out[name] = url && apiKey ? { url, apiKey } : null;
+  }
+  return out;
+}
+
 /**
  * Real (network) implementation of the probe sweep's `runProbe` (card P2.3,
- * design 5.2): one warm one-word completion against NVIDIA's chat-completions
- * endpoint, aborted at `timeoutMs`. This is the same "warm one-word probe"
- * methodology Chef previously ran by hand with curl. Used only as the
- * production default when `discoverCatalog()` isn't given an explicit
- * `probeRunProbe` (tests always inject one, so this never runs under test).
- * Fail-soft: any error (including no api key) resolves `{ ok: false }`
- * rather than throwing, matching every other network call in this module.
+ * design 5.2): one warm one-word completion against the provider's
+ * OpenAI-compatible chat-completions endpoint, aborted at `timeoutMs`. This
+ * is the same "warm one-word probe" methodology Chef previously ran by hand
+ * with curl. Used only as the production default when `discoverCatalog()`
+ * isn't given an explicit `probeRunProbe` (tests always inject one, so this
+ * never runs under test). Fail-soft: any error (including no api key)
+ * resolves `{ ok: false }` rather than throwing, matching every other network
+ * call in this module. Was NVIDIA-only until 2026-09-04; now takes the
+ * provider's `{url, apiKey}` so the same sweep serves OpenRouter.
  */
-async function nvidiaCompletionProbe(id, { timeoutMs, maxTokens }, apiKey) {
-  if (!apiKey) return { ok: false };
+async function providerCompletionProbe(id, { timeoutMs, maxTokens }, backend) {
+  if (!backend || !backend.apiKey || !backend.url) return { ok: false };
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const r = await globalThis.fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
+    const r = await globalThis.fetch(`${backend.url}/chat/completions`, {
       method: 'POST',
-      headers: { authorization: `Bearer ${apiKey}`, 'content-type': 'application/json' },
+      headers: { authorization: `Bearer ${backend.apiKey}`, 'content-type': 'application/json' },
       body: JSON.stringify({
         model: id,
         max_tokens: maxTokens,
@@ -720,6 +757,48 @@ async function nvidiaCompletionProbe(id, { timeoutMs, maxTokens }, apiKey) {
     return { ok: r.ok, status: r.status };
   } catch {
     return { ok: false };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Real (network) `chatComplete` for the tier-2 capability battery
+ * (capability-assessment.mjs), DIRECT to the provider, same transport as the
+ * tier-1 probe above and deliberately NOT through this gateway's own
+ * /v1/chat/completions (which is what the operator-triggered
+ * /admin/models/eval uses, src/ranking/eval.mjs). Two reasons:
+ *   - the provider's own status codes reach classifyTransport() untouched, so
+ *     a free-tier 429 is recorded `unmeasured`, exactly as card 2ba73bf9
+ *     requires, rather than whatever the router turns an upstream 429 into;
+ *   - no router alias, failover or bucket logic can serve the request from a
+ *     different model than the one being measured. A measurement is only
+ *     evidence about the model it was actually sent to.
+ * Returns the raw completion body under `json` (the OpenAI wire shape
+ * capability-assessment.mjs's extractMessage reads). Fail-soft: a thrown
+ * fetch/abort resolves `{ ok: false, status: undefined }`, which
+ * classifyTransport() reads as timeout_or_network, i.e. unmeasured.
+ */
+async function providerChatComplete(id, request, { timeoutMs } = {}, backend) {
+  if (!backend || !backend.apiKey || !backend.url) return { ok: false, status: undefined };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs || 30_000);
+  try {
+    const r = await globalThis.fetch(`${backend.url}/chat/completions`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${backend.apiKey}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ ...request, model: id }),
+      signal: controller.signal,
+    });
+    let json = null;
+    try {
+      json = await r.json();
+    } catch {
+      json = null;
+    }
+    return { ok: r.ok, status: r.status, json };
+  } catch {
+    return { ok: false, status: undefined };
   } finally {
     clearTimeout(timer);
   }
@@ -799,29 +878,43 @@ export async function discoverCatalog(opts) {
     probePool,
     probeRunProbe,
     probeProvider = 'nvidia',
+    // 2026-09-04: the sweep runs once per provider in this list, each against
+    // its own backend endpoint, its own pool bucket and its own
+    // declaredModelsElsewhere() exclusion set. Defaults to just
+    // `probeProvider` so every pre-existing caller keeps its NVIDIA-only
+    // shape; production threads `discovery.probe_providers` through here.
+    probeProviders = [probeProvider],
     // Incident inc-2026-08-18-qwen38-eol: ids another backend declares are
-    // excluded from THIS provider's sweep (see declaredModelsElsewhere). 
-    // Injectable for tests; the default reads the live config.
-    probeExcludedIds = declaredModelsElsewhere(probeProvider),
+    // excluded from THIS provider's sweep (see declaredModelsElsewhere).
+    // Injectable for tests (applied to every provider in the list when
+    // given); the default is computed per provider from the live config.
+    probeExcludedIds,
     nvidiaApiKey = process.env.NVIDIA_API_KEY,
+    // Per-provider `{url, apiKey}` for the real probe/battery calls.
+    // Injectable for tests; the default reads the live config's backends.
+    probeBackends,
     // Card 2ba73bf9 / C9 (measurement half): the tier-2 capability battery
     // rides this same probe sweep (see probe.mjs's probeModels doc comment).
-    // Threaded through here the same way probeSeconds/probeBudget/etc. were
-    // BEFORE card 1f65cf45/C3 wired index.mjs's refreshCatalog() to actually
-    // pass them: this function supports the knobs correctly, but nothing in
-    // this repo's index.mjs reads a `discovery.capability_*` config key yet,
-    // so production never reaches this path today. That is deliberate, not
-    // an oversight: C9's measurement half is out-of-scope for touching
-    // index.mjs or enabling anything in live config (both explicitly
-    // reserved). Whoever wires cfg.discovery through should follow the exact
-    // pattern C3 used for probeSeconds, and should NOT add a
-    // `discovery.capability_seconds`-shaped config doc comment until that
-    // wiring lands, for the same reason C3 itself exists: documenting a key
-    // nothing reads is worse than not documenting it.
+    // Until 2026-09-04 nothing in index.mjs read a `discovery.capability_*`
+    // key, so production never reached this path (deliberately: C9 reserved
+    // the wiring). Card 0e010400 wired it, following the exact pattern C3
+    // used for probeSeconds: refreshCatalog() reads `discovery.capability_budget`,
+    // `capability_interval_seconds`, `capability_timeout_ms`,
+    // `capability_scope` and `providers.<name>.capability_battery`, and
+    // config/skgateway.yaml.example documents them now that they are read.
     capabilityBudget,
     capabilityIntervalMs,
     capabilityTimeoutMs,
+    capabilityScope,
     chatComplete,
+    // Providers whose sweep carries the tier-2 battery (2026-09-04, card
+    // 0e010400). Only meaningful when no explicit `chatComplete` is injected:
+    // an injected runner applies to every probed provider (the pre-existing
+    // test contract), otherwise a provider listed here gets the real
+    // direct-to-provider runner (providerChatComplete) and any other provider
+    // stays liveness-only. Production threads
+    // `discovery.providers.<name>.capability_battery: true` through here.
+    capabilityProviders = [],
     probeRunCapabilityAssessment,
   } = opts;
   const at = now();
@@ -997,29 +1090,51 @@ export async function discoverCatalog(opts) {
     try {
       const dueAt = (typeof cache.lastProbedAt === 'number' ? cache.lastProbedAt : -Infinity) + probeSeconds * 1000;
       if (at >= dueAt) {
-        const storeForProbe = loadLifecycleStoreFresh(lifecycleStorePath);
-        const runProbe =
-          probeRunProbe || ((id, o) => nvidiaCompletionProbe(id, o, nvidiaApiKey));
-        const probed = await probeModels(storeForProbe, {
-          budget: probeBudget,
-          timeoutMs: probeTimeoutMs,
-          maxTokens: probeMaxTokens,
-          provider: probeProvider,
-          excludedIds: probeExcludedIds,
-          pool: probePool || getPool(),
-          poolBackendId: DEFAULT_POOL_BACKEND_ID,
-          now: () => at,
-          runProbe,
-          // Card 2ba73bf9 / C9: undefined unless a caller explicitly opts in
-          // (no production default for chatComplete, mirroring runProbe's own
-          // no-silent-network-default discipline); probeModels() treats a
-          // missing chatComplete as tier 2 fully disabled, tier 1 unaffected.
-          chatComplete,
-          runCapabilityAssessment: probeRunCapabilityAssessment,
-          capabilityBudget,
-          capabilityIntervalMs,
-          capabilityTimeoutMs,
-        });
+        let probed = loadLifecycleStoreFresh(lifecycleStorePath);
+        const providers = Array.isArray(probeProviders) && probeProviders.length ? probeProviders : [probeProvider];
+        // Resolved lazily and only when a real network runner is needed, so a
+        // fully-injected (test) sweep never reads the live config or env.
+        const backends = (probeRunProbe && (chatComplete || !capabilityProviders.length))
+          ? {}
+          : (probeBackends || resolveProbeBackends(providers, { nvidiaApiKey }));
+        // Sequential per provider, not parallel: each provider's sweep already
+        // fans out across its own pool bucket, and the store is folded
+        // provider by provider so one sweep's records are the next one's input.
+        for (const name of providers) {
+          const backend = backends[name] || null;
+          const runProbe = probeRunProbe || ((id, o) => providerCompletionProbe(id, o, backend));
+          if (!probeRunProbe && !backend) continue; // no url/key: nothing to probe with
+          const batteryEnabled = capabilityProviders.includes(name);
+          // An injected chatComplete applies to every probed provider when no
+          // capabilityProviders list is given (the pre-existing C9 test
+          // contract) and only to the listed providers when one is.
+          const tier2 = chatComplete
+            ? ((capabilityProviders.length === 0 || batteryEnabled) ? chatComplete : undefined)
+            : (batteryEnabled && backend ? (id, req, o) => providerChatComplete(id, req, o, backend) : undefined);
+          probed = await probeModels(probed, {
+            budget: probeBudget,
+            timeoutMs: probeTimeoutMs,
+            maxTokens: probeMaxTokens,
+            provider: name,
+            excludedIds: probeExcludedIds || declaredModelsElsewhere(name),
+            pool: probePool || getPool(),
+            // Each provider draws from its own bucket (NVIDIA's 20-concurrent
+            // limit, OpenRouter's max_concurrent), never from another's.
+            poolBackendId: name,
+            now: () => at,
+            runProbe,
+            // Card 2ba73bf9 / C9: tier 2 only when this provider's battery is
+            // enabled (or a caller injected a runner explicitly); probeModels()
+            // treats a missing chatComplete as tier 2 fully disabled, tier 1
+            // unaffected.
+            chatComplete: tier2,
+            runCapabilityAssessment: probeRunCapabilityAssessment,
+            capabilityBudget,
+            capabilityIntervalMs,
+            capabilityTimeoutMs,
+            capabilityScope,
+          });
+        }
         saveLifecycleStore(probed, lifecycleStorePath);
         cache.lastProbedAt = at;
       }

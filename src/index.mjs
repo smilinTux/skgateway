@@ -621,6 +621,26 @@ export async function refreshCatalog(cfg, discoverCatalogFn = discoverCatalog) {
     probeSeconds: d.probe_seconds || 0,
     probeBudget: d.probe_budget,
     probeTimeoutMs: d.probe_timeout_ms,
+    // 2026-09-04 (card 0e010400): which providers the sweep hits, and which
+    // of them carry the tier-2 capability battery. Same "wiring lands with
+    // the feature" rule as C3 above: every key here is read at the only
+    // production call site, so an operator setting it sees it take effect.
+    //   discovery.probe_providers: [nvidia, openrouter]   (default [nvidia])
+    //   discovery.providers.<name>.capability_battery: true (default off)
+    //   discovery.capability_budget / capability_interval_seconds /
+    //   capability_timeout_ms / capability_scope ('sweep' | 'provider')
+    // Undefined knobs fall through to probe.mjs / capability-assessment.mjs
+    // defaults, exactly like probe_budget above.
+    probeProviders: Array.isArray(d.probe_providers) && d.probe_providers.length
+      ? d.probe_providers.map(String)
+      : undefined,
+    capabilityProviders: Object.entries(d.providers || {})
+      .filter(([, p]) => p && p.capability_battery === true)
+      .map(([name]) => name),
+    capabilityBudget: d.capability_budget,
+    capabilityIntervalMs: d.capability_interval_seconds ? d.capability_interval_seconds * 1000 : undefined,
+    capabilityTimeoutMs: d.capability_timeout_ms,
+    capabilityScope: d.capability_scope,
   });
   _catalog = models;
   registerDiscoveredRoutes(cfg, models);

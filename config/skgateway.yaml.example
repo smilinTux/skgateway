@@ -488,6 +488,40 @@ discovery:
   #                             # display limit: raise it deliberately.
   # probe_timeout_ms:  15000   # hard per-model abort timeout for a probe call
   #                             # (matches probe.mjs's DEFAULT_PROBE_TIMEOUT_MS).
+  # probe_providers: [nvidia]  # which providers get a sweep (card 0e010400).
+  #                             # One sweep per entry, each against that
+  #                             # backend's own url/api_key_env and pool
+  #                             # bucket. A provider with no backends.<name>
+  #                             # url or key in the environment is skipped.
+  #
+  ## Capability battery (card 2ba73bf9 / C9, wired by card 0e010400). Rides
+  ## the probe sweep above: a model that passed its liveness probe gets a
+  ## real tool_call / structured_output / instruction_following /
+  ## min_output_tokens battery (src/discovery/capability-assessment.mjs), up
+  ## to 7 completions, sent DIRECT to the provider. The result lands on the
+  ## model's lifecycle record as `measured_capabilities`, which ranking reads
+  ## as basis:'eval' ahead of any provider card claim. A 429/timeout/5xx is
+  ## recorded `unmeasured`, never `fail`. Off unless a provider opts in.
+  #
+  # providers:
+  #   nvidia:     { enabled: true, capability_battery: true }
+  #   openrouter: { enabled: true, capability_battery: true }
+  # capability_budget:            3    # models battered per provider per
+  #                                    # sweep (never-assessed first, then
+  #                                    # oldest-assessed). Real completions.
+  # capability_interval_seconds:  2592000  # re-assess an already-measured
+  #                                    # model at most every 30 days.
+  # capability_timeout_ms:        30000
+  # capability_scope:             sweep # `sweep`: only this sweep's long-tail
+  #                                    # candidates (models with no traffic in
+  #                                    # 7 days) are eligible, the original C9
+  #                                    # shape. `provider`: every non-dead model
+  #                                    # of the provider is eligible, so the
+  #                                    # actively-used models (which never fall
+  #                                    # into the long tail) get measured too;
+  #                                    # each still gets its liveness probe
+  #                                    # first, at most capability_budget extra
+  #                                    # probes per sweep.
   #
   ## Before setting probe_seconds > 0 anywhere it matters: confirm the cadence
   ## gate and budget behave as expected on a low-stakes node first. A live

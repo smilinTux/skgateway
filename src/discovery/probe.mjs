@@ -214,6 +214,20 @@ export function selectProbeCandidates(
  * @param {number} [opts.capabilityBudget]
  * @param {number} [opts.capabilityIntervalMs]
  * @param {number} [opts.capabilityTimeoutMs]
+ * @param {'sweep'|'provider'} [opts.capabilityScope] where tier-2 candidates
+ *   are drawn from. `'sweep'` (default, the original C9 shape): only from
+ *   this sweep's own tier-1 long-tail list. `'provider'`: from EVERY record
+ *   selectProbeCandidates would consider for this provider with the traffic
+ *   window ignored (non-dead, provider-scoped, not claimed elsewhere). The
+ *   long-tail rule exists to save liveness budget on models real traffic
+ *   already verifies, but it also means a model that is used every day never
+ *   becomes a tier-1 candidate and so, under 'sweep', never receives a
+ *   battery: the most-routed models were the least measured (observed
+ *   2026-09-04: 19 active NVIDIA ids, one with any measurement at all). Under
+ *   'provider' the selected ids are ADDED to this sweep's loop, so each still
+ *   gets its one-word liveness probe first, draws exactly one pool slot, and
+ *   is battered only if that probe succeeded; the extra cost is at most
+ *   `capabilityBudget` liveness probes per sweep on top of `budget`.
  * @returns {Promise<Record<string, object>>} a NEW store map; entries not
  *   selected this sweep are carried over unchanged, selected entries carry
  *   their post-probe lifecycle record plus an updated `measured_capabilities`.
@@ -235,6 +249,7 @@ export async function probeModels(store, opts = {}) {
     capabilityBudget = DEFAULT_CAPABILITY_BUDGET,
     capabilityIntervalMs = DEFAULT_CAPABILITY_INTERVAL_MS,
     capabilityTimeoutMs = DEFAULT_CAPABILITY_TIMEOUT_MS,
+    capabilityScope = 'sweep',
   } = opts;
 
   const safeStore = store || {};
@@ -245,16 +260,29 @@ export async function probeModels(store, opts = {}) {
   }
 
   const candidates = selectProbeCandidates(safeStore, { budget, now: nowMs, trafficWindowMs, provider, excludedIds });
-  if (candidates.length === 0) {
-    return { ...safeStore };
-  }
 
   const assessBattery = typeof chatComplete === 'function'
     ? (runCapabilityAssessmentOpt || runCapabilityAssessment)
     : null;
-  const capabilityIds = assessBattery
-    ? new Set(selectCapabilityCandidates(safeStore, candidates, { budget: capabilityBudget, now: nowMs, intervalMs: capabilityIntervalMs }))
-    : new Set();
+  let capabilityIds = new Set();
+  if (assessBattery) {
+    // 'provider' scope: the tier-2 pool is the provider's whole non-dead
+    // roster (trafficWindowMs: 0 makes every record "outside the window"),
+    // uncapped by the tier-1 budget so selectCapabilityCandidates' own
+    // never-assessed-first ordering decides, not the liveness sweep's
+    // oldest-verified-first ordering.
+    const tier2Pool = capabilityScope === 'provider'
+      ? selectProbeCandidates(safeStore, { budget: Infinity, now: nowMs, trafficWindowMs: 0, provider, excludedIds })
+      : candidates;
+    capabilityIds = new Set(selectCapabilityCandidates(safeStore, tier2Pool, { budget: capabilityBudget, now: nowMs, intervalMs: capabilityIntervalMs }));
+    for (const id of capabilityIds) {
+      if (!candidates.includes(id)) candidates.push(id);
+    }
+  }
+
+  if (candidates.length === 0) {
+    return { ...safeStore };
+  }
 
   const next = { ...safeStore };
   const canPool = pool && typeof pool.acquire === 'function' && typeof pool.release === 'function';

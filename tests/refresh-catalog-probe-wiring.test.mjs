@@ -267,6 +267,44 @@ describe("card C3: refreshCatalog wires discovery.probe_* into discoverCatalog",
     assert.ok(captured.cache && typeof captured.cache === "object", "the shared discovery cache object must still be passed");
   });
 
+  test("card 0e010400: probe_providers, providers.<name>.capability_battery and capability_* reach discoverCatalog's opts", async () => {
+    let captured = null;
+    const spy = async (opts) => { captured = opts; return { models: [] }; };
+    const cfg = {
+      backends: {},
+      discovery: {
+        enabled: true,
+        providers: {
+          nvidia: { enabled: true, capability_battery: true },
+          openrouter: { enabled: true, capability_battery: true },
+          opencode: { enabled: false, capability_battery: false },
+        },
+        probe_seconds: 86400,
+        probe_providers: ["nvidia", "openrouter"],
+        capability_budget: 4,
+        capability_interval_seconds: 604800,
+        capability_timeout_ms: 20000,
+        capability_scope: "provider",
+      },
+    };
+    await mod.refreshCatalog(cfg, spy);
+    assert.deepEqual(captured.probeProviders, ["nvidia", "openrouter"]);
+    assert.deepEqual(captured.capabilityProviders.sort(), ["nvidia", "openrouter"]);
+    assert.equal(captured.capabilityBudget, 4);
+    assert.equal(captured.capabilityIntervalMs, 604800 * 1000);
+    assert.equal(captured.capabilityTimeoutMs, 20000);
+    assert.equal(captured.capabilityScope, "provider");
+  });
+
+  test("card 0e010400: with none of the new keys set, the sweep stays NVIDIA-only and the battery stays off (defaults unchanged)", async () => {
+    let captured = null;
+    const spy = async (opts) => { captured = opts; return { models: [] }; };
+    await mod.refreshCatalog({ backends: {}, discovery: { enabled: true, providers: {}, probe_seconds: 86400 } }, spy);
+    assert.equal(captured.probeProviders, undefined);
+    assert.deepEqual(captured.capabilityProviders, []);
+    assert.equal(captured.capabilityScope, undefined);
+  });
+
   // ── Prove refreshCatalog is reachable off the real, fully-booted module ──
 
   test("mod.refreshCatalog is exported from the real src/index.mjs (not a helper redefined only for this test)", () => {

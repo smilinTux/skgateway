@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Capability battery enabled per provider (card 0e010400). The tier-2
+  battery (card C9: tool_call, structured_output, instruction_following,
+  min_output_tokens) now rides the probe sweep for every provider with
+  `discovery.providers.<name>.capability_battery: true`, direct to that
+  provider, and the sweep runs once per provider in
+  `discovery.probe_providers` on that backend's own url/key and pool bucket
+  (it was NVIDIA-only and hardcoded). New knobs `capability_budget`,
+  `capability_interval_seconds`, `capability_timeout_ms` and
+  `capability_scope` (`provider` makes actively-used models eligible, not
+  only the 7-day long tail, so the most-routed models stop being the least
+  measured). Capability is measured by a real completion, never inferred
+  from a model name; a 429/timeout/5xx records unmeasured, never fail.
 - GET /queue now includes `inFlight`: live in-flight requests with agent,
   model, backend, and age (oldest first, capped at 50). Two fleet workers
   were mistaken for hung on ep_poll on 2026-09-03 while actively
@@ -18,6 +30,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 ### Fixed
+
+- The battery now reads the OpenAI wire shape (`choices[0].message`). The
+  loopback runner behind `POST /admin/models/eval` returns that shape, so
+  every eval through it had recorded a tool-capable model as `fail` /
+  `no_matching_tool_call`; the eval test only asserted truthiness and hid
+  it.
 
 - History trim no longer leaves orphan assistant tool_calls: the final
   assembled candidate (head slice + notice + repaired tail) now passes
