@@ -361,7 +361,7 @@ discovery:
   ## Measured, never inferred from a model name. Runs only where probe_seconds
   ## is > 0 and the provider has a backends.<name> url + key.
   probe_providers: [nvidia, openrouter]
-  capability_budget: 3
+  capability_budget: 8
   capability_interval_seconds: 2592000
   capability_timeout_ms: 30000
   capability_scope: provider
