@@ -2107,7 +2107,10 @@ export const server = http.createServer(async (req, res) => {
           attribution: {
             client: req.headers["x-app"] || undefined,
             application: req.headers["user-agent"] || undefined,
-            logicalRoute: routeRequest.context || routeRequest.service || routeRequest.role || undefined,
+            // One canonical source: the router's result.logicalRoute, the
+            // same value response headers expose. Never re-derive here.
+            // Card bc908525 / review b62e19f8 finding 4.
+            logicalRoute: result?.logicalRoute || undefined,
             rail: result?.rail || undefined,
             provider: result?.provider || undefined,
             backendNode: result?.backendId || undefined,

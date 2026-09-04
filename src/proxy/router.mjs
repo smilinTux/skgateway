@@ -3719,10 +3719,12 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // Return immediately after releasing the pool/meter slot in `finally`,
     // before energy reads, health/lifecycle writes, or failover can run.
     if (res?.cancelled || res?.status === 499) {
+      // A cancellation is not evidence of what was served: keep the value
+      // enforceResponseContract observed (including null), never the
+      // routing candidate. Card bc908525 / review b62e19f8 findings 1-2.
       lastResult = {
         ...res,
         backendId,
-        servedModel: candidateModel,
         failover: didFailover,
         queueWaitMs,
         inflightConcurrency,

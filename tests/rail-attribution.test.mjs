@@ -45,8 +45,11 @@ function freePort() {
   });
 }
 
-/** Stub upstream that returns a simple JSON response. */
-function startUpstream() {
+/** Stub upstream that returns a simple JSON response.
+ * serveModel: string forces the served model (differs from the request to
+ * catch requested-versus-served substitution); null OMITS the model field
+ * so the gateway must record served_model as NULL. Default echoes. */
+function startUpstream(serveModel) {
   return new Promise((res) => {
     const server = http.createServer((req, r) => {
       const chunks = [];
@@ -55,9 +58,10 @@ function startUpstream() {
         let body = "";
         try {
           const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+          const served = serveModel === undefined ? (parsed.model || "test-model") : serveModel;
           body = JSON.stringify({
             id: "cmpl-test",
-            model: parsed.model || "test-model",
+            ...(served ? { model: served } : {}),
             choices: [{ message: { role: "assistant", content: "ok" } }],
             usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
           });
@@ -200,7 +204,9 @@ describe("rail attribution on live gateway", () => {
   let up, gw, port, dbPath, dbDir;
 
   before(async () => {
-    up = await startUpstream();
+    // Serve a model that DIFFERS from the request so requested-versus-served
+    // substitution is detectable (review b62e19f8 finding 3).
+    up = await startUpstream("test-served-distinct");
     port = await freePort();
     const dashPort = await freePort();
     dbDir = mkdtempSync(join(tmpdir(), "skgw-rail-attrib-live-"));
@@ -310,7 +316,7 @@ describe("rail attribution on live gateway", () => {
     assert.equal(row.backend_node, "test-local", `expected backend_node=test-local, got ${row.backend_node}`);
   });
 
-  test("requested_model and served_model are populated", async () => {
+  test("requested_model and served_model record different facts", async () => {
     const r = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -325,7 +331,33 @@ describe("rail attribution on live gateway", () => {
 
     assert.ok(row);
     assert.equal(row.requested_model, "test-model");
-    assert.equal(row.served_model, "test-model");
+    // The upstream served a different id; recording the requested alias here
+    // is exactly the substitution review b62e19f8 finding 1 prohibits.
+    assert.equal(row.served_model, "test-served-distinct",
+      `served_model must be the upstream-observed model, got ${row.served_model}`);
+  });
+
+  test("chiap08 grouping query works over attribution columns", async () => {
+    // The acceptance criterion is that traffic can be grouped by logical
+    // rail, backend node, requested model, and served model. Run the real
+    // query instead of asserting the schema exists (replaces vacuous test).
+    await sleep(1000);
+    const db = new Database(dbPath, { readonly: true });
+    const rows = db.prepare(`
+      SELECT logical_route, backend_node, requested_model, served_model, COUNT(*) AS n
+      FROM request_log
+      WHERE requested_model IS NOT NULL
+      GROUP BY logical_route, backend_node, requested_model, served_model
+    `).all();
+    db.close();
+
+    assert.ok(rows.length >= 1, "grouping query returned no rows");
+    const mine = rows.filter((row) => row.requested_model === "test-model");
+    assert.ok(mine.length >= 1, "no grouped rows for test-model requests");
+    for (const row of mine) {
+      assert.equal(row.served_model, "test-served-distinct");
+      assert.ok(row.backend_node, "backend_node must group");
+    }
   });
 
   test("runtime_revision is recorded", async () => {
@@ -368,28 +400,9 @@ describe("rail attribution on live gateway", () => {
   });
 });
 
-// ─── acceptance criteria: chiap08 Qwen3.8 grouping ─────────────────────────
-
-describe("acceptance: chiap08 Qwen3.8 can be grouped by rail fields", () => {
-  test("all required fields are present for grouping", () => {
-    // This is a documentation test confirming the schema supports
-    // the required grouping queries from criterion 2
-    const requiredFields = [
-      "logical_route",
-      "backend_node",
-      "requested_model",
-      "served_model",
-    ];
-
-    // The actual test above confirms these columns exist
-    // This documents the intent: you can now run:
-    // SELECT logical_route, backend_node, requested_model, served_model, COUNT(*)
-    // FROM request_log
-    // WHERE backend_node LIKE '%qwen38%'
-    // GROUP BY logical_route, backend_node, requested_model, served_model;
-    assert.ok(true, "schema supports grouping by logical_route, backend_node, requested_model, served_model");
-  });
-});
+// The chiap08 grouping acceptance is now covered by the real GROUP BY query
+// in the live-gateway describe above. (Replaces the former vacuous
+// assert.ok(true) documentation test flagged by review b62e19f8 finding 3.)
 
 // ─── acceptance criteria: no private data ───────────────────────────────────
 
@@ -443,5 +456,48 @@ describe("acceptance: no private endpoint or credential data", () => {
     assert.ok(!row.backend_node?.includes("secret"));
     assert.ok(!row.requested_model?.includes("password"));
     assert.ok(!row.served_model?.includes("password"));
+  });
+});
+
+// ─── unknown served model stays NULL ────────────────────────────────────────
+
+describe("served_model is NULL when the upstream sends no model field", () => {
+  let up, gw, port, dbPath, dbDir;
+
+  before(async () => {
+    // serveModel=null: the upstream response omits the model field entirely.
+    up = await startUpstream(null);
+    port = await freePort();
+    const dashPort = await freePort();
+    dbDir = mkdtempSync(join(tmpdir(), "skgw-rail-attrib-null-"));
+    dbPath = join(dbDir, "metrics.db");
+    gw = await bootGateway({ port, dashPort, upstreamUrl: up.url, dbPath });
+  });
+
+  after(async () => {
+    if (gw) { try { gw.child.kill("SIGKILL"); } catch {} rmSync(gw.dir, { recursive: true, force: true }); }
+    if (up) await up.close();
+    if (dbDir) rmSync(dbDir, { recursive: true, force: true });
+  });
+
+  test("records requested but leaves served_model NULL, not the routing candidate", async () => {
+    const r = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "test-model", messages: [{ role: "user", content: "hi" }] }),
+    });
+    const reqId = r.headers.get("x-sk-req-id");
+    await sleep(6000);
+
+    const db = new Database(dbPath, { readonly: true });
+    const row = db.prepare("SELECT * FROM request_log WHERE id = ?").get(reqId);
+    db.close();
+
+    assert.ok(row);
+    assert.equal(row.requested_model, "test-model");
+    // Review b62e19f8 finding 2: no model field upstream means the fact was
+    // not observed, and unobserved must survive as NULL, never the candidate.
+    assert.equal(row.served_model, null,
+      `served_model must be NULL when unobserved, got ${row.served_model}`);
   });
 });
