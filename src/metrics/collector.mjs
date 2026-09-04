@@ -508,7 +508,9 @@ export function createMetricsCollector(config) {
       `),
       updateRequest: db.prepare(`
         UPDATE request_log
-        SET status_code = @status_code,
+        SET agent_id = @agent_id,
+            session_id = @session_id,
+            status_code = @status_code,
             status_class = @status_class,
             terminal_state = @terminal_state,
             first_byte_ms = @first_byte_ms,
@@ -973,6 +975,8 @@ export function createMetricsCollector(config) {
       writeBuffer.push({
         _type: 'response',
         id: reqId,
+        agent_id: agentId,
+        session_id: sessionId,
         status_code: status,
         status_class: statusClass,
         terminal_state: terminalState,
