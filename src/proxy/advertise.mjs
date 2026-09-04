@@ -96,7 +96,8 @@ export function isModelAvailable(model, router) {
     if (!b || typeof b.supportsModel !== "function") continue;
     if (!b.supportsModel(model)) continue;
     serving++;
-    if (typeof b.isAvailable === "function" && b.isAvailable()) return true;
+    if (typeof b.isAvailable === "function" && b.isAvailable()
+        && (typeof b.isModelClaimAvailable !== "function" || b.isModelClaimAvailable(model))) return true;
   }
   // No router-tracked backend serves this model -> cannot judge, assume usable.
   return serving === 0;
@@ -209,6 +210,8 @@ export function buildModelCatalog(backends = {}, router = null, mode = DEFAULT_R
       if (typeof model !== "string" || model.includes("*") || seen.has(model) || excluded.has(model)) continue;
       seen.add(model);
       const entry = { id: model, object: "model", created: 0, owned_by: id };
+      const claimHealth = m === "off" ? null : router?.getBackend?.(id)?.getModelClaimHealth?.(model);
+      if (claimHealth) entry.claim_health = claimHealth;
       if (m !== "off") {
         const available = isModelAvailable(model, router);
         if (m === "hide" && !available) continue; // omit dead model from catalog
