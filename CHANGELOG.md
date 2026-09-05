@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Keep quarantined per-model claims out of routing, health, and catalog availability until one authenticated half-open recovery request succeeds; repeated upstream 502 or invalid completion responses re-quarantine the exact model claim.
 - Persist provider-neutral request attribution with explicit unknown values for client, application, route, rail, provider, backend node, requested model, served model, and runtime revision.
 
 ### Added
