@@ -73,6 +73,19 @@ function writeRegistry(url) {
   utimesSync(registryPath, fresh, fresh);
 }
 
+function createSingleDoorRouter() {
+  return createRouter({
+    backends: {
+      "chiap08-qwen38": {
+        url: upstream.url,
+        auth_type: "none",
+        models: ["qwen3.8-27b"],
+        priority: 1,
+      },
+    },
+  });
+}
+
 function startHoldingServer() {
   const state = {
     active: 0,
@@ -209,6 +222,10 @@ describe("chiap08 Qwen shared capacity domain", () => {
   });
 
   test("queue-full and queue-timeout return distinct retryable 503 responses", async () => {
+    // This test exercises terminal admission on one physical door. The suite's
+    // default fallback is intentionally excluded here: after PR94, a distinct
+    // idle capacity domain must receive failover instead of returning 503.
+    router = createSingleDoorRouter();
     getPool({
       capacityDomains: {
         "chiap08-qwen38": {
@@ -260,6 +277,7 @@ describe("chiap08 Qwen shared capacity domain", () => {
   });
 
   test("queued client cancellation remains 499 and never reaches fallback or upstream", async () => {
+    router = createSingleDoorRouter();
     getPool({
       capacityDomains: {
         "chiap08-qwen38": {

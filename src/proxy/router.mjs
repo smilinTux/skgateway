@@ -3537,6 +3537,35 @@ export async function routeAndSend(router, request, upstreamPath, method, client
   // row rather than being overwritten by the attempt that happened to win.
   // Stays empty on the disabled path, where it is never attached to a result.
   const energyAttempts = [];
+  // Which doors refused admission, so attribution can say a request failed over
+  // on CAPACITY rather than silently reporting only the door that served it.
+  // Bounded on purpose: one entry per candidate is already bounded by the
+  // candidate list, but the list is built per request from config and a
+  // misconfigured fan-out should not be able to grow this without limit.
+  const admissionAttempts = [];
+  const MAX_ADMISSION_ATTEMPTS = 16;
+  // Detail of the rejection that caused the NEXT candidate to be tried.
+  // It rides on the failover event instead of a second response event.
+  let admissionRejectionDetail = null;
+  // True when some LATER candidate sits in a different capacity domain, i.e.
+  // there is a genuinely different door to try. Candidates sharing a domain
+  // are the same door and must not be treated as failover targets.
+  const capacityDomainOf = (backendId) => {
+    try {
+      return pool?.getStats(backendId)?.capacityDomain ?? null;
+    } catch {
+      return null;
+    }
+  };
+  const nextDifferentDomainIndex = (idx, backendId) => {
+    const mine = capacityDomainOf(backendId);
+    const offset = candidates
+      .slice(idx + 1)
+      .findIndex((candidate) => capacityDomainOf(candidate.backendId) !== mine);
+    return offset < 0 ? -1 : idx + offset + 1;
+  };
+  const hasDifferentDomainLater = (idx, backendId) =>
+    nextDifferentDomainIndex(idx, backendId) >= 0;
   // Every candidate that ended in a throttle (429/402), whether an actual
   // upstream response or a still-cooling-down door skipped without a
   // network call (card 9e28de88 fix #3/#6). Drives the attributable-429
@@ -3615,7 +3644,12 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         from_backend: candidates[i - 1].backendId,
         to_backend: backendId,
         reason: `previous_status_${lastResult?.status ?? "error"}`,
+        // Capacity detail for a rejection that no longer emits its own
+        // response event. Without this the failover would record THAT it
+        // happened but not the queue wait or admission outcome behind it.
+        ...(admissionRejectionDetail || {}),
       }, { backend: backendId });
+      admissionRejectionDetail = null;
     }
 
     // Model-granular throttle cooldown (card 9e28de88 fix #2): this exact
@@ -3691,7 +3725,23 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     let slot = null;
     if (pool) {
       try {
-        slot = await pool.acquire(backendId, { signal: abortSignal });
+        // Only fail fast when there is somewhere ELSE to go.
+        //
+        // A candidate may queue if it is the last one, OR if every remaining
+        // candidate shares its capacity domain. Two backend ids in the same
+        // domain are the SAME DOOR: capacity domains exist precisely to pool
+        // them, so "failing over" between them buys nothing and costs the
+        // request its queue position.
+        //
+        // Found by tests/qwen-capacity-domain.test.mjs, whose domain declares
+        // members ["chiap08-qwen38", "reg:qwen38"]. Treating those as separate
+        // doors made a request that should have queued skip through both and
+        // never queue at all, which hung that test rather than failing it.
+        const mayQueue = !hasDifferentDomainLater(i, backendId);
+        slot = await pool.acquire(backendId, {
+          signal: abortSignal,
+          nonBlocking: !mayQueue,
+        });
       } catch (err) {
         // A client which leaves while queued is the same neutral 499 as one
         // which leaves after dispatch: no failover and no backend-health write.
@@ -3759,7 +3809,70 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         const backoffClassification = code === "queue_timeout"
           ? "timeout"
           : "local_admission_denial";
-        await emitSiem("response", {
+        // Whether this rejection is TERMINAL is knowable here, so say it
+        // truthfully. This used to hardcode failover:false and emit before the
+        // decision, so a request that failed over successfully still wrote a
+        // 503 "response" event claiming it had not, and the later 200 wrote a
+        // second one. Two terminal responses for one request, one of them a
+        // lie, is worse than no telemetry: it makes admission failover look
+        // like a 503 rate in every dashboard reading these events.
+        // Terminal in the same sense: nowhere else to send it.
+        const differentDomainIndex = nextDifferentDomainIndex(i, backendId);
+        const admissionIsTerminal = differentDomainIndex < 0;
+
+        // ABORT RACE: FIXED BY REMOVING THE EMIT, NOT BY A GUARD.
+        //
+        // Review 2927a814 reproduced [503, 499] for one cancelled request by
+        // aborting during the admission_rejected emission. The prescribed
+        // repair was a guard before that emit. I implemented both a pre-emit
+        // and a post-emit guard and then proved BOTH unreachable: deleting
+        // either fails no test, and the reasoning holds beyond the tests.
+        //
+        //   pool.acquire() checks signal.aborted FIRST and returns
+        //   client_closed, so a client that has already left never reaches
+        //   the capacity branch at all.
+        //
+        //   After the rejection, a non-final candidate now has NO await
+        //   before the failover decision, so that window is synchronous and
+        //   nothing can abort inside it.
+        //
+        //   For the FINAL candidate the 503 IS the correct terminal response.
+        //   A guard there would emit a 499 after it and produce the very
+        //   [503, 499] this was meant to prevent.
+        //
+        // Two dead guards would be the same defect the review caught in the
+        // attribution test: code that looks like a fix and is never executed.
+        //
+        // A NON-TERMINAL rejection emits NO "response" event.
+        //
+        // Reproduced by review 2927a814: aborting during the admission_rejected
+        // emission produced the terminal sequence [503, 499] for ONE cancelled
+        // request. No guard placement fixes that, because a guard before the
+        // emit cannot see an abort that lands inside it, and a guard after it
+        // cannot unsend what was already sent.
+        //
+        // The emit itself was the defect. A rejection on a non-final candidate
+        // is not a response to the client, it is an internal step, and the
+        // router ALREADY records it: the failover event below carries
+        // previous_status 503 with the backend and model. Emitting a second
+        // "response" for the same step double-counted it, and made every
+        // capacity failover look like a 503 downstream.
+        //
+        // So intermediate detail rides on the failover event, and only the
+        // FINAL candidate emits a terminal response. One request, one response.
+        if (!admissionIsTerminal) {
+          admissionRejectionDetail = {
+            queue_wait_ms: queueWaitMs,
+            inflight_concurrency: inflightConcurrency,
+            admission_outcome: admissionOutcome,
+            backoff_classification: backoffClassification,
+            retry_after_seconds: retryAfterSeconds,
+            admission_rejected: true,
+            code,
+            capacity_domain: capacityDomain,
+          };
+        }
+        if (admissionIsTerminal) await emitSiem("response", {
           status: 503,
           latency_ms: queueWaitMs,
           queue_wait_ms: queueWaitMs,
@@ -3768,11 +3881,12 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           backoff_classification: backoffClassification,
           retry_after_seconds: retryAfterSeconds,
           failover: false,
+          terminal: true,
           admission_rejected: true,
           code,
           capacity_domain: capacityDomain,
         }, { backend: backendId });
-        return {
+        const admissionRejection = {
           status: 503,
           headers: {
             "content-type": "application/json",
@@ -3799,6 +3913,59 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           retryAfterSeconds,
           failover: didFailover,
         };
+
+        // An admission rejection is a CAPACITY outcome on THIS door, not
+        // evidence that the model or the backend is unhealthy. The code above
+        // already says so, and deliberately does not write a health outcome.
+        // It is therefore failover-eligible in exactly the way an upstream 5xx
+        // is: try the next candidate, which may be completely idle.
+        //
+        // Until now this returned immediately with failover:false, so a full
+        // pool killed the request even when a sibling door had free slots.
+        // Measured on the chi cluster 2026-09-01: chiap08-qwen38 was admitting
+        // against a vLLM engine that sustains 2 to 3 concurrent, while
+        // chiap01-qwen38 sat at totalProcessed=0 for its entire lifetime. In
+        // the first hour after the admission cap was corrected, 49 of 103
+        // admitted requests timed out with an idle door one position down the
+        // candidate list. The config comment in skgateway-codex.yaml records
+        // the same conclusion and says the only safe setting was to WAIT
+        // rather than die, because dying could not fail over.
+        //
+        // Only the LAST candidate returns. Anything earlier hands the 503 to
+        // lastResult and continues, so the existing i > 0 branch at the top of
+        // the loop emits the failover audit with previous_status_503. No new
+        // SIEM event type is introduced, which matters because that emitter is
+        // a fail-closed boundary where an unknown type would throw into the
+        // request path.
+        //
+        // route() already trims candidates to a single entry when failover is
+        // disabled, so config with failover:false keeps returning immediately
+        // and its behaviour is unchanged.
+        if (admissionAttempts.length < MAX_ADMISSION_ATTEMPTS) {
+          admissionAttempts.push({
+            backendId,
+            capacityDomain,
+            code,
+            queueWaitMs,
+            inflightConcurrency,
+          });
+        }
+        admissionRejection.admissionAttempts = admissionAttempts;
+
+        if (!admissionIsTerminal) {
+          // Consecutive aliases in this capacity domain are the same physical
+          // door. Skip them so one rejection creates one attempt and the
+          // failover event names the door that actually refused admission.
+          candidates.splice(i + 1, differentDomainIndex - i - 1);
+          console.warn(
+            `[routeAndSend] admission ${code} on backend=${backendId} ` +
+            `(domain=${capacityDomain}), trying next backend ` +
+            `${candidates[i + 1].backendId}`
+          );
+          lastResult = admissionRejection;
+          continue;
+        }
+        return admissionRejection;
       }
     }
 
