@@ -773,6 +773,23 @@ export function createMetricsCollector(config) {
   }
 
   /**
+   * Live in-flight requests with age, oldest-first capped. Read-only view of
+   * the pending map: the working-vs-hung discriminator and the barrier
+   * signal (empty means quiesced). ponytail: linear scan of the pending map,
+   * bounded by concurrent requests; index it if fleets exceed hundreds.
+   */
+  function inFlightRequests() {
+    const now = Date.now();
+    return [...pending.entries()].map(([id, p]) => ({
+      id,
+      agentId: p.agentId ?? null,
+      model: p.model ?? null,
+      backend: p.backend ?? null,
+      ageMs: now - p.startedAt,
+    }));
+  }
+
+  /**
    * Record the completion of a proxy request (including token usage).
    *
    * @param {object} meta
@@ -1264,6 +1281,7 @@ export function createMetricsCollector(config) {
     recordRequest,
     recordResponse,
     recordEnergy,
+    inFlightRequests,
     getStats,
     getAnomalies,
     getTokenUsage,

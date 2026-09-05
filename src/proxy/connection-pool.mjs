@@ -44,12 +44,17 @@ let nextPoolInstanceId = 1;
 
 /** Typed admission failure consumed by the router's structured retry path. */
 export class PoolAdmissionError extends Error {
-  constructor(code, capacityDomain, message, retryAfterSeconds) {
+  constructor(code, capacityDomain, message, retryAfterSeconds, telemetry = {}) {
     super(message);
     this.name = "PoolAdmissionError";
     this.code = code;
     this.capacityDomain = capacityDomain;
     this.retryAfterSeconds = retryAfterSeconds;
+    // Bounded, non-identifying admission facts for request telemetry. Keep
+    // these on the typed error so callers never have to parse messages.
+    this.queueWaitMs = telemetry.queueWaitMs ?? 0;
+    this.inflightConcurrency = telemetry.inflightConcurrency ?? 0;
+    this.admissionOutcome = telemetry.admissionOutcome ?? "denied";
   }
 }
 
@@ -179,12 +184,18 @@ export class ConnectionPool {
     return this._pools.get(settings.domainId);
   }
 
-  _issueTicket(state, backendId) {
+  _issueTicket(state, backendId, enqueuedAt = null, inflightConcurrency = state.active) {
+    const acquiredAt = Date.now();
     const ticket = Object.freeze({
       id: state.id,
       backendId,
-      acquiredAt: Date.now(),
+      acquiredAt,
       ticketId: `${this._poolInstanceId}:${state.id}:${this._nextTicketId++}`,
+      queueWaitMs: enqueuedAt === null
+        ? 0
+        : Math.min(state.queueTimeoutMs, Math.max(0, acquiredAt - enqueuedAt)),
+      inflightConcurrency: Math.min(state.max, Math.max(1, inflightConcurrency)),
+      admissionOutcome: "admitted",
     });
     this._issuedTickets.set(ticket, state);
     return ticket;
@@ -216,6 +227,11 @@ export class ConnectionPool {
           state.id,
           `[connection-pool] backend=${backendId} client disconnected before admission`,
           retryAfterSeconds,
+          {
+            queueWaitMs: 0,
+            inflightConcurrency: Math.min(state.max, Math.max(0, state.active)),
+            admissionOutcome: "cancelled",
+          },
         ));
         return;
       }
@@ -239,6 +255,11 @@ export class ConnectionPool {
           `[connection-pool] domain=${state.id} queue full ` +
             `(${state.queue.length}/${state.maxQueue}). Request dropped.`,
           retryAfterSeconds,
+          {
+            queueWaitMs: 0,
+            inflightConcurrency: Math.min(state.max, Math.max(0, state.active)),
+            admissionOutcome: "denied",
+          },
         ));
         return;
       }
@@ -264,7 +285,7 @@ export class ConnectionPool {
           settled = true;
           cleanup();
           state.totalProcessed++;
-          resolve(this._issueTicket(state, backendId));
+          resolve(this._issueTicket(state, backendId, waiter.enqueuedAt, state.active + 1));
           return true;
         },
         enqueuedAt: Date.now(),
@@ -284,6 +305,11 @@ export class ConnectionPool {
             `[connection-pool] domain=${state.id} queue timeout after ` +
               `${state.queueTimeoutMs}ms`,
             retryAfterSeconds,
+            {
+              queueWaitMs: state.queueTimeoutMs,
+              inflightConcurrency: Math.min(state.max, Math.max(0, state.active)),
+              admissionOutcome: "timeout",
+            },
           ));
         }
       }, state.queueTimeoutMs);
@@ -298,6 +324,14 @@ export class ConnectionPool {
             state.id,
             `[connection-pool] backend=${backendId} client disconnected while queued`,
             retryAfterSeconds,
+            {
+              queueWaitMs: Math.min(
+                state.queueTimeoutMs,
+                Math.max(0, Date.now() - waiter.enqueuedAt),
+              ),
+              inflightConcurrency: Math.min(state.max, Math.max(0, state.active)),
+              admissionOutcome: "cancelled",
+            },
           ));
         }
       };
@@ -404,6 +438,7 @@ export class ConnectionPool {
     // observable before first traffic. Runtime-only ungrouped pools join the
     // set only after a real acquire; arbitrary getStats() lookups never do.
     const domainIds = new Set([
+      ...Object.keys(this._overrides).map((id) => this._domainId(id)),
       ...Object.keys(this._capacityDomains),
       ...this._pools.keys(),
     ]);

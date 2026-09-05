@@ -31,14 +31,14 @@ pooling:
   capacity_domains:
     chiap08-qwen38:
       members: [chiap08-qwen38, "reg:qwen38"]
-      max: 3
-      maxQueue: 8
-      queueTimeoutMs: 30000
+      max: 2
+      maxQueue: 2
+      queueTimeoutMs: 10000
     chiap01-qwen38:
       members: [chiap01-qwen38]
-      max: 2
-      maxQueue: 4
-      queueTimeoutMs: 30000
+      max: 1
+      maxQueue: 1
+      queueTimeoutMs: 10000
 
 ## Backends - non-Matter only, exact profile 6073417e
 backends:
@@ -47,9 +47,7 @@ backends:
     auth_type: none
     models:
       - qwen3.8-27b-huihui-abliterated-q4_k_m
-      - qwen3.8-27b-ud-q5_k_xl
-      - qwen3.8-27b
-      - qwen38-abliterated
+    context_limit: 32768
     priority: 3
 
   chiap08-qwen38:
@@ -57,9 +55,9 @@ backends:
     auth_type: none
     models:
       - qwen3.8-27b-huihui-abliterated-q4_k_m
-      - qwen3.8-27b-ud-q5_k_xl
-      - qwen3.8-27b
-      - qwen38-abliterated
+      - qwen3.8-chiap08
+      - qwen3.8-vllm
+    context_limit: 131072
     priority: 3
 
   ## SKLegal backend - EXCLUDED per profile 6073417e
@@ -120,6 +118,8 @@ sanitizer:
 ## Model limits - exact profile 6073417e
 model_limits:
   qwen3.8-27b-huihui-abliterated-q4_k_m: { max_body_bytes: 800000, max_system_bytes: 320000 }
+  qwen3.8-chiap08:                       { max_body_bytes: 800000, max_system_bytes: 320000 }
+  qwen3.8-vllm:                          { max_body_bytes: 800000, max_system_bytes: 320000 }
   qwen3.8-27b-ud-q5_k_xl:                { max_body_bytes: 800000, max_system_bytes: 320000 }
   qwen3.8-27b:                           { max_body_bytes: 800000, max_system_bytes: 320000 }
   qwen38-abliterated:                    { max_body_bytes: 800000, max_system_bytes: 320000 }

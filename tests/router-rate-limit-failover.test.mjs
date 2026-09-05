@@ -225,6 +225,11 @@ describe("router 429/402 rate-limit failover (card 9e28de88)", () => {
     const r = await routeAndSend(router, { model: modelId, agentId: "test" }, "/chat/completions", "POST", HEADERS, bodyFor(modelId), false);
 
     assert.equal(r.status, 429);
+    assert.equal(r.admissionOutcome, "admitted");
+    assert.equal(r.backoffClassification, "provider_429");
+    assert.ok(r.inflightConcurrency >= 1);
+    assert.ok(r.queueWaitMs >= 0);
+    assert.ok(r.retryAfterSeconds >= 1);
     const payload = JSON.parse(r.body.toString("utf-8"));
     assert.equal(payload.error.type, "rate_limited_all_candidates");
     assert.equal(payload.attempted.length, 2, "both throttled doors are attributed");
@@ -343,5 +348,177 @@ describe("router @match multi-door preference (card 9e28de88 fix #5)", () => {
 
     const primaryHealth = router.getHealth().primary;
     assert.equal(primaryHealth.quarantined, false, "the throttled door stays healthy");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Card e7c2b4a9 regression tests: preserve backoff and cooldown admission truth
+// ---------------------------------------------------------------------------
+
+describe("router backoff and cooldown admission truth (card e7c2b4a9)", () => {
+  let primary, secondary;
+
+  before(async () => {
+    primary = await startUpstream();
+    secondary = await startUpstream();
+  });
+
+  after(async () => {
+    await primary.close();
+    await secondary.close();
+  });
+
+  beforeEach(() => {
+    _resetThrottleCooldownsForTests();
+    _resetCacheForTests();
+    primary.ref.status = 200;
+    primary.ref.headers = {};
+    secondary.ref.status = 200;
+    secondary.ref.headers = {};
+  });
+
+  test("repair #1: all-402 attempt chain preserves provider_backoff classification", async () => {
+    const modelId = `all-402-backoff-${Date.now()}`;
+    const router = createRouter({
+      backends: {
+        primary: { url: primary.base, auth_type: "none", models: [modelId], priority: 1 },
+        secondary: { url: secondary.base, auth_type: "none", models: [modelId], priority: 2 },
+      },
+    });
+
+    // Both providers return 402 (quota exceeded, not standard 429)
+    primary.ref.status = 402;
+    secondary.ref.status = 402;
+
+    const r = await routeAndSend(
+      router,
+      { model: modelId, agentId: "test" },
+      "/chat/completions",
+      "POST",
+      HEADERS,
+      bodyFor(modelId),
+      false
+    );
+
+    assert.equal(r.status, 429, "final response is 429 for all throttled candidates");
+    assert.equal(r.backoffClassification, "provider_backoff",
+      "all-402 chain must preserve provider_backoff, not overwrite to provider_429");
+    assert.equal(r.admissionOutcome, "admitted", "first attempt was admitted before 402");
+    assert.equal(r.inflightConcurrency, 1, "inflight concurrency reflects admission");
+
+    const payload = JSON.parse(r.body.toString("utf-8"));
+    assert.equal(payload.error.type, "rate_limited_all_candidates");
+    assert.equal(payload.attempted.length, 2, "both attempts are attributed");
+    assert.ok(payload.attempted.every((a) => a.status === 402), "all attempts are 402");
+  });
+
+  test("repair #2: cooldown-only rejection reports truthful no-admission outcome", async () => {
+    const modelId = `cooldown-only-denied-${Date.now()}`;
+    const router = createRouter({
+      backends: {
+        primary: { url: primary.base, auth_type: "none", models: [modelId], priority: 1 },
+        secondary: { url: secondary.base, auth_type: "none", models: [modelId], priority: 2 },
+      },
+    });
+
+    // First request: both backends return 402, arming cooldowns
+    primary.ref.status = 402;
+    primary.ref.headers = { "retry-after": "10" };
+    secondary.ref.status = 402;
+    secondary.ref.headers = { "retry-after": "10" };
+
+    const r1 = await routeAndSend(
+      router,
+      { model: modelId, agentId: "test" },
+      "/chat/completions",
+      "POST",
+      HEADERS,
+      bodyFor(modelId),
+      false
+    );
+
+    assert.equal(r1.status, 429);
+    assert.equal(r1.admissionOutcome, "admitted", "first request was admitted");
+    assert.equal(r1.inflightConcurrency, 1);
+
+    // Verify cooldowns are armed
+    const primaryState = _throttleStateForTests("primary", modelId);
+    const secondaryState = _throttleStateForTests("secondary", modelId);
+    assert.ok(primaryState, "primary cooldown recorded");
+    assert.ok(secondaryState, "secondary cooldown recorded");
+    assert.equal(primaryState.status, 402);
+    assert.equal(secondaryState.status, 402);
+
+    // Second request: both doors are still cooling, so no admission occurs
+    const r2 = await routeAndSend(
+      router,
+      { model: modelId, agentId: "test" },
+      "/chat/completions",
+      "POST",
+      HEADERS,
+      bodyFor(modelId),
+      false
+    );
+
+    assert.equal(r2.status, 429, "cooldown-only rejection returns 429");
+    assert.equal(r2.admissionOutcome, "denied",
+      "cooldown-only request must report denied, not admitted with zero inflight");
+    assert.equal(r2.inflightConcurrency, 0,
+      "no inflight concurrency when no admission occurred");
+    assert.equal(r2.backoffClassification, "provider_backoff",
+      "cooldown-only rejection preserves the underlying backoff classification");
+
+    // Verify both attempts were skipped without network calls
+    const payload2 = JSON.parse(r2.body.toString("utf-8"));
+    assert.equal(payload2.error.type, "rate_limited_all_candidates");
+    assert.equal(payload2.attempted.length, 2);
+    assert.ok(payload2.attempted.every((a) => a.skipped === true),
+      "all attempts were skipped due to cooldown");
+  });
+
+  test("repair #2: mixed 402/429 cooldown rejection preserves truthful classification", async () => {
+    const modelId = `mixed-cooldown-denied-${Date.now()}`;
+    const router = createRouter({
+      backends: {
+        primary: { url: primary.base, auth_type: "none", models: [modelId], priority: 1 },
+        secondary: { url: secondary.base, auth_type: "none", models: [modelId], priority: 2 },
+      },
+    });
+
+    // First request: primary 402, secondary 429
+    primary.ref.status = 402;
+    primary.ref.headers = { "retry-after": "10" };
+    secondary.ref.status = 429;
+    secondary.ref.headers = { "retry-after": "10" };
+
+    const r1 = await routeAndSend(
+      router,
+      { model: modelId, agentId: "test" },
+      "/chat/completions",
+      "POST",
+      HEADERS,
+      bodyFor(modelId),
+      false
+    );
+
+    assert.equal(r1.status, 429);
+    assert.equal(r1.admissionOutcome, "admitted");
+
+    // Second request while cooling
+    const r2 = await routeAndSend(
+      router,
+      { model: modelId, agentId: "test" },
+      "/chat/completions",
+      "POST",
+      HEADERS,
+      bodyFor(modelId),
+      false
+    );
+
+    assert.equal(r2.status, 429);
+    assert.equal(r2.admissionOutcome, "denied", "cooldown-only reports denied");
+    assert.equal(r2.inflightConcurrency, 0);
+    assert.equal(r2.backoffClassification, "provider_429",
+      "mixed status chain uses provider_429 when any 429 is present");
   });
 });

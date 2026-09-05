@@ -34,12 +34,12 @@ function choicesResponse(chunks) {
   }, REQUESTED);
 }
 
-function assertRejected(deltas) {
+function assertRejected(deltas, code = "invalid_upstream_tool_calls") {
   const result = response(deltas);
   assert.equal(result.status, 502);
   assert.equal(result.headers["content-type"], "application/json");
   assert.equal(result.headers["content-length"], undefined);
-  assert.equal(JSON.parse(result.body).error.code, "invalid_upstream_tool_calls");
+  assert.equal(JSON.parse(result.body).error.code, code);
   assert.equal(result.body.includes(Buffer.from("[DONE]")), false);
   assert.equal(result.body.includes(Buffer.from("private chain")), false);
 }
@@ -451,8 +451,26 @@ describe("completed SSE tool-call structure", () => {
   });
 
   test("rejects empty and non-array tool-call collections", () => {
-    assertRejected([{ delta: { tool_calls: [] } }]);
+    // Both are still rejected. They differ in WHY, and the code now says which.
+    //
+    // tool_calls: [] is the OpenAI shape for "no tool calls this turn", so it is
+    // not malformed evidence, it is the absence of evidence. With no visible
+    // content either, the stream carries nothing, which is empty_upstream_response.
+    // Reporting that as invalid TOOL evidence sent debuggers after the wrong
+    // thing, and rejecting it as malformed 502'd every provider that always
+    // emits the key (NVIDIA returns {content, tool_calls: [], finish_reason}
+    // on every plain chat turn).
+    assertRejected([{ delta: { tool_calls: [] } }], "empty_upstream_response");
+    // A non-array IS structurally wrong, so this stays invalid_upstream_tool_calls.
     assertRejected([{ delta: { tool_calls: {} } }]);
+  });
+
+  test("a delta carrying tool_calls: [] alongside real content is NOT rejected", () => {
+    // The live regression: content present, tool_calls empty. Must pass.
+    const result = response([
+      { delta: { role: "assistant", content: "OK", tool_calls: [] }, finishReason: "stop" },
+    ]);
+    assert.equal(result.status, 200, "content is present, so this is a valid answer");
   });
 
   test("rejects missing or unsupported identity and type", () => {
