@@ -45,7 +45,6 @@ own any logic itself.
 | `proxy/stream.mjs` | `SSEWriter`, `SSEParser`, `jsonToSSE`, `passthroughStream` | SSE framing; keep-alive; upstream stream relay |
 | `proxy/upstream.mjs` | `sendUpstream` | Raw HTTP relay to a selected backend |
 | `identity/capauth.mjs` | `loadAgentRegistry`, `identityMiddleware` | CapAuth PGP verification; agent registry |
-| `policy/engine.mjs` | `createPolicyEngine`, `loadPolicies`, `evaluatePolicy` | YAML rule loading; O(rules × conditions) evaluation |
 | `classifiers/classifier.mjs` | `classifyPrompt`, `scoreRisk`, `detectJailbreak`, `detectInjection` | Pure regex/keyword classification; zero ML deps |
 | `metrics/collector.mjs` | `createMetricsCollector` | Token/cost/latency aggregation; SQLite batch writes |
 | `siem/events.mjs` | `createEventBus`, `createEvent`, `formatCEF`, `EventType` | Event factory; in-memory pub/sub bus; CEF formatter |
@@ -81,7 +80,6 @@ graph TD
     end
 
     subgraph Policy
-        PE[policy/engine.mjs]
     end
 
     subgraph Classifiers
@@ -277,79 +275,6 @@ The bus maintains an internal ring buffer (`maxBuffer`, default 1000 events).
 If your adapter is slow, events are queued there. When the buffer fills, the
 oldest events are dropped and an overflow counter is incremented. Design your
 adapter to be non-blocking; do expensive I/O asynchronously.
-
----
-
-## Adding a New Policy Transform
-
-Transforms are named effects applied to a request before it is forwarded. They
-do not stop the policy chain — after a transform runs, evaluation continues.
-
-### Step 1 — Register the transform name
-
-In `src/policy/engine.mjs` add the identifier to `KNOWN_TRANSFORMS`:
-
-```js
-export const KNOWN_TRANSFORMS = new Set([
-  'redact_pii',
-  'downgrade_model',
-  'strip_tools',
-  'add_safety_prompt',
-  'my_new_transform',   // <-- add here
-]);
-```
-
-### Step 2 — Implement the transform
-
-In `src/policy/engine.mjs`, locate the `applyTransform(transform, request, ruleCfg)`
-function and add a case:
-
-```js
-case 'my_new_transform':
-  // mutate request.body in place
-  request.body.my_field = ruleCfg.my_param ?? 'default_value';
-  break;
-```
-
-The `request` object has:
-- `request.body` — parsed JSON body (mutable)
-- `request.headers` — incoming HTTP headers (mutable)
-- `request.context` — identity/classification context (read-only here)
-
-The `ruleCfg` object is the full rule YAML node, so any extra fields you add to
-the YAML rule are available here.
-
-### Step 3 — Add YAML support
-
-No schema validation exists beyond `KNOWN_TRANSFORMS`. Write a rule like:
-
-```yaml
-- name: "apply-my-transform"
-  condition:
-    agent_id: "some-agent"
-  action: transform
-  transform: my_new_transform
-  my_param: "value"
-  severity: low
-```
-
-### Step 4 — Add a test
-
-```js
-// tests/policy.test.mjs
-test('my_new_transform sets my_field', () => {
-  const engine = createPolicyEngine([{
-    name: 'test-rule',
-    condition: { agent_id: 'test' },
-    action: 'transform',
-    transform: 'my_new_transform',
-    my_param: 'hello',
-  }]);
-  const req = { body: {}, headers: {}, context: { agent_id: 'test' } };
-  engine.evaluate(req, { agent_id: 'test' });
-  assert.equal(req.body.my_field, 'hello');
-});
-```
 
 ---
 

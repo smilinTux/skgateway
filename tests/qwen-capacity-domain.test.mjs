@@ -113,7 +113,10 @@ function startHoldingServer() {
         releaseAll() {
           for (const release of state.pending.splice(0)) release();
         },
-        close: () => new Promise((done) => server.close(done)),
+        close: () => new Promise((done) => {
+          server.close(done);
+          server.closeAllConnections();
+        }),
       });
     });
   });
@@ -164,6 +167,15 @@ afterEach(async () => {
 
 
 describe("chiap08 Qwen shared capacity domain", () => {
+  test("fixture teardown closes a retained upstream socket", { timeout: 1000 }, async () => {
+    const retained = request("qwen3.8-27b");
+    await waitFor(() => upstream.state.active === 1, "retained upstream request");
+
+    await upstream.close();
+    upstream = null;
+    await retained;
+  });
+
   test("mixed direct and registry traffic never exceeds four combined upstream calls", async () => {
     getPool({ capacityDomains: DOMAIN });
     const firstFour = [
@@ -300,14 +312,14 @@ test("source config pins two independent Qwen replica capacity domains", async (
   const config = yamlLoad(readFileSync(new URL("../config/skgateway.yaml", import.meta.url), "utf8"));
   assert.deepEqual(config.pooling.capacity_domains["chiap08-qwen38"], {
     members: ["chiap08-qwen38", "reg:qwen38"],
-    max: 3,
-    maxQueue: 8,
-    queueTimeoutMs: 30_000,
+    max: 2,
+    maxQueue: 2,
+    queueTimeoutMs: 10_000,
   });
   assert.deepEqual(config.pooling.capacity_domains["chiap01-qwen38"], {
     members: ["chiap01-qwen38"],
-    max: 2,
-    maxQueue: 4,
-    queueTimeoutMs: 30_000,
+    max: 1,
+    maxQueue: 1,
+    queueTimeoutMs: 10_000,
   });
 });
