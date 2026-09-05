@@ -2129,7 +2129,7 @@ export const server = http.createServer(async (req, res) => {
     // failure here must not become a second, fabricated error stacked on top
     // of whatever the request path already did.
     let metricsClosed = false;
-    function closeMetrics({ statusCode, firstByteMs, generationMs, responseHeaders, responseBody, backend, modelServed, errorMsg, energy, energyAttempts } = {}) {
+    function closeMetrics({ statusCode, firstByteMs, generationMs, responseHeaders, responseBody, backend, modelServed, errorMsg, energy, energyAttempts, result } = {}) {
       if (!metrics || !metricsReqId || metricsClosed) return;
       metricsClosed = true;
       try {
@@ -2152,6 +2152,21 @@ export const server = http.createServer(async (req, res) => {
           modelServed,
           backend,
           errorMsg,
+          // Provider-neutral rail attribution (card e19f88db / SKGW-ATTRIBUTION-01)
+          attribution: {
+            client: req.headers["x-app"] || undefined,
+            application: req.headers["user-agent"] || undefined,
+            // One canonical source: the router's result.logicalRoute, the
+            // same value response headers expose. Never re-derive here.
+            // Card bc908525 / review b62e19f8 finding 4.
+            logicalRoute: result?.logicalRoute || undefined,
+            rail: result?.rail || undefined,
+            provider: result?.provider || undefined,
+            backendNode: result?.backendId || undefined,
+            requestedModel: parsedModel || undefined,
+            servedModel: modelServed || undefined,
+            runtimeRevision: result?.runtimeRevision || undefined,
+          },
         });
       } catch (err) {
         console.error("[skgateway] metrics recordResponse failed:", err.message);
@@ -2558,6 +2573,7 @@ export const server = http.createServer(async (req, res) => {
           errorMsg: dispatchError.message,
           energy: result?.energy,
           energyAttempts: result?.energyAttempts,
+          result,
         });
       } else {
         let parsedBody = null;
@@ -2591,10 +2607,11 @@ export const server = http.createServer(async (req, res) => {
           // parsedBody is already null when the body is SSE or non-JSON, so
           // this is undefined on exactly those paths and the column stays NULL
           // meaning unobserved. That is by construction, not by a special
-          // case, and it must never be widened to `|| parsedModel`.
+          // case, and it must must never be widened to `|| parsedModel`.
           modelServed: result?.servedModel,
           energy: result?.energy,
           energyAttempts: result?.energyAttempts,
+          result,
         });
       }
     }
