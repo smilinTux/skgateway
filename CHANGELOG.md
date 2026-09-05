@@ -61,6 +61,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Gateway config activation now validates and hashes one immutable config snapshot before binding, drains the prior listener with a bounded fail-closed rollback, and records listener PID and revision continuity evidence.
 - Request classifier input is bounded (8K head + 2K tail per message).
   A single 420KB message drove catastrophic regex behavior in the heuristic
   classifier and froze the entire gateway event loop, including unrelated
