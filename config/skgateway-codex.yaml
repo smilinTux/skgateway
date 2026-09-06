@@ -32,20 +32,14 @@ pooling:
     chiap08-qwen38:
       members: [chiap08-qwen38, "reg:qwen38"]
       ## llama-server on chiap08:11439 runs --parallel 4 --cont-batching.
-      ## Take 3 of its 4 real slots and leave 1 for the dream engine, the wiki
-      ## pipeline and Hermes, which hit llama-server directly and cannot see
-      ## this queue. Taking all 4 makes them queue invisibly behind us.
-      max: 3
-      maxQueue: 8
-      ## Short on purpose: fail over to cloud fast rather than wait on local.
-      queueTimeoutMs: 30000
+      max: 2
+      maxQueue: 2
+      queueTimeoutMs: 10000
     chiap01-qwen38:
       members: [chiap01-qwen38]
-      ## Arc Pro B70 card 1 runs --parallel 2 on chiap01:18810.
-      ## This is independent hardware from chiap08 and owns both real slots.
-      max: 2
-      maxQueue: 4
-      queueTimeoutMs: 30000
+      max: 1
+      maxQueue: 1
+      queueTimeoutMs: 10000
   per_backend:
     ## ollama pool left defined but its backend is disabled above (Chef 5060).
     ollama:
@@ -124,9 +118,8 @@ backends:
     auth_type: none
     models:
       - qwen3.8-27b-huihui-abliterated-q4_k_m
-      - qwen3.8-27b-ud-q5_k_xl
-      - qwen3.8-27b
-      - qwen38-abliterated
+    context_limit: 32768
+    provider_purity: true
     priority: 3
 
   chiap08-qwen38:
@@ -134,9 +127,10 @@ backends:
     auth_type: none
     models:
       - qwen3.8-27b-huihui-abliterated-q4_k_m
-      - qwen3.8-27b-ud-q5_k_xl
-      - qwen3.8-27b
-      - qwen38-abliterated
+      - qwen3.8-chiap08
+      - qwen3.8-vllm
+    context_limit: 131072
+    provider_purity: true
     priority: 3
 
   ## DISABLED 2026-08-26 by Chef: the chi cluster has no Anthropic
