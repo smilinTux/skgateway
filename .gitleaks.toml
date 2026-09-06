@@ -1,0 +1,3 @@
+[allowlist]
+description = "Historical test fixture contains a deliberately non-secret placeholder token."
+commits = ["ada9d16c2a97247339daf159c44108266e7442a3"]

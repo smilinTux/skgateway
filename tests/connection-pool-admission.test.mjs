@@ -85,6 +85,53 @@ describe("ConnectionPool capacity domains", () => {
     });
   });
 
+  test("configured per-backend pools are visible before traffic without double-counting domains", async () => {
+    const pool = new ConnectionPool({
+      defaultMaxConcurrent: 20,
+      perBackend: {
+        codex: { max: 7, maxQueue: 3, queueTimeoutMs: 12_000 },
+        "reg:qwen38": { max: 99 },
+      },
+      capacityDomains: QWEN_DOMAIN,
+    });
+
+    assert.deepEqual(Object.keys(pool.getAllStats()), ["codex", "chiap08-qwen38"]);
+    assert.deepEqual(pool.getAllStats().codex, {
+      capacityDomain: "codex",
+      members: ["codex"],
+      active: 0,
+      queued: 0,
+      max: 7,
+      maxQueue: 3,
+      queueTimeoutMs: 12_000,
+      totalProcessed: 0,
+      totalDropped: 0,
+      totalTimedOut: 0,
+      totalCancelled: 0,
+      peakActive: 0,
+      peakQueue: 0,
+    });
+    assert.equal(pool.getAllStats()["chiap08-qwen38"].max, 4);
+    assert.deepEqual(pool.getTotalStats(), {
+      totalActive: 0,
+      totalQueued: 0,
+      totalCapacity: 11,
+    });
+
+    const runtimeTicket = await pool.acquire("runtime-created");
+    assert.deepEqual(Object.keys(pool.getAllStats()), [
+      "codex",
+      "chiap08-qwen38",
+      "runtime-created",
+    ]);
+    assert.deepEqual(pool.getTotalStats(), {
+      totalActive: 1,
+      totalQueued: 0,
+      totalCapacity: 31,
+    });
+    assert.equal(pool.release(runtimeTicket), true);
+  });
+
   test("tickets are single-use and foreign, forged, or string releases cannot free a slot", async () => {
     const pool = new ConnectionPool({
       capacityDomains: {
