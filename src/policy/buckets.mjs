@@ -628,34 +628,63 @@ export function orderMembersByCost(members, counter = 0) {
 }
 
 /**
+ * Order an admitted bucket pool by class fit, then cost.
+ *
+ * A model_class is a floor, so larger models remain valid failover candidates.
+ * They must not, however, win every bucket merely because they share the
+ * cheapest cost tier. The nearest class to the requested floor is preferred;
+ * cost and rotation break ties within that class. This makes S, M, L and XL
+ * useful addresses while preserving upward-only capability failover.
+ *
+ * This function only reorders members already admitted by resolveBucket(). It
+ * cannot widen the sensitivity ceiling or admit a model below the class floor.
+ *
+ * @param {Array<object>} members members already admitted by resolveBucket
+ * @param {string|null} requestedClass bucket model_class
+ * @param {number} counter monotonically increasing per bucket
+ * @returns {Array<object>}
+ */
+export function orderMembersForClass(members, requestedClass, counter = 0) {
+  const costOrdered = orderMembersByCost(members, counter);
+  const requestedRank = classRank(requestedClass);
+  if (requestedRank === null) return costOrdered;
+
+  return costOrdered
+    .map((member, index) => ({ member, index, rank: classRank(member.model_class) }))
+    .sort((a, b) => {
+      const aDistance = a.rank === null ? Number.POSITIVE_INFINITY : a.rank - requestedRank;
+      const bDistance = b.rank === null ? Number.POSITIVE_INFINITY : b.rank - requestedRank;
+      return aDistance - bDistance || a.index - b.index;
+    })
+    .map(({ member }) => member);
+}
+
+/**
  * Pick which member serves THIS request.
  *
- * Selection rotates only within the cheapest available cost tier. Costlier
- * tiers remain failover candidates through `orderMembersByCost()`, but are not
- * selected while an equally eligible cheaper tier exists.
+ * Selection first chooses the closest admitted model_class, then rotates only
+ * within that class's cheapest cost tier. Larger classes and costlier tiers
+ * remain failover candidates through orderMembersForClass().
  *
- * An optional family preference is applied WITHIN the selected cost tier,
- * allowing callers to prefer a family at the same cost level. The preference
- * never widens the member set and never selects a costlier tier over a cheaper
- * one. If no member in the cheapest tier matches the preference, the normal
- * cost-tier rotation is used.
+ * An optional family preference is applied within the selected class and cost
+ * tier. It never widens the member set or crosses the sensitivity ceiling.
  *
  * @param {Array<object>} members members already admitted by resolveBucket
  * @param {number} counter monotonically increasing per bucket
  * @param {Array<string>|null} [familyPreference=null] ordered list of family names or 'free'/'sovereign'
+ * @param {string|null} [requestedClass=null] bucket model_class
  * @returns {object|null}
  */
-export function selectMember(members, counter = 0, familyPreference = null) {
-  const costOrdered = orderMembersByCost(members, counter);
-  if (costOrdered.length === 0) return null;
+export function selectMember(members, counter = 0, familyPreference = null, requestedClass = null) {
+  const ordered = orderMembersForClass(members, requestedClass, counter);
+  if (ordered.length === 0) return null;
 
-  // Find all members in the cheapest cost tier
+  const closestClass = ordered[0].model_class;
+  const closestMembers = ordered.filter((member) => member.model_class === closestClass);
+  const costOrdered = orderMembersByCost(closestMembers, counter);
   const cheapestTier = costOrdered[0].cost_tier;
-  const cheapestMembers = costOrdered.filter(m => m.cost_tier === cheapestTier);
-
-  // Apply family preference only within the cheapest tier
+  const cheapestMembers = costOrdered.filter((member) => member.cost_tier === cheapestTier);
   const preferredInCheapest = applyFamilyPreference(cheapestMembers, familyPreference);
 
-  // Return the first preferred member in the cheapest tier
   return preferredInCheapest[0] || null;
 }
