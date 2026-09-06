@@ -378,14 +378,17 @@ export function applyCardOverlay(model, overrides) {
   const src = model.card && model.card.source;
   // Never clobber a live provider's authoritative card.
   if (src && _FRESH_PROVIDER_SOURCES.has(src)) return model;
-  return {
-    ...model,
-    card: {
-      ...(model.card || {}),
-      ...override,
-      source: 'manual',
-    },
+  const card = {
+    ...(model.card || {}),
+    ...override,
+    source: 'manual',
   };
+  // Cost is a card fact, not a provider-name heuristic.  Configured models
+  // start as free when their backend is otherwise unknown; a curated
+  // paid-cloud tier must correct that declaration while leaving trust-zone,
+  // data-handling, and provider-purity fields untouched.
+  const free = card.tier === 'paid-cloud' ? false : model.free;
+  return { ...model, free, card };
 }
 
 /** Apply the manual overlay across a whole merged catalog (card P2.2). */
