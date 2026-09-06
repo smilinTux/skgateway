@@ -859,7 +859,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   clears `ExecStart=` and re-declares it without `--config`, so the service loads the
   Syncthing-synced `~/.skcapstone/gateway/skgateway.yaml`, not the in-repo config. Also
   recorded that `ExecStart` runs source directly out of the shared working checkout
-  `~/clawd/skcapstone-repos/skgateway`, so an uncommitted edit there is live behaviour.
+  `/home/YOUR_USER/skcapstone-repos/skgateway`, so an uncommitted edit there is live behaviour.
 - **SOP §9: stopped quoting a stale version.** `package.json` and the hardcoded
   `src/index.mjs:962` `/status` string both still say `0.1.0` while the newest release tag
   is far past it, and `publish-npm` overwrites `package.json` from the tag anyway. The SOP

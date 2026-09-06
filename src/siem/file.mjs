@@ -132,7 +132,7 @@ async function listRotated(activePath) {
  *
  * TODO: Implement actual PGP signing when the SKSecurity module exposes
  * a programmatic signing API.  Suggested approach:
- *   1. Import `signFile` from `~/clawd/skcapstone-repos/SKSecurity/sign.mjs`.
+ *   1. Import `signFile` from `/home/YOUR_USER/skcapstone-repos/SKSecurity/sign.mjs`.
  *   2. Call `await signFile(path, { detach: true, keyId: agentKeyId })`.
  *   3. This produces `${path}.asc` alongside the rotated archive.
  *   4. Store key ID in `config.pgp_key_id`.
