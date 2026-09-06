@@ -438,6 +438,7 @@ export class ConnectionPool {
     // observable before first traffic. Runtime-only ungrouped pools join the
     // set only after a real acquire; arbitrary getStats() lookups never do.
     const domainIds = new Set([
+      ...Object.keys(this._overrides).map((id) => this._domainId(id)),
       ...Object.keys(this._capacityDomains),
       ...this._pools.keys(),
     ]);

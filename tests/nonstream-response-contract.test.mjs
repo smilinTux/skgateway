@@ -276,3 +276,49 @@ describe("non-stream public output contract", () => {
     }
   });
 });
+
+// ── Regression: an empty tool_calls array is "no tool calls", not malformed ──
+//
+// NVIDIA's OpenAI-compatible endpoint always emits the tool_calls key, empty on
+// a plain chat turn. The contract counted "key present but not a valid non-empty
+// call list" as malformed evidence and returned 502, so EVERY nvidia completion
+// failed. Verified live 2026-09-02: the upstream returned
+// {content: "OK", tool_calls: [], finish_reason: "stop"} and the gateway
+// answered 502 invalid_upstream_tool_calls.
+describe("empty tool_calls is the absence of tool calls, not bad evidence", () => {
+  const upstream = (message, finish = "stop") => enforceResponseContract({
+    status: 200,
+    headers: { "content-type": "application/json" },
+    body: Buffer.from(JSON.stringify({
+      id: "chatcmpl-nvidia", object: "chat.completion", model: MODEL,
+      choices: [{ index: 0, message, finish_reason: finish }],
+      usage: USAGE,
+    }), "utf8"),
+  }, REQUESTED);
+
+  test("content plus tool_calls: [] passes (the exact live NVIDIA shape)", () => {
+    const res = upstream({ role: "assistant", content: "OK", tool_calls: [] });
+    assert.equal(res.status, 200, "a valid answer must not be rejected");
+    assert.equal(JSON.parse(res.body.toString("utf8")).choices[0].message.content, "OK");
+  });
+
+  test("content plus tool_calls: null passes", () => {
+    const res = upstream({ role: "assistant", content: "OK", tool_calls: null });
+    assert.equal(res.status, 200);
+  });
+
+  test("NEGATIVE CONTROL: no content AND no calls is still rejected", () => {
+    const res = upstream({ role: "assistant", content: null, tool_calls: [] });
+    assert.equal(res.status, 502, "an empty answer must not be relayed as success");
+    assert.equal(JSON.parse(res.body.toString("utf8")).error.code, "empty_upstream_response");
+  });
+
+  test("NEGATIVE CONTROL: a present but structurally broken call is still rejected", () => {
+    const res = upstream(
+      { role: "assistant", content: null, tool_calls: [{ id: "", type: "function" }] },
+      "tool_calls",
+    );
+    assert.equal(res.status, 502);
+    assert.equal(JSON.parse(res.body.toString("utf8")).error.code, "invalid_upstream_tool_calls");
+  });
+});
