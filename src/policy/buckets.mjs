@@ -434,10 +434,25 @@ export function resolveBucket({ bucket, catalog = [], sensitivityPolicy, isRouta
         ? { unfamilied_reason: entry.card.unfamilied_reason }
         : {}),
       cost_tier: entry?.card?.cost_tier ?? null,
+      backend: entry?.provider || null,
+      physical_service: entry?.url || entry?.provider || entry.id,
     });
   }
 
   return { members, rejected, ceiling };
+}
+
+/** Honest physical capacity view: aliases on one service count once. */
+export function physicalCapacity(members = []) {
+  const services = new Map();
+  for (const member of members) {
+    const service = member?.physical_service || member?.backend || member?.id;
+    if (!services.has(service)) {
+      services.set(service, { service, backend: member?.backend || null, models: [] });
+    }
+    services.get(service).models.push(member.id);
+  }
+  return [...services.values()];
 }
 
 /**
