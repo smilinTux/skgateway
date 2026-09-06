@@ -46,11 +46,18 @@ pooling:
       max: 2
       maxQueue: 4
       queueTimeoutMs: 30000
+    kimi-for-coding:
+      members: [kimi-for-coding, "reg:kimi-for-coding"]
+      max: 1
+      maxQueue: 1
+      queueTimeoutMs: 30000
+    kimi-k3:
+      members: [kimi-k3, "reg:k3"]
+      max: 1
+      maxQueue: 1
+      queueTimeoutMs: 30000
   per_backend:
-    ## ollama pool left defined but its backend is disabled above (Chef 5060).
-    ollama:
-      max: 50
-      maxQueue: 200
+    ## No ollama pool: the staged codex profile does not declare an ollama backend.
     ## DISABLED 2026-08-26: no chi Anthropic subscription. Keeping this
     ## capacity entry would advertise an orphaned domain after backend removal.
     # anthropic:
@@ -209,6 +216,31 @@ backends:
     priority: 2
     timeout_ms: 300000
 
+  ## Kimi Code subscription. The gateway reads the CLI-owned OAuth file only;
+  ## it never refreshes or writes credentials. These routes remain fail-closed
+  ## until a successful bounded probe establishes observed health.
+  kimi-for-coding:
+    url: https://api.kimi.ai/coding/v1
+    auth_type: kimi_oauth
+    credentials_path: ~/.kimi-code/credentials/kimi-code.json
+    models:
+      - kimi-for-coding
+    priority: 2
+    timeout_ms: 30000
+    context_limit: 262144
+    require_observed_health: true
+
+  kimi-k3:
+    url: https://api.kimi.ai/coding/v1
+    auth_type: kimi_oauth
+    credentials_path: ~/.kimi-code/credentials/kimi-code.json
+    models:
+      - k3
+    priority: 2
+    timeout_ms: 60000
+    context_limit: 1048576
+    require_observed_health: true
+
   ## REMOVED 2026-08-25 by Chef. Same box as above, his personal 5060, not part
   ## of the chi cluster. This pool had never been instantiated, meaning it had
   ## served zero requests in the process lifetime.
@@ -285,6 +317,10 @@ sanitizer:
   strip_thinking: true
 
 model_limits:
+  ## Kimi Code subscription routes. These stay admission-gated until observed
+  ## health is established by the bounded compatibility probes.
+  kimi-for-coding:                         { max_body_bytes: 838000,   max_system_bytes: 335000  }
+  k3:                                      { max_body_bytes: 2000000,  max_system_bytes: 800000  }
   ornith-1.5-9b:                              { max_body_bytes: 209715,   max_system_bytes: 83886   }
   ornith-1.0-35b:                             { max_body_bytes: 800000,   max_system_bytes: 320000  }
   ornith-big:                                 { max_body_bytes: 800000,   max_system_bytes: 320000  }

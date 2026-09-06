@@ -820,6 +820,10 @@ export class Backend {
     // accepting the socket but never replying) so the router can fail over
     // instead of hanging the request. See sendUpstream(timeoutMs).
     this.timeout_ms = typeof config.timeout_ms === "number" ? config.timeout_ms : 0;
+    // Opt-in fail-closed admission for providers whose health has not yet been
+    // observed. Legacy providers retain warm-start behaviour; newly admitted
+    // external lanes must prove a bounded probe before receiving work.
+    this.require_observed_health = config.require_observed_health === true;
 
     // Dead-alias auto-quarantine tunables (card 2d1f3a2c). Per-backend config
     // overrides the router-level default which overrides the module default.
@@ -1062,6 +1066,8 @@ export class Backend {
    * @returns {boolean}
    */
   isAvailable() {
+    if (this.require_observed_health && this._lastCheck === 0) return false;
+
     // Quarantine takes precedence over the error-rate status: a quarantined
     // alias is fully out of rotation until its cooldown elapses. After the
     // cooldown a single probe is admitted (quarantine stays armed until a
@@ -1769,7 +1775,11 @@ export function createRouter(config = {}) {
       const transientDown = available.length > 0
         && declared.some((b) => b._providerPurity)
         && declared.every((b) => !b.isAvailable() && !b._quarantined);
-      if (transientDown) {
+      // Admission-gated owners must not be sprayed through unrelated fallback
+      // providers while health is still unknown, including as the only owner.
+      const unobservedRequired = declared.some((b) => b.require_observed_health)
+        && declared.every((b) => !b.isAvailable() && !b._quarantined);
+      if (transientDown || unobservedRequired) {
         const ownerDown = [];
         ownerDown.ownerDown = true;
         ownerDown.declaredBy = declared.map((b) => b.id);
