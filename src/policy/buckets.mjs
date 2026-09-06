@@ -440,6 +440,19 @@ export function resolveBucket({ bucket, catalog = [], sensitivityPolicy, isRouta
   return { members, rejected, ceiling };
 }
 
+/** Honest physical capacity view: aliases on one service count once. */
+export function physicalCapacity(members = []) {
+  const services = new Map();
+  for (const member of members) {
+    const service = member?.physical_service || member?.backend || member?.id;
+    if (!services.has(service)) {
+      services.set(service, { service, backend: member?.backend || null, models: [] });
+    }
+    services.get(service).models.push(member.id);
+  }
+  return [...services.values()];
+}
+
 /**
  * Validate a comma-separated family preference string.
  *

@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Refresh PR96 onto current main so live-pipeline sanitizer and model-limit changes are evaluated against the latest gateway code.
 - Persist provider-neutral request attribution with explicit unknown values for client, application, route, rail, provider, backend node, requested model, served model, and runtime revision.
 
 ### Added
