@@ -33,7 +33,7 @@ The exact candidate is the reviewed git diff for this branch. A reviewer can
 reproduce it with `git diff origin/main...HEAD -- README.md docs/POLICIES.md
 SOP.md docs/DOCS-DISPOSITION.md scripts/skgateway.service src/siem/file.mjs`.
 Documentation checks performed: `git diff --check`, a repository search for the
-enumerated `/home/cbrd21` and `~/clawd` strings, and an inventory listing with
+enumerated personal-path forms, and an inventory listing with
 `find docs/superpowers/plans docs/superpowers/specs docs/deploy-plan docs/evidence
 -maxdepth 2 -type f`.
 
