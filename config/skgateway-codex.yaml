@@ -52,8 +52,8 @@ pooling:
       ## Keep its admission domain separate so existing chiap01/chiap08
       ## capacity and failover policy are unchanged.
       max: 2
-      maxQueue: 4
-      queueTimeoutMs: 30000
+      maxQueue: 2
+      queueTimeoutMs: 10000
   per_backend:
     ## ollama pool left defined but its backend is disabled above (Chef 5060).
     ollama:
