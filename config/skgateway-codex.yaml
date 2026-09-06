@@ -7,7 +7,7 @@
 ##   + bucket routing enabled (sk-<class>-<sensitivity> pool addressing)
 ##   - nvidia/openrouter dropped (no provider keys provisioned on this host
 ##     today; re-add from the fleet config when keys are vaulted here)
-## Active routed backends retained: chiap08 qwen38, codex and z.ai.
+## Active routed backends retained: chiap08 qwen38, chiap01 qwen38, Greg direct qwen38, codex and z.ai.
 ## Anthropic wrapper and direct fallback are disabled below because the chi
 ## cluster has no Anthropic subscription; their advertised models hung 45s.
 ##
@@ -43,6 +43,14 @@ pooling:
       members: [chiap01-qwen38]
       ## Arc Pro B70 card 1 runs --parallel 2 on chiap01:18810.
       ## This is independent hardware from chiap08 and owns both real slots.
+      max: 2
+      maxQueue: 4
+      queueTimeoutMs: 30000
+    greg-qwen38:
+      members: [greg-qwen38]
+      ## Greg's WSL-only vLLM endpoint is an independent governed member.
+      ## Keep its admission domain separate so existing chiap01/chiap08
+      ## capacity and failover policy are unchanged.
       max: 2
       maxQueue: 4
       queueTimeoutMs: 30000
@@ -131,6 +139,16 @@ backends:
 
   chiap08-qwen38:
     url: http://100.81.238.58:11439/v1
+    auth_type: none
+    models:
+      - qwen3.8-27b-huihui-abliterated-q4_k_m
+      - qwen3.8-27b-ud-q5_k_xl
+      - qwen3.8-27b
+      - qwen38-abliterated
+    priority: 3
+
+  greg-qwen38:
+    url: http://ziowk01-wsl.tail204f0c.ts.net:11439/v1
     auth_type: none
     models:
       - qwen3.8-27b-huihui-abliterated-q4_k_m

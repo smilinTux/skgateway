@@ -1,0 +1,29 @@
+# Rollback for f23b1c9e: remove only Greg's direct backend/member.
+# Apply from repository root with:
+#   git apply rollback/f23b1c9e-remove-greg-qwen38.patch
+# This intentionally leaves chiap01-qwen38, chiap08-qwen38, policies, and all
+# other backends unchanged.
+
+*** Begin Patch
+*** Update File: config/skgateway-codex.yaml
+@@
+-    greg-qwen38:
+-      members: [greg-qwen38]
+-      ## Greg's WSL-only vLLM endpoint is an independent governed member.
+-      ## Keep its admission domain separate so existing chiap01/chiap08
+-      ## capacity and failover policy are unchanged.
+-      max: 2
+-      maxQueue: 4
+-      queueTimeoutMs: 30000
+@@
+-  greg-qwen38:
+-    url: http://ziowk01-wsl.tail204f0c.ts.net:11439/v1
+-    auth_type: none
+-    models:
+-      - qwen3.8-27b-huihui-abliterated-q4_k_m
+-      - qwen3.8-27b-ud-q5_k_xl
+-      - qwen3.8-27b
+-      - qwen38-abliterated
+-    priority: 3
+-
+*** End Patch
