@@ -340,7 +340,7 @@ drop-in strips it back off:
 
 | | Command |
 |---|---|
-| Base unit `~/.config/systemd/user/skgateway.service` | `/usr/bin/node ~/clawd/skcapstone-repos/skgateway/src/index.mjs --port 18780 --config ~/clawd/skcapstone-repos/skgateway/config/skgateway.yaml` |
+| Base unit `~/.config/systemd/user/skgateway.service` | `/usr/bin/node /home/YOUR_USER/skcapstone-repos/skgateway/src/index.mjs --port 18780 --config /home/YOUR_USER/skcapstone-repos/skgateway/config/skgateway.yaml` |
 | Drop-in `skgateway.service.d/config-path.conf` | clears `ExecStart=` (the empty assignment resets the list-typed setting) and re-declares it **without** `--config` |
 | **Effective, both nodes** | `/usr/bin/node /home/OPERATOR/clawd/skcapstone-repos/skgateway/src/index.mjs --port 18780` |
 
@@ -356,7 +356,7 @@ systemctl --user cat  skgateway                # unit + every drop-in, in order
 ```
 
 **2. `ExecStart` points into the shared working checkout,
-`~/clawd/skcapstone-repos/skgateway`, on both nodes.** There is no build step and no
+`/home/YOUR_USER/skcapstone-repos/skgateway`, on both nodes.** There is no build step and no
 deployed artifact: the service executes the source files in that directory. So **an
 uncommitted edit in that checkout is live behaviour**, immediately on the next restart,
 with nothing in git recording it. Other sessions share that checkout. Never edit it to
@@ -379,9 +379,9 @@ Front-end / Exposure: see §2, including the `0.0.0.0` deviation.
 The live checkout must be a fast-forward of GitHub, never a copied working tree:
 
 ```bash
-git -C ~/clawd/skcapstone-repos/skgateway fetch --tags origin
-git -C ~/clawd/skcapstone-repos/skgateway status --short
-git -C ~/clawd/skcapstone-repos/skgateway pull --ff-only origin main
+git -C /home/YOUR_USER/skcapstone-repos/skgateway fetch --tags origin
+git -C /home/YOUR_USER/skcapstone-repos/skgateway status --short
+git -C /home/YOUR_USER/skcapstone-repos/skgateway pull --ff-only origin main
 systemctl --user restart skgateway
 systemctl --user is-active skgateway
 curl -fsS http://127.0.0.1:18780/healthz
@@ -403,9 +403,9 @@ the helper only in this repository:
 ```bash
 install -d -m 700 ~/.config/git
 install -m 600 /dev/null ~/.config/git/skgateway-credentials
-git -C ~/clawd/skcapstone-repos/skgateway config --local \
+git -C /home/YOUR_USER/skcapstone-repos/skgateway config --local \
   credential.helper "store --file $HOME/.config/git/skgateway-credentials"
-git -C ~/clawd/skcapstone-repos/skgateway remote set-url origin \
+git -C /home/YOUR_USER/skcapstone-repos/skgateway remote set-url origin \
   https://github.com/smilinTux/skgateway.git
 ```
 
@@ -542,7 +542,7 @@ canonical check that metrics are recording (non-null object once enabled).
 | Restart succeeds but code/config appears stale | Compare the listener PID (`ss -ltnp`) with `systemctl --user show skgateway -p MainPID`. A second unmanaged Node process can own `:18780` while the managed unit crash-loops. Stop the duplicate, then restart and probe the unit. |
 | `better-sqlite3` fails to load (`Could not locate the bindings file`) | The native addon was not built. Most often the install ran with `--ignore-scripts`, which skips it and fails 19 metrics/energy/SIEM tests. Re-run plain `npm ci` or `npm install` (needs a `node-gyp` toolchain). |
 | Config edits not taking effect | Two causes, check both. (a) Config is read once at startup and only re-read on `SIGHUP`: `systemctl --user kill -s HUP skgateway`. (b) **You probably edited the wrong file.** The effective command passes no `--config`, so the service loads `~/.skcapstone/gateway/skgateway.yaml`, not the in-repo `config/skgateway.yaml`. Confirm with `systemctl --user show skgateway -p ExecStart` (§5, §6). |
-| Behaviour changed and nothing was committed / a fix "disappeared" after a pull | `ExecStart` runs the source directly out of the **shared working checkout** `~/clawd/skcapstone-repos/skgateway`, with no build and no deployed artifact. An uncommitted edit there is live behaviour, and any later `git pull`/`checkout`/`reset` by another session silently erases it. `git -C ~/clawd/skcapstone-repos/skgateway status` before you conclude anything. Never edit that checkout: use a worktree, commit, then pull. |
+| Behaviour changed and nothing was committed / a fix "disappeared" after a pull | `ExecStart` runs the source directly out of the **shared working checkout** `/home/YOUR_USER/skcapstone-repos/skgateway`, with no build and no deployed artifact. An uncommitted edit there is live behaviour, and any later `git pull`/`checkout`/`reset` by another session silently erases it. `git -C /home/YOUR_USER/skcapstone-repos/skgateway status` before you conclude anything. Never edit that checkout: use a worktree, commit, then pull. |
 | A green CI checkmark on a PR | Since card `62a5256d` it does certify `npm test` on Node 20 and 22. Confirm the `test` job actually ran: if a diff put a shell success-guard back on the step, or reverted the install to `--ignore-scripts`, green means nothing again (§4). |
 | `/status` reports a version that does not match what is installed | Expected, not a bug. The string is hardcoded at `src/index.mjs:962` and is not touched by the publish flow. Use `git describe --tags --match 'v[0-9]*'` or the published npm version (§9). |
 | Claude Code / `claude` CLI gets an untranslated or garbled response from `/v1/messages` | The Anthropic frontend matches by **pathname**. If someone changed `req.url.split("?")[0] === "/v1/messages"` to an exact `req.url ===` comparison, `?beta=true` requests fall through to the raw OpenAI proxy untranslated (`src/index.mjs:1347`). |

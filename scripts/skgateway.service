@@ -9,7 +9,7 @@ StartLimitBurst=5
 [Service]
 Type=simple
 # Paths use %h (systemd expands to the invoking user's home). The repo is
-# expected at the fleet-standard location ~/clawd/skcapstone-repos/skgateway.
+# expected at the fleet-standard location /home/YOUR_USER/skcapstone-repos/skgateway.
 # scripts/install.sh auto-detects the actual repo dir and rewrites these lines
 # if this checkout lives somewhere else, so a cold machine needs no hand edits.
 WorkingDirectory=%h/clawd/skcapstone-repos/skgateway
