@@ -1,9 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import yaml from 'js-yaml';
+import { load as parseYaml } from 'js-yaml';
 
-const config = yaml.load(fs.readFileSync(new URL('../config/skgateway-codex.yaml', import.meta.url), 'utf8'));
+const config = parseYaml(fs.readFileSync(new URL('../config/skgateway-codex.yaml', import.meta.url), 'utf8'));
 const fixture = JSON.parse(fs.readFileSync(new URL('./fixtures/qwen38-codex-config.json', import.meta.url), 'utf8'));
 
 test('codex staged Qwen mapping matches deterministic audited fixture', () => {
