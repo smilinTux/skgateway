@@ -546,8 +546,6 @@ export function resolveBucket({
         ? { unfamilied_reason: entry.card.unfamilied_reason }
         : {}),
       cost_tier: entry?.card?.cost_tier ?? null,
-      backend: entry?.provider || null,
-      physical_service: entry?.url || entry?.provider || entry.id,
     });
   }
 
