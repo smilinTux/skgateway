@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+
+port=28882
+for _ in 1 2 3 4 5; do
+    if /usr/bin/curl --fail --silent --show-error --max-time 2 "http://127.0.0.1:${port}/health" >/dev/null; then
+        exit 0
+    fi
+    sleep 1
+done
+exit 1

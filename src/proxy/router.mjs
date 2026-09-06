@@ -22,7 +22,7 @@ import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
 import { sendUpstream } from "./upstream.mjs";
-import { createEvent } from "../siem/events.mjs";
+import { createEvent, EventType } from "../siem/events.mjs";
 import { isAnthropicBackend, toAnthropicRequest, toOpenAIResponse } from "./anthropic-adapter.mjs";
 import {
   isCodexBackend,
@@ -51,14 +51,24 @@ import { buildServingCatalog } from "../discovery.mjs";
 import { rankModels } from "../ranking/rank.mjs";
 import { buildCapabilityCatalog } from "../ranking/catalog.mjs";
 import { loadAllowlist } from "../advertise.mjs";
-import { isCatalogDisabledBackend, isModelAvailable } from "./advertise.mjs";
+import { isCatalogDisabledBackend, isModelAvailable, excludedModelIds, withoutExcludedModels } from "./advertise.mjs";
 import {
   resolveZoneCeiling,
   isZoneAllowed,
   policyFromRegistry,
   TRUST_ZONES,
 } from "../policy/sensitivity.mjs";
-import { parseBucketId, resolveBucket, orderMembersByCost, looksLikeBucketAttempt, allBuckets } from "../policy/buckets.mjs";
+import {
+  parseBucketId,
+  resolveBucket,
+  orderMembersByCost,
+  validateFamilyPreference,
+  applyFamilyPreference,
+  selectMember,
+  requiresToolUse,
+  looksLikeBucketAttempt,
+  allBuckets,
+} from "../policy/buckets.mjs";
 import { codexPurityProblems } from "../policy/codex-purity.mjs";
 
 // sk-auto routing decision cache (TTL+LRU); keyed by request fingerprint + config epoch.
@@ -103,6 +113,7 @@ export const CLIENT_CREDENTIAL_HEADERS = [
 export const INTERNAL_CONTROL_HEADERS = [
   "x-sk-card-id",
   "x-sk-context",
+  "x-sk-prefer",
   "x-sk-require",
   "x-sk-role",
   "x-sk-service",
@@ -114,6 +125,7 @@ export const INTERNAL_CONTROL_HEADERS = [
   "x-sk-operator-credential-revision",
   "x-session-id",
   "x-model",
+  "x-sk-family-preference",
   "x-sklegal-service-authorization",
   "x-sklegal-tenant-id",
   "x-sklegal-matter-id",
@@ -185,6 +197,36 @@ export class ModelEolError extends Error {
 }
 
 /**
+ * Every backend which explicitly declares this model is temporarily
+ * quarantined for this exact claim. This is intentionally distinct from a
+ * global lifecycle EOL verdict: another backend declaring the same model can
+ * remain selectable and advertised.
+ */
+export class ModelClaimQuarantinedError extends Error {
+  constructor(model) {
+    super(`all backend claims for model "${model}" are quarantined`);
+    this.name = "ModelClaimQuarantinedError";
+    this.model = model;
+    this.status = 503;
+  }
+}
+
+export class ModelOwnerDownError extends Error {
+  /** Fail closed when a declared model's owning backend is down (purity). */
+  constructor(model, declaredBy) {
+    super(
+      `model "${model}" is declared by [${(declaredBy || []).join(", ")}] ` +
+        `but every owner backend is currently unavailable; refusing to route ` +
+        `to unrelated backends`,
+    );
+    this.name = "ModelOwnerDownError";
+    this.model = model;
+    this.declaredBy = declaredBy || [];
+    this.status = 503;
+  }
+}
+
+/**
  * Dead-alias auto-quarantine (card 2d1f3a2c).
  *
  * The error-rate health machine (DEGRADED/DOWN above) reacts to the fraction of
@@ -203,11 +245,20 @@ const DEFAULT_QUARANTINE_THRESHOLD = 5;
 /** Cooldown (ms) a quarantined alias stays out of rotation before a re-probe. */
 const DEFAULT_QUARANTINE_COOLDOWN_MS = 30_000;
 
-/** Fast wrong-answer failures before one backend-model claim is quarantined. */
-const DEFAULT_MODEL_QUARANTINE_THRESHOLD = 3;
+/** Repeated fast wrong-answer failures before one backend-model claim is removed. */
+const DEFAULT_MODEL_CLAIM_QUARANTINE_THRESHOLD = 3;
+const DEFAULT_MODEL_CLAIM_QUARANTINE_COOLDOWN_MS = 30_000;
 
-/** Fast failures are distinct from completion hangs (504). */
-const FAST_MODEL_FAILURE_STATUSES = new Set([404, 502]);
+/**
+ * Fast wrong answers are classified synchronously from the completed attempt.
+ * 404/410 mean this door rejected the exact model id. 502 includes a refused
+ * connection or absent listener as normalized by sendUpstream(). A slow 504
+ * completion timeout is deliberately excluded and remains the separate
+ * completion-liveness path.
+ */
+export function isFastModelClaimFailure(status) {
+  return status === 404 || status === 410 || status === 502;
+}
 
 // ---------------------------------------------------------------------------
 // Rate-limit failover (card 9e28de88): 429 (and, deliberately, 402) are
@@ -261,6 +312,54 @@ const MAX_THROTTLE_COOLDOWN_MS = 24 * 60 * 60 * 1000; // 24h
 
 function throttleKey(backendId, model) {
   return `${backendId}::${model}`;
+}
+
+/**
+ * Infer provider name from backend ID (card e19f88db / SKGW-ATTRIBUTION-01).
+ * Uses discovery backend flag if set, otherwise infers from known patterns.
+ *
+ * @param {string} backendId
+ * @returns {string|null} provider name or null if unknown
+ */
+function inferProviderFromBackend(backendId) {
+  if (!backendId) return null;
+  const id = String(backendId).toLowerCase();
+  if (id.includes('nvidia')) return 'nvidia';
+  if (id.includes('anthropic')) return 'anthropic';
+  if (id.includes('ollama')) return 'ollama';
+  if (id.includes('openrouter')) return 'openrouter';
+  if (id.includes('zai')) return 'zai';
+  if (id.includes('codex')) return 'codex';
+  // Local sovereign backends (chiap08-qwen38, chiap08-ornith, etc.)
+  if (id.includes('chiap') || id.includes('ornith') || id.includes('qwen') || id === 'local') {
+    return 'local';
+  }
+  return null; // Unknown provider
+}
+
+/**
+ * Infer rail type from backend (card e19f88db / SKGW-ATTRIBUTION-01).
+ * Rail describes whether the request served from local, cloud, or hybrid infrastructure.
+ *
+ * @param {string} backendId
+ * @param {string} backendUrl
+ * @param {Function} isLocalUrlFn
+ * @param {string|null} provider  Pre-computed provider value
+ * @returns {string|null} 'local', 'cloud', 'hybrid', or null if unknown
+ */
+function inferRailFromBackend(backendId, backendUrl, isLocalUrlFn, provider) {
+  if (!backendId) return null;
+  const resolvedProvider = provider || inferProviderFromBackend(backendId);
+  if (resolvedProvider === 'local') return 'local';
+  if (resolvedProvider === 'nvidia' || resolvedProvider === 'anthropic' || resolvedProvider === 'openrouter' || resolvedProvider === 'zai') {
+    return 'cloud';
+  }
+  // Check if URL is local for hybrid detection
+  if (backendUrl && typeof isLocalUrlFn === 'function' && isLocalUrlFn(backendUrl)) {
+    return 'local';
+  }
+  // Default to cloud for known providers, null for unknown
+  return resolvedProvider ? 'cloud' : null;
 }
 
 /**
@@ -446,6 +545,7 @@ export function _throttleStateForTests(backendId, model) {
  * @property {string}  [model]        Model ID from the incoming request body
  * @property {string}  [agentId]      Agent identifier (for restriction checks)
  * @property {string}  [path]         Request path (e.g. "/v1/chat/completions")
+ * @property {string}  [sessionId]    Conversation/session identifier for audit correlation
  */
 
 // ---------------------------------------------------------------------------
@@ -579,6 +679,57 @@ function exitMeter(url) {
 }
 
 // ---------------------------------------------------------------------------
+// Deterministic backend-door balancer for equal-priority same-model replicas
+// ---------------------------------------------------------------------------
+
+/**
+ * Round-robin counters keyed by (priority, model) tuples.
+ * Each counter rotates through backends in that group to ensure balanced
+ * selection across equal-priority doors serving the same model.
+ *
+ * The key format is "<priority>:<model>" so chiap08-qwen38 and chiap01-qwen38
+ * (both priority 1, both serving qwen3.8-27b-huihui-abliterated-q4_k_m)
+ * share counter "1:qwen3.8-27b-huihui-abliterated-q4_k_m" and alternate.
+ *
+ * @type {Map<string, number>}
+ */
+const _replicaBalancers = new Map();
+
+/**
+ * Get the next backend index for a (priority, model) group using round-robin.
+ * This is deterministic and ensures equal distribution across all backends
+ * in the group over time.
+ *
+ * @param {number} priority
+ * @param {string} model
+ * @param {number} count  Number of backends in the group
+ * @returns {number} Index (0 to count-1) of the backend to select
+ */
+function nextReplicaIndex(priority, model, count) {
+  if (count <= 1) return 0; // No balancing needed for single backend
+  const key = `${priority}:${model}`;
+  const current = _replicaBalancers.get(key) || 0;
+  const next = (current + 1) % count;
+  _replicaBalancers.set(key, next);
+  return current; // Use current index before incrementing
+}
+
+/**
+ * Reset all balancer counters. Used only in tests.
+ */
+export function _resetReplicaBalancers() {
+  _replicaBalancers.clear();
+}
+
+/**
+ * Get the current balancer state. Used only in tests.
+ * @returns {Record<string, number>}
+ */
+export function _replicaBalancerState() {
+  return Object.fromEntries(_replicaBalancers);
+}
+
+// ---------------------------------------------------------------------------
 // Sliding-window latency tracker (P50 via reservoir sampling)
 // ---------------------------------------------------------------------------
 
@@ -654,7 +805,14 @@ export class Backend {
     // at runtime by registerDiscoveredRoutes() once a discovery fetch
     // succeeds. See supportsModel(): an empty list on a discovery backend must
     // NOT wildcard-match, unlike an ordinary statically-configured backend.
-    this.discovery = config.discovery || null;
+    // Discovery-managed backends claim only models registered by an
+    // authoritative catalog. Z.ai predates the explicit `discovery:` key, so
+    // infer its source rather than treating `models: []` as accept-everything.
+    this.discovery = config.discovery || (isZaiBackend(config) ? "zai" : null);
+    this.discoveryStatus = this.discovery ? "pending" : "static";
+    this.discoveryRevision = 0;
+    this.readinessRevision = 0;
+    this.discoveryAt = null;
     this.priority = typeof config.priority === "number" ? config.priority : 99;
     this.cooldown_ms = config.cooldown_ms || DEFAULT_COOLDOWN_MS;
     // Optional per-backend idle timeout (ms). 0 = no timeout (default). Used to
@@ -672,6 +830,14 @@ export class Backend {
     this.quarantine_cooldown_ms = typeof config.quarantine_cooldown_ms === "number"
       ? config.quarantine_cooldown_ms
       : DEFAULT_QUARANTINE_COOLDOWN_MS;
+    this.model_claim_quarantine_threshold = Number.isInteger(config.model_claim_quarantine_threshold)
+      ? config.model_claim_quarantine_threshold
+      : DEFAULT_MODEL_CLAIM_QUARANTINE_THRESHOLD;
+    this.model_claim_quarantine_cooldown_ms = typeof config.model_claim_quarantine_cooldown_ms === "number"
+      ? config.model_claim_quarantine_cooldown_ms
+      : DEFAULT_MODEL_CLAIM_QUARANTINE_COOLDOWN_MS;
+    /** @type {Map<string,{failures:number,quarantinedAt:number,lastStatus:number}>} */
+    this._modelClaimFailures = new Map();
 
     // Auth credentials. credentials_path (the key the YAML schema and
     // config/skgateway.yaml.example document, and what the live config uses
@@ -696,6 +862,14 @@ export class Backend {
     this._zaiAuth = null;
     this._zaiAuthMtime = -1;
     this._zaiAuthPath = this._credentials_file;
+    // Kimi Code subscription auth follows the same read-only file contract:
+    // the kimi CLI owns OAuth refresh and writes
+    // ~/.kimi-code/credentials/<env>.json. Access tokens are short lived
+    // (observed 900s), so a keepalive timer runs the CLI on the gateway
+    // host and this gateway re-reads the file on mtime change only.
+    this._kimiAuth = null;
+    this._kimiAuthMtime = -1;
+    this._kimiAuthPath = this._credentials_file;
 
     // Agent-level restrictions — set of agent IDs allowed to use this backend.
     // Empty set = no restrictions.
@@ -723,11 +897,19 @@ export class Backend {
     this._consecutiveFailures = 0;
     /** @type {boolean} true = out of rotation (skipped by selection) */
     this._quarantined = false;
+    // Provider purity (card fc22572b): when true, a model id this backend
+    // DECLARES fails closed with 503 model_owner_backend_down while every
+    // declaring backend is unavailable, instead of the legacy fall-through
+    // spray to unrelated providers. Opt-in: pinned contracts (lifecycle
+    // 410 attribution, fast-failure quarantine) keep the legacy behavior
+    // unless a backend explicitly claims purity.
+    this._providerPurity = config.provider_purity === true;
     /** @type {number} epoch ms (when quarantine started / cooldown last re-armed) */
     this._quarantinedSince = 0;
-    /** Exact model claims quarantined after repeated fast wrong answers. */
-    this._modelFailures = new Map();
-    this._modelQuarantined = new Set();
+    /** @type {number|null} true serving-engine token ceiling (card 9ed4a9f7) */
+    this.context_limit = Number.isFinite(config.context_limit) && config.context_limit > 0
+      ? config.context_limit
+      : null;
 
     this._totalRequests = 0;
     this._totalErrors = 0;
@@ -764,37 +946,54 @@ export class Backend {
     return this.models.some((pattern) => modelMatches(pattern, model));
   }
 
-  /** Whether this exact backend-model claim remains eligible. */
-  isModelAvailable(model) {
-    return this.isAvailable() && !this._modelQuarantined.has(model);
+  /** Whether this exact declared backend-model claim is currently selectable. */
+  isModelClaimAvailable(model) {
+    const state = this._modelClaimFailures.get(model);
+    if (!state?.quarantinedAt) return true;
+    return Date.now() - state.quarantinedAt >= this.model_claim_quarantine_cooldown_ms;
   }
 
   /**
-   * Quarantine only the exact claim after repeated fast wrong answers.
-   * A 504 is deliberately absent: slow completion hangs use their own timeout
-   * guard and are not evidence that a model alias is wrong.
+   * Fold one completed attempt into exact-claim health. Only repeated fast
+   * wrong answers quarantine. Success clears the exact claim. 504 and other
+   * slow/ambiguous outcomes do not participate.
    */
-  recordModelStatus(model, status) {
-    if (!model) return null;
+  recordModelClaimOutcome(model, status) {
+    if (!model || !this.supportsModel(model) || this.model_claim_quarantine_threshold <= 0) return null;
     if (status >= 200 && status < 300) {
-      this._modelFailures.delete(model);
-      if (this._modelQuarantined.delete(model)) return { transition: "readmitted", model };
-      return null;
+      const prior = this._modelClaimFailures.get(model);
+      this._modelClaimFailures.delete(model);
+      return prior?.quarantinedAt ? { transition: "readmitted", model, failures: 0 } : null;
     }
-    if (!FAST_MODEL_FAILURE_STATUSES.has(status)) return null;
-    const failures = (this._modelFailures.get(model) || 0) + 1;
-    this._modelFailures.set(model, failures);
-    if (failures >= DEFAULT_MODEL_QUARANTINE_THRESHOLD && !this._modelQuarantined.has(model)) {
-      this._modelQuarantined.add(model);
-      return {
-        transition: "quarantined",
-        model,
-        status,
-        consecutiveFailures: failures,
-        threshold: DEFAULT_MODEL_QUARANTINE_THRESHOLD,
-      };
+    if (!isFastModelClaimFailure(status)) return null;
+
+    const prior = this._modelClaimFailures.get(model) || { failures: 0, quarantinedAt: 0, lastStatus: 0 };
+    const failures = prior.failures + 1;
+    const quarantinedAt = failures >= this.model_claim_quarantine_threshold ? Date.now() : prior.quarantinedAt;
+    this._modelClaimFailures.set(model, { failures, quarantinedAt, lastStatus: status });
+    if (!prior.quarantinedAt && quarantinedAt) {
+      return { transition: "quarantined", model, failures, status };
     }
     return null;
+  }
+
+  /** Whether an unclaimed id belongs to this provider's discovery namespace. */
+  mayDiscoverModel(model) {
+    return Boolean(this.discovery && model &&
+      (this.discovery === "zai" ? /^glm-/i.test(model) : false));
+  }
+
+  /** Replace one provider snapshot and advance observable process revisions. */
+  replaceDiscoveredModels(models, { ok = true, stale = false, at = Date.now() } = {}) {
+    const next = [...new Set((models || []).filter((id) => typeof id === "string"))];
+    const status = ok ? (stale ? "stale" : "ready") : (next.length ? "stale" : "failed");
+    this.discoveryRevision += 1;
+    if (status !== this.discoveryStatus || JSON.stringify(next) !== JSON.stringify(this.models)) {
+      this.readinessRevision += 1;
+    }
+    this.models = next;
+    this.discoveryStatus = status;
+    this.discoveryAt = at;
   }
 
   // -------------------------------------------------------------------------
@@ -851,7 +1050,6 @@ export class Backend {
       totalRequests: this._totalRequests,
       totalErrors: this._totalErrors,
       quarantined: this._quarantined,
-      quarantinedModels: [...this._modelQuarantined],
       consecutiveFailures: this._consecutiveFailures,
     };
   }
@@ -1066,6 +1264,23 @@ export class Backend {
         return headers;
       }
 
+      case "kimi_oauth": {
+        // Kimi Code subscription auth: bearer access token read read-only
+        // from the kimi CLI credentials file. The CLI on the gateway host
+        // owns refresh (tokens live ~15 minutes; a keepalive timer drives
+        // it), so this gateway never refreshes and never writes the file.
+        const headers = this._getKimiAuthHeaders();
+        if (!headers) {
+          console.warn(
+            `[router] backend=${this.id} kimi_oauth auth but no usable credentials at ` +
+              `${this._kimiAuthPath || "(no credentials_path/file set)"}. ` +
+              `Sending UNAUTHENTICATED (expect 401). Sync kimi CLI credentials there.`,
+          );
+          return {};
+        }
+        return headers;
+      }
+
       case "none":
       default:
         return {};
@@ -1141,6 +1356,38 @@ export class Backend {
     } catch (err) {
       console.error(
         `[router] backend=${this.id} failed to load codex credentials ${this._codexAuthPath}: ${err.message}`,
+      );
+      return null;
+    }
+  }
+
+  /**
+   * Return the z.ai subscription auth headers, re-reading the ZCode
+   * credentials file when its mtime changes. Never writes or refreshes.
+   *
+   * @returns {Record<string, string>|null}
+   */
+  _getKimiAuthHeaders() {
+    if (!this._kimiAuthPath) return null;
+    try {
+      const filePath = this._kimiAuthPath.replace(/^~/, process.env.HOME || "");
+      const mtime = statSync(filePath).mtimeMs;
+      if (!this._kimiAuth || mtime !== this._kimiAuthMtime) {
+        const raw = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+        const accessToken = raw && (raw.access_token || raw.accessToken);
+        if (!accessToken) {
+          console.warn(
+            `[router] backend=${this.id} kimi credentials file has no access token: ${filePath}`,
+          );
+          return null;
+        }
+        this._kimiAuth = { authorization: `Bearer ${accessToken}` };
+        this._kimiAuthMtime = mtime;
+      }
+      return this._kimiAuth;
+    } catch (err) {
+      console.error(
+        `[router] backend=${this.id} failed to load kimi credentials ${this._kimiAuthPath}: ${err.message}`,
       );
       return null;
     }
@@ -1393,17 +1640,62 @@ export function createRouter(config = {}) {
    * Find backends that claim to support `model`, sorted by priority.
    * Falls back to all available backends if none explicitly match.
    *
+   * Equal-priority backends serving the same model are balanced using a
+   * deterministic round-robin mechanism to prevent one backend from
+   * queuing while another remains idle (card 786d9232).
+   *
    * @param {string|undefined} model
    * @param {string|undefined} agentId
    * @returns {Backend[]}
    */
-  function candidatesFor(model, agentId) {
+  function candidatesFor(model, agentId, expand = false) {
     const available = availableByPriority().filter((b) => b.allowsAgent(agentId));
 
     if (!model) return available;
 
-    // Exact or glob match first
-    const matched = available.filter((b) => b.supportsModel(model) && b.isModelAvailable(model));
+    // Keep declaration separate from current exact-claim availability. A
+    // quarantined claim must not turn into an unmatched-model spray, and one
+    // bad claimer must not condemn another claimer or the global model id.
+    const declared = [...backends.values()].filter((b) => b.supportsModel(model));
+    const matched = available.filter(
+      (b) => b.supportsModel(model) && b.isModelClaimAvailable(model),
+    );
+
+    // Balancing for equal-priority same-model replicas (card 786d9232).
+    // Group backends by priority and apply round-robin within each group.
+    if (matched.length > 1) {
+      // Group by priority
+      const byPriority = new Map();
+      for (const backend of matched) {
+        const p = backend.priority;
+        if (!byPriority.has(p)) {
+          byPriority.set(p, []);
+        }
+        byPriority.get(p).push(backend);
+      }
+
+      // For each priority group with multiple backends, rotate the order
+      // using the deterministic balancer
+      const balanced = [];
+      for (const [priority, group] of byPriority) {
+        if (group.length > 1) {
+          // Use round-robin to select the first backend in the group
+          const selectedIndex = nextReplicaIndex(priority, model, group.length);
+          // Rotate the array so the selected backend is first
+          const rotated = [
+            ...group.slice(selectedIndex),
+            ...group.slice(0, selectedIndex),
+          ];
+          balanced.push(...rotated);
+        } else {
+          balanced.push(...group);
+        }
+      }
+      // Preserve overall priority order by sorting the balanced result
+      balanced.sort((a, b) => a.priority - b.priority);
+      // Replace matched with the balanced ordering
+      matched.splice(0, matched.length, ...balanced);
+    }
 
     // The gate has to be checked here too, not only in the fallback branch
     // below. `Backend.models` is a snapshot written by
@@ -1435,6 +1727,54 @@ export function createRouter(config = {}) {
         return gated;
       }
       return matched;
+    }
+
+    if (declared.length > 0 && declared.every((b) => !b.isModelClaimAvailable(model))) {
+      const claimQuarantined = [];
+      claimQuarantined.claimQuarantined = true;
+      return claimQuarantined;
+    }
+
+    // Provider purity (card f361407c, incident 2026-09-03): a model id that
+    // some backend DECLARES must never spray to unrelated backends when the
+    // declaring backend is merely DOWN (error cooldown) or agent-restricted.
+    // Observed live: during a z.ai cooldown, glm-4.6 and glm-4.7 fell through
+    // to primary=codex, which can only answer "model not supported"; and a
+    // fresh kimi backend's first empty-content failure marked it DOWN, so k3
+    // requests sprayed to codex the same way. Requests for a declared id
+    // fail closed here so the client sees the owner backend's real state and
+    // the retry loop backs off instead of burning a codex 400 on every
+    // attempt. Undeclared ids keep the historic fall-through.
+    if (declared.length > 0 && expand !== true) {
+      // Precedence rules (independent review of PR108, 2026-09-03):
+      //   1. A known eol|dead id keeps its terminal lifecycle verdict even
+      //      when its declarer is down.
+      //   2. Claim-quarantined declarers keep the legacy fall-through: the
+      //      410-lifecycle and fast-failure quarantine machinery needs real
+      //      attempts to real doors.
+      //   3. A total outage (no available backends at all) keeps the legacy
+      //      attempt-all path so callers see the owner's own terminal
+      //      502/410 instead of a pre-emptive 503.
+      //   4. Purity is OPT-IN per backend (provider_purity: true): only
+      //      flagged backends' declared ids fail closed on transient
+      //      error-cooldown down. Unflagged backends keep the historic
+      //      fall-through contract everywhere.
+      const lcDeclared = getLifecycle(model);
+      if (!isRoutable(lcDeclared)) {
+        const gated = [];
+        gated.eolGated = true;
+        gated.eolReason = lcDeclared.eol_reason;
+        return gated;
+      }
+      const transientDown = available.length > 0
+        && declared.some((b) => b._providerPurity)
+        && declared.every((b) => !b.isAvailable() && !b._quarantined);
+      if (transientDown) {
+        const ownerDown = [];
+        ownerDown.ownerDown = true;
+        ownerDown.declaredBy = declared.map((b) => b.id);
+        return ownerDown;
+      }
     }
 
     // No backend explicitly claims this model. A KNOWN eol|dead id (per the
@@ -1517,11 +1857,21 @@ export function createRouter(config = {}) {
       throw new Error("[router] No backends registered — cannot route request");
     }
 
-    const candidates = candidatesFor(model, agentId);
+    const candidates = candidatesFor(model, agentId, request.expand === true);
 
     if (candidates.eolGated) {
       siemEvent("model_eol_gated", { model, agentId, eol_reason: candidates.eolReason });
       throw new ModelEolError(model, candidates.eolReason);
+    }
+    if (candidates.claimQuarantined) {
+      siemEvent("model_claims_quarantined", { model, agentId });
+      throw new ModelClaimQuarantinedError(model);
+    }
+    if (candidates.ownerDown) {
+      siemEvent("model_owner_backend_down", {
+        model, agentId, declared_by: candidates.declaredBy,
+      });
+      throw new ModelOwnerDownError(model, candidates.declaredBy);
     }
 
     if (candidates.length === 0) {
@@ -1684,7 +2034,14 @@ export function createRouter(config = {}) {
   // Return router interface
   // -------------------------------------------------------------------------
 
-  return { route, getHealth, addBackend, removeBackend, getBackend, getBackends, resolveAgentTarget };
+  function registerDiscoveredModels(id, models, outcome) {
+    const backend = backends.get(id);
+    if (!backend?.discovery) return false;
+    backend.replaceDiscoveredModels(models, outcome);
+    return true;
+  }
+
+  return { route, getHealth, addBackend, removeBackend, getBackend, getBackends, registerDiscoveredModels, resolveAgentTarget };
 }
 
 // ---------------------------------------------------------------------------
@@ -1896,6 +2253,18 @@ function buildMatchCatalog() {
   } catch {
     models = [];
   }
+  // Exclusions are a config-driven NARROWING, so they are applied separately
+  // and never gate the catalog itself. Calling getConfig() as the first
+  // statement of the try above put the whole build behind a loaded config:
+  // getConfig() throws when none is loaded, the catch returned [], and the
+  // documented fail-closed behaviour (an unreadable config yields the
+  // discovery cache ALONE, never nothing) silently became an empty catalog.
+  // buildServingCatalog() already degrades correctly on its own.
+  try {
+    models = withoutExcludedModels(models, excludedModelIds(getConfig()));
+  } catch {
+    // No config loaded: there is nothing to exclude. Keep the catalog as-is.
+  }
   return buildCapabilityCatalog(models, { getLifecycleFn: getLifecycle });
 }
 
@@ -2035,6 +2404,43 @@ function eolGatedResponse(err) {
   };
 }
 
+function claimQuarantinedResponse(err) {
+  return {
+    status: 503,
+    headers: { "content-type": "application/json", "retry-after": "30" },
+    body: Buffer.from(JSON.stringify({
+      error: {
+        message: err.message,
+        code: 503,
+        type: "model_claim_quarantined",
+        model: err.model,
+        retryable: true,
+      },
+    }), "utf-8"),
+    backendId: null,
+    failover: false,
+  };
+}
+
+function ownerDownResponse(err) {
+  return {
+    status: 503,
+    headers: { "content-type": "application/json", "retry-after": "30" },
+    body: Buffer.from(JSON.stringify({
+      error: {
+        message: err.message,
+        code: 503,
+        type: "model_owner_backend_down",
+        model: err.model,
+        declared_by: err.declaredBy,
+        retryable: true,
+      },
+    }), "utf-8"),
+    backendId: null,
+    failover: false,
+  };
+}
+
 /**
  * High-level helper used by the proxy request handler.
  * Tries each candidate backend in order, acquires a pool slot, sends the
@@ -2051,12 +2457,13 @@ function eolGatedResponse(err) {
  * @param {Record<string, string>} clientHeaders  Incoming client headers
  * @param {Buffer}  body           Buffered request body
  * @param {boolean} [usePool=true] Whether to use the connection pool
- * @param {?function(object): void} [siem=null]
- *   Optional best-effort SIEM hook. Called with a fully-structured
+ * @param {?function(object): (void|Promise<void>)} [siem=null]
+ *   Optional SIEM sink. Called with a fully-structured
  *   {@link module:siem/events.GatewayEvent} at each request lifecycle point
  *   (auth decision, route/model selected, upstream error, failover, and
- *   completion with status/latency/tokens). The hook MUST NEVER block or throw
- *   into the hot path — invocations are guarded and any error is swallowed.
+ *   completion with status/latency/tokens). When configured, each call is
+ *   awaited and a sink failure rejects the request boundary rather than
+ *   allowing a success with no audit record.
  * @returns {Promise<{
  *   status: number,
  *   headers: Record<string, string>,
@@ -2267,9 +2674,9 @@ function invalidBucketIdResponse(id, reason) {
  * @param {{bucket:string, model_class:string, sensitivity:string}} addr
  * @param {object} request
  * @param {Buffer} body raw request body, rewritten to the chosen concrete model
- * @param {(type:string, details?:object, ctx?:object)=>void} [emitSiem]
+ * @param {(type:string, details?:object, ctx?:object)=>Promise<object|null>} [emitSiem]
  */
-async function resolveBucketCandidates(router, addr, request, body, emitSiem = () => {}) {
+async function resolveBucketCandidates(router, addr, request, body, emitSiem = async () => null) {
   let catalog = [];
   try {
     catalog = buildMatchCatalog();
@@ -2284,10 +2691,24 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = (
     policy = undefined;
   }
 
+  // A caller that sent `tools` must not be handed a model that cannot hold a
+  // tool call. buckets.mjs gates on size class, and size is a PRIOR: on this
+  // fleet `nvidia/ising-calibration-1.5-31b` clears the class floor and still
+  // answers in prose with no tool_calls. Parsing is FAIL-SOFT on purpose, an
+  // unreadable body simply does not narrow the pool, so a malformed request
+  // degrades to today's behaviour instead of 503ing.
+  let wantsTools = false;
+  try {
+    wantsTools = requiresToolUse(JSON.parse(Buffer.from(body).toString("utf-8")));
+  } catch {
+    wantsTools = false;
+  }
+
   const { members, rejected, ceiling } = resolveBucket({
     bucket: addr,
     catalog,
     sensitivityPolicy: policy,
+    requireToolUse: wantsTools,
     isRoutable: (e) => {
       const claimers = typeof router.getBackends === "function"
         ? router.getBackends()
@@ -2298,13 +2719,17 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = (
     },
   });
 
-  emitSiem("bucket_resolve", {
+  await emitSiem(EventType.REQUEST, {
+    decision: "bucket_resolve",
+    phase: "eligibility",
+    outcome: members.length > 0 ? "eligible_members" : "no_eligible_member",
     bucket: addr.bucket,
     model_class: addr.model_class,
     sensitivity: addr.sensitivity,
     ceiling,
     eligible: members.length,
     rejected: rejected.length,
+    require_tool_use: wantsTools,
   }, {});
 
   if (members.length === 0) {
@@ -2339,13 +2764,68 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = (
 
   const n = (_bucketCounters.get(addr.bucket) || 0) + 1;
   _bucketCounters.set(addr.bucket, n);
-  const orderedMembers = orderMembersByCost(members, n);
-  const picked = orderedMembers[0];
+  
+  // Read and validate family preference from x-sk-prefer header (card 1e26943e)
+  const prefHeader = request.headers?.['x-sk-prefer'];
+  let familyPreference = null;
+  let prefError = null;
+
+  if (prefHeader !== undefined) {
+    const validation = validateFamilyPreference(prefHeader, addr.sensitivity);
+    if (validation.valid) {
+      familyPreference = validation.preference;
+      if (familyPreference && familyPreference.length > 0) {
+        console.log(
+          `[router] bucket ${addr.bucket} applying family preference: ${familyPreference.join(',')}`,
+        );
+      }
+    } else {
+      prefError = validation.reason;
+      console.warn(
+        `[router] bucket ${addr.bucket} invalid family preference: ${prefError}`,
+      );
+      return {
+        failClosed: {
+          status: 400,
+          headers: { "content-type": "application/json" },
+          body: Buffer.from(JSON.stringify({
+            error: {
+              message: `Invalid family preference: ${prefError}`,
+              code: 400,
+              type: "invalid_family_preference",
+            },
+          }), "utf-8"),
+        },
+      };
+    }
+  }
+
+  // Apply family preference within cheapest cost tier
+  const picked = selectMember(members, n, familyPreference);
+  
+  if (!picked) {
+    console.warn(`[router] bucket ${addr.bucket} no member selected after preference`);
+    return {
+      failClosed: {
+        status: 503,
+        headers: { "content-type": "application/json" },
+        body: Buffer.from(JSON.stringify({
+          error: {
+            message: `No model available for bucket ${addr.bucket}`,
+            code: 503,
+            type: "bucket_no_member",
+          },
+        }), "utf-8"),
+      },
+    };
+  }
 
   console.log(
     `[router] bucket ${addr.bucket} -> ${picked.id} ` +
       `(class ${picked.model_class || "?"} via ${picked.class_basis}, zone ${picked.trust_zone ?? "?"}, ` +
-      `${members.length} eligible)`,
+      `family ${picked.family || "?"}, ` +
+      `${members.length} eligible)` +
+      (familyPreference ? ` [preference: ${familyPreference.join(',')}]` : ''),
   );
 
   // Resolve the chosen id through the router's own model matching, so
@@ -2364,6 +2844,17 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = (
   // path does await the same call; this one was simply missed, and no test ever
   // reached it. The normalization is kept for the resolved value, which really
   // can be a single object or an array.
+  // selectMember() returns the ONE best member (cheapest cost tier, preference
+  // applied within that tier). The candidate loop below still needs the full
+  // member list so failover, quarantine and pooling keep working when the
+  // chosen member's backend is down. Rebuild it with the picked member first,
+  // then every other member in cost order: the preference decides who serves,
+  // it does not remove anyone from the failover chain.
+  const orderedMembers = [
+    picked,
+    ...orderMembersByCost(members, n).filter((m) => m.id !== picked.id),
+  ];
+
   const candidates = [];
   const seen = new Set();
   const skipped = [];
@@ -2374,11 +2865,50 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = (
     } catch (err) {
       if (err instanceof ModelEolError) {
         skipped.push(member.id);
-        emitSiem("bucket_member_skipped", {
+        await emitSiem(EventType.ANOMALY, {
+          type: "bucket_member_skipped",
+          outcome: "skipped",
           bucket: addr.bucket,
           member: member.id,
-          eol_reason: err.reason || err.message,
+          eol_reason: err.eolReason || err.message,
         }, {});
+        continue;
+      }
+      // Provider purity in a bucket chain: a member whose declaring backend
+      // is down is retried as an expansion route (the bucket tier treats
+      // members as fungible across sibling backends, health-aware expansion).
+      // If expansion still yields nothing servable, the member is skipped and
+      // the next live member serves. Direct (non-bucket) requests never take
+      // this path: for them ModelOwnerDownError fails closed at route().
+      if (err instanceof ModelOwnerDownError) {
+        try {
+          results = await router.route({
+            ...request, model: member.id, agentId: request.agentId, expand: true,
+          });
+        } catch (expandErr) {
+          skipped.push(member.id);
+          await emitSiem(EventType.ANOMALY, {
+            type: "bucket_member_skipped",
+            outcome: "skipped",
+            bucket: addr.bucket,
+            member: member.id,
+            eol_reason: expandErr instanceof Error ? expandErr.message : String(expandErr),
+          }, {});
+          continue;
+        }
+        const list2 = Array.isArray(results) ? results : results ? [results] : [];
+        for (const result of list2) {
+          const key = `${result.backendId}:${member.id}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          candidates.push({
+            ...result,
+            bodyOverride: rewriteBodyModel(body, member.id),
+            model: member.id,
+            bucket: addr.bucket,
+            bucketMember: member.id,
+          });
+        }
         continue;
       }
       throw err;
@@ -2419,7 +2949,10 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = (
     };
   }
 
-  emitSiem("bucket_resolve", {
+  await emitSiem(EventType.REQUEST, {
+    decision: "bucket_resolve",
+    phase: "candidate_chain",
+    outcome: "candidate_chain_built",
     bucket: addr.bucket,
     chain_length: candidates.length,
     skipped,
@@ -2427,6 +2960,36 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = (
   return {
     candidates,
     isBucketChain: true,
+  };
+}
+
+/**
+ * Build the typed, fail-closed SIEM boundary used by routeAndSend().
+ *
+ * Event construction and sink completion are both part of emission: an
+ * unknown EventType throws before the sink is called, and a synchronous throw
+ * or rejected sink promise rejects the caller. This prevents a policy/routing
+ * decision from succeeding without its required record. Absence of a sink is
+ * still an explicit no-op because SIEM itself is optional in configuration.
+ *
+ * @param {Function|null} siem
+ * @param {object|(() => object)} requestSource
+ * @param {string} [requestId]
+ * @returns {(type:string, details?:object, ctx?:object)=>Promise<object|null>}
+ */
+export function createRouteSiemEmitter(siem, requestSource = {}, requestId = randomUUID()) {
+  return async (type, details = {}, ctx = {}) => {
+    const request = typeof requestSource === "function" ? requestSource() : requestSource;
+    const event = createEvent(type, details, {
+      request_id: requestId,
+      ...(request?.agentId ? { agent_id: request.agentId } : {}),
+      ...(request?.sessionId ? { session_id: request.sessionId } : {}),
+      ...(request?.model ? { model: request.model } : {}),
+      ...ctx,
+    });
+    if (typeof siem !== "function") return null;
+    await siem(event);
+    return event;
   };
 }
 
@@ -2451,22 +3014,12 @@ export async function routeAndSend(router, request, upstreamPath, method, client
   // ── SIEM: per-request audit correlation ──
   // Every lifecycle event emitted for this request shares one request_id so a
   // SIEM/SOC can stitch auth → request → (failover) → response|error together.
-  // The hook is best-effort: guarded (typeof check) and fully swallowed so a
-  // throwing or slow consumer can never break or delay routing.
+  // Audit decisions are a fail-closed boundary: createEvent() type errors and
+  // synchronous or asynchronous sink failures propagate. A request must not
+  // report success after its required evidence was rejected by the contract or
+  // sink. No configured sink remains an explicit, backwards-compatible no-op.
   const _siemRequestId = randomUUID();
-  const emitSiem = (type, details = {}, ctx = {}) => {
-    if (typeof siem !== "function") return;
-    try {
-      siem(createEvent(type, details, {
-        request_id: _siemRequestId,
-        ...(request?.agentId ? { agent_id: request.agentId } : {}),
-        ...(request?.model   ? { model:    request.model }   : {}),
-        ...ctx,
-      }));
-    } catch {
-      // SIEM must never break routing.
-    }
-  };
+  const emitSiem = createRouteSiemEmitter(siem, () => request, _siemRequestId);
 
   // ── Per-agent model routing (CR-5.1: registry agent:<id> context) ──
   // Map the resolved CapAuth agent identity to its pinned target read LIVE from
@@ -2539,7 +3092,10 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           `Not falling through to registry defaults, which would apply no ` +
           `capability floor and no trust-zone ceiling.`,
       );
-      emitSiem("invalid_bucket_id", {
+      await emitSiem(EventType.ERROR, {
+        type: "invalid_bucket_id",
+        status_code: 400,
+        outcome: "rejected",
         model: request.model,
         reason: attempt.reason,
       }, {});
@@ -2637,6 +3193,8 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           candidates = await router.route({ ...request, model: reg.model, agentId: request.agentId });
         } catch (err) {
           if (err instanceof ModelEolError) return eolGatedResponse(err);
+          if (err instanceof ModelClaimQuarantinedError) return claimQuarantinedResponse(err);
+          if (err instanceof ModelOwnerDownError) return ownerDownResponse(err);
           throw err;
         }
         if (!candidates || candidates.length === 0) {
@@ -2771,12 +3329,15 @@ export async function routeAndSend(router, request, upstreamPath, method, client
               `${isSensitivityEnforced() ? "BLOCKS" : "would block (shadow)"} ` +
               `cloud failover to ${fb.id} (zone ${fbZone})`;
             console.warn(msg);
-            emitSiem("sensitivity_gate", {
+            await emitSiem(EventType.POLICY_VIOLATION, {
+              rule: "sensitivity_ceiling",
+              severity: "warning",
               enforced: isSensitivityEnforced(),
               sensitivity: zc.sensitivity,
               ceiling: zc.ceiling,
               candidate_zone: fbZone,
               action: isSensitivityEnforced() ? "blocked" : "shadow",
+              outcome: isSensitivityEnforced() ? "blocked" : "shadow",
             }, { backend: fb.id });
           }
           // Shadow mode logs and does nothing else, so a soak can show what
@@ -2827,7 +3388,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
               `failing over to ${fc.fallbackBackend}/${fc.fallbackModel} ` +
               `(sovereign-first, cloud-fallback)`
             );
-            emitSiem("failover", {
+            await emitSiem("failover", {
               from_backend: "reg:" + reg.backend,
               to_backend: fb.id,
               reason: "local_backend_unhealthy",
@@ -2853,12 +3414,50 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       : [];
     const claimsRequested = configured.some((backend) => backend.supportsModel?.(request.model));
     if (request.model && configured.length > 0 && !claimsRequested) {
+      const awaiting = configured.find((backend) =>
+        backend.mayDiscoverModel?.(request.model) &&
+        (backend.discoveryStatus === "pending" || backend.discoveryStatus === "failed")
+      );
+      if (awaiting) {
+        const result = {
+          status: 503,
+          headers: { "content-type": "application/json", "retry-after": "1" },
+          body: Buffer.from(JSON.stringify({
+            error: {
+              message: `Model capability discovery is not ready: ${awaiting.id}/${request.model}`,
+              code: "model_discovery_not_ready",
+              type: "service_unavailable",
+            },
+            requested_model: requestedModel,
+            backend: awaiting.id,
+            readiness_revision: awaiting.readinessRevision,
+            discovery_revision: awaiting.discoveryRevision,
+            discovery_status: awaiting.discoveryStatus,
+          }), "utf8"),
+          backendId: null,
+          requestedModel,
+          readinessRevision: awaiting.readinessRevision,
+          discoveryRevision: awaiting.discoveryRevision,
+        };
+        emitSiem("error", {
+          status: 503,
+          code: "model_discovery_not_ready",
+          requested_model: requestedModel,
+          candidate_backend: awaiting.id,
+          readiness_revision: awaiting.readinessRevision,
+          discovery_revision: awaiting.discoveryRevision,
+          discovery_status: awaiting.discoveryStatus,
+        }, {});
+        return result;
+      }
       const lifecycle = getLifecycle(request.model);
       if (!isRoutable(lifecycle)) {
         try {
           await router.route(request);
         } catch (err) {
           if (err instanceof ModelEolError) return eolGatedResponse(err);
+          if (err instanceof ModelClaimQuarantinedError) return claimQuarantinedResponse(err);
+          if (err instanceof ModelOwnerDownError) return ownerDownResponse(err);
           throw err;
         }
       }
@@ -2871,13 +3470,15 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         }), "utf8"),
         requestedModel,
       };
-      emitSiem("response", { status: 404, code: "unknown_model", requested_model: requestedModel }, {});
+      await emitSiem("response", { status: 404, code: "unknown_model", requested_model: requestedModel }, {});
       return result;
     }
     try {
       candidates = await router.route(request);
     } catch (err) {
       if (err instanceof ModelEolError) return eolGatedResponse(err);
+      if (err instanceof ModelClaimQuarantinedError) return claimQuarantinedResponse(err);
+      if (err instanceof ModelOwnerDownError) return ownerDownResponse(err);
       throw err;
     }
   }
@@ -2901,7 +3502,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       }), 'utf8'),
       requestedModel,
     };
-    emitSiem('error', { status: 503, code: 'codex_provider_unavailable', requested_model: requestedModel }, {});
+    await emitSiem('error', { status: 503, code: 'codex_provider_unavailable', requested_model: requestedModel }, {});
     return result;
   }
 
@@ -2912,8 +3513,8 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     const authType = primary.backend?.auth_type || "none";
     const authOk = authType === "none" ||
       (primary.authHeaders && Object.keys(primary.authHeaders).length > 0);
-    emitSiem("auth", { success: !!authOk, method: authType }, { backend: primary.backendId });
-    emitSiem("request", {
+    await emitSiem("auth", { success: !!authOk, method: authType }, { backend: primary.backendId });
+    await emitSiem("request", {
       path: upstreamPath,
       method,
       candidate_count: candidates.length,
@@ -2923,6 +3524,13 @@ export async function routeAndSend(router, request, upstreamPath, method, client
 
   let lastResult = null;
   let didFailover = false;
+  // Doors that refused the context preflight (card 9ed4a9f7), bounded one
+  // entry per candidate, used to synthesize the explicit 400 when EVERY
+  // door is too small for the request.
+  const contextRejections = [];
+  // Doors whose engine returned exceed_context_size_error (preflight missed
+  // it), advanced without health penalty.
+  const contextOverflows = [];
   // Every attempt that produced an energy observation, in attempt order.
   // Reads are per attempt (spec 4.5), so writes must be too: a local metered
   // attempt that burned real joules and then failed over to cloud gets its own
@@ -2942,6 +3550,39 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // candidate rewrites the model to a cloud-served id). Default to the shared
     // body when no override is present.
     const attemptBody = candidates[i].bodyOverride || body;
+
+    // Context preflight (card 9ed4a9f7): a backend may declare context_limit,
+    // the true serving-engine token ceiling (e.g. llama.cpp --ctx-size 32768
+    // behind a shared model id whose vLLM replica serves 131072). Estimate
+    // the request size and SKIP doors that cannot hold it, failing over to a
+    // capable replica, instead of sending and letting the engine truncate or
+    // error. Never silently truncate: if every door is too small the request
+    // fails with an explicit 400 naming each limit. The estimate is a
+    // documented heuristic (~3 bytes per token for JSON chat payloads),
+    // deliberately coarse because it gates only obvious overflows.
+    if (backend && Number.isFinite(backend.context_limit) && backend.context_limit > 0) {
+      // ponytail: /3 heuristic over-estimates plain text ~25 percent; measured
+      // structured Pi prompts ran 3.0-3.5 bytes/token, so /4 undercounted and
+      // slipped real 16.6K-18.5K prompts past a 16384 slot. Upgrade path: a
+      // tokenizer when preflight false-negatives matter.
+      const estimatedTokens = Math.ceil(attemptBody.length / 3);
+      if (estimatedTokens > backend.context_limit) {
+        console.warn(
+          `[routeAndSend] context preflight rejected backend=${backendId}: ` +
+            `estimated ${estimatedTokens} tokens exceeds context_limit ${backend.context_limit}; ` +
+            `deferring to the next candidate`,
+        );
+        await emitSiem("error", {
+          type: "context_preflight_rejected",
+          backend: backendId,
+          estimated_tokens: estimatedTokens,
+          context_limit: backend.context_limit,
+          model: candidates[i].model || request.model,
+        }, { backend: backendId });
+        contextRejections.push({ backendId, estimatedTokens, context_limit: backend.context_limit });
+        continue;
+      }
+    }
     // The model THIS door actually serves. Only differs from request.model
     // for candidates that carry an explicit tag (the @match chain, card
     // 9e28de88 fix #5, and the cloud-fallback/local-registry candidates);
@@ -2970,7 +3611,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         `[router] FAILOVER: ${candidates[i - 1].backendId} → ${backendId}` +
         ` (prev_status=${lastResult?.status})`
       );
-      emitSiem("failover", {
+      await emitSiem("failover", {
         from_backend: candidates[i - 1].backendId,
         to_backend: backendId,
         reason: `previous_status_${lastResult?.status ?? "error"}`,
@@ -3055,11 +3696,14 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         // A client which leaves while queued is the same neutral 499 as one
         // which leaves after dispatch: no failover and no backend-health write.
         if (err instanceof PoolAdmissionError && err.code === "client_closed") {
-          const queueWaitMs = Date.now() - queueStart;
-          emitSiem("response", {
+          const queueWaitMs = err.queueWaitMs;
+          await emitSiem("response", {
             status: 499,
             latency_ms: queueWaitMs,
             queue_wait_ms: queueWaitMs,
+            inflight_concurrency: err.inflightConcurrency,
+            admission_outcome: err.admissionOutcome,
+            backoff_classification: "cancellation",
             failover: false,
             cancelled: true,
           }, { backend: backendId });
@@ -3075,6 +3719,9 @@ export async function routeAndSend(router, request, upstreamPath, method, client
             backendId,
             capacityDomain: err.capacityDomain,
             queueWaitMs,
+            inflightConcurrency: err.inflightConcurrency,
+            admissionOutcome: err.admissionOutcome,
+            backoffClassification: "cancellation",
             failover: false,
             cancelled: true,
           };
@@ -3092,7 +3739,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           ? err.retryAfterSeconds
           : 1;
         console.error(`[routeAndSend] pool rejected backend=${backendId}: ${err.message}`);
-        emitSiem("error", {
+        await emitSiem("error", {
           type: code === "queue_timeout" ? "pool_queue_timeout" : "pool_capacity_exceeded",
           status_code: 503,
           backend: backendId,
@@ -3100,11 +3747,26 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           retry_after_seconds: retryAfterSeconds,
           message: err.message,
         }, { backend: backendId });
-        const queueWaitMs = Date.now() - queueStart;
-        emitSiem("response", {
+        const queueWaitMs = err instanceof PoolAdmissionError
+          ? err.queueWaitMs
+          : Math.max(0, Date.now() - queueStart);
+        const inflightConcurrency = err instanceof PoolAdmissionError
+          ? err.inflightConcurrency
+          : 0;
+        const admissionOutcome = err instanceof PoolAdmissionError
+          ? err.admissionOutcome
+          : "denied";
+        const backoffClassification = code === "queue_timeout"
+          ? "timeout"
+          : "local_admission_denial";
+        await emitSiem("response", {
           status: 503,
           latency_ms: queueWaitMs,
           queue_wait_ms: queueWaitMs,
+          inflight_concurrency: inflightConcurrency,
+          admission_outcome: admissionOutcome,
+          backoff_classification: backoffClassification,
+          retry_after_seconds: retryAfterSeconds,
           failover: false,
           admission_rejected: true,
           code,
@@ -3130,13 +3792,22 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           })),
           backendId,
           capacityDomain,
-          queueWaitMs: Date.now() - queueStart,
+          queueWaitMs,
+          inflightConcurrency,
+          admissionOutcome,
+          backoffClassification,
+          retryAfterSeconds,
           failover: didFailover,
         };
       }
     }
 
-    const queueWaitMs = Date.now() - queueStart;
+    // Pool tickets carry the admission snapshot. This avoids sampling after a
+    // concurrent release or promotion and bounds queue wait to the configured
+    // queue SLA. The no-pool path remains an admitted, zero-wait attempt.
+    const queueWaitMs = slot?.queueWaitMs ?? 0;
+    const inflightConcurrency = slot?.inflightConcurrency ?? 1;
+    const admissionOutcome = slot?.admissionOutcome ?? "admitted";
 
     // Meter read is per attempt, not per request: a failover attempt must be
     // attributed to the backend that actually served it. Fail-open, so a slow
@@ -3226,6 +3897,27 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         } else {
           res = await sendUpstream(upstreamPath, method, forwardHeaders, attemptBody, targetUrl, attemptTimeoutMs, abortSignal);
         }
+      } else if (isCodexBackend(backend)) {
+        // Translate OpenAI chat-completions -> Codex Responses API (OpenAI
+        // *subscription* inference; see codex-adapter.mjs). Same contract as
+        // the Anthropic branch above: a translatable body is converted and the
+        // buffered upstream SSE answer converted back (to SSE for the client
+        // when the client asked stream:true); anything else passes through.
+        const tr = toCodexRequest(attemptBody);
+        if (tr) {
+          if (tr.dropped.length) {
+            console.warn(
+              `[router] codex ${backendId}: dropped unsupported params [${tr.dropped.join(",")}] ` +
+                `for model=${candidateModel}`,
+            );
+          }
+          const cHeaders = { ...forwardHeaders, ...tr.headers };
+          delete cHeaders["content-length"];
+          const raw = await sendUpstream(tr.path, method, cHeaders, tr.body, targetUrl, backend.timeout_ms, abortSignal);
+          res = raw?.cancelled ? raw : fromCodexResponse(raw, candidateModel, tr.clientStream);
+        } else {
+          res = await sendUpstream(upstreamPath, method, forwardHeaders, attemptBody, targetUrl, backend.timeout_ms, abortSignal);
+        }
       } else {
         res = await sendUpstream(upstreamPath, method, forwardHeaders, attemptBody, targetUrl, attemptTimeoutMs, abortSignal);
       }
@@ -3257,22 +3949,31 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // Return immediately after releasing the pool/meter slot in `finally`,
     // before energy reads, health/lifecycle writes, or failover can run.
     if (res?.cancelled || res?.status === 499) {
+      // A cancellation is not evidence of what was served: keep the value
+      // enforceResponseContract observed (including null), never the
+      // routing candidate. Card bc908525 / review b62e19f8 findings 1-2.
       lastResult = {
         ...res,
         backendId,
-        servedModel: candidateModel,
         failover: didFailover,
         queueWaitMs,
+        inflightConcurrency,
+        admissionOutcome: "cancelled",
+        backoffClassification: "cancellation",
+        firstByteMs: Number.isFinite(res?.firstByteMs) ? queueWaitMs + res.firstByteMs : null,
         cancelled: true,
       };
       if (isBucketChain) {
         lastResult.bucket = bucketAddr.bucket;
         lastResult.bucketMember = candidateModel;
       }
-      emitSiem("response", {
+      await emitSiem("response", {
         status: 499,
         latency_ms: latencyMs,
         queue_wait_ms: queueWaitMs,
+        inflight_concurrency: inflightConcurrency,
+        admission_outcome: "cancelled",
+        backoff_classification: "cancellation",
         failover: false,
         cancelled: true,
       }, { backend: backendId });
@@ -3329,12 +4030,21 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // response or try the next door; splitting the two is the whole point
     // of this card, so a throttled model can fail over WITHOUT damaging
     // backend health or lifecycle state.
-    // Fast wrong answers are claim-granular. Do not let a 502 for one alias
-    // remove every other model on the backend through the backend-wide health
-    // machine. Slow hangs and other 5xx retain the existing backend signal.
-    const healthy = res.status < 500 || FAST_MODEL_FAILURE_STATUSES.has(res.status);
+    const healthy = res.status < 500;
     const qTransition = backend.recordOutcome(healthy, latencyMs);
-    const modelTransition = backend.recordModelStatus(candidateModel, res.status);
+    const claimTransition = backend.recordModelClaimOutcome(candidateModel, res.status);
+    if (claimTransition) {
+      const quarantined = claimTransition.transition === "quarantined";
+      process.stdout.write(JSON.stringify({
+        ts: new Date().toISOString(),
+        event: quarantined ? "model_claim_quarantined" : "model_claim_readmitted",
+        source: "router",
+        backend: backendId,
+        model: candidateModel,
+        status: res.status,
+        consecutive_failures: claimTransition.failures,
+      }) + "\n");
+    }
 
     // Model-granular lifecycle bookkeeping (card P1.2, section 4.2 of the
     // model-ranking design doc): record this concrete model's completion
@@ -3362,18 +4072,12 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     const claimsHere = candidateModel && typeof backend.supportsModel === "function"
       ? backend.supportsModel(candidateModel)
       : false;
-    const claimers = typeof router.getBackends === "function" && candidateModel
-      ? router.getBackends().filter(
+    const anyClaimer = typeof router.getBackends === "function" && candidateModel
+      ? router.getBackends().some(
           (b) => typeof b.supportsModel === "function" && b.supportsModel(candidateModel)
         )
-      : [];
-    const anyClaimer = claimers.length > 0;
-    const anotherClaimer = claimers.some((b) => b !== backend);
-    recordModelOutcome(candidateModel, {
-      status: res.status,
-      now: Date.now(),
-      claiming: (claimsHere && !anotherClaimer) || !anyClaimer,
-    });
+      : false;
+    recordModelOutcome(candidateModel, { status: res.status, now: Date.now(), claiming: claimsHere || !anyClaimer });
 
     // Feed the real completion outcome back into the local-health verdict so a
     // wedged local backend that got past the probe but then hung/errored is
@@ -3383,18 +4087,8 @@ export async function routeAndSend(router, request, upstreamPath, method, client
 
     // Dead-alias auto-quarantine transitions (card 2d1f3a2c). Mirror the
     // failover pattern: a stdout JSON line (always) plus a structured SIEM
-    // event via the shared emitter (best-effort). Quarantine removes the alias
+    // event via the shared fail-closed emitter. Quarantine removes the alias
     // from rotation; re-admit returns it once a probe succeeds.
-    if (modelTransition) {
-      emitSiem("anomaly", {
-        type: `backend_model_${modelTransition.transition}`,
-        backend: backendId,
-        model: candidateModel,
-        status_code: res.status,
-        consecutive_failures: modelTransition.consecutiveFailures || 0,
-      }, { backend: backendId });
-    }
-
     if (qTransition) {
       const isQ = qTransition.transition === "quarantined";
       process.stdout.write(JSON.stringify({
@@ -3406,7 +4100,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         consecutive_failures: qTransition.consecutiveFailures,
         threshold: qTransition.threshold,
       }) + "\n");
-      emitSiem("anomaly", {
+      await emitSiem("anomaly", {
         type: isQ ? "backend_quarantine" : "backend_recovery",
         backend: backendId,
         consecutive_failures: qTransition.consecutiveFailures,
@@ -3425,11 +4119,31 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // Set from the attempt that is about to be returned, so on a failover it
     // names the SERVING attempt and never a blend across attempts, which is
     // the same ruling the energy headers already follow.
-    lastResult = { ...res, backendId, failover: didFailover, queueWaitMs };
+    lastResult = {
+      ...res,
+      backendId,
+      requestedModel,
+      readinessRevision: backend.readinessRevision,
+      discoveryRevision: backend.discoveryRevision,
+      failover: didFailover,
+      queueWaitMs,
+      inflightConcurrency,
+      admissionOutcome,
+      backoffClassification: "nonterminal",
+      firstByteMs: Number.isFinite(res?.firstByteMs) ? queueWaitMs + res.firstByteMs : null,
+    };
     if (isBucketChain) {
       lastResult.bucket = bucketAddr.bucket;
       lastResult.bucketMember = candidateModel;
     }
+    // Provider-neutral rail attribution (card e19f88db / SKGW-ATTRIBUTION-01)
+    // Populate only facts known by the request path. NULL when unknown.
+    const inferredProvider = backend.discovery || inferProviderFromBackend(backendId);
+    lastResult.provider = inferredProvider;
+    lastResult.rail = inferRailFromBackend(backendId, backendUrl, isLocalUrl, inferredProvider);
+    lastResult.logicalRoute = isBucketChain ? bucketAddr.bucket : (isRegistryRouted(request) ? request.model : null);
+    // Runtime revision combines readiness and discovery for tracking
+    lastResult.runtimeRevision = `${backend.readinessRevision}:${backend.discoveryRevision}`;
     if (attemptEnergy) lastResult.energy = attemptEnergy;
     // Only attached when something was actually observed, so the disabled
     // path returns a result whose shape is unchanged, field for field.
@@ -3440,9 +4154,45 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // caller. `healthy` above already kept backend health/lifecycle out of
     // this decision entirely.
     const retryElsewhere = isFailoverStatus(res.status) ||
-      (claimsHere && res.status === 404) ||
       (isBucketChain && (res.status === 404 || res.status === 410));
     const throttled = isThrottleStatus(res.status);
+
+    // Narrow context-overflow failover (card 9ed4a9f7 amendment): a 400 whose
+    // parsed body is the engine's exceed_context_size_error is a DOOR limit,
+    // not a payload defect. Advance to a same-model candidate with a strictly
+    // larger context_limit (or no limit) WITHOUT a health penalty. Every other
+    // 400 stays terminal; nothing blanket-fails-over.
+    if (res.status === 400) {
+      let ctxOverflow = false;
+      try {
+        const parsedErr = JSON.parse(res.body?.toString("utf-8") || "{}");
+        const err = parsedErr?.error || parsedErr;
+        ctxOverflow = err?.type === "exceed_context_size_error"
+          || err?.code === "exceed_context_size_error";
+      } catch { /* not JSON: terminal 400 */ }
+      if (ctxOverflow) {
+        const currentLimit = Number.isFinite(backend?.context_limit) ? backend.context_limit : 0;
+        const larger = candidates.slice(i + 1).some((c) => {
+          if (c.model && c.model !== candidateModel) return false;
+          const lim = Number.isFinite(c.backend?.context_limit) ? c.backend.context_limit : Infinity;
+          return lim > currentLimit;
+        });
+        console.warn(
+          `[router] 400 context overflow backend=${backendId} model=${candidateModel}; ` +
+          `${larger ? "advancing to a larger-context same-model candidate" : "no larger door, terminal"}`,
+        );
+        await emitSiem("error", {
+          type: "context_overflow",
+          backend: backendId,
+          model: candidateModel,
+          advanced: larger,
+        }, { backend: backendId });
+        if (larger) {
+          contextOverflows.push({ backendId, model: candidateModel });
+          continue;  // no health write: the door is fine, the prompt is just big
+        }
+      }
+    }
 
     if (!retryElsewhere) {
       console.log(
@@ -3458,20 +4208,26 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         try { detail = res.body?.toString("utf-8").slice(0, 500); } catch { /* ignore */ }
         console.warn(`[router] ${res.status} upstream_error backend=${backendId} body=${detail}`);
         // 4xx are non-retryable but are client/payload errors the SOC needs.
-        emitSiem("error", {
+        await emitSiem("error", {
           type: "upstream_client_error",
           status_code: res.status,
           backend: backendId,
         }, { backend: backendId });
       }
       // Completion — status + latency + best-effort token usage.
-      emitSiem("response", {
+      await emitSiem("response", {
         status: res.status,
         latency_ms: latencyMs,
         queue_wait_ms: queueWaitMs,
+        inflight_concurrency: inflightConcurrency,
+        admission_outcome: admissionOutcome,
+        backoff_classification: "nonterminal",
         failover: didFailover,
         requested_model: lastResult.requestedModel,
+        chosen_backend: backendId,
         served_model: lastResult.servedModel,
+        readiness_revision: lastResult.readinessRevision,
+        discovery_revision: lastResult.discoveryRevision,
         ...extractUsage(res.body),
       }, { backend: backendId });
       return lastResult;
@@ -3490,10 +4246,18 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         `cooldown=${cooldownMs}ms` +
         (i < candidates.length - 1 ? " (trying next door)" : " (no more candidates)")
       );
-      emitSiem("anomaly", {
+      lastResult.backoffClassification = res.status === 429
+        ? "provider_429"
+        : "provider_backoff";
+      lastResult.retryAfterMs = cooldownMs;
+      await emitSiem("anomaly", {
         type: "rate_limited",
         backend: backendId,
         status_code: res.status,
+        queue_wait_ms: queueWaitMs,
+        inflight_concurrency: inflightConcurrency,
+        admission_outcome: admissionOutcome,
+        backoff_classification: lastResult.backoffClassification,
         cooldown_ms: cooldownMs,
       }, { backend: backendId, severity: "info" });
       continue;
@@ -3504,7 +4268,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       (i < candidates.length - 1 ? " — trying next backend" : " — no more backends")
     );
     // Retryable upstream failure (>=500) — one error event per failed attempt.
-    emitSiem("error", {
+    await emitSiem("error", {
       type: "upstream_error",
       status_code: res.status,
       backend: backendId,
@@ -3522,6 +4286,23 @@ export async function routeAndSend(router, request, upstreamPath, method, client
   if (candidates.length > 0 && throttledAttempts.length === candidates.length) {
     const waitsMs = throttledAttempts.map((t) => t.cooldownMs ?? DEFAULT_429_COOLDOWN_MS);
     const retryAfterSec = Math.max(1, Math.ceil(Math.min(...waitsMs) / 1000));
+
+    // Card e7c2b4a9 repair #1: derive final backoff classification from attempts.
+    // If ALL throttled attempts are 402, preserve provider_backoff. Only if
+    // ANY attempt was a 429 should we classify as provider_429.
+    const all402 = throttledAttempts.every((t) => t.status === 402);
+    const backoffClassification = all402 ? "provider_backoff" : "provider_429";
+
+    // Card e7c2b4a9 repair #2: detect cooldown-only rejections (no admission occurred).
+    // When ALL doors were skipped via cooldown, lastResult is null and no pool
+    // admission ever happened. Report a truthful no-admission outcome rather
+    // than defaulting to "admitted" with zero inflight concurrency.
+    const allSkipped = throttledAttempts.every((t) => t.skipped);
+    const admissionOutcome = allSkipped ? "denied" : (lastResult?.admissionOutcome ?? "admitted");
+    const inflightConcurrency = allSkipped ? 0 : (lastResult?.inflightConcurrency ?? 0);
+    const queueWaitMs = lastResult?.queueWaitMs ?? 0;
+    const backendId = lastResult?.backendId ?? null;
+
     const payload = JSON.stringify({
       error: {
         message: "All candidate models are currently rate limited",
@@ -3532,26 +4313,68 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     });
     console.warn(
       `[router] 429 ALL CANDIDATES THROTTLED model=${request.model} ` +
-      `tried=[${throttledAttempts.map((t) => `${t.backendId}/${t.model}`).join(", ")}]`
+      `tried=[${throttledAttempts.map((t) => `${t.backendId}/${t.model}`).join(", ")}]` +
+      (allSkipped ? " (all doors cooling, no admission)" : "")
     );
-    emitSiem("response", {
+    await emitSiem("response", {
       status: 429,
+      queue_wait_ms: queueWaitMs,
+      inflight_concurrency: inflightConcurrency,
+      admission_outcome: admissionOutcome,
+      backoff_classification: backoffClassification,
+      retry_after_seconds: retryAfterSec,
       failover: didFailover,
       all_backends_failed: true,
       all_throttled: true,
-    }, { backend: lastResult?.backendId ?? null });
+    }, { backend: backendId });
     return {
       status: 429,
       headers: { "content-type": "application/json", "retry-after": String(retryAfterSec) },
       body: Buffer.from(payload, "utf-8"),
-      backendId: lastResult?.backendId ?? null,
+      backendId,
+      queueWaitMs,
+      inflightConcurrency,
+      admissionOutcome,
+      backoffClassification,
+      retryAfterSeconds: retryAfterSec,
       failover: didFailover,
+    };
+  }
+
+  // Context preflight rejected every door (card 9ed4a9f7): the request can
+  // never fit. Fail EXPLICITLY instead of attempting, truncating, or
+  // returning a misleading upstream error. Never silently truncate.
+  if (!lastResult && contextRejections.length > 0) {
+    const payload = JSON.stringify({
+      error: {
+        message: `prompt exceeds every candidate backend context limit: `
+          + contextRejections.map((r) => `${r.backendId}=${r.context_limit}`).join(", ")
+          + ` (estimated ${contextRejections[0].estimatedTokens} tokens, heuristic 3 bytes/token)`,
+        code: "context_exceeded",
+        type: "invalid_request_error",
+        estimated_tokens: contextRejections[0].estimatedTokens,
+        backends: contextRejections.map((r) => ({ backend: r.backendId, context_limit: r.context_limit })),
+        retryable: false,
+      },
+    });
+    await emitSiem("response", {
+      status: 400,
+      failover: false,
+      context_exceeded: true,
+      backends: contextRejections.map((r) => r.backendId),
+    }, {});
+    return {
+      status: 400,
+      headers: { "content-type": "application/json" },
+      body: Buffer.from(payload, "utf-8"),
+      backendId: null,
+      failover: false,
     };
   }
 
   // All backends failed for some other (non-throttle) reason: return the
   // last response so the caller can relay the error.
-  emitSiem("response", {
+  await emitSiem("response", {
     status: lastResult?.status ?? 502,
     failover: didFailover,
     all_backends_failed: true,

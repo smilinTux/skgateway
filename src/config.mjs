@@ -27,7 +27,7 @@ import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import { load as yamlLoad } from 'js-yaml';
 import { isRegistryRouted, loadRegistry } from './proxy/registry.mjs';
-import { assertCodexRegistryPurity } from './policy/codex-purity.mjs';
+import { assertCodexConfigPurity, assertCodexRegistryPurity } from './policy/codex-purity.mjs';
 
 // ─── paths ────────────────────────────────────────────────────────────────────
 
@@ -410,6 +410,114 @@ function deepClone(obj) {
   return JSON.parse(JSON.stringify(obj));
 }
 
+/** True only for a YAML mapping, never null or an array. */
+function isMapping(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
+ * Merge one parsed config document over the defaults.
+ *
+ * `backends` is deliberately different from ordinary nested settings: when a
+ * file declares the key, that mapping is the complete backend registry. This
+ * makes omission an actual removal instead of allowing deepMerge() to restore
+ * a same-named built-in backend. `enabled: false` is the explicit equivalent;
+ * a disabled entry needs no url, auth, models, or priority because it is
+ * removed before backend validation and before any consumer sees the config.
+ *
+ * @param {object} base mutable clone of DEFAULTS
+ * @param {object} fromFile parsed YAML document
+ * @returns {Set<string>} backend ids explicitly disabled or removed from defaults
+ */
+function mergeConfigDocument(base, fromFile) {
+  if (!isMapping(fromFile)) {
+    throw new ConfigError(['configuration document must be a YAML mapping']);
+  }
+
+  const hasBackends = Object.prototype.hasOwnProperty.call(fromFile, 'backends');
+  const rest = { ...fromFile };
+  delete rest.backends;
+  deepMerge(base, rest);
+
+  if (!hasBackends) return new Set();
+  if (!isMapping(fromFile.backends)) {
+    throw new ConfigError(['backends must be a mapping when declared']);
+  }
+
+  const problems = [];
+  const configured = {};
+  const removed = new Set(
+    Object.keys(DEFAULTS.backends).filter(
+      (id) => !Object.prototype.hasOwnProperty.call(fromFile.backends, id),
+    ),
+  );
+
+  for (const [id, backend] of Object.entries(fromFile.backends)) {
+    if (!isMapping(backend)) {
+      problems.push(`backends.${id} must be an object or { enabled: false }`);
+      continue;
+    }
+    if (Object.prototype.hasOwnProperty.call(backend, 'enabled') && typeof backend.enabled !== 'boolean') {
+      problems.push(`backends.${id}.enabled must be a boolean`);
+      continue;
+    }
+    if (backend.enabled === false) {
+      removed.add(id);
+      continue;
+    }
+    const inherited = Object.prototype.hasOwnProperty.call(DEFAULTS.backends, id)
+      ? deepClone(DEFAULTS.backends[id])
+      : {};
+    configured[id] = deepMerge(inherited, backend);
+  }
+
+  if (problems.length) throw new ConfigError(problems);
+  base.backends = configured;
+  return removed;
+}
+
+/**
+ * A discovery provider without a same-named serving backend cannot produce a
+ * routable catalog entry. Turn those inherited defaults off in the effective
+ * config so removing a backend cannot leave provider polling or cached catalog
+ * advertisement enabled behind it.
+ */
+function disableOrphanDiscoveryProviders(cfg) {
+  const providers = cfg.discovery?.providers;
+  if (!isMapping(providers)) return;
+  for (const [id, provider] of Object.entries(providers)) {
+    if (!Object.prototype.hasOwnProperty.call(cfg.backends || {}, id) && isMapping(provider)) {
+      provider.enabled = false;
+    }
+  }
+}
+
+/**
+ * Normalise the semantic-cache section. Always present, always OFF by default.
+ * `shadow` records what WOULD have been served and serves nothing; `serve`
+ * returns cached responses to clients. Shadow is the only default because the
+ * hit rate on this fleet has never been measured.
+ */
+function normalizeSemanticCache(raw = {}) {
+  const sc = raw && typeof raw === "object" ? raw : {};
+  const mode = sc.mode === "serve" ? "serve" : "shadow";
+  return {
+    enabled: sc.enabled === true,
+    mode,
+    threshold: Number.isFinite(sc.threshold) ? sc.threshold : 0.92,
+    ttl_seconds: Number.isFinite(sc.ttl_seconds) ? sc.ttl_seconds : 3600,
+    max_entries: Number.isFinite(sc.max_entries) ? sc.max_entries : 2000,
+    embed_url: typeof sc.embed_url === "string" && sc.embed_url
+      ? sc.embed_url : "http://192.168.0.100:11438/v1/embeddings",
+    embed_model: typeof sc.embed_model === "string" && sc.embed_model
+      ? sc.embed_model : "mxbai-embed-large",
+    embed_timeout_ms: Number.isFinite(sc.embed_timeout_ms) ? sc.embed_timeout_ms : 5000,
+    categories: Array.isArray(sc.categories) && sc.categories.length
+      ? sc.categories.filter((c) => typeof c === "string")
+      : ["administrative", "system", "data_query"],
+  };
+}
+
 // ─── env overrides ────────────────────────────────────────────────────────────
 
 /**
@@ -449,8 +557,15 @@ export function applyEnvOverrides(cfg) {
   if (e.SKGATEWAY_PORT)           cfg.server.port            = Number(e.SKGATEWAY_PORT);
   if (e.SKGATEWAY_DASHBOARD_PORT) cfg.server.dashboard_port  = Number(e.SKGATEWAY_DASHBOARD_PORT);
   if (e.SKGATEWAY_BIND)           cfg.server.bind            = e.SKGATEWAY_BIND;
-  if (e.SKGATEWAY_TARGET)         cfg.backends.nvidia.url    = e.SKGATEWAY_TARGET;
-  if (e.SKGATEWAY_NVIDIA_KEY_ENV) cfg.backends.nvidia.api_key_env = e.SKGATEWAY_NVIDIA_KEY_ENV;
+  if (e.SKGATEWAY_TARGET || e.SKGATEWAY_NVIDIA_KEY_ENV) {
+    if (!cfg.backends?.nvidia) {
+      throw new ConfigError([
+        'SKGATEWAY_TARGET/SKGATEWAY_NVIDIA_KEY_ENV cannot target removed backend "nvidia"',
+      ]);
+    }
+    if (e.SKGATEWAY_TARGET) cfg.backends.nvidia.url = e.SKGATEWAY_TARGET;
+    if (e.SKGATEWAY_NVIDIA_KEY_ENV) cfg.backends.nvidia.api_key_env = e.SKGATEWAY_NVIDIA_KEY_ENV;
+  }
   if (e.SKGATEWAY_METRICS_DB)     cfg.metrics.db_path        = e.SKGATEWAY_METRICS_DB;
   if (e.SKGATEWAY_RETENTION_DAYS) cfg.metrics.retention_days = Number(e.SKGATEWAY_RETENTION_DAYS);
 
@@ -571,7 +686,7 @@ function applyElasticsearchEnv(cfg, e) {
 
 // ─── validation ───────────────────────────────────────────────────────────────
 
-const VALID_AUTH_TYPES = new Set(['api_key', 'oauth', 'bearer', 'none', 'codex_oauth', 'zai_oauth']);
+const VALID_AUTH_TYPES = new Set(['api_key', 'oauth', 'bearer', 'none', 'codex_oauth', 'zai_oauth', 'kimi_oauth']);
 
 /**
  * Test whether a model id matches a backend `models` pattern. Patterns may use
@@ -626,7 +741,12 @@ function modelMatchesPattern(pattern, model) {
  *   used at boot/reload.
  * @returns {string[]} The accumulated problems (empty when the routes are valid).
  */
-export function assertProviderRoutes(cfg, errs = [], registryPath = undefined) {
+export function assertProviderRoutes(
+  cfg,
+  errs = [],
+  registryPath = undefined,
+  removedBackendIds = new Set(),
+) {
   const backends = (cfg.backends && typeof cfg.backends === 'object') ? cfg.backends : {};
   const backendIds = new Set(Object.keys(backends));
 
@@ -638,8 +758,17 @@ export function assertProviderRoutes(cfg, errs = [], registryPath = undefined) {
     if (auth === 'oauth' && !backend.credentials_path && !backend.credentials_file) {
       errs.push(`backends.${name}.auth_type is "oauth" but no credentials_path/credentials_file is set`);
     }
+    if ('context_limit' in backend && (!Number.isFinite(backend.context_limit) || backend.context_limit <= 0)) {
+      errs.push(`backends.${name}.context_limit must be a positive number of tokens`);
+    }
     if (auth === 'codex_oauth' && !backend.credentials_path && !backend.credentials_file) {
       errs.push(`backends.${name}.auth_type is "codex_oauth" but no credentials_path/credentials_file is set`);
+    }
+    if ('provider_purity' in backend && typeof backend.provider_purity !== 'boolean') {
+      errs.push(`backends.${name}.provider_purity must be a boolean`);
+    }
+    if (auth === 'kimi_oauth' && !backend.credentials_path && !backend.credentials_file) {
+      errs.push(`backends.${name}.auth_type is "kimi_oauth" but no credentials_path/credentials_file is set`);
     }
     if (auth === 'zai_oauth' && !backend.credentials_path && !backend.credentials_file) {
       errs.push(`backends.${name}.auth_type is "zai_oauth" but no credentials_path/credentials_file is set`);
@@ -703,6 +832,10 @@ export function assertProviderRoutes(cfg, errs = [], registryPath = undefined) {
             errs.push(`${prefix}.members entries must be non-empty strings`);
             continue;
           }
+          const configuredId = member.startsWith('reg:') ? member.slice(4) : member;
+          if (removedBackendIds.has(configuredId)) {
+            errs.push(`${prefix}.members references disabled or removed backend ${configuredId}`);
+          }
           if (!backendIds.has(member) && !/^reg:[A-Za-z0-9._-]+$/.test(member)) {
             errs.push(
               `${prefix}.members contains unknown route ${member}; expected a declared ` +
@@ -762,9 +895,11 @@ export function assertProviderRoutes(cfg, errs = [], registryPath = undefined) {
     }
   }
 
-  // Codex is a provider boundary, not a capability hint. Validate the live
-  // registry at boot and reload so a Codex-labelled role cannot point at a
-  // local Qwen or a third-party aggregator even transiently.
+  // Codex is a provider boundary, not a capability hint. Validate both the
+  // configured backends and live registry at boot and reload so a Codex-named
+  // direct target, alias or bucket cannot point at another provider even
+  // transiently.
+  assertCodexConfigPurity(cfg, errs);
   try {
     assertCodexRegistryPurity(loadRegistry(registryPath), errs);
   } catch {
@@ -782,7 +917,7 @@ export function assertProviderRoutes(cfg, errs = [], registryPath = undefined) {
  * @param {object} cfg
  * @throws {ConfigError}
  */
-function validate(cfg) {
+function validate(cfg, removedBackendIds = new Set()) {
   const errs = [];
 
   // server
@@ -901,7 +1036,7 @@ function validate(cfg) {
   // Provider-route consistency (card 7ec1d18a): assert routes map to known
   // backends / resolvable aliases at boot AND reload, so a mis-wired route fails
   // fast here rather than silently mis-routing at first request.
-  assertProviderRoutes(cfg, errs);
+  assertProviderRoutes(cfg, errs, undefined, removedBackendIds);
 
   if (errs.length) throw new ConfigError(errs);
 }
@@ -1033,24 +1168,26 @@ export function getConfig() {
 function _readAndBuild(filePath, silent) {
   const base = deepClone(DEFAULTS);
 
+  let removedBackendIds = new Set();
   if (existsSync(filePath)) {
+    let fromFile;
     try {
       const raw = readFileSync(filePath, 'utf8');
-      const fromFile = yamlLoad(raw) ?? {};
-      deepMerge(base, fromFile);
-      if (!silent) process.stderr.write(`[skgateway:config] Loaded ${filePath}\n`);
+      fromFile = yamlLoad(raw) ?? {};
     } catch (err) {
-      // Parse error — fall back to defaults and warn
-      process.stderr.write(`[skgateway:config] WARN: could not parse ${filePath}: ${err.message}\n`);
-      process.stderr.write('[skgateway:config] Falling back to built-in defaults.\n');
+      throw new ConfigError([`could not parse ${filePath}: ${err.message}`]);
     }
+    removedBackendIds = mergeConfigDocument(base, fromFile);
+    if (!silent) process.stderr.write(`[skgateway:config] Loaded ${filePath}\n`);
   } else {
     if (!silent) process.stderr.write(`[skgateway:config] ${filePath} not found — using defaults.\n`);
   }
 
+  disableOrphanDiscoveryProviders(base);
+  base.semantic_cache = normalizeSemanticCache(base.semantic_cache);
   applyEnvOverrides(base);
   resolvePaths(base);
-  validate(base);   // throws ConfigError on bad values
+  validate(base, removedBackendIds);   // throws ConfigError on bad values
 
   return base;
 }

@@ -1,0 +1,390 @@
+## SKGateway config for the STAGED codex instance on chiap01
+## (~/skgateway-codex, ports 18790/18781-dash 18791).
+##
+## Derived from the fleet config /opt/skgateway/config/skgateway.yaml with:
+##   + the codex (OpenAI ChatGPT subscription) backend
+##   + codex model discovery (live /models poll, opt-in)
+##   + bucket routing enabled (sk-<class>-<sensitivity> pool addressing)
+##   - nvidia/openrouter dropped (no provider keys provisioned on this host
+##     today; re-add from the fleet config when keys are vaulted here)
+## Active routed backends retained: chiap08 qwen38, codex and z.ai.
+## Anthropic wrapper and direct fallback are disabled below because the chi
+## cluster has no Anthropic subscription; their advertised models hung 45s.
+##
+## SECRETS: none in this file. The codex credential is a synced COPY of the
+## chiap08 Codex CLI auth.json at secrets/codex-auth.json (0600); refresh
+## ownership stays with the chiap08 CLI login (read-only here, never written,
+## never refreshed by the gateway).
+
+server:
+  port: 18790
+  dashboard_port: 18791
+  bind: 0.0.0.0
+
+advertise:
+  reconcile: hide
+
+pooling:
+  default_max_concurrent: 20
+  default_max_queue: 1000
+  queue_timeout_ms: 300000
+  capacity_domains:
+    chiap08-qwen38:
+      members: [chiap08-qwen38, "reg:qwen38"]
+      ## llama-server on chiap08:11439 runs --parallel 4 --cont-batching.
+      ## Take 3 of its 4 real slots and leave 1 for the dream engine, the wiki
+      ## pipeline and Hermes, which hit llama-server directly and cannot see
+      ## this queue. Taking all 4 makes them queue invisibly behind us.
+      max: 3
+      maxQueue: 8
+      ## Short on purpose: fail over to cloud fast rather than wait on local.
+      queueTimeoutMs: 30000
+    chiap01-qwen38:
+      members: [chiap01-qwen38]
+      ## Arc Pro B70 card 1 runs --parallel 2 on chiap01:18810.
+      ## This is independent hardware from chiap08 and owns both real slots.
+      max: 2
+      maxQueue: 4
+      queueTimeoutMs: 30000
+  per_backend:
+    ## ollama pool left defined but its backend is disabled above (Chef 5060).
+    ollama:
+      max: 50
+      maxQueue: 200
+    ## DISABLED 2026-08-26: no chi Anthropic subscription. Keeping this
+    ## capacity entry would advertise an orphaned domain after backend removal.
+    # anthropic:
+    #   max: 10
+    #   maxQueue: 200
+    ## Raised 4 -> 16 on 2026-08-25 by Chef to max out the ChatGPT plan.
+    ## The old value of 4 was a guess that was never measured against the real
+    ## account, and it capped a 22-agent swarm at peakQueue=18 behind 4 slots.
+    ## Safe to overshoot: retry.mjs honours Retry-After with jittered backoff
+    ## (max429Retries 3) and holds per-backend rate-limit state, so 429s clamp
+    ## us instead of erroring. Watch count429; step to 24 then 32 while clean.
+    codex:
+      max: 32
+      maxQueue: 200
+    ## Measured account-wide on 2026-08-25: nine GLM requests were served at
+    ## once. The next request received an upstream 429. One upstream 429 puts
+    ## the whole Z.ai backend into a 30 second cooldown, so overshoot is costly.
+    ## Hold nine local slots and queue all excess work here.
+    ## 2026-08-25 FINAL: 10, set by Chef. Bucketed telemetry pinned the ceiling.
+    ## At peak concurrency 5 and 8: ZERO 429s across 294 requests. At peak 30:
+    ## 47 of 114 rejected, a 41 percent failure rate. True z.ai limit is between
+    ## 8 and 30, and the plan is ~10 concurrent. Fleet runs 9 sessions, so 10
+    ## leaves exactly one slot of headroom. Do not raise this without new 429
+    ## telemetry: overshoot does not queue, it puts the WHOLE backend into a 30s
+    ## cooldown, during which glm falls through to backends that cannot serve it
+    ## and returns 404 to the client. See cards f361407c and the PR49 lineage.
+    zai:
+      max: 10
+      maxQueue: 400
+    ## DISABLED 2026-08-26 by Chef: retain these values as the governed
+    ## future NIM pool template, but do not instantiate NVIDIA capacity now.
+    ## Re-enable only with a separately approved backend and credential path.
+    # nvidia:
+    #   max: 20
+    #   maxQueue: 1000
+
+backends:
+  ## REMOVED 2026-08-25 by Chef. 192.168.0.100 is his personal 5060 and is not
+  ## part of the chi cluster. It was also a black hole: it answered /v1/models
+  ## instantly but HUNG on /v1/chat/completions (measured 90s via gateway, 45s
+  ## direct). It was a live member of 6 buckets, so blind round-robin selection
+  ## could route real work into it. Bucket counts after removal: sk-s-public
+  ## 33->32, sk-s-internal 18->17, sk-s-secret 7->6, sk-m-public 19->18,
+  ## sk-m-internal 13->12, sk-m-secret 7->6. No bucket empties.
+  ## Sovereign local inference for the chi cluster is chiap08 (ornith + qwen38),
+  ## and next will be the two Arc Pro B70 cards on chiap01.
+  # local:
+  #   url: http://192.168.0.100:8082/v1
+  #   auth_type: none
+  #   models:
+  #     - ornith-1.5-9b
+  #   priority: 1
+
+  ## PURGED 2026-08-25 by Chef. chiap08:11436 is DEAD: connection refused in
+  ## 0.4ms, zero listeners on chiap08, no systemd unit for it. Both models it
+  ## declared returned 404/502 through the gateway while remaining live members
+  ## of every sk-*-secret bucket, so blind selection could pick a corpse.
+  ## This is the fast-failure sibling of the .100 black hole removed earlier
+  ## today. PR49 completion-liveness does NOT cover this class: a 404 in 50ms is
+  ## a fast wrong answer, not a slow no answer. Tracked as card db431f61.
+  # chiap08-ornith:
+  #   url: http://100.81.238.58:11436/v1
+  #   auth_type: none
+  #   models:
+  #     - ornith-1.0-35b
+  #     - ornith-big
+  #   priority: 4
+
+  chiap01-qwen38:
+    url: http://100.80.180.78:18810/v1
+    auth_type: none
+    models:
+      - qwen3.8-27b-huihui-abliterated-q4_k_m
+      - qwen3.8-27b-ud-q5_k_xl
+      - qwen3.8-27b
+      - qwen38-abliterated
+    priority: 3
+
+  chiap08-qwen38:
+    url: http://100.81.238.58:11439/v1
+    auth_type: none
+    models:
+      - qwen3.8-27b-huihui-abliterated-q4_k_m
+      - qwen3.8-27b-ud-q5_k_xl
+      - qwen3.8-27b
+      - qwen38-abliterated
+    priority: 3
+
+  ## DISABLED 2026-08-26 by Chef: the chi cluster has no Anthropic
+  ## subscription. Tested Claude ids hung for 45 seconds rather than failing
+  ## fast, poisoning eight derived buckets. Config deep-merge restores built-in
+  ## defaults when the key is absent, and validation rejects an empty array, so
+  ## this non-advertised wildcard is the schema-valid disabled override.
+  anthropic:
+    url: http://127.0.0.1:9/v1
+    auth_type: none
+    models:
+      - "__disabled_anthropic_no_subscription__*"
+    priority: 999
+
+  ## Historical wrapper settings kept commented for exact rollback.
+  # anthropic:
+  #   url: http://127.0.0.1:18782/v1
+  #   auth_type: none
+  #   models:
+  #     - claude-fable-5
+  #     - claude-haiku-4-5
+  #     - claude-haiku-4-5-20251001
+  #     - claude-opus-4-5-20251101
+  #     - claude-opus-4-6
+  #     - claude-opus-4-7
+  #     - claude-opus-4-8
+  #     - claude-opus-5
+  #     - claude-sonnet-4-5-20250929
+  #     - claude-sonnet-4-6
+  #     - claude-sonnet-5
+  #   priority: 2
+  #   timeout_ms: 120000
+
+  ## DISABLED 2026-08-26 by Chef: no Anthropic subscription or authorized
+  ## direct-provider route exists for chi. Kept commented for exact rollback.
+  # anthropic-direct:
+  #   url: https://api.anthropic.com/v1
+  #   auth_type: oauth
+  #   credentials_path: ~/.claude/.credentials.json
+  #   models:
+  #     - claude-fable-5
+  #     - claude-haiku-4-5
+  #     - claude-haiku-4-5-20251001
+  #     - claude-opus-4-5-20251101
+  #     - claude-opus-4-6
+  #     - claude-opus-4-7
+  #     - claude-opus-4-8
+  #     - claude-opus-5
+  #     - claude-sonnet-4-5-20250929
+  #     - claude-sonnet-4-6
+  #     - claude-sonnet-5
+  #   priority: 8
+  #   timeout_ms: 120000
+
+  ## OpenAI Codex (ChatGPT subscription). First-party subscription usage via
+  ## the Responses backend; wire translation in src/proxy/codex-adapter.mjs.
+  ## TRUST ZONE 2 (providers.codex = trains in config/model-cards.overrides
+  ## .yaml): public-sensitivity buckets only, never internal/secret.
+  codex:
+    url: https://chatgpt.com/backend-api/codex
+    auth_type: codex_oauth
+    credentials_path: ~/skgateway-codex/secrets/codex-auth.json
+    models:
+      - gpt-5.6-sol
+      - gpt-5.6-terra
+      - gpt-5.6-luna
+      - gpt-5.5
+      - gpt-5.4
+      - gpt-5.4-mini
+    priority: 2
+    timeout_ms: 300000
+
+  ## REMOVED 2026-08-25 by Chef. Same box as above, his personal 5060, not part
+  ## of the chi cluster. This pool had never been instantiated, meaning it had
+  ## served zero requests in the process lifetime.
+  # ollama:
+  #   url: http://192.168.0.100:11434/v1
+  #   auth_type: none
+  #   models:
+  #     - "dolphin-*"
+  #   priority: 3
+
+  ## z.ai ZCode Coding Plan. The gateway reads the provisioned credential
+  ## files read-only. ZCode remains the credential lifecycle owner.
+  zai:
+    url: https://api.z.ai/api/coding/paas/v4
+    auth_type: zai_oauth
+    credentials_path: ~/.zcode/v2/config.json
+    discovery: zai
+    models: []
+    priority: 2
+    timeout_ms: 300000
+
+  ## DISABLED 2026-08-26 by Chef: NVIDIA NIM is reserved for future use.
+  ## The config loader deep-merges built-in defaults when this key is absent,
+  ## so omission is not a disable. This explicit non-advertised sentinel
+  ## prevents the default provider from returning without deleting its future
+  ## configuration contract. Re-enable only through a separately reviewed
+  ## provider, credential, discovery, pool, and model-set change.
+  nvidia:
+    url: http://127.0.0.1:9/v1
+    auth_type: none
+    models:
+      - "__disabled_nvidia_future_use__*"
+    priority: 999
+
+  ## OpenRouter free catalog. Disabled until OPENROUTER_API_KEY is provisioned
+  ## through the host secret workflow. The catalog must not be advertised as
+  ## usable while the account credential is absent.
+  openrouter:
+    url: https://openrouter.ai/api/v1
+    auth_type: api_key
+    api_key_env: OPENROUTER_API_KEY
+    discovery: free
+    models: []
+    priority: 5
+    timeout_ms: 120000
+
+tools:
+  guaranteed:
+    - exec
+    - read
+    - write
+    - edit
+    - message
+  max_budget: 16
+  fallback_budget: 8
+  call_limit: 10
+
+streaming:
+  default: true
+  force_header: x-skgateway-nonstream
+  auto_nonstream:
+    enabled: true
+    trigger_if_body_bytes_ge: 40000
+    trigger_if_messages_ge: 6
+    trigger_if_tool_call_history_ge: 3
+    aggressive_models:
+      - deepseek-ai/deepseek-v4-flash
+
+sanitizer:
+  max_system_bytes: 40000
+  max_body_bytes: 120000
+  keep_start: 2
+  keep_end: 12
+  strip_thinking: true
+
+model_limits:
+  ornith-1.5-9b:                              { max_body_bytes: 209715,   max_system_bytes: 83886   }
+  ornith-1.0-35b:                             { max_body_bytes: 800000,   max_system_bytes: 320000  }
+  ornith-big:                                 { max_body_bytes: 800000,   max_system_bytes: 320000  }
+  qwen3.8-27b-huihui-abliterated-q4_k_m:      { max_body_bytes: 800000,   max_system_bytes: 320000  }
+  qwen3.8-27b-ud-q5_k_xl:                     { max_body_bytes: 800000,   max_system_bytes: 320000  }
+  qwen3.8-27b:                                { max_body_bytes: 800000,   max_system_bytes: 320000  }
+  qwen38-abliterated:                         { max_body_bytes: 800000,   max_system_bytes: 320000  }
+  ## Codex family: 272K provider-declared context (272000*4*0.80 formula).
+  gpt-5.6-sol:                                { max_body_bytes: 870400,   max_system_bytes: 348160  }
+  gpt-5.6-terra:                              { max_body_bytes: 870400,   max_system_bytes: 348160  }
+  gpt-5.6-luna:                               { max_body_bytes: 870400,   max_system_bytes: 348160  }
+  gpt-5.5:                                    { max_body_bytes: 870400,   max_system_bytes: 348160  }
+  gpt-5.4:                                    { max_body_bytes: 870400,   max_system_bytes: 348160  }
+  gpt-5.4-mini:                               { max_body_bytes: 870400,   max_system_bytes: 348160  }
+
+metrics:
+  enabled: true
+  db_path: ./data/metrics.db
+  retention_days: 90
+  token_tracking: true
+  cost_tracking: true
+  pricing:
+    claude-opus-4-7:
+      input: 15.00
+      output: 75.00
+      cache_read: 1.50
+      cache_write: 3.75
+    claude-sonnet-4-6:
+      input: 3.00
+      output: 15.00
+      cache_read: 0.30
+      cache_write: 0.375
+    claude-haiku-4-5:
+      input: 0.80
+      output: 4.00
+      cache_read: 0.08
+      cache_write: 0.10
+    ## Codex subscription models: flat plan quota, zero incremental per-token
+    ## price. The budget signal is plan quota/rate limits, not dollars.
+    gpt-5.6-sol:
+      input: 0
+      output: 0
+    gpt-5.6-terra:
+      input: 0
+      output: 0
+    gpt-5.6-luna:
+      input: 0
+      output: 0
+    gpt-5.5:
+      input: 0
+      output: 0
+    gpt-5.4:
+      input: 0
+      output: 0
+    gpt-5.4-mini:
+      input: 0
+      output: 0
+    default_local:
+      input: 0
+      output: 0
+
+siem:
+  enabled: true
+  outputs:
+    - type: file
+      path: ./logs/audit.jsonl
+      rotate_mb: 100
+
+classification:
+  enabled: true
+  classifier: heuristic
+  gate: false
+
+identity:
+  enabled: true
+  allow_anonymous: true
+  require_agent_id: false
+
+## Bucket addressing ON for this instance: model ids shaped
+## sk-<S|M|L|XL>-<public|internal|secret> address a derived pool (capability
+## floor hard, trust-zone ceiling hard, fail closed 503 with reasons when
+## empty). codex models derive zone 2 and join *-public pools only.
+routing:
+  buckets_enabled: true
+  per_agent: {}
+
+dashboard:
+  enabled: true
+  refresh_ms: 5000
+
+discovery:
+  enabled: true
+  refresh_seconds: 3600
+  providers:
+    nvidia:     { enabled: false }
+    openrouter: { enabled: false }
+    codex:      { enabled: true }
+    zai:        { enabled: true }
+    ## anthropic stays DISABLED on this staged host (no CCAPI_TOKEN
+    ## provisioned; enabling without a token flips every cycle stale via the
+    ## 'anthropic wrapper token is unset' throw). Enable together with the
+    ## backend flip noted under backends.anthropic above.
+    # anthropic: { enabled: true, free_only: false, chat_only: true }

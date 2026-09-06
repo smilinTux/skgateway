@@ -1,0 +1,35 @@
+## skmodels registry for the STAGED codex gateway instance (chiap01, :18790).
+## Single source of truth for logical role routing on THIS instance. Buckets
+## (sk-<class>-<sensitivity>) bypass the registry entirely; these roles are
+## the stable named defaults for callers that do not assess workload class.
+##
+## SOVEREIGN DEFAULT: sk-default is the chiap08 Qwen3.8 27B (zone 0), so an
+## unclassified request never leaves our hardware. Zone-1 (claude) and zone-2
+## (codex subscription) targets are explicit opt-ins, never defaults.
+
+backends:
+  qwen38:
+    url: http://100.81.238.58:11439/v1
+    model: qwen3.8-27b-huihui-abliterated-q4_k_m
+    vision: true
+    min_output_tokens: 8192
+  codex-frontier:
+    url: https://chatgpt.com/backend-api/codex
+    model: gpt-5.6-sol
+  codex-mid:
+    url: https://chatgpt.com/backend-api/codex
+    model: gpt-5.6-luna
+  codex-fast:
+    url: https://chatgpt.com/backend-api/codex
+    model: gpt-5.4-mini
+
+roles:
+  ## Sovereign default: reasoning + tools + vision, zone 0, never egresses.
+  sk-default: qwen38
+  ## Subscription frontier (zone 2, public-classification work only).
+  sk-codex: codex-frontier
+  sk-codex-mid: codex-mid
+  sk-codex-fast: codex-fast
+
+defaults:
+  role: sk-default

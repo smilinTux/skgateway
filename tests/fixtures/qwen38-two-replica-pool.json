@@ -1,0 +1,26 @@
+{
+  "canonical_model": "qwen3.8-27b-huihui-abliterated-q4_k_m",
+  "request_aliases": [
+    "qwen3.8-27b-ud-q5_k_xl",
+    "qwen3.8-27b",
+    "qwen38-abliterated"
+  ],
+  "owned_by": "skgateway-qwen38-pool",
+  "replicas": [
+    {
+      "id": "chiap08-qwen38",
+      "capacity_domain": "chiap08-qwen38",
+      "max_concurrent": 4,
+      "advertised": true
+    },
+    {
+      "id": "chiap01-qwen38",
+      "capacity_domain": "chiap01-qwen38",
+      "max_concurrent": 4,
+      "advertised": true
+    }
+  ],
+  "excluded_backends": [
+    "nvidia"
+  ]
+}

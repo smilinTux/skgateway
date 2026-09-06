@@ -356,7 +356,7 @@ describe("recoverKimiToolCalls", () => {
 // ---------------------------------------------------------------------------
 
 describe("sanitizeResponse + recovery integration", () => {
-  test("recovers leaked tool_calls and flips finish_reason to tool_calls", () => {
+  test("recovers leaked tool_calls without rewriting finish_reason", () => {
     const body = {
       choices: [
         {
@@ -367,7 +367,7 @@ describe("sanitizeResponse + recovery integration", () => {
     };
     const out = sanitizeResponse(body, { label: "test" });
     const choice = out.choices[0];
-    assert.equal(choice.finish_reason, "tool_calls");
+    assert.equal(choice.finish_reason, "stop");
     assert.equal(choice.message.tool_calls.length, 1);
     assert.equal(choice.message.tool_calls[0].function.name, "search_files");
     assert.ok(choice.message.content.startsWith("I'll analyze"));
@@ -417,7 +417,7 @@ describe("sanitizeResponse + recovery integration", () => {
     };
     const out = sanitizeResponse(body, { label: "test" });
     const choice = out.choices[0];
-    assert.equal(choice.finish_reason, "tool_calls");
+    assert.equal(choice.finish_reason, "stop");
     assert.equal(choice.message.tool_calls.length, 1);
     assert.equal(choice.message.content, "");
   });
@@ -438,8 +438,8 @@ describe("sanitizeResponse + recovery integration", () => {
     assert.equal(choice.message.content, "Normal text response, no tools.");
   });
 
-  test("recovered malformed JSON args flow through Step 4 repair", () => {
-    // Args missing closing brace — Step 1a recovers, Step 4 repairs
+  test("leaves recovered malformed JSON args unchanged for strict validation", () => {
+    // Arguments missing a closing brace stay byte-exact and invalid.
     const body = {
       choices: [
         {
@@ -456,7 +456,7 @@ describe("sanitizeResponse + recovery integration", () => {
     };
     const out = sanitizeResponse(body, { label: "test" });
     const tc = out.choices[0].message.tool_calls[0];
-    // Repair should have closed the brace
-    assert.doesNotThrow(() => JSON.parse(tc.function.arguments));
+    assert.equal(tc.function.arguments, '{"path":"a","content":"x"');
+    assert.throws(() => JSON.parse(tc.function.arguments));
   });
 });

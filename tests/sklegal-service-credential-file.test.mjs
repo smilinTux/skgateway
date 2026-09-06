@@ -8,6 +8,7 @@ import {
   chmodSync,
   linkSync,
   mkdtempSync,
+  mkdirSync,
   renameSync,
   rmSync,
   symlinkSync,
@@ -64,6 +65,29 @@ function credential(value = "synthetic-service-credential") {
   return path;
 }
 
+function systemdCredential(value = "synthetic-service-credential") {
+  const credentialsRoot = root();
+  const unit = "skgateway-sklegal-qualification.service";
+  const directory = join(credentialsRoot, unit);
+  const path = join(directory, "skgateway-authz-service-token");
+  mkdirSync(directory, { mode: 0o700 });
+  writeFileSync(path, value, { mode: 0o440 });
+  chmodSync(path, 0o440);
+  return {
+    credentialsRoot,
+    directory,
+    path,
+    options: {
+      currentUid: typeof process.geteuid === "function" ? process.geteuid() : 0,
+      systemdRootUid: typeof process.geteuid === "function" ? process.geteuid() : 0,
+      systemdCredentialsRoot: credentialsRoot,
+      systemdCredentialDirectory: directory,
+      systemdCgroup: `0::/system.slice/${unit}\n`,
+      systemdMountInfo: `31 22 0:28 / ${directory} ro,nosuid,nodev,noexec - ramfs ramfs ro,nosuid,nodev\n`,
+    },
+  };
+}
+
 function client(path, fetchImpl, extra = {}) {
   return createSkLegalAuthzClient({
     url: "http://127.0.0.1:28779/v1/authz/decide",
@@ -82,6 +106,77 @@ describe("SKLegal systemd credential-file source", () => {
     const value = readSkLegalServiceCredential(path);
     assert.equal(value.toString("ascii"), "synthetic-service-credential");
     value.fill(0);
+  });
+
+  test("accepts 0440 only for the exact private systemd credential boundary", () => {
+    const fixture = systemdCredential();
+    const value = readSkLegalServiceCredential(fixture.path, fixture.options);
+    assert.equal(value.toString("ascii"), "synthetic-service-credential");
+    value.fill(0);
+  });
+
+  test("rejects every near-miss 0440 boundary before decoding", (context) => {
+    const fixture = systemdCredential();
+    const cases = [
+      ["missing directory identity", { systemdCredentialDirectory: undefined }],
+      ["wrong credentials root", { systemdCredentialsRoot: `${fixture.credentialsRoot}-other` }],
+      ["wrong service cgroup", { systemdCgroup: "0::/system.slice/other.service\n" }],
+      ["missing mount", { systemdMountInfo: "" }],
+      ["writable mount", { systemdMountInfo: fixture.options.systemdMountInfo.replaceAll("ro,", "rw,") }],
+      ["suid mount", { systemdMountInfo: fixture.options.systemdMountInfo.replaceAll(",nosuid", "") }],
+      ["device mount", { systemdMountInfo: fixture.options.systemdMountInfo.replaceAll(",nodev", "") }],
+      ["ordinary filesystem", { systemdMountInfo: fixture.options.systemdMountInfo.replaceAll("ramfs", "ext4") }],
+      ["wrong root owner", { systemdRootUid: fixture.options.systemdRootUid + 1 }],
+    ];
+    return Promise.all(cases.map(([name, changes]) => context.test(name, () => {
+      assert.throws(
+        () => readSkLegalServiceCredential(fixture.path, { ...fixture.options, ...changes }),
+        /credential file is unavailable/,
+      );
+    })));
+  });
+
+  test("rejects arbitrary 0440 paths even with otherwise valid systemd evidence", () => {
+    const fixture = systemdCredential();
+    const arbitrary = join(fixture.directory, "other-token");
+    writeFileSync(arbitrary, "synthetic", { mode: 0o440 });
+    chmodSync(arbitrary, 0o440);
+    assert.throws(
+      () => readSkLegalServiceCredential(arbitrary, fixture.options),
+      /credential file is unavailable/,
+    );
+  });
+
+  test("rejects linked or concurrently replaced exact 0440 credentials", () => {
+    const hardlinked = systemdCredential();
+    linkSync(hardlinked.path, join(hardlinked.directory, "second-link"));
+    assert.throws(
+      () => readSkLegalServiceCredential(hardlinked.path, hardlinked.options),
+      /credential file is unavailable/,
+    );
+
+    const symlinked = systemdCredential();
+    chmodSync(symlinked.path, 0o600);
+    renameSync(symlinked.path, `${symlinked.path}.real`);
+    symlinkSync(`${symlinked.path}.real`, symlinked.path);
+    assert.throws(
+      () => readSkLegalServiceCredential(symlinked.path, symlinked.options),
+      /credential file is unavailable/,
+    );
+
+    const replaced = systemdCredential();
+    assert.throws(
+      () => readSkLegalServiceCredential(replaced.path, {
+        ...replaced.options,
+        afterLstat: () => {
+          chmodSync(replaced.path, 0o600);
+          renameSync(replaced.path, `${replaced.path}.original`);
+          writeFileSync(replaced.path, "replacement", { mode: 0o440 });
+          chmodSync(replaced.path, 0o440);
+        },
+      }),
+      /credential file is unavailable/,
+    );
   });
 
   test("accepts every visible 7-bit ASCII boundary byte before decoding", () => {
@@ -108,6 +203,23 @@ describe("SKLegal systemd credential-file source", () => {
       assert.equal(decision.reason, "authz_decide fail-closed: authorization backend unavailable");
     }
     assert.equal(calls, 0);
+  });
+
+  test("rejects every control and high-bit byte through exact systemd 0440 before PDP", () => {
+    const fixture = systemdCredential();
+    const invalidBytes = [
+      ...Array.from({ length: 0x21 }, (_, byte) => byte),
+      ...Array.from({ length: 0x100 - 0x7f }, (_, index) => 0x7f + index),
+    ];
+    for (const byte of invalidBytes) {
+      chmodSync(fixture.path, 0o600);
+      writeFileSync(fixture.path, Buffer.from([0x41, byte, 0x42]), { mode: 0o440 });
+      chmodSync(fixture.path, 0o440);
+      assert.throws(
+        () => readSkLegalServiceCredential(fixture.path, fixture.options),
+        /credential file is unavailable/,
+      );
+    }
   });
 
   test("sends the file credential only to the local PDP and keeps request CapAuth separate", async () => {

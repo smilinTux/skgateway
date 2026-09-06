@@ -11,13 +11,10 @@
 
 import http from "node:http";
 import { loadConfig, getConfig } from "./config.mjs";
-import {
-  buildConfig,
-  applyModelLimits,
-  sanitizeSuccessfulResponseBody,
-} from "./proxy/core.mjs";
+import { createProxyServer, handleRequest, buildConfig, trimSystemMessages, trimConversationHistory } from "./proxy/core.mjs";
 import { createRouter, routeAndSend } from "./proxy/router.mjs";
-import { buildModelCatalog, reconcileModeFromConfig, tagLocalModels, mergeDiscoveredCatalog, isModelAvailable } from "./proxy/advertise.mjs";
+import { sanitizeResponse } from "./proxy/sanitizer.mjs";
+import { buildModelCatalog, reconcileModeFromConfig, tagLocalModels, mergeDiscoveredCatalog, isModelAvailable, excludedModelIds, withoutExcludedModels } from "./proxy/advertise.mjs";
 import { loadAllowlist, saveAllowlist, applyAllowlist } from "./advertise.mjs";
 import { discoverCatalog, loadCache, saveCache, fetchNvidia, fetchOpenRouter, fetchOpencode, fetchAnthropicWrapper, fetchCodex, fetchZai, catalogStatus, loadCardOverrides, applyCardOverlays, buildServingCatalog } from "./discovery.mjs";
 import { getPool, resetPool } from "./proxy/connection-pool.mjs";
@@ -26,6 +23,7 @@ import { ClientAuthenticator, classifyAuthenticationRoute, stripCallerCredential
 import { createAuthzClient } from "./policy/authz_decide.mjs";
 import { createSkLegalAuthzClient } from "./policy/sklegal_authz_decide.mjs";
 import { classifyRoute } from "./policy/authz_routes.mjs";
+import { runModelEval, isEvalEligible, createLoopbackChatComplete } from "./ranking/eval.mjs";
 import {
   authzEnforceEnabled,
   authorizeRequest,
@@ -53,11 +51,13 @@ import { buildCapabilityCatalog } from "./ranking/catalog.mjs";
 import { REGISTRY_PATH } from "./proxy/registry.mjs";
 import { energyRowsFrom, energyHeaders } from "./metrics/energy.mjs";
 import { attributionHeaders } from "./metrics/attribution.mjs";
-import { allBuckets, physicalCapacity, resolveBucket } from "./policy/buckets.mjs";
+import { sampleTokenRatio } from "./metrics/token-ratio.mjs";
+import { allBuckets, resolveBucket } from "./policy/buckets.mjs";
 import { loadRegistry, REGISTRY_PATH as _REGISTRY_PATH } from "./proxy/registry.mjs";
 import { policyFromRegistry } from "./policy/sensitivity.mjs";
 import { readFileSync } from "node:fs";
 import { load as yamlLoad } from "js-yaml";
+import { createShadowRecorder } from "./proxy/semantic-cache-shadow.mjs";
 
 // ─── Parse CLI args ───
 const args = process.argv.slice(2);
@@ -243,20 +243,19 @@ export function registerDiscoveredRoutes(cfg, catalog, opts = {}) {
     // For discovery-managed backends the configured list is a cold-start seed,
     // not a permanent union. The first authoritative cycle replaces it so a
     // retired model can actually leave routing.
-    const staticModels = cfg.backends?.[name]?.discovery
+    const staticModels = backend.discovery
       ? []
       : (cfg.backends?.[name]?.models || []).filter((x) => typeof x === "string");
     const merged = [...new Set([...staticModels, ...ids])];
-    backend.models = filterRoutableModelIds(merged, getLifecycleFn, [name]);
-    // Lifecycle pruning can legitimately empty this list (every known id for
-    // this provider is currently eol/dead). Backend#supportsModel() treats an
-    // EMPTY models array as "wildcard match everything" UNLESS the backend is
-    // flagged `discovery`-managed (router.mjs:398), and this function IS the
-    // discovery route registrar for nvidia/openrouter, whether or not the
-    // operator also set config.backends.<name>.discovery in YAML. Without
-    // this guard an all-eol provider would flip from "serves nothing"
-    // (correct) to "serves everything" (exactly what P1.4 exists to prevent).
-    if (backend.models.length === 0) backend.discovery = backend.discovery || name;
+    const routable = filterRoutableModelIds(merged, getLifecycleFn, [name]);
+    if (typeof backend.replaceDiscoveredModels === "function" && backend.discovery) {
+      backend.replaceDiscoveredModels(routable);
+    } else {
+      backend.models = routable;
+      // Lifecycle pruning can legitimately empty this list. Mark it discovery
+      // managed so empty never becomes the ordinary wildcard convention.
+      if (backend.models.length === 0) backend.discovery = backend.discovery || name;
+    }
   }
 }
 
@@ -622,9 +621,40 @@ export async function refreshCatalog(cfg, discoverCatalogFn = discoverCatalog) {
     probeSeconds: d.probe_seconds || 0,
     probeBudget: d.probe_budget,
     probeTimeoutMs: d.probe_timeout_ms,
+    // 2026-09-04 (card 0e010400): which providers the sweep hits, and which
+    // of them carry the tier-2 capability battery. Same "wiring lands with
+    // the feature" rule as C3 above: every key here is read at the only
+    // production call site, so an operator setting it sees it take effect.
+    //   discovery.probe_providers: [nvidia, openrouter]   (default [nvidia])
+    //   discovery.providers.<name>.capability_battery: true (default off)
+    //   discovery.capability_budget / capability_interval_seconds /
+    //   capability_timeout_ms / capability_scope ('sweep' | 'provider')
+    // Undefined knobs fall through to probe.mjs / capability-assessment.mjs
+    // defaults, exactly like probe_budget above.
+    probeProviders: Array.isArray(d.probe_providers) && d.probe_providers.length
+      ? d.probe_providers.map(String)
+      : undefined,
+    capabilityProviders: Object.entries(d.providers || {})
+      .filter(([, p]) => p && p.capability_battery === true)
+      .map(([name]) => name),
+    capabilityBudget: d.capability_budget,
+    capabilityIntervalMs: d.capability_interval_seconds ? d.capability_interval_seconds * 1000 : undefined,
+    capabilityTimeoutMs: d.capability_timeout_ms,
+    capabilityScope: d.capability_scope,
   });
   _catalog = models;
   registerDiscoveredRoutes(cfg, models);
+  // Providers absent from the returned catalog still completed a discovery
+  // attempt. Record that outcome so pending becomes attributable failed/stale
+  // instead of remaining ambiguous forever.
+  const zaiProvider = _discoveryCache.providers?.zai;
+  if (cfg.backends?.zai && !models.some((m) => m.provider === "zai")) {
+    router.registerDiscoveredModels?.("zai", [], {
+      ok: zaiProvider?.ok !== false,
+      stale: zaiProvider?.ok === false,
+      at: zaiProvider?.lastAttemptAt || Date.now(),
+    });
+  }
   saveCache(_discoveryCache);
   return models;
 }
@@ -959,6 +989,23 @@ function siemHook(evt) {
   for (const out of esOutputs) {
     try { out.write(evt); } catch { /* never let ES break the hot path */ }
   }
+}
+
+/**
+ * One recorder for the process. Built lazily on first eligible request so a
+ * disabled cache costs nothing at boot and an unreachable embedder cannot stop
+ * the gateway starting. A disabled→enabled config transition (e.g. via a
+ * SIGHUP reload that mutates the same config object) takes effect on the next
+ * eligible request, since _shadowCache is still null until then; but once
+ * built, later changes to threshold/categories/embed settings on an
+ * already-enabled cache are NOT picked up until process restart.
+ */
+let _shadowCache = null;
+function shadowCache(config) {
+  const cfg = config.semantic_cache;
+  if (!cfg?.enabled) return null;
+  if (!_shadowCache) _shadowCache = createShadowRecorder(cfg, { emit: siemHook });
+  return _shadowCache;
 }
 
 // ─── Build per-model limit map from YAML model_limits section ───
@@ -1396,6 +1443,14 @@ export const server = http.createServer(async (req, res) => {
   if (req.url === "/queue") {
     const allStats = pool.getAllStats();
     const total = pool.getTotalStats();
+    // In-flight requests with age: the discriminator between a WORKING
+    // worker (fresh open request, ages cycling) and a HUNG one (a request
+    // open for many minutes). Two fleet workers were mistaken for hung on
+    // ep_poll on 2026-09-03; this ends that ambiguity for every consumer:
+    // ops, the barrier test (expects inFlight: []), and monitoring.
+    const inFlight = (typeof metrics?.inFlightRequests === "function"
+      ? metrics.inFlightRequests() : [])
+      .sort((a, b) => b.ageMs - a.ageMs).slice(0, 50);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
       pool: {
@@ -1404,6 +1459,7 @@ export const server = http.createServer(async (req, res) => {
         totalCapacity: total.totalCapacity,
         utilization: total.totalCapacity > 0 ? (total.totalActive / total.totalCapacity) : 0,
       },
+      inFlight,
       backends: allStats,
       timestamp: new Date().toISOString(),
     }));
@@ -1449,12 +1505,14 @@ export const server = http.createServer(async (req, res) => {
     try {
       const discovered = await getDiscoveredCatalog();
       const advertiseBackends = effectiveAdvertiseBackends(config.backends || {}, router);
-      const reconciled = buildModelCatalog(advertiseBackends, router, advertiseReconcileMode);
+      const excluded = excludedModelIds(config);
+      const reconciled = buildModelCatalog(advertiseBackends, router, advertiseReconcileMode, excluded);
       // mergeDiscoveredCatalog() layers the discovered provider/free/stale tags
       // onto the reconciled health/status entries and GUARANTEES every model
       // carries a non-empty provider (see src/proxy/advertise.mjs). The
       // allowlist is applied last, exactly as on /admin/models.
-      const merged = mergeDiscoveredCatalog(reconciled, discovered, config?.advertise?.excluded_models);
+      const merged = withoutExcludedModels(
+        mergeDiscoveredCatalog(reconciled, discovered, advertiseBackends), excluded);
       const allowlist = loadAllowlist();
       const allowed = applyAllowlist(merged, allowlist);
       // Aliases (buckets + registry roles): additive, allowlist-aware,
@@ -1476,7 +1534,8 @@ export const server = http.createServer(async (req, res) => {
     } catch (e) {
       console.warn("[skgateway] /v1/models discovery merge failed, falling back to static catalog:", e.message);
       const advertiseBackends = effectiveAdvertiseBackends(config.backends || {}, router);
-      const fallback = buildModelCatalog(advertiseBackends, router, advertiseReconcileMode);
+      const excluded = excludedModelIds(config);
+      const fallback = buildModelCatalog(advertiseBackends, router, advertiseReconcileMode, excluded);
       const allowlist = loadAllowlist();
       const allowed = applyAllowlist(fallback, allowlist);
       const aliases = allowAliases(aliasCatalogEntries(getConfig()), allowlist);
@@ -1512,8 +1571,11 @@ export const server = http.createServer(async (req, res) => {
     if (!id) { notFound(); return; }
     try {
       const discovered = await getDiscoveredCatalog();
-      const reconciled = buildModelCatalog(effectiveAdvertiseBackends(config.backends || {}, router), router, advertiseReconcileMode);
-      const merged = mergeDiscoveredCatalog(reconciled, discovered, config?.advertise?.excluded_models);
+      const excluded = excludedModelIds(config);
+      const advertiseBackends = effectiveAdvertiseBackends(config.backends || {}, router);
+      const reconciled = buildModelCatalog(advertiseBackends, router, advertiseReconcileMode, excluded);
+      const merged = withoutExcludedModels(
+        mergeDiscoveredCatalog(reconciled, discovered, advertiseBackends), excluded);
       const data = applyAllowlist(merged, loadAllowlist());
       const entry = data.find((m) => m.id === id);
       // Registry role (sk-default/sk-auto/sk-creative/...): a valid routing
@@ -1549,7 +1611,10 @@ export const server = http.createServer(async (req, res) => {
       // Overlay our curated cards so static models (claude/ornith, which
       // discovery never gives a card) show their real capabilities + dex
       // fields here, not just the discovered ones (model-dex work).
-      const full = applyCardOverlays(await getDiscoveredCatalog(), loadCardOverrides());
+      const full = withoutExcludedModels(
+        applyCardOverlays(await getDiscoveredCatalog(), loadCardOverrides()),
+        excludedModelIds(config),
+      );
       const allow = loadAllowlist();
       // Aliases (buckets + registry roles): additive to the admin view.
       // Buckets gated on routing.buckets_enabled; roles always advertised.
@@ -1688,6 +1753,71 @@ export const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ── POST /admin/models/eval?model=<id> — card P3.5, the micro-eval harness ──
+  // Runs the deterministic battery (capability-assessment.mjs: tool_call,
+  // structured_output, instruction_following, min_output_tokens) against ONE
+  // model THROUGH this gateway, and persists the result onto that model's
+  // lifecycle record, where catalog.mjs threads it back into
+  // capabilities.tool_use as `basis:'eval'`.
+  //
+  // EXPLICITLY OPERATOR-TRIGGERED, never automatic (design 6.3: "Never runs in
+  // the hot path or refresh loop"). The battery spends real completions and
+  // real latency; attaching that to the refresh loop is how a smoke test
+  // quietly becomes a benchmark nobody authorised. Loopback only, same gate as
+  // every other /admin route.
+  if (req.method === "POST" && req.url.split("?")[0] === "/admin/models/eval") {
+    if (!isLoopback(req)) {
+      res.writeHead(403, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "Admin routes are loopback only", code: 403 } }));
+      return;
+    }
+    let modelId = null;
+    try {
+      modelId = new URL(req.url, "http://127.0.0.1").searchParams.get("model");
+    } catch {
+      modelId = null;
+    }
+    if (!modelId) {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "query parameter `model` is required", code: 400 } }));
+      return;
+    }
+    try {
+      const catalog = buildCapabilityCatalog(buildServingCatalog(), { getLifecycleFn: getLifecycle });
+      const entry = catalog.find((e) => e.id === modelId);
+      if (!entry) {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: `unknown model ${modelId}`, code: 404 } }));
+        return;
+      }
+      if (!isEvalEligible(entry)) {
+        // Design 6.3 scopes the harness to free/local. An UNKNOWN tier lands
+        // here too: billing someone's paid account to discover a capability is
+        // the most expensive possible way to guess.
+        res.writeHead(409, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          error: {
+            message: "eval runs against free/local models only",
+            code: 409,
+            model: modelId,
+            sovereignty: entry.capabilities?.sovereignty ?? null,
+          },
+        }));
+        return;
+      }
+      const out = await runModelEval(modelId, {
+        chatComplete: createLoopbackChatComplete({ port }),
+      });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, ...out }));
+    } catch (e) {
+      console.warn("[skgateway] /admin/models/eval failed:", e.message);
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "eval failed", code: 500 } }));
+    }
+    return;
+  }
+
   // ── GET /admin/buckets — live per-bucket pool membership (Part 1b) ──
   // Loopback only, read-only (pattern: /admin/models/rank).
   if (req.url === "/admin/buckets" && req.method === "GET") {
@@ -1701,7 +1831,9 @@ export const server = http.createServer(async (req, res) => {
       // the live bucket request path. Raw discovery omits local/Anthropic
       // entries and carries no derived trust_zone, which made this endpoint
       // report every internal and secret pool as empty while routing disagreed.
-      const catalog = buildCapabilityCatalog(buildServingCatalog(), {
+      const cfg = getConfig();
+      const excluded = excludedModelIds(cfg);
+      const catalog = buildCapabilityCatalog(withoutExcludedModels(buildServingCatalog(), excluded), {
         getLifecycleFn: getLifecycle,
       });
       const policy = policyFromRegistry(loadRegistry());
@@ -1711,7 +1843,6 @@ export const server = http.createServer(async (req, res) => {
           .map((backend) => backend.id);
         return isEffectivelyRoutable(getLifecycle(e.id), claimers);
       };
-      const cfg = getConfig();
       const bucketsEnabled = cfg?.routing?.buckets_enabled === true;
       const all = allBuckets();
       const out = [];
@@ -1723,13 +1854,16 @@ export const server = http.createServer(async (req, res) => {
             sensitivityPolicy: policy,
             isRoutable: isRoutableFn,
           });
+          const physicalResources = new Set(members.map((m) => m.physical_resource_id));
           out.push({
             bucket: b.bucket,
             model_class: b.model_class,
             sensitivity: b.sensitivity,
             ceiling,
             members,
-            physical_capacity: physicalCapacity(members),
+            member_alias_count: members.length,
+            physical_server_count: physicalResources.size,
+            physical_resources: [...physicalResources],
             rejected,
           });
         } catch (e) {
@@ -1781,7 +1915,10 @@ export const server = http.createServer(async (req, res) => {
     try {
       // Overlay curated cards first so static models (claude/ornith) carry the
       // capabilities the ranker needs (tools/ctx), not just discovered models.
-      const full = applyCardOverlays(await getDiscoveredCatalog(), loadCardOverrides());
+      const full = withoutExcludedModels(
+        applyCardOverlays(await getDiscoveredCatalog(), loadCardOverrides()),
+        excludedModelIds(config),
+      );
       const catalog = buildRankCatalog(full);
       const allow = loadAllowlist();
       const chain = rankModels(catalog, requirements, {
@@ -1896,56 +2033,22 @@ export const server = http.createServer(async (req, res) => {
 
     let parsedModel = req.headers["x-model"] || undefined;
     let parsedMessages = undefined;
-    let parsedRouteBody = null;
     if (anthropicWant || (req.headers["content-type"]?.includes("application/json") && routeBody.length)) {
       try {
-        parsedRouteBody = JSON.parse(routeBody.toString("utf-8"));
-        parsedModel = parsedRouteBody.model || parsedModel;
+        const parsed = JSON.parse(routeBody.toString("utf-8"));
+        parsedModel = parsed.model || parsedModel;
         // Carry messages for sk-auto difficulty classification (registry.mjs).
-        if (Array.isArray(parsedRouteBody.messages)) parsedMessages = parsedRouteBody.messages;
+        if (Array.isArray(parsed.messages)) parsedMessages = parsed.messages;
       } catch {}
-    }
-
-    // Apply the same model-limit stages used by the standalone proxy core.
-    // A body that cannot be brought within policy is rejected before routing,
-    // so no backend or provider can observe it.
-    if (
-      req.method === "POST" &&
-      routePath.split("?")[0] === "/v1/chat/completions" &&
-      parsedRouteBody
-    ) {
-      const limitResult = applyModelLimits(parsedRouteBody, proxyConfig);
-      if (!limitResult.ok) {
-        siemHook({
-          ts: new Date().toISOString(),
-          event: "model_limit_rejected",
-          model: parsedModel || null,
-          body_bytes: limitResult.bodyBytes,
-          system_bytes: limitResult.systemBytes,
-          path: req.url,
-        });
-        res.writeHead(413, { "content-type": "application/json", "cache-control": "no-store" });
-        res.end(JSON.stringify({
-          error: {
-            message: "Request still exceeds configured model limits after trimming",
-            code: "model_limit_exceeded",
-            status: 413,
-          },
-        }));
-        return;
-      }
-      if (limitResult.applied) {
-        routeBody = limitResult.body;
-        parsedMessages = parsedRouteBody.messages;
-      }
     }
 
     // ── Prompt classification (P3.5) — PASSIVE observability into SIEM ──
     // Label the request's intent/risk/jailbreak/injection and emit it. Pure
     // heuristic (no network, sub-10ms), fail-open, and it NEVER changes routing.
+    let classification = null;
     if (config.classification?.enabled && Array.isArray(parsedMessages)) {
       try {
-        const classification = classifyRequest(parsedMessages, {
+        classification = classifyRequest(parsedMessages, {
           classifier: config.classification.classifier,
         });
         siemHook(toSiemEvent(classification, {
@@ -2026,7 +2129,7 @@ export const server = http.createServer(async (req, res) => {
     // failure here must not become a second, fabricated error stacked on top
     // of whatever the request path already did.
     let metricsClosed = false;
-    function closeMetrics({ statusCode, responseHeaders, responseBody, backend, modelServed, errorMsg, energy, energyAttempts } = {}) {
+    function closeMetrics({ statusCode, firstByteMs, generationMs, responseHeaders, responseBody, backend, modelServed, errorMsg, energy, energyAttempts, result } = {}) {
       if (!metrics || !metricsReqId || metricsClosed) return;
       metricsClosed = true;
       try {
@@ -2034,6 +2137,8 @@ export const server = http.createServer(async (req, res) => {
           reqId: metricsReqId,
           statusCode,
           totalMs: Date.now() - startTime,
+          firstByteMs,
+          generationMs,
           responseHeaders: responseHeaders ?? {},
           responseBody: responseBody ?? null,
           agentId: metricsAgentId,
@@ -2047,6 +2152,21 @@ export const server = http.createServer(async (req, res) => {
           modelServed,
           backend,
           errorMsg,
+          // Provider-neutral rail attribution (card e19f88db / SKGW-ATTRIBUTION-01)
+          attribution: {
+            client: req.headers["x-app"] || undefined,
+            application: req.headers["user-agent"] || undefined,
+            // One canonical source: the router's result.logicalRoute, the
+            // same value response headers expose. Never re-derive here.
+            // Card bc908525 / review b62e19f8 finding 4.
+            logicalRoute: result?.logicalRoute || undefined,
+            rail: result?.rail || undefined,
+            provider: result?.provider || undefined,
+            backendNode: result?.backendId || undefined,
+            requestedModel: parsedModel || undefined,
+            servedModel: modelServed || undefined,
+            runtimeRevision: result?.runtimeRevision || undefined,
+          },
         });
       } catch (err) {
         console.error("[skgateway] metrics recordResponse failed:", err.message);
@@ -2083,11 +2203,71 @@ export const server = http.createServer(async (req, res) => {
       }
     }
 
+    // ── Apply model limits to request body (card 080e032e) ──
+    // Fail-closed: reject before any provider dispatch if limits are exceeded.
+    // Uses the same model_limits config section as core.mjs, with the same
+    // per-model overrides for maxBodyBytes and maxSystemBytes.
+    let transformedBody = routeBody;
+    let transformedMessages = parsedMessages;
+    try {
+      if (parsedModel && parsedMessages && Array.isArray(parsedMessages)) {
+        // Build a minimal parsed body object for the trim functions
+        const parsedBody = { model: parsedModel, messages: [...parsedMessages] };
+
+        // Resolve per-model limits (overrides global defaults)
+        const modelLimits = buildModelLimits(config.model_limits || {});
+        const perModel = modelLimits[parsedModel] || {};
+        const maxBodyBytes = perModel.maxBodyBytes || 120000;
+        const maxSystemBytes = perModel.maxSystemBytes || 40000;
+
+        // trimSystemMessages() and trimConversationHistory() both do
+        //     const log = cfg.logger.log.bind(cfg.logger);
+        // so a cfg without a logger throws on the FIRST line of the trim, the
+        // fail-closed catch below turns that into a 500, and every request the
+        // gateway serves 500s. A logger is not optional here.
+        const cfg = {
+          maxBodyBytes,
+          maxSystemBytes,
+          logger: { log: (msg) => console.log(`[skgateway] ${msg}`) },
+        };
+
+        // Trim system messages first (to free budget for history)
+        trimSystemMessages(parsedBody, cfg);
+
+        // Trim conversation history
+        trimConversationHistory(parsedBody, cfg);
+
+        // Update the transformed messages for dispatch
+        transformedMessages = parsedBody.messages;
+
+        // Re-serialize the body with transformed messages
+        // This replaces routeBody before it goes to routeAndSend
+        if (anthropicWant || (req.headers["content-type"]?.includes("application/json"))) {
+          const requestObj = JSON.parse(routeBody.toString("utf-8"));
+          requestObj.messages = transformedMessages;
+          transformedBody = Buffer.from(JSON.stringify(requestObj), "utf-8");
+        }
+      }
+    } catch (e) {
+      // Fail-closed: any error during limit application rejects the request
+      // before provider dispatch
+      console.error("[skgateway] model limits processing failed (fail-closed):", e.message);
+      closeMetrics({ statusCode: 500, errorMsg: "Request processing failed" });
+      if (!res.headersSent) {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "Request processing failed", code: 500 } }));
+      }
+      return;
+    }
+
     const routeRequest = {
       model:   parsedModel,
-      messages: parsedMessages,
+      messages: transformedMessages,
       // Verified CapAuth identity (falls back to X-Agent-Id / anonymous).
       agentId: metricsAgentId,
+      // Preserve the resolved request/session identity on every typed router
+      // audit event, alongside agent and per-request correlation ids.
+      sessionId: identity.session_id || req.headers["x-session-id"] || undefined,
       // skmodels registry role/context routing (single source of truth).
       // Present => routeAndSend resolves via ~/.skcapstone/models/registry.yaml
       // (precedence context > service > role > default) before backend select.
@@ -2125,41 +2305,144 @@ export const server = http.createServer(async (req, res) => {
     res.once("close", onClientClose);
     if (res.destroyed) onClientClose();
     try {
+      // Semantic cache, SHADOW ONLY. Records whether a cached answer would have
+      // matched and throws that answer away. It cannot change what is served.
+      // Guarded on eligible() first so ineligible traffic never spends an embed.
+      const _sc = shadowCache(config);
+      // KNOWN BIASES — all three inflate the measured shadow hit rate above
+      // what serving would ever achieve, because they make distinct requests
+      // hash/embed identically. Deliberately left as-is here (fixing them is
+      // a design decision for whoever enables serving, not this shadow-only
+      // measurement pass); see the CAVEAT emitted alongside the hit rate in
+      // scripts/semantic-cache-report.mjs.
+      //   1. Only role==="user" content is included: the system prompt is
+      //      excluded from the key. Two requests with identical user text but
+      //      different system prompts embed identically and count as a
+      //      would-hit, even though namespacing (agent:category) does not
+      //      isolate them.
+      //   2. Non-string content (multimodal/array turns, e.g. images) maps to
+      //      "": two requests differing only by an image embed identically.
+      //   3. createShadowRecorder() below passes no maxChars, so
+      //      embedders/mxbai.mjs truncates at 1100 chars: two long
+      //      conversations sharing a prefix become the same vector.
+      const _scText = _sc && Array.isArray(parsedMessages)
+        ? parsedMessages.filter((m) => m?.role === "user")
+            .map((m) => (typeof m.content === "string" ? m.content : "")).join("\n").trim()
+        : "";
+      const _scCategory = classification?.category;
+      const _scEligible = Boolean(_sc && _scText && _sc.eligible(_scCategory));
+      if (_scEligible) {
+        try {
+          await _sc.observe({ text: _scText, agent: metricsAgentId, category: _scCategory });
+        } catch { /* the cache is an observer; a failure here must never fail the request */ }
+      }
+
       result = await routeAndSend(
-        router, routeRequest, routePath, req.method, req.headers, routeBody, true, siemHook,
+        router, routeRequest, routePath, req.method, req.headers, transformedBody, true, siemHook,
         upstreamAbort.signal,
       );
 
-      // The live composed entrypoint owns response writing, so it must run the
-      // core sanitizer before any successful chat response reaches the client.
-      if (
-        result?.status === 200 &&
-        routePath.split("?")[0] === "/v1/chat/completions" &&
-        String(result.headers?.["content-type"] || "").includes("application/json")
-      ) {
+      // ── Response sanitization (card 080e032e) ──
+      // Apply sanitizer.mjs response sanitization before the client receives bytes.
+      // This strips leaked markup, handles <think> blocks, and repairs malformed content.
+      // Fail-closed: sanitization errors reject before sending to client.
+      if (result && result.body && result.status === 200) {
         try {
-          result = { ...result, body: sanitizeSuccessfulResponseBody(result.body, proxyConfig) };
-        } catch (err) {
-          siemHook({
-            ts: new Date().toISOString(),
-            event: "response_sanitizer_rejected",
-            model: parsedModel || null,
-            path: req.url,
-            reason: err.message,
-          });
-          result = {
-            ...result,
-            status: 502,
-            headers: { "content-type": "application/json", "cache-control": "no-store" },
-            body: Buffer.from(JSON.stringify({
-              error: {
-                message: "Upstream response failed sanitizer processing",
-                code: "response_sanitizer_failed",
-                status: 502,
-              },
-            })),
-          };
+          let responseBody = result.body;
+          let needsReencoding = false;
+
+          // Parse response body for sanitization
+          if (!result.headers["content-type"]?.includes("text/event-stream")) {
+            // Non-streaming response: parse and sanitize JSON
+            try {
+              const parsedResponse = JSON.parse(responseBody.toString("utf-8"));
+              const sanitized = sanitizeResponse(parsedResponse, {
+                label: "skgateway",
+                thinkMode: config.sanitizer?.thinkMode || "strip"
+              });
+
+              // Check if sanitization changed anything
+              if (JSON.stringify(parsedResponse) !== JSON.stringify(sanitized)) {
+                result.body = Buffer.from(JSON.stringify(sanitized), "utf-8");
+                console.log(`[skgateway] response sanitized for model=${parsedModel}`);
+              }
+            } catch (parseError) {
+              // Not parseable as JSON - pass through unchanged
+              console.warn(`[skgateway] response not JSON, skipping sanitization: ${parseError.message}`);
+            }
+          }
+          // Streaming responses are buffered by routeAndSend and arrive here as
+          // complete bodies, so the same sanitization applies.
+        } catch (e) {
+          // Fail-closed: sanitization error rejects before sending to client
+          console.error("[skgateway] response sanitization failed (fail-closed):", e.message);
+          closeMetrics({ statusCode: 500, errorMsg: "Response sanitization failed" });
+          if (!res.headersSent) {
+            res.writeHead(500, { "content-type": "application/json" });
+            res.end(JSON.stringify({ error: { message: "Response sanitization failed", code: 500 } }));
+          }
+          return;
         }
+
+        if (_scEligible && result?.status === 200 && result?.body) {
+          try {
+            _sc.record({
+              text: _scText,
+              response: JSON.parse(result.body.toString("utf-8")),
+              agent: metricsAgentId,
+              category: _scCategory,
+            });
+          } catch { /* not JSON, nothing to cache; never break the response */ }
+        }
+
+        // Measure bytes-per-token against what the backend actually reported, so
+        // the context guard's byte budget can eventually stop guessing at ~4.
+        // Sampling only: nothing here changes trimming, routing, response bytes,
+        // or status codes. Never throws.
+        //
+        // bodyBytes is transformedBody, NOT routeBody: transformedBody is what
+        // was actually sent to the backend after model-limit trimming (see
+        // ~line 2165), and the backend's reported prompt_tokens describes
+        // exactly that payload. Measuring the pre-trim routeBody against those
+        // tokens would overstate bytes-per-token on every trimmed request.
+        //
+        // model is read from the response body the backend named, NOT
+        // result.servedModel and NEVER parsedModel/the requested alias. Same
+        // reasoning as the modelServed comment below (~line 2490): the backend
+        // can answer a different model than the router dispatched or the
+        // caller requested, and a ratio filed under the requested alias would
+        // blend every model that alias resolves to. sampleTokenRatio() already
+        // returns null when neither name is present, so no fabrication risk.
+        //
+        // Samples cover NON-STREAMING JSON responses only: an SSE body is a
+        // stream of `data: {...}` frames, not a single JSON object, so
+        // JSON.parse on it throws and the sample would silently vanish into
+        // the catch below. Rather than let that failure mode masquerade as
+        // "nothing to measure", detect it up front from the content-type and
+        // emit a token_ratio.skipped event instead, so the skipped population
+        // is countable and B-Task 3 can report "N measured, M skipped
+        // (streaming)" rather than presenting an unrepresentative sample as
+        // if it covered all traffic.
+        //
+        // Gated on siemEnabled: with SIEM off, siemHook() no-ops at line 959
+        // anyway, so the JSON.parse below (and the streaming content-type
+        // check) would run on every 200 response purely to throw the result
+        // away. That parse is synchronous and blocks the event loop for
+        // every concurrent request; skip the work entirely rather than pay
+        // it for a sink that is not listening.
+        if (siemEnabled) try {
+          if (result.headers?.["content-type"]?.includes("text/event-stream")) {
+            siemHook({ ts: new Date().toISOString(), event: "token_ratio.skipped", reason: "streaming" });
+          } else {
+            const _parsed = JSON.parse(result.body.toString("utf-8"));
+            const _sample = sampleTokenRatio({
+              model: (typeof _parsed?.model === "string" && _parsed.model) ? _parsed.model : result?.servedModel,
+              bodyBytes: transformedBody?.length ?? 0,
+              usage: _parsed?.usage,
+            });
+            if (_sample) siemHook({ ts: new Date().toISOString(), event: "token_ratio.sample", ..._sample });
+          }
+        } catch { /* a backend that reports no usage simply is not measured */ }
       }
 
       // The socket is already gone. routeAndSend has released the upstream
@@ -2282,12 +2565,15 @@ export const server = http.createServer(async (req, res) => {
         // missing row.
         closeMetrics({
           statusCode: res.headersSent ? (res.statusCode || 502) : 502,
+          firstByteMs: result?.firstByteMs,
+          generationMs: result?.generationMs,
           responseHeaders: {},
           responseBody: null,
           backend: result?.backendId,
           errorMsg: dispatchError.message,
           energy: result?.energy,
           energyAttempts: result?.energyAttempts,
+          result,
         });
       } else {
         let parsedBody = null;
@@ -2298,6 +2584,8 @@ export const server = http.createServer(async (req, res) => {
         }
         closeMetrics({
           statusCode: result?.status ?? res.statusCode,
+          firstByteMs: result?.firstByteMs,
+          generationMs: result?.generationMs,
           responseHeaders: result?.headers ?? {},
           responseBody: parsedBody,
           backend: result?.backendId,
@@ -2319,10 +2607,11 @@ export const server = http.createServer(async (req, res) => {
           // parsedBody is already null when the body is SSE or non-JSON, so
           // this is undefined on exactly those paths and the column stays NULL
           // meaning unobserved. That is by construction, not by a special
-          // case, and it must never be widened to `|| parsedModel`.
+          // case, and it must must never be widened to `|| parsedModel`.
           modelServed: result?.servedModel,
           energy: result?.energy,
           energyAttempts: result?.energyAttempts,
+          result,
         });
       }
     }
@@ -2373,6 +2662,20 @@ server.listen(port, bind, () => {
     const backendNames = Object.keys(config.backends || {});
     console.log("[skgateway] backends: " + (backendNames.join(", ") || "default"));
     console.log("[skgateway] metrics: " + (metrics ? "enabled" : "disabled"));
+    // Semantic cache (shadow mode) categorizes requests using the classifier's
+    // output (_scCategory, ~line 2272) and eligible() gates on that category.
+    // With classification off, classification is never assigned, _scCategory
+    // is always undefined, eligible(undefined) is always false, and the cache
+    // silently records zero events with no error anywhere on the request
+    // path. Warn once at startup so the operator finds the right knob instead
+    // of concluding semantic_cache.enabled itself is broken.
+    if (config.semantic_cache?.enabled && !config.classification?.enabled) {
+      console.warn(
+        "[skgateway] semantic_cache.enabled is true but classification.enabled is false: " +
+        "the semantic cache categorizes requests using the classifier's output, so with " +
+        "classification off it will record zero shadow events for every request.",
+      );
+    }
     if (dashboard) {
       const dashPort = config.dashboard?.port || config.server?.dashboard_port || 18781;
       console.log("[skgateway] dashboard: port " + dashPort);

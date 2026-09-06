@@ -56,10 +56,10 @@ const wedge = () => (_req, _res) => { /* intentionally never respond */ };
 const BODY = Buffer.from(JSON.stringify({ model: "claude-test", messages: [] }));
 const HEADERS = { "content-type": "application/json" };
 
-// ── 1. config wiring: fallback backend exists and orders after the wrapper ──
+// ── 1. config wiring: the wrapper is the ONLY claude-* backend ──────────────
 
-describe("config: anthropic-direct fallback backend", () => {
-  test("claude-* models resolve to [wrapper, direct] in priority order", async () => {
+describe("config: claude-* is subscription-only (no direct Anthropic)", () => {
+  test("claude-* resolves to the wrapper alone, with a fail-fast timeout", async () => {
     const cfg = (await loadConfig({ silent: true })).current();
     const rb = {};
     for (const [id, b] of Object.entries(cfg.backends || {})) {
@@ -71,18 +71,23 @@ describe("config: anthropic-direct fallback backend", () => {
     const candidates = await router.route({ model: "claude-opus-4-8" });
     const ids = candidates.map((c) => c.backendId);
 
-    // The wrapper is primary; the direct backend is a strictly lower-priority
-    // fallback for the SAME model → the SPOF now has a failover path.
+    // OPERATOR POLICY (2026-08-29, Chef): no direct-to-Anthropic route exists.
+    // Hitting api.anthropic.com with the subscription OAuth token bills as
+    // third-party extra usage and 400s outright ("Third-party apps now draw
+    // from your extra usage, not your plan limits") — it took the Telegram
+    // agent down. The wrapper on :18782 is the only subscription-covered path,
+    // so it is the only claude-* backend.
     assert.ok(ids.includes("anthropic"), "wrapper backend must serve claude-*");
-    assert.ok(ids.includes("anthropic-direct"), "direct fallback must serve claude-*");
     assert.equal(ids[0], "anthropic", "wrapper must be tried first");
-    assert.ok(ids.indexOf("anthropic-direct") > ids.indexOf("anthropic"),
-      "direct fallback must come after the wrapper");
+    assert.ok(!ids.includes("anthropic-direct"),
+      "no direct api.anthropic.com fallback may serve claude-*");
+    assert.ok(!cfg.backends?.["anthropic-direct"],
+      "anthropic-direct backend must not be configured");
 
+    // ACCEPTED TRADE-OFF: removing the fallback reinstates the :18782 SPOF
+    // (card 2b5bcedd). The fail-fast idle timeout is therefore load-bearing —
+    // a wedged wrapper must 504 quickly rather than hang forever.
     const wrap = router.getBackend("anthropic");
-    const direct = router.getBackend("anthropic-direct");
-    assert.ok(direct.priority > wrap.priority, "direct must be lower priority (higher number)");
-    assert.equal(direct.auth_type, "oauth", "direct fallback uses OAuth to api.anthropic.com");
     assert.ok(wrap.timeout_ms > 0, "wrapper must have a fail-fast idle timeout");
   });
 });

@@ -35,7 +35,7 @@
 import { test, describe, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -56,11 +56,13 @@ const {
   requestZoneCeiling,
   bucketLivenessTimeoutMs,
   DEFAULT_BUCKET_LIVENESS_TIMEOUT_MS,
+  ModelEolError,
 } = await import('../src/proxy/router.mjs');
 const { loadConfig } = await import('../src/config.mjs');
 const { _resetCacheForTests } = await import('../src/discovery/model_catalog_store.mjs');
 const { resetLocalHealth } = await import('../src/proxy/local-failover.mjs');
 const { looksLikeBucketAttempt, parseBucketId, allBuckets } = await import('../src/policy/buckets.mjs');
+const { EventType } = await import('../src/siem/events.mjs');
 
 const HEADERS = { 'content-type': 'application/json' };
 const bodyFor = (model) => Buffer.from(JSON.stringify({ model, messages: [{ role: 'user', content: 'hi' }] }));
@@ -119,6 +121,17 @@ function startUpstream(name) {
 }
 
 const parseBody = (r) => JSON.parse(r.body.toString('utf-8'));
+
+/** A real one-event-per-line sink, plus authoritative readback for assertions. */
+function auditSink(name) {
+  const auditPath = join(FIX_DIR, `${name}.jsonl`);
+  writeFileSync(auditPath, '', 'utf8');
+  return {
+    path: auditPath,
+    write: async (event) => appendFileSync(auditPath, `${JSON.stringify(event)}\n`, 'utf8'),
+    read: () => readFileSync(auditPath, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse),
+  };
+}
 
 // ───────────────────────────────────────────────────────────────────────────
 // Pure: which ids count as a missed bucket
@@ -222,13 +235,15 @@ ${extraRoles}defaults:
     pool.state.lastModel = null;
   });
 
-  test('flag ON: a valid bucket resolves to a member and dispatches', async () => {
-    // This is also the regression test for the emitSiem ReferenceError: before
-    // that fix, resolveBucketCandidates() threw before it could return
-    // candidates at all, so this request could not succeed.
+  test('SIEM call sites 1 + 3: both bucket_resolve decisions write one typed, attributable line', async () => {
+    // One request reaches both exact call sites: eligibility before the empty
+    // pool gate, then candidate-chain construction after lifecycle routing.
+    const audit = auditSink('bucket-resolve');
     await applyConfig({ buckets_enabled: true });
     const r = await routeAndSend(
-      router, { model: 'sk-l-secret', agentId: 't' }, '/chat/completions', 'POST', HEADERS, bodyFor('sk-l-secret'), false,
+      router,
+      { model: 'sk-l-secret', agentId: 'lumina', sessionId: 'sess-bucket' },
+      '/chat/completions', 'POST', HEADERS, bodyFor('sk-l-secret'), false, audit.write,
     );
     assert.equal(r.status, 200, 'a valid bucket must actually route');
     assert.equal(pool.state.count, 1);
@@ -236,6 +251,61 @@ ${extraRoles}defaults:
       pool.state.lastModel, 'pool-l-local',
       'secret admits only the sovereign member, and the body was rewritten to it',
     );
+
+    const decisions = audit.read().filter((e) => e.details.decision === 'bucket_resolve');
+    assert.equal(decisions.length, 2, 'each bucket_resolve call site writes exactly one line');
+    const eligibility = decisions.find((e) => e.details.phase === 'eligibility');
+    const chain = decisions.find((e) => e.details.phase === 'candidate_chain');
+    assert.equal(eligibility.event_type, EventType.REQUEST);
+    assert.equal(eligibility.details.outcome, 'eligible_members');
+    assert.equal(eligibility.details.bucket, 'sk-l-secret');
+    assert.equal(chain.event_type, EventType.REQUEST);
+    assert.equal(chain.details.outcome, 'candidate_chain_built');
+    assert.equal(chain.details.chain_length, 1);
+    for (const event of decisions) {
+      assert.equal(event.agent_id, 'lumina');
+      assert.equal(event.session_id, 'sess-bucket');
+      assert.ok(event.request_id);
+    }
+    assert.equal(new Set(decisions.map((e) => e.request_id)).size, 1);
+  });
+
+  test('SIEM call site 2: an EOL bucket member skip writes one anomaly outcome line', async () => {
+    const audit = auditSink('bucket-member-skipped');
+    writeFileSync(CATALOG_CACHE_PATH, JSON.stringify({ models: [
+      { id: 'skip-local', provider: 'local', free: true, card: { tier: 'local', size_class: 'L' } },
+      { id: 'serve-local', provider: 'local', free: true, card: { tier: 'local', size_class: 'L' } },
+    ] }), 'utf8');
+    _resetCacheForTests();
+    const backing = createRouter({
+      backends: { poolbackend: { url: pool.base, auth_type: 'none', models: ['skip-local', 'serve-local'], priority: 1 } },
+    });
+    const skipRouter = {
+      ...backing,
+      route: async (request) => {
+        if (request.model === 'skip-local') throw new ModelEolError(request.model, 'provider_410');
+        return backing.route(request);
+      },
+    };
+    await applyConfig({ buckets_enabled: true });
+
+    const r = await routeAndSend(
+      skipRouter,
+      { model: 'sk-l-secret', agentId: 'lumina', sessionId: 'sess-skip' },
+      '/chat/completions', 'POST', HEADERS, bodyFor('sk-l-secret'), false, audit.write,
+    );
+    assert.equal(r.status, 200);
+    assert.equal(r.bucketMember, 'serve-local');
+
+    const lines = audit.read().filter((e) => e.details.type === 'bucket_member_skipped');
+    assert.equal(lines.length, 1);
+    assert.equal(lines[0].event_type, EventType.ANOMALY);
+    assert.equal(lines[0].details.outcome, 'skipped');
+    assert.equal(lines[0].details.member, 'skip-local');
+    assert.equal(lines[0].details.eol_reason, 'provider_410');
+    assert.equal(lines[0].agent_id, 'lumina');
+    assert.equal(lines[0].session_id, 'sess-skip');
+    assert.ok(lines[0].request_id);
   });
 
   test('flag ON: an S-graded public request prefers sovereign local over a costlier coin flip', async () => {
@@ -367,11 +437,15 @@ ${extraRoles}defaults:
     assert.equal(pool.state.count, 0, 'NOTHING was dispatched: fail closed means closed');
   });
 
-  test('flag ON: a near-miss bucket id fails with invalid_bucket_id instead of being served', async () => {
-    // The measured defect: this used to return 200 from sk-auto's pick.
+  test('SIEM call site 4: invalid_bucket_id rejection writes one typed, attributable line', async () => {
+    // The measured defect: this used to return 200 from sk-auto's pick, while
+    // the invalid event type also meant the attempted evidence disappeared.
+    const audit = auditSink('invalid-bucket-id');
     await applyConfig({ buckets_enabled: true });
     const r = await routeAndSend(
-      router, { model: 'sk-xl-secrets', agentId: 't' }, '/chat/completions', 'POST', HEADERS, bodyFor('sk-xl-secrets'), false,
+      router,
+      { model: 'sk-xl-secrets', agentId: 'lumina', sessionId: 'sess-invalid' },
+      '/chat/completions', 'POST', HEADERS, bodyFor('sk-xl-secrets'), false, audit.write,
     );
     assert.equal(r.status, 400, '400 not 503: the address is wrong, and waiting does not fix it');
     const { error } = parseBody(r);
@@ -381,6 +455,16 @@ ${extraRoles}defaults:
     assert.ok(error.valid_buckets.includes('sk-xl-secret'), 'the caller is told the correction, not left guessing');
     assert.equal(error.valid_buckets.length, 12);
     assert.equal(pool.state.count, 0, 'nothing was routed');
+
+    const lines = audit.read();
+    assert.equal(lines.length, 1);
+    assert.equal(lines[0].event_type, EventType.ERROR);
+    assert.equal(lines[0].details.type, 'invalid_bucket_id');
+    assert.equal(lines[0].details.outcome, 'rejected');
+    assert.equal(lines[0].details.status_code, 400);
+    assert.equal(lines[0].agent_id, 'lumina');
+    assert.equal(lines[0].session_id, 'sess-invalid');
+    assert.ok(lines[0].request_id);
   });
 
   test('flag ON: the OTHER half of a near miss (bad class, real sensitivity) also fails', async () => {
@@ -507,12 +591,15 @@ defaults:
     process.env.SKGATEWAY_LOCAL_HEALTH_TTL_MS = '20000';
   });
 
-  test('ENFORCE ON + local down + secret: the exact sensitivity_no_eligible_candidate 503 contract', async () => {
+  test('SIEM call site 5: blocked sensitivity gate writes one policy decision line', async () => {
+    const audit = auditSink('sensitivity-gate');
     local.state.modelsStatus = 503; // liveness probe fails, local is unusable
     await applyConfig({ sensitivity_enforced: true });
 
     const r = await routeAndSend(
-      router, secretRequest(), '/chat/completions', 'POST', HEADERS, bodyFor('sk-default'), false,
+      router,
+      { ...secretRequest(), agentId: 'lumina', sessionId: 'sess-sensitive' },
+      '/chat/completions', 'POST', HEADERS, bodyFor('sk-default'), false, audit.write,
     );
 
     assert.equal(r.status, 503);
@@ -524,6 +611,18 @@ defaults:
     assert.equal(error.ceiling, 0);
     assert.equal(error.rejected_zone, 2, 'the free-remote fallback is the zone that was refused');
     assert.equal(cloud.state.count, 0, 'the whole point: the request did NOT leave for the cloud');
+
+    const lines = audit.read();
+    assert.equal(lines.length, 1);
+    assert.equal(lines[0].event_type, EventType.POLICY_VIOLATION);
+    assert.equal(lines[0].details.rule, 'sensitivity_ceiling');
+    assert.equal(lines[0].details.action, 'blocked');
+    assert.equal(lines[0].details.outcome, 'blocked');
+    assert.equal(lines[0].details.candidate_zone, 2);
+    assert.equal(lines[0].backend, 'cloudbackend');
+    assert.equal(lines[0].agent_id, 'lumina');
+    assert.equal(lines[0].session_id, 'sess-sensitive');
+    assert.ok(lines[0].request_id);
   });
 
   test('NEGATIVE CONTROL, ENFORCE OFF: the identical request is served by the cloud fallback', async () => {

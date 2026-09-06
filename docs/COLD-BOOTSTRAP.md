@@ -94,9 +94,14 @@ None are secrets:
 
 ### 2. Clone and install
 
+Choose a checkout directory with `SKGATEWAY_DIR`; the default below is portable
+across user accounts and can be overridden before running the commands.
+
 ```bash
-git clone https://github.com/smilinTux/skgateway.git ~/clawd/skcapstone-repos/skgateway
-cd ~/clawd/skcapstone-repos/skgateway
+export SKGATEWAY_DIR="${SKGATEWAY_DIR:-$HOME/src/skgateway}"
+mkdir -p "$(dirname "$SKGATEWAY_DIR")"
+git clone https://github.com/smilinTux/skgateway.git "$SKGATEWAY_DIR"
+cd "$SKGATEWAY_DIR"
 npm ci                       # reproducible install from package-lock.json
 node --check src/index.mjs   # exits 0 if the entrypoint parses
 ```

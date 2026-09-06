@@ -5,12 +5,18 @@
  * The gateway has always written `(id, agent_id, model, backend, session_id,
  * ...)` into request_log and returned NONE of it, so a caller holding a
  * response had no key to look its own request up by. It could see that the
- * gateway answered and could not see which row that answer was. These three
- * headers close that gap:
+ * gateway answered and could not see which row that answer was. These headers
+ * close that gap.
  *
- *   x-sk-req-id        the request_log primary key for THIS call
- *   x-sk-backend       the backend id that served it
- *   x-sk-model-served  the model that backend actually served
+ * Core attribution headers (card 3351d25b):
+ *   x-sk-req-id          the request_log primary key for THIS call
+ *   x-sk-backend         the backend id that served it
+ *   x-sk-model-served    the model that backend actually served
+ *
+ * Provider-neutral rail attribution headers (card e19f88db / SKGW-ATTRIBUTION-01):
+ *   x-sk-provider        inferred provider (nvidia, anthropic, local, etc.)
+ *   x-sk-rail            infrastructure rail (local, cloud, hybrid)
+ *   x-sk-logical-route   registry routing context (context/service/role)
  *
  * Two rules, both inherited on purpose from energyHeaders() in energy.mjs
  * rather than reinvented here, because the fleet must not carry two different
@@ -42,7 +48,7 @@
  *   The id recordRequest() returned, i.e. request_log.id. Null when metrics
  *   are disabled or recordRequest failed, in which case there is no row to
  *   join to and the header is correctly absent.
- * @param {{backendId?:string|null, servedModel?:string|null}|null|undefined} result
+ * @param {{backendId?:string|null, servedModel?:string|null, requestedModel?:string|null, bucket?:string|null, bucketMember?:string|null, provider?:string|null, rail?:string|null, logicalRoute?:string|null}|null|undefined} result
  *   routeAndSend()'s result for the SERVING attempt.
  * @returns {Record<string,string>}
  */
@@ -63,6 +69,16 @@ export function attributionHeaders(reqId, result) {
   }
   if (typeof result?.bucketMember === "string" && result.bucketMember) {
     out["x-sk-bucket-member"] = result.bucketMember;
+  }
+  // Provider-neutral rail attribution (card e19f88db / SKGW-ATTRIBUTION-01)
+  if (typeof result?.provider === "string" && result.provider) {
+    out["x-sk-provider"] = result.provider;
+  }
+  if (typeof result?.rail === "string" && result.rail) {
+    out["x-sk-rail"] = result.rail;
+  }
+  if (typeof result?.logicalRoute === "string" && result.logicalRoute) {
+    out["x-sk-logical-route"] = result.logicalRoute;
   }
   return out;
 }

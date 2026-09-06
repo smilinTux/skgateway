@@ -11,10 +11,14 @@
 ## (credentials_path). Real secrets arrive at runtime through a 0600
 ## EnvironmentFile (see docs/COLD-BOOTSTRAP.md), never in this YAML.
 ##
-## Every field has a code-level default in src/config.mjs, so a section you
-## delete falls back to that default. Reload the file at runtime with
-## `kill -HUP <pid>` (config only; secrets and backend topology need a full
-## restart).
+## Most fields have code-level defaults in src/config.mjs, so an omitted
+## section falls back to that default. `backends:` is different: when present,
+## it is the complete backend registry, so omitting an entry removes that
+## built-in backend. For explicit intent use `backend-name: { enabled: false }`.
+## Remove its pooling.per_backend and capacity_domains member references too;
+## orphan direct or reg:<backend> references fail startup validation. Reload the
+## file at runtime with `kill -HUP <pid>` (config only; secrets and backend
+## topology need a full restart).
 
 server:
   port: 18780
@@ -54,7 +58,11 @@ pooling:
 
 ## Backends are matched by model name. A request routes to the lowest priority
 ## NUMBER that lists a matching model (priority 1 wins), failing over to the next
-## eligible backend on 5xx. Replace the example host IPs and ports below with the
+## eligible backend on 5xx. This mapping replaces the built-in registry. Omit a
+## backend to remove it, or retain an explicit tombstone such as:
+##   anthropic: { enabled: false }
+## Disabled entries are removed before routing, discovery, advertisement, and
+## bucket construction. Replace the example host IPs and ports below with the
 ## reachable upstreams on THIS network.
 backends:
   ## Local OpenAI-compatible server (example: an ornith/llama.cpp box).
@@ -480,6 +488,44 @@ discovery:
   #                             # display limit: raise it deliberately.
   # probe_timeout_ms:  15000   # hard per-model abort timeout for a probe call
   #                             # (matches probe.mjs's DEFAULT_PROBE_TIMEOUT_MS).
+  # probe_providers: [nvidia]  # which providers get a sweep (card 0e010400).
+  #                             # One sweep per entry, each against that
+  #                             # backend's own url/api_key_env and pool
+  #                             # bucket. A provider with no backends.<name>
+  #                             # url or key in the environment is skipped.
+  #
+  ## Capability battery (card 2ba73bf9 / C9, wired by card 0e010400). Rides
+  ## the probe sweep above: a model that passed its liveness probe gets a
+  ## real tool_call / structured_output / instruction_following /
+  ## min_output_tokens battery (src/discovery/capability-assessment.mjs), up
+  ## to 7 completions, sent DIRECT to the provider. The result lands on the
+  ## model's lifecycle record as `measured_capabilities`, which ranking reads
+  ## as basis:'eval' ahead of any provider card claim. A 429/timeout/5xx is
+  ## recorded `unmeasured`, never `fail`. Off unless a provider opts in.
+  #
+  # providers:
+  #   nvidia:     { enabled: true, capability_battery: true }
+  #   openrouter: { enabled: true, capability_battery: true }
+  # capability_budget:            3    # models battered per provider per
+  #                                    # sweep (never-assessed first, then
+  #                                    # oldest-assessed). Real completions.
+  #                                    # Chef's estate runs 8: a fleet of
+  #                                    # ~20 active ids per provider is
+  #                                    # covered in 3 days, and an id that
+  #                                    # 429'd stays eligible until measured.
+  # capability_interval_seconds:  2592000  # re-assess an already-measured
+  #                                    # model at most every 30 days.
+  # capability_timeout_ms:        30000
+  # capability_scope:             sweep # `sweep`: only this sweep's long-tail
+  #                                    # candidates (models with no traffic in
+  #                                    # 7 days) are eligible, the original C9
+  #                                    # shape. `provider`: every non-dead model
+  #                                    # of the provider is eligible, so the
+  #                                    # actively-used models (which never fall
+  #                                    # into the long tail) get measured too;
+  #                                    # each still gets its liveness probe
+  #                                    # first, at most capability_budget extra
+  #                                    # probes per sweep.
   #
   ## Before setting probe_seconds > 0 anywhere it matters: confirm the cadence
   ## gate and budget behave as expected on a low-stakes node first. A live

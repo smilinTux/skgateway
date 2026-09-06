@@ -303,8 +303,9 @@ function startUpstream() {
         try { parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")); } catch {}
         if (parsed.stream) {
           r.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
-          r.write(`data: {"id":"c1","model":"${SERVED_ID}","choices":[{"delta":{"content":"hi"}}]}\n\n`);
-          r.write('data: {"id":"c1","choices":[{"delta":{}}],"usage":{"prompt_tokens":3,"completion_tokens":2}}\n\n');
+          r.write(`data: {"id":"c1","model":"${SERVED_ID}","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}\n\n`);
+          r.write('data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n');
+          r.write('data: {"id":"c1","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2}}\n\n');
           r.write("data: [DONE]\n\n");
           r.end();
           return;

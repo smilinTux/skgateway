@@ -274,8 +274,13 @@ describe("card P3.3: GET /admin/models/rank (suggest-only rank API)", () => {
     const a = out.find((m) => m.id === "model-a");
     assert.deepEqual(a.lifecycle, { state: "active" });
     assert.deepEqual(a.capabilities, { tag: "model-a" });
-    // Original fields survive (card, provider, free): additive, not replaced.
-    assert.deepEqual(a.card, { supported_parameters: ["tools"] });
+    // Original fields survive and routing declarations are additive.
+    assert.deepEqual(a.card, {
+      supported_parameters: ["tools"],
+      family: null,
+      unfamilied_reason: "No reviewed broad-family mapping exists for this catalog id",
+      cost_tier: "free-remote",
+    });
     assert.equal(a.free, true);
     const b = out.find((m) => m.id === "model-b");
     assert.deepEqual(b.lifecycle, { state: "eol" });

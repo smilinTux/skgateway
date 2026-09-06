@@ -241,6 +241,36 @@ export function recordModelOutcome(modelId, { status, now = Date.now(), claiming
 }
 
 /**
+ * Merge a measured capability record onto a model's PERSISTENT lifecycle
+ * record (card P3.5, design 6.3).
+ *
+ * The sibling of `recordModelOutcome` for the measurement half. probe.mjs
+ * already builds `measured_capabilities` during a sweep, but it owns the whole
+ * store map for that sweep and rewrites it wholesale; the on-demand eval path
+ * touches exactly ONE model and must not disturb any other record, so it needs
+ * this read-merge-write instead.
+ *
+ * NOT fail-soft, unlike `recordModelOutcome`. That one runs on the hot
+ * completion path where a store write must never break a request. This runs
+ * only from an explicit operator-triggered eval, where silently discarding the
+ * measurement you just spent real completions to obtain is the worse outcome.
+ *
+ * @param {string} modelId
+ * @param {object} record a CapabilityRecord from capability-assessment.mjs
+ * @param {string} [path]
+ * @returns {object} the merged lifecycle record as persisted
+ */
+export function recordCapabilityMeasurement(modelId, record, path = STORE_PATH) {
+  if (!modelId) throw new Error('recordCapabilityMeasurement: modelId is required');
+  assertNotProductionStoreInTest(path);
+  const store = loadCatalogStore(path);
+  const prev = store[modelId] || defaultLifecycle();
+  const next = { ...prev, measured_capabilities: record };
+  saveCatalogStore({ ...store, [modelId]: next }, path);
+  return next;
+}
+
+/**
  * Test-only: clear the in-memory cache. Not needed for cross-path isolation
  * (the cache is path-scoped already) but useful when a test reuses one path
  * and wants to force a fresh disk read.

@@ -1,0 +1,70 @@
+[Unit]
+Description=SKGateway shared shadow backend (profile 6073417e)
+Documentation=https://github.com/sk-oss/skgateway
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+## Profile hash for verification: 6073417e80f1f50fcdcc1ded64f823af98ae1cf39c2e190dc5c9a1c094f22380
+
+[Service]
+Type=simple
+User=sklegal-skgateway
+Group=sklegal-skgateway
+WorkingDirectory=/var/lib/sklegal/skgateway/shared-shadow
+
+## Configuration validation - must exist and be readable
+ExecStartPre=/usr/bin/test -r /etc/sklegal/skgateway/shared-shadow.yaml
+ExecStart=/usr/bin/node /opt/skgateway/src/index.mjs \
+    --port 28880 \
+    --config /etc/sklegal/skgateway/shared-shadow.yaml
+
+## Graceful reload on HUP
+ExecReload=/bin/kill -HUP $MAINPID
+
+## Restart policy - bounded
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+
+## Environment
+Environment=NODE_ENV=production
+Environment=SK_STANDALONE=1
+Environment=HOME=/var/lib/sklegal/skgateway/shared-shadow
+EnvironmentFile=-/etc/default/skgateway-shared-shadow
+
+## Security hardening
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+## Path restrictions
+ReadOnlyPaths=/opt/skgateway /etc/sklegal/skgateway
+ReadWritePaths=/var/lib/sklegal/skgateway /var/log/sklegal/skgateway
+
+## Standard I/O
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=skgateway-shared-shadow
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,85 @@
+[Unit]
+Description=SKGateway shared shadow tailnet-only ingress proxy
+Documentation=https://github.com/sk-oss/skgateway
+BindsTo=skgateway-shared-tailnet.socket
+After=skgateway-shared-shadow.service
+Requires=skgateway-shared-shadow.service
+## Restart rate limiting belongs in [Unit]; systemd ignores these keys in
+## [Service] and logged "Unknown key name 'StartLimitIntervalSec'", so the
+## restart limit was silently not applied.
+StartLimitIntervalSec=60s
+StartLimitBurst=3
+
+[Service]
+## Root-owned hardened supervised proxy
+Type=simple
+User=root
+Group=root
+
+## Security hardening - no privileges needed for TCP proxy
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+## Resource limits - connection and restart constraints
+LimitNOFILE=65536
+LimitNPROC=512
+MemoryMax=256M
+TasksMax=256
+CPUQuota=50%
+
+## Restart policy - bounded restarts with backoff
+Restart=on-failure
+RestartSec=5s
+
+## Timeout settings
+TimeoutStartSec=30s
+TimeoutStopSec=10s
+
+## Forward the tailnet-accepted connection to the loopback backend.
+##
+## systemd-socket-proxyd ships with systemd and does exactly this: it takes the
+## listening socket passed by the .socket unit and proxies to the given
+## address. It replaces a socat invocation that did not work: the socket unit
+## used Accept=yes (systemd accepts and hands over the connection) while socat
+## was told TCP4-LISTEN:0 (open a NEW listener on a random port), so the
+## accepted connection was never served and the listener nothing dialled.
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd --exit-idle-time=300s 127.0.0.1:28880
+
+## Environment
+Environment=NODE_ENV=production
+EnvironmentFile=-/etc/default/skgateway-shared-tailnet
+
+## Capability bounding - none needed
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+## Path restrictions - read-only system, no home access
+ReadOnlyPaths=/
+ReadWritePaths=/var/log/skgateway /var/run/skgateway
+InaccessiblePaths=/home /root /boot
+
+## Standard I/O
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=skgateway-shared-tailnet
+
+[Install]
+WantedBy=multi-user.target

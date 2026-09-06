@@ -415,3 +415,30 @@ describe('selectCapabilityCandidates', () => {
     assert.equal(DEFAULT_CAPABILITY_BUDGET, 3);
   });
 });
+
+describe('extractMessage accepts the raw OpenAI wire shape (loopback / direct runners)', () => {
+  test('a tool_call delivered as {json: {choices: [{message}]}} passes, instead of a false no_matching_tool_call', async () => {
+    const chatComplete = async () => ({
+      ok: true,
+      status: 200,
+      json: { choices: [{ message: { tool_calls: [{ function: { name: 'get_weather', arguments: '{"city":"Paris"}' } }] } }] },
+    });
+    const entry = await assessToolCalling(chatComplete, 'm', { now: 1 });
+    assert.equal(entry.status, 'pass');
+    assert.deepEqual(entry.evidence.arguments, { city: 'Paris' });
+  });
+
+  test('content delivered as a bare completion body is read too', async () => {
+    const chatComplete = async () => ({ ok: true, status: 200, choices: [{ message: { content: 'PONG' } }] });
+    const entry = await assessInstructionFollowing(chatComplete, 'm', { now: 1 });
+    assert.equal(entry.status, 'pass');
+  });
+
+  test('a 2xx with no readable message is still a determinate fail, never a throw', async () => {
+    const chatComplete = async () => ({ ok: true, status: 200, json: null });
+    const entry = await assessToolCalling(chatComplete, 'm', { now: 1 });
+    assert.equal(entry.status, 'fail');
+    assert.equal(entry.evidence.reason, 'no_matching_tool_call');
+  });
+});
+

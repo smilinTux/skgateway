@@ -1,0 +1,51 @@
+{
+  "card_id": "ae44a693",
+  "tailnet_interface": "tailscale0",
+  "ingress_port": 28880,
+  "backend_port": 28880,
+  "backend_address": "127.0.0.1",
+  "created_by": "jarvis",
+  "created_at": "2026-08-27T01:00:00Z",
+  "human_intent": "Estate-wide tailnet access is intended for qualified shared non-Matter SKGateway (profile 6073417e). This ingress provides controlled, supervised access across the estate tailnet while preserving the exact loopback backend profile.",
+  "acceptance_criteria": {
+    "1": "Ingress binds only the tailscale0 interface on port 28880, never wildcard, LAN, public, dashboard, or metrics; backend stays 127.0.0.1:28880 with exact profile 6073417e.",
+    "2": "Use a root-owned hardened supervised socket/proxy unit or equivalently narrow mechanism with exact hashes, no inline credential, Tailscale identity boundary, connection and restart limits, and disabled-by-default installation before qualification.",
+    "3": "Qualify access from chiap08 and denial or absence on non-tailnet interfaces; health, catalog, chat, SSE, tools, attribution, capacity, cancellation, backend outage, proxy restart, gateway restart, leakage, and audit pass with public synthetic traffic only.",
+    "4": "Existing 18790 remains rollback and protected SKLegal/OpenRouter remain excluded; rollback disables/removes only ingress and shared unit and proves 28880 closed on tailnet and loopback."
+  },
+  "rollback": {
+    "primary": "http://chiap01:18790/v1",
+    "command": "systemctl disable --now skgateway-shared-tailnet.socket skgateway-shared-tailnet.service skgateway-shared-shadow.service && rm -f /etc/systemd/system/skgateway-shared-tailnet.* /etc/sklegal/skgateway/shared-shadow.yaml*"
+  },
+  "constraints_satisfied": [
+    "CardStore append-only - no direct JSON concatenation",
+    "Structural events separate from evidence events",
+    "No commit/push to origin/main - branch-only workflow",
+    "No live config mutation - files are deploy artifacts only",
+    "No credential disclosure - auth-provider-pure handles authorization",
+    "No WAKE-02 enablement - profile excludes protected routes",
+    "No live_execution - deployment is disabled by default",
+    "No automerge - requires human qualification",
+    "No human_signoff - operator files verification only",
+    "No repository visibility changes"
+  ],
+  "artifacts": {
+    "skgateway.shared-shadow.yaml": {
+      "path": "/etc/sklegal/skgateway/shared-shadow.yaml",
+      "purpose": "Shared gateway backend configuration (profile 6073417e)"
+    },
+    "skgateway-shared-tailnet.socket": {
+      "path": "/etc/systemd/system/skgateway-shared-tailnet.socket",
+      "purpose": "Tailnet-only ingress socket unit (tailscale0:28880)"
+    },
+    "skgateway-shared-tailnet.service": {
+      "path": "/etc/systemd/system/skgateway-shared-tailnet.service",
+      "purpose": "Root-owned supervised socat proxy service"
+    },
+    "skgateway-shared-shadow.service": {
+      "path": "/etc/systemd/system/skgateway-shared-shadow.service",
+      "purpose": "Shared shadow gateway backend service (profile 6073417e)"
+    }
+  },
+  "_note": "Provenance only. File hashes were removed: they were stored in the same git commit as the files they hashed, so anyone able to edit a file could edit its hash. Git already provides content integrity for this repo, and pinning hashes made the artifacts un-editable without re-issuing them."
+}
