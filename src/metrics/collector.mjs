@@ -452,6 +452,8 @@ function calcCost(tokens, pricing) {
  * @param {object} config  The metrics config, or the full gateway config.
  * @returns {MetricsCollector}
  */
+import { createObservation } from './observations.mjs';
+
 export function createMetricsCollector(config) {
   const cfg = config?.metrics ?? config ?? {};
 
@@ -1158,6 +1160,8 @@ export function createMetricsCollector(config) {
 
   /** @typedef {object} MetricsCollector */
   return {
+    /** Build a governed observation from explicit gateway facts only. */
+    createObservation,
     recordRequest,
     recordResponse,
     recordEnergy,
