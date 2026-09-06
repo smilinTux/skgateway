@@ -374,6 +374,14 @@ const _FRESH_PROVIDER_SOURCES = new Set(["openrouter", "models.dev"]);
 
 export function applyCardOverlay(model, overrides) {
   const override = overrides && overrides[model.id];
+  const existingCard = model.card || {};
+  // Cost is derived from the card tier, never from provider names. Preserve
+  // every other classification field, including trust and data handling.
+  // This correction also applies to fresh provider cards: their metadata is
+  // authoritative, but a stale free flag must not contradict their tier.
+  if (existingCard.tier === 'paid-cloud' && model.free !== false) {
+    model = { ...model, free: false };
+  }
   if (!override) return model;
   const src = model.card && model.card.source;
   // Never clobber a live provider's authoritative card.
