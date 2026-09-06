@@ -21,6 +21,7 @@ import {
   meetsClassFloor,
   resolveBucket,
   orderMembersByCost,
+  orderMembersForClass,
   selectMember,
   gradeVocabulary,
   measuredClassCeiling,
@@ -209,6 +210,34 @@ describe('C9: cost-ranked selection rotates only among equal-cost members', () =
     assert.deepEqual(
       [0, 1, 2, 3, 4].map((i) => selectMember(members, i).id),
       ['local-a', 'local-b', 'local-a', 'local-b', 'local-a'],
+    );
+  });
+
+  test('S, M, L and XL select the nearest admitted class instead of one cheap XL model', () => {
+    const mixed = [
+      { id: 'xl-cheap', model_class: 'XL', cost_tier: 'local' },
+      { id: 's-paid', model_class: 'S', cost_tier: 'paid-cloud' },
+      { id: 'l-free', model_class: 'L', cost_tier: 'free-remote' },
+      { id: 'm-paid', model_class: 'M', cost_tier: 'paid-cloud' },
+    ];
+
+    assert.deepEqual(
+      ['S', 'M', 'L', 'XL'].map((modelClass) =>
+        selectMember(mixed, 0, null, modelClass).id),
+      ['s-paid', 'm-paid', 'l-free', 'xl-cheap'],
+    );
+  });
+
+  test('class-fit ordering retains larger classes as upward-only failover', () => {
+    const mixed = [
+      { id: 'xl', model_class: 'XL', cost_tier: 'local' },
+      { id: 'm', model_class: 'M', cost_tier: 'paid-cloud' },
+      { id: 'l', model_class: 'L', cost_tier: 'free-remote' },
+    ];
+
+    assert.deepEqual(
+      orderMembersForClass(mixed, 'M', 0).map((member) => member.id),
+      ['m', 'l', 'xl'],
     );
   });
 
