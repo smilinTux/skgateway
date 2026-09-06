@@ -679,8 +679,13 @@ export function selectMember(members, counter = 0, familyPreference = null, requ
   const ordered = orderMembersForClass(members, requestedClass, counter);
   if (ordered.length === 0) return null;
 
-  const closestClass = ordered[0].model_class;
-  const closestMembers = ordered.filter((member) => member.model_class === closestClass);
+  // Without a requested class this helper retains its historical pool
+  // semantics: all admitted members participate in cost-tier rotation. The
+  // class-specific narrowing is only meaningful for an addressed bucket.
+  const closestClass = requestedClass === null ? null : ordered[0].model_class;
+  const closestMembers = closestClass === null
+    ? ordered
+    : ordered.filter((member) => member.model_class === closestClass);
   const costOrdered = orderMembersByCost(closestMembers, counter);
   const cheapestTier = costOrdered[0].cost_tier;
   const cheapestMembers = costOrdered.filter((member) => member.cost_tier === cheapestTier);
