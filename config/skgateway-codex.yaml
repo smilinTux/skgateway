@@ -46,6 +46,16 @@ pooling:
       max: 2
       maxQueue: 4
       queueTimeoutMs: 30000
+    ## Kimi services have independent account capacity. Keep these as explicit
+    ## domains so startup and the read-only queue projection expose the limits.
+    kimi-coding:
+      members: [kimi-coding]
+      max: 28
+      maxQueue: 400
+    kimi-k3:
+      members: [kimi-k3]
+      max: 14
+      maxQueue: 400
   per_backend:
     ## ollama pool left defined but its backend is disabled above (Chef 5060).
     ollama:
