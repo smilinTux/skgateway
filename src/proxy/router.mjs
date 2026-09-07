@@ -4064,37 +4064,36 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       const retryAfter = res.headers?.["retry-after"] ?? res.headers?.["Retry-After"];
       const retryAt = Date.now() + Math.min(parseRetryAfterMs(retryAfter) ?? DEFAULT_402_COOLDOWN_MS, MAX_THROTTLE_COOLDOWN_MS);
       if (isSubscriptionExhaustion(res.status, res.body)) {
-        let capacityRecord;
+        await emitSiem(EventType.CAPACITY, {
+          action: "subscription_exhausted",
+          state: "throttled",
+          scope: "provider",
+          reason: "subscription_exhausted",
+          retry_at: retryAt,
+          probe_state: "pending",
+        }, { backend: backendId, correlation_id: _siemRequestId });
         if (capacityAdmission.probe) {
-          capacityRecord = finishCapacityProbe(providerName, false, {
+          finishCapacityProbe(providerName, false, {
             probeOwner: capacityProbeOwner, model: candidateModel, retryAt, providerWide: true,
           });
         } else {
-          capacityRecord = recordSubscriptionExhausted(providerName, { retryAt });
+          recordSubscriptionExhausted(providerName, { retryAt });
         }
-        await emitSiem(EventType.CAPACITY, {
-          action: "subscription_exhausted",
-          state: capacityRecord.state,
-          scope: capacityRecord.scope,
-          reason: capacityRecord.reason,
-          retry_at: capacityRecord.retry_at,
-          probe_state: capacityRecord.probe_state,
-        }, { backend: backendId, correlation_id: _siemRequestId });
       } else if (capacityAdmission.probe) {
         const probeSucceeded = res.status >= 200 && res.status < 300;
-        const capacityRecord = finishCapacityProbe(providerName, probeSucceeded, {
-          probeOwner: capacityProbeOwner, model: candidateModel, retryAt,
-        });
         if (probeSucceeded) {
           await emitSiem(EventType.CAPACITY, {
             action: "probe_recovered",
-            state: capacityRecord.state,
-            scope: capacityRecord.scope,
-            reason: capacityRecord.reason,
-            retry_at: capacityRecord.retry_at,
-            probe_state: capacityRecord.probe_state,
+            state: "available",
+            scope: "provider",
+            reason: null,
+            retry_at: null,
+            probe_state: "succeeded",
           }, { backend: backendId, correlation_id: _siemRequestId });
         }
+        finishCapacityProbe(providerName, probeSucceeded, {
+          probeOwner: capacityProbeOwner, model: candidateModel, retryAt,
+        });
       } else if (res.status === 429 || res.status === 402) {
         recordModelThrottled(providerName, candidateModel, { retryAt });
       } else if (res.status >= 200 && res.status < 300) {

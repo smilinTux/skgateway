@@ -26,6 +26,31 @@ test("provider exhaustion fails closed, admits one bounded recovery probe, and c
   assert.equal(capacity.admitCapacity("codex", "gpt-5.1", { now: 2002, path: store }).admitted, true);
 });
 
+test("rejected capacity audit leaves provider state unchanged", async (t) => {
+  capacity._resetCapacityProbesForTests();
+  const sharedStore = capacity.CAPACITY_STORE_PATH;
+  capacity.clearCapacity("codex", "gpt-5", { path: sharedStore });
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(429, { "content-type": "application/json", "retry-after": "1" });
+    res.end(JSON.stringify({ error: "subscription usage limit reached" }));
+  });
+  await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => upstream.close(resolve)));
+  const router = createRouter({ backends: { codex: {
+    url: `http://127.0.0.1:${upstream.address().port}/v1`, auth_type: "none",
+    discovery: "codex", models: ["gpt-5"],
+  } } });
+  const rejectCapacityAudit = async (event) => {
+    if (event.event_type === "capacity") throw new Error("capacity audit unavailable");
+  };
+  await assert.rejects(
+    routeAndSend(router, { model: "gpt-5" }, "/v1/chat/completions", "POST", {},
+      Buffer.from(JSON.stringify({ model: "gpt-5", messages: [] })), false, rejectCapacityAudit),
+    /capacity audit unavailable/,
+  );
+  assert.equal(capacity.capacityStatus("codex", "gpt-5", { path: sharedStore }).state, "available");
+});
+
 test("stale and failed probe evidence stays fail closed", () => {
   capacity._resetCapacityProbesForTests();
   const owner = {};
