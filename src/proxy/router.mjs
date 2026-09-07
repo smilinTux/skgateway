@@ -40,6 +40,7 @@ import { recordModelOutcome, getLifecycle } from "../discovery/model_catalog_sto
 import {
   admitCapacity, capacityStatus, clearCapacity, finishCapacityProbe,
   isSubscriptionExhaustion, recordModelThrottled, recordSubscriptionExhausted,
+  releaseCapacityProbe,
 } from "../discovery/capacity_store.mjs";
 import { isRoutable, isEffectivelyRoutable } from "../discovery/lifecycle.mjs";
 import { applyReasoningFloor } from "./core.mjs";
@@ -3683,15 +3684,20 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       : { admitted: true, probe: false };
     if (capacityAdmission.probe) {
       attemptTimeoutMs = Math.min(attemptTimeoutMs || PROBE_TIMEOUT_MS, PROBE_TIMEOUT_MS);
-      await emitSiem(EventType.CAPACITY, {
-        action: "probe_attempt",
-        state: "throttled",
-        scope: capacityAdmission.status.scope,
-        reason: capacityAdmission.status.reason,
-        retry_at: capacityAdmission.status.retry_at,
-        probe_state: "in_progress",
-        deadline_ms: PROBE_TIMEOUT_MS,
-      }, { backend: backendId, correlation_id: _siemRequestId });
+      try {
+        await emitSiem(EventType.CAPACITY, {
+          action: "probe_attempt",
+          state: "throttled",
+          scope: capacityAdmission.status.scope,
+          reason: capacityAdmission.status.reason,
+          retry_at: capacityAdmission.status.retry_at,
+          probe_state: "in_progress",
+          deadline_ms: PROBE_TIMEOUT_MS,
+        }, { backend: backendId, correlation_id: _siemRequestId });
+      } catch (error) {
+        releaseCapacityProbe(providerName, capacityProbeOwner);
+        throw error;
+      }
     }
     const probeResponseLimit = capacityAdmission.probe ? 1024 * 1024 : 0;
     if (!capacityAdmission.admitted) {

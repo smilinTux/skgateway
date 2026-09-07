@@ -51,6 +51,37 @@ test("rejected capacity audit leaves provider state unchanged", async (t) => {
   assert.equal(capacity.capacityStatus("codex", "gpt-5", { path: sharedStore }).state, "available");
 });
 
+test("rejected probe-attempt audit releases the half-open owner", async () => {
+  capacity._resetCapacityProbesForTests();
+  const due = Date.now();
+  const sharedStore = capacity.CAPACITY_STORE_PATH;
+  capacity.recordSubscriptionExhausted("codex", {
+    now: due - 2000, retryAt: due - 1000, path: sharedStore,
+  });
+  const firstOwner = {};
+  const router = createRouter({ backends: { codex: {
+    url: "http://127.0.0.1:1/v1", auth_type: "none", discovery: "codex", models: ["gpt-5"],
+  } } });
+  await assert.rejects(
+    routeAndSend(router, {
+      model: "gpt-5", context: "public", capacityProbeOwner: firstOwner,
+    }, "/v1/chat/completions", "POST",
+    { "x-sk-context": "public", "x-sk-probe": "synthetic" },
+    Buffer.from(JSON.stringify({ model: "gpt-5", messages: [] })), false,
+    async (event) => {
+      if (event.event_type === "capacity") throw new Error("capacity audit unavailable");
+    }),
+    /capacity audit unavailable/,
+  );
+  const nextOwner = {};
+  assert.equal(capacity.admitCapacity("codex", "gpt-5", {
+    now: due, publicSynthetic: true, probeOwner: nextOwner, path: sharedStore,
+  }).probe, true);
+  capacity.finishCapacityProbe("codex", false, {
+    probeOwner: nextOwner, model: "gpt-5", now: due, path: sharedStore,
+  });
+});
+
 test("stale and failed probe evidence stays fail closed", () => {
   capacity._resetCapacityProbesForTests();
   const owner = {};
