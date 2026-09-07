@@ -432,12 +432,37 @@ function extractTokens({ headers = {}, body = {} } = {}) {
   }
 
   // ── OpenAI-compatible body.usage ──────────────────────────────────────────
+  if (Buffer.isBuffer(body) || typeof body === 'string') {
+    const text = Buffer.isBuffer(body) ? body.toString('utf8') : body;
+    try {
+      body = JSON.parse(text);
+    } catch {
+      let usage = null;
+      for (const line of text.split('\n')) {
+        if (!line.startsWith('data:')) continue;
+        const payload = line.slice(5).trim();
+        if (!payload || payload === '[DONE]') continue;
+        try {
+          const event = JSON.parse(payload);
+          if (event?.usage && typeof event.usage === 'object') usage = event.usage;
+        } catch { /* ignore malformed transport data */ }
+      }
+      body = usage ? { usage } : {};
+    }
+  }
+
   const u = body?.usage;
   if (u && typeof u === 'object') {
+    const usedPromptTokens = input == null && u.input_tokens == null && u.prompt_tokens != null;
     input      ??= observedCount(u.input_tokens ?? u.prompt_tokens);
     output     ??= observedCount(u.output_tokens ?? u.completion_tokens);
     cacheRead  ??= observedCount(u.cache_read_input_tokens);
     cacheWrite ??= observedCount(u.cache_creation_input_tokens);
+    const cachedPrompt = u.prompt_tokens_details?.cached_tokens;
+    if (cacheRead == null && Number.isSafeInteger(cachedPrompt) && cachedPrompt >= 0) {
+      cacheRead = cachedPrompt;
+      if (usedPromptTokens && input != null) input = Math.max(0, input - cacheRead);
+    }
   }
 
   return {
