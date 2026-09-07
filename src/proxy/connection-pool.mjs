@@ -87,6 +87,7 @@ class PoolState {
 
     /** Total dropped due to full queue (metrics) */
     this.totalDropped = 0;
+    this.totalDeferred = 0;
 
     /** Total waiters rejected when their domain queue SLA expired */
     this.totalTimedOut = 0;
@@ -215,7 +216,7 @@ export class ConnectionPool {
    *   Resolves with a ticket that MUST be passed to release().
    *   Rejects if the queue is full or the wait times out.
    */
-  acquire(backendId, { signal = null } = {}) {
+  acquire(backendId, { signal = null, nonBlocking = false } = {}) {
     const state = this._getOrCreate(backendId);
     const retryAfterSeconds = Math.max(1, Math.ceil(state.queueTimeoutMs / 1000));
 
@@ -245,7 +246,33 @@ export class ConnectionPool {
         return;
       }
 
-      // Slow path: must queue
+      // Slow path: the door is full.
+      //
+      // Non-blocking admission (card f5c7022b). The caller still has another
+      // candidate to try, so a full door must fail IMMEDIATELY rather than
+      // queue. Queueing here is precisely what made the PR94 failover
+      // unreachable: with the production maxQueue of 24 the primary enqueued
+      // the request and it waited out queueTimeoutMs, so the code that picks
+      // the next candidate never ran. The original PR94 tests passed only
+      // because they used maxQueue: 0, the single configuration in which the
+      // defect cannot appear.
+      //
+      // This is deliberately NOT counted as a drop. A deferral that fails over
+      // successfully is a served request, and folding it into totalDropped
+      // would make the drop metric report healthy failovers as losses.
+      if (nonBlocking) {
+        state.totalDeferred++;
+        reject(new PoolAdmissionError(
+          "capacity_exceeded",
+          state.id,
+          `[connection-pool] domain=${state.id} at capacity ` +
+            `(${state.active}/${state.max}); deferred to the next candidate ` +
+            `without queueing.`,
+          retryAfterSeconds,
+        ));
+        return;
+      }
+
       // maxQueue=0 means fail fast. It must never mean "disable the cap".
       if (state.queue.length >= state.maxQueue) {
         state.totalDropped++;
@@ -389,7 +416,7 @@ export class ConnectionPool {
   /**
    * Get current stats for a specific backend pool.
    * @param {string} backendId
-   * @returns {{ capacityDomain: string, members: string[], active: number, queued: number, max: number, maxQueue: number, queueTimeoutMs: number, totalProcessed: number, totalDropped: number, totalTimedOut: number, totalCancelled: number, peakActive: number, peakQueue: number }}
+   * @returns {{ capacityDomain: string, members: string[], active: number, queued: number, max: number, maxQueue: number, queueTimeoutMs: number, totalProcessed: number, totalDropped: number, totalDeferred: number, totalTimedOut: number, totalCancelled: number, peakActive: number, peakQueue: number }}
    */
   getStats(backendId) {
     const settings = this._settings(backendId);
@@ -405,6 +432,7 @@ export class ConnectionPool {
         queueTimeoutMs: settings.queueTimeoutMs,
         totalProcessed: 0,
         totalDropped: 0,
+        totalDeferred: 0,
         totalTimedOut: 0,
         totalCancelled: 0,
         peakActive: 0,
@@ -421,6 +449,7 @@ export class ConnectionPool {
       queueTimeoutMs: state.queueTimeoutMs,
       totalProcessed: state.totalProcessed,
       totalDropped: state.totalDropped,
+      totalDeferred: state.totalDeferred,
       totalTimedOut: state.totalTimedOut,
       totalCancelled: state.totalCancelled,
       peakActive: state.peakActive,
