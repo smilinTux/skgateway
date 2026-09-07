@@ -113,6 +113,25 @@ test("scheduler releases the provider probe lock when transport throws", async (
   assert.equal(calls, 0);
 });
 
+test("transport throw after half-open admission re-arms and releases the owned lock", async () => {
+  capacity._resetCapacityProbesForTests();
+  capacity.recordSubscriptionExhausted("codex", { now: 4000, retryAt: 5000, path: store });
+  const target = [{ provider: "codex", model: "gpt-5" }];
+  const thrown = await capacity.runDueCapacityProbes(target, async ({ provider, model }) => {
+    const owner = {};
+    assert.equal(capacity.admitCapacity(provider, model, {
+      now: 5000, publicSynthetic: true, probeOwner: owner, path: store,
+    }).probe, true);
+    throw new Error("transport after admission");
+  }, { now: 5000, path: store });
+  assert.match(thrown[0].error.message, /after admission/);
+  const rearmed = capacity.capacityStatus("codex", "gpt-5", { now: 5001, path: store });
+  assert.equal(rearmed.probe_state, "pending");
+  assert.equal(capacity.admitCapacity("codex", "gpt-5", {
+    now: rearmed.retry_at, publicSynthetic: true, probeOwner: {}, path: store,
+  }).probe, true);
+});
+
 test("scheduler never releases a half-open lock owned by another caller", async () => {
   capacity._resetCapacityProbesForTests();
   const externalOwner = {};
@@ -154,6 +173,22 @@ test("model cooldown is visible without suppressing sibling Codex models", () =>
   ], lookup).map((entry) => entry.id), ["gpt-5.1"]);
 });
 
+test("due model cooldown admits one bounded probe and clears only that model", () => {
+  capacity._resetCapacityProbesForTests();
+  capacity.clearCapacity("codex", null, { now: 10000, path: store });
+  capacity.recordModelThrottled("codex", "gpt-5", { now: 10001, retryAt: 11001, path: store });
+  capacity.recordModelThrottled("codex", "gpt-5.1", { now: 10001, retryAt: 12001, path: store });
+  const owner = {};
+  assert.equal(capacity.admitCapacity("codex", "gpt-5", {
+    now: 11001, publicSynthetic: true, probeOwner: owner, path: store,
+  }).probe, true);
+  capacity.finishCapacityProbe("codex", true, {
+    probeOwner: owner, model: "gpt-5", now: 11002, path: store,
+  });
+  assert.equal(capacity.capacityStatus("codex", "gpt-5", { now: 11003, path: store }).state, "available");
+  assert.equal(capacity.capacityStatus("codex", "gpt-5.1", { now: 11003, path: store }).state, "throttled");
+});
+
 test("scheduler timer is bounded and unrefed", () => {
   let interval;
   let unrefed = false;
@@ -184,7 +219,15 @@ test("pool rejection cannot strand a half-open Codex probe lock", async () => {
   const first = await routeAndSend(router, { model: "gpt-5" }, "/v1/chat/completions", "POST", headers, body);
   pool.release(holder);
   assert.equal(first.status, 503);
-  assert.equal(capacity.capacityStatus("codex", "gpt-5", { path: sharedStore }).probe_state, "pending");
+  const rearmed = capacity.capacityStatus("codex", "gpt-5", { path: sharedStore });
+  assert.equal(rearmed.probe_state, "pending");
+  const nextOwner = {};
+  assert.equal(capacity.admitCapacity("codex", "gpt-5", {
+    now: rearmed.retry_at, publicSynthetic: true, probeOwner: nextOwner, path: sharedStore,
+  }).probe, true);
+  capacity.finishCapacityProbe("codex", false, {
+    probeOwner: nextOwner, model: "gpt-5", now: rearmed.retry_at, path: sharedStore,
+  });
   resetPool();
 });
 
@@ -192,6 +235,7 @@ test("autonomous half-open probe clears capacity through router on the same stor
   capacity._resetCapacityProbesForTests();
   const sharedStore = capacity.CAPACITY_STORE_PATH;
   const now = Date.now();
+  capacity.clearCapacity("codex", "gpt-5", { now: now - 3000, path: sharedStore });
   capacity.recordSubscriptionExhausted("codex", {
     now: now - 2000, retryAt: now - 500, path: sharedStore,
   });
@@ -219,4 +263,41 @@ test("autonomous half-open probe clears capacity through router on the same stor
   );
   assert.equal(results[0].result.status, 200);
   assert.equal(capacity.capacityStatus("codex", "gpt-5", { path: sharedStore }).state, "available");
+});
+
+test("subscription 429 through router re-arms its owned lock for a later probe", async (t) => {
+  capacity._resetCapacityProbesForTests();
+  const sharedStore = capacity.CAPACITY_STORE_PATH;
+  const now = Date.now();
+  capacity.clearCapacity("codex", "gpt-5", { now: now - 3000, path: sharedStore });
+  capacity.recordSubscriptionExhausted("codex", {
+    now: now - 2000, retryAt: now - 500, path: sharedStore,
+  });
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(429, { "content-type": "application/json", "retry-after": "1" });
+    res.end(JSON.stringify({ error: "subscription usage limit reached" }));
+  });
+  await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => upstream.close(resolve)));
+  const router = createRouter({ backends: { codex: {
+    url: `http://127.0.0.1:${upstream.address().port}/v1`, auth_type: "none",
+    discovery: "codex", models: ["gpt-5"],
+  } } });
+  const results = await capacity.runDueCapacityProbes(
+    [{ provider: "codex", model: "gpt-5" }],
+    (_target, { signal }) => routeAndSend(
+      router, { model: "gpt-5", context: "public" }, "/v1/chat/completions", "POST",
+      { "x-sk-context": "public", "x-sk-probe": "synthetic" },
+      Buffer.from(JSON.stringify({
+        model: "gpt-5", messages: [{ role: "user", content: "Reply with ok." }], stream: false,
+      })), false, null, signal,
+    ),
+    { now, path: sharedStore, deadlineMs: 1000 },
+  );
+  assert.equal(results[0].result.status, 429);
+  const rearmed = capacity.capacityStatus("codex", "gpt-5", { path: sharedStore });
+  assert.equal(rearmed.probe_state, "pending");
+  assert.equal(capacity.admitCapacity("codex", "gpt-5", {
+    now: rearmed.retry_at, publicSynthetic: true, probeOwner: {}, path: sharedStore,
+  }).probe, true);
 });

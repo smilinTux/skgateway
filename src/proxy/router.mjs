@@ -3993,7 +3993,13 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       const retryAfter = res.headers?.["retry-after"] ?? res.headers?.["Retry-After"];
       const retryAt = Date.now() + Math.min(parseRetryAfterMs(retryAfter) ?? DEFAULT_402_COOLDOWN_MS, MAX_THROTTLE_COOLDOWN_MS);
       if (isSubscriptionExhaustion(res.status, res.body)) {
-        recordSubscriptionExhausted(providerName, { retryAt });
+        if (capacityAdmission.probe) {
+          finishCapacityProbe(providerName, false, {
+            probeOwner: capacityProbeOwner, model: candidateModel, retryAt,
+          });
+        } else {
+          recordSubscriptionExhausted(providerName, { retryAt });
+        }
       } else if (capacityAdmission.probe) {
         finishCapacityProbe(providerName, res.status >= 200 && res.status < 300, {
           probeOwner: capacityProbeOwner, model: candidateModel, retryAt,

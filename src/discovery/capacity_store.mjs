@@ -85,9 +85,13 @@ export function admitCapacity(provider, model, {
 export function finishCapacityProbe(provider, success, {
   probeOwner = null, model = null, retryAt, now = Date.now(), path = CAPACITY_STORE_PATH,
 } = {}) {
-  if (!probeOwner || probes.get(provider) !== probeOwner) return capacityStatus(provider, model, { now, path });
+  const status = capacityStatus(provider, model, { now, path });
+  if (!probeOwner || probes.get(provider) !== probeOwner) return status;
   probes.delete(provider);
-  if (success) return clearCapacity(provider, null, { now, path });
+  if (success) return clearCapacity(provider, model, { now, path });
+  if (status.scope === "model") {
+    return recordModelThrottled(provider, model, { retryAt, now, path });
+  }
   return recordSubscriptionExhausted(provider, { retryAt, now, path });
 }
 
@@ -121,7 +125,13 @@ export async function runDueCapacityProbes(targets, probe, {
       // A throw bypasses routeAndSend's normal outcome recorder. Re-arm the
       // provider instead of retrying every scheduler tick.
       const probeOwner = probes.get(target.provider);
-      if (!probeOwner) recordSubscriptionExhausted(target.provider, { now, path });
+      if (probeOwner) {
+        finishCapacityProbe(target.provider, false, {
+          probeOwner, model: target.model, now, path,
+        });
+      } else {
+        recordSubscriptionExhausted(target.provider, { now, path });
+      }
       results.push({ ...target, error });
     } finally {
       clearTimeout(timer);
