@@ -3646,7 +3646,9 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     const providerName = backend.discovery || inferProviderFromBackend(backendId);
     const publicSynthetic = clientHeaders?.["x-sk-context"] === "public" &&
       clientHeaders?.["x-sk-probe"] === "synthetic";
-    const capacityProbeOwner = publicSynthetic ? Symbol(providerName) : null;
+    const capacityProbeOwner = publicSynthetic
+      ? (request.capacityProbeOwner || Symbol(providerName))
+      : null;
     const capacityAdmission = providerName === "codex"
       ? admitCapacity(providerName, candidateModel, { publicSynthetic, probeOwner: capacityProbeOwner })
       : { admitted: true, probe: false };

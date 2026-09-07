@@ -732,15 +732,14 @@ const pool = getPool(poolConfig);
 // eight-second half-open timeout. No prompt or credential is logged here.
 const subscriptionProbeTargets = Object.entries(config.backends || {})
   .filter(([, backend]) => backend?.auth_type === "codex_oauth" && backend.enabled !== false)
-  .map(([provider, backend]) => ({
-    provider,
-    model: (backend.models || []).find((model) => typeof model === "string" && !model.includes("*")),
-  }))
+  .flatMap(([provider, backend]) => (backend.models || [])
+    .filter((model) => typeof model === "string" && !model.includes("*"))
+    .map((model) => ({ provider, model })))
   .filter((target) => target.model);
 
 startCapacityProbeScheduler({
   targets: subscriptionProbeTargets,
-  probe: ({ model }, { signal }) => {
+  probe: ({ model }, { signal, probeOwner }) => {
     const probeBody = Buffer.from(JSON.stringify({
       model,
       messages: [{ role: "user", content: "Reply with ok." }],
@@ -748,7 +747,7 @@ startCapacityProbeScheduler({
     }));
     return routeAndSend(router, {
       model, messages: [{ role: "user", content: "Reply with ok." }],
-      agentId: "skgateway-capacity-probe", context: "public",
+      agentId: "skgateway-capacity-probe", context: "public", capacityProbeOwner: probeOwner,
     }, "/v1/chat/completions", "POST", {
       "content-type": "application/json",
       "x-sk-context": "public",
