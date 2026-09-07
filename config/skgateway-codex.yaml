@@ -308,6 +308,8 @@ streaming:
     trigger_if_tool_call_history_ge: 3
     aggressive_models:
       - deepseek-ai/deepseek-v4-flash
+      - kimi-for-coding
+      - k3
 
 sanitizer:
   max_system_bytes: 40000

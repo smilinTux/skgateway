@@ -33,6 +33,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Codex subscription exhaustion now removes the provider from advertised
+  models and buckets until one owned, bounded probe succeeds after the retry
+  deadline. Model cooldowns cannot override the provider-wide state.
+- Buffered Kimi responses converted back to SSE preserve every choice and
+  tool call, assign stable ordinal indices only when an upstream call omits
+  one, emit usage in its own trailer, and pass the canonical stream contract.
 - `capability_scope: provider` no longer offers tier-2 slots to retired
   (`eol`, `not_chat`) records. Never-assessed ids sort first and
   alphabetically, so on the first live sweep three 404 eol ids took every
