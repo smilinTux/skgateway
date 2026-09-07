@@ -3997,7 +3997,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       if (isSubscriptionExhaustion(res.status, res.body)) {
         if (capacityAdmission.probe) {
           finishCapacityProbe(providerName, false, {
-            probeOwner: capacityProbeOwner, model: candidateModel, retryAt,
+            probeOwner: capacityProbeOwner, model: candidateModel, retryAt, providerWide: true,
           });
         } else {
           recordSubscriptionExhausted(providerName, { retryAt });

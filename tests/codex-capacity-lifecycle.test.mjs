@@ -171,6 +171,22 @@ test("model cooldown is visible without suppressing sibling Codex models", () =>
   ], lookup).map((entry) => entry.id), ["gpt-5.1"]);
 });
 
+test("provider exhaustion dominates an earlier model retry deadline", () => {
+  capacity._resetCapacityProbesForTests();
+  capacity.clearCapacity("codex", "gpt-5", { now: 9500, path: store });
+  capacity.recordModelThrottled("codex", "gpt-5", { now: 9600, retryAt: 10000, path: store });
+  capacity.recordSubscriptionExhausted("codex", { now: 9700, retryAt: 20000, path: store });
+  const status = capacity.capacityStatus("codex", "gpt-5", { now: 10000, path: store });
+  assert.equal(status.scope, "provider");
+  assert.equal(status.retry_at, 20000);
+  assert.equal(capacity.admitCapacity("codex", "gpt-5", {
+    now: 10000, publicSynthetic: true, probeOwner: {}, path: store,
+  }).admitted, false);
+  assert.equal(capacity.admitCapacity("codex", "gpt-5", {
+    now: 20000, publicSynthetic: true, probeOwner: {}, path: store,
+  }).probe, true);
+});
+
 test("due model cooldown admits one bounded probe and clears only that model", () => {
   capacity._resetCapacityProbesForTests();
   capacity.clearCapacity("codex", null, { now: 10000, path: store });
@@ -267,12 +283,12 @@ test("autonomous routed probe clears one due model cooldown and preserves its si
   assert.equal(capacity.capacityStatus("codex", "gpt-5.1", { path: sharedStore }).state, "throttled");
 });
 
-test("subscription 429 through router re-arms its owned lock for a later probe", async (t) => {
+test("subscription 429 during a model probe records provider-wide exhaustion", async (t) => {
   capacity._resetCapacityProbesForTests();
   const sharedStore = capacity.CAPACITY_STORE_PATH;
   const now = Date.now();
   capacity.clearCapacity("codex", "gpt-5", { now: now - 3000, path: sharedStore });
-  capacity.recordSubscriptionExhausted("codex", {
+  capacity.recordModelThrottled("codex", "gpt-5", {
     now: now - 2000, retryAt: now - 500, path: sharedStore,
   });
   const upstream = http.createServer((_req, res) => {
@@ -300,6 +316,8 @@ test("subscription 429 through router re-arms its owned lock for a later probe",
   assert.equal(results[0].result.status, 429);
   const rearmed = capacity.capacityStatus("codex", "gpt-5", { path: sharedStore });
   assert.equal(rearmed.probe_state, "pending");
+  assert.equal(rearmed.scope, "provider");
+  assert.equal(rearmed.reason, "subscription_exhausted");
   assert.equal(capacity.admitCapacity("codex", "gpt-5", {
     now: rearmed.retry_at, publicSynthetic: true, probeOwner: {}, path: sharedStore,
   }).probe, true);

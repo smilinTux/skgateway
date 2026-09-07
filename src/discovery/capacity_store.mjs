@@ -28,7 +28,9 @@ function save(value, path = CAPACITY_STORE_PATH) {
 
 export function capacityStatus(provider, model, { now = Date.now(), path = CAPACITY_STORE_PATH } = {}) {
   const store = load(path);
-  const record = store[`model:${provider}:${model}`] || store[`provider:${provider}`];
+  const providerRecord = store[`provider:${provider}`];
+  const modelRecord = store[`model:${provider}:${model}`];
+  const record = providerRecord?.state === "throttled" ? providerRecord : (modelRecord || providerRecord);
   if (!record) return { state: "unknown", reason: null, retry_at: null, probe_state: "none", current: false };
   const current = Number.isFinite(record.observed_at) && now - record.observed_at <= 48 * 60 * 60 * 1000;
   if (record.state === "available") return { ...record, current };
@@ -86,13 +88,14 @@ export function admitCapacity(provider, model, {
 }
 
 export function finishCapacityProbe(provider, success, {
-  probeOwner = null, model = null, retryAt, now = Date.now(), path = CAPACITY_STORE_PATH,
+  probeOwner = null, model = null, retryAt, providerWide = false,
+  now = Date.now(), path = CAPACITY_STORE_PATH,
 } = {}) {
   const status = capacityStatus(provider, model, { now, path });
   if (!probeOwner || probes.get(provider) !== probeOwner) return status;
   probes.delete(provider);
   if (success) return clearCapacity(provider, model, { now, path });
-  if (status.scope === "model") {
+  if (!providerWide && status.scope === "model") {
     return recordModelThrottled(provider, model, { retryAt, now, path });
   }
   return recordSubscriptionExhausted(provider, { retryAt, now, path });
