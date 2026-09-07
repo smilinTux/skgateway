@@ -26,6 +26,62 @@ test("provider exhaustion fails closed, admits one bounded recovery probe, and c
   assert.equal(capacity.admitCapacity("codex", "gpt-5.1", { now: 2002, path: store }).admitted, true);
 });
 
+test("rejected capacity audit leaves provider state unchanged", async (t) => {
+  capacity._resetCapacityProbesForTests();
+  const sharedStore = capacity.CAPACITY_STORE_PATH;
+  capacity.clearCapacity("codex", "gpt-5", { path: sharedStore });
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(429, { "content-type": "application/json", "retry-after": "1" });
+    res.end(JSON.stringify({ error: "subscription usage limit reached" }));
+  });
+  await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => upstream.close(resolve)));
+  const router = createRouter({ backends: { codex: {
+    url: `http://127.0.0.1:${upstream.address().port}/v1`, auth_type: "none",
+    discovery: "codex", models: ["gpt-5"],
+  } } });
+  const rejectCapacityAudit = async (event) => {
+    if (event.event_type === "capacity") throw new Error("capacity audit unavailable");
+  };
+  await assert.rejects(
+    routeAndSend(router, { model: "gpt-5" }, "/v1/chat/completions", "POST", {},
+      Buffer.from(JSON.stringify({ model: "gpt-5", messages: [] })), false, rejectCapacityAudit),
+    /capacity audit unavailable/,
+  );
+  assert.equal(capacity.capacityStatus("codex", "gpt-5", { path: sharedStore }).state, "available");
+});
+
+test("rejected probe-attempt audit releases the half-open owner", async () => {
+  capacity._resetCapacityProbesForTests();
+  const due = Date.now();
+  const sharedStore = capacity.CAPACITY_STORE_PATH;
+  capacity.recordSubscriptionExhausted("codex", {
+    now: due - 2000, retryAt: due - 1000, path: sharedStore,
+  });
+  const firstOwner = {};
+  const router = createRouter({ backends: { codex: {
+    url: "http://127.0.0.1:1/v1", auth_type: "none", discovery: "codex", models: ["gpt-5"],
+  } } });
+  await assert.rejects(
+    routeAndSend(router, {
+      model: "gpt-5", context: "public", capacityProbeOwner: firstOwner,
+    }, "/v1/chat/completions", "POST",
+    { "x-sk-context": "public", "x-sk-probe": "synthetic" },
+    Buffer.from(JSON.stringify({ model: "gpt-5", messages: [] })), false,
+    async (event) => {
+      if (event.event_type === "capacity") throw new Error("capacity audit unavailable");
+    }),
+    /capacity audit unavailable/,
+  );
+  const nextOwner = {};
+  assert.equal(capacity.admitCapacity("codex", "gpt-5", {
+    now: due, publicSynthetic: true, probeOwner: nextOwner, path: sharedStore,
+  }).probe, true);
+  capacity.finishCapacityProbe("codex", false, {
+    probeOwner: nextOwner, model: "gpt-5", now: due, path: sharedStore,
+  });
+});
+
 test("stale and failed probe evidence stays fail closed", () => {
   capacity._resetCapacityProbesForTests();
   const owner = {};
@@ -321,4 +377,73 @@ test("subscription 429 during a model probe records provider-wide exhaustion", a
   assert.equal(capacity.admitCapacity("codex", "gpt-5", {
     now: rearmed.retry_at, publicSynthetic: true, probeOwner: {}, path: sharedStore,
   }).probe, true);
+});
+
+test("capacity audit records exhaustion, bounded probe, and recovery without sensitive data", async (t) => {
+  capacity._resetCapacityProbesForTests();
+  const sharedStore = capacity.CAPACITY_STORE_PATH;
+  const model = "gpt-5-capacity-audit";
+  capacity.clearCapacity("codex", model, { path: sharedStore });
+  let responseCount = 0;
+  const upstream = http.createServer((_req, res) => {
+    responseCount += 1;
+    if (responseCount === 1) {
+      res.writeHead(429, { "content-type": "application/json", "retry-after": "1" });
+      res.end(JSON.stringify({ error: "subscription usage limit reached", credential: "response-secret" }));
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ model, choices: [{ message: { role: "assistant", content: "ok" } }] }));
+  });
+  await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => upstream.close(resolve)));
+  const router = createRouter({ backends: { codex: {
+    url: `http://127.0.0.1:${upstream.address().port}/v1`, auth_type: "none",
+    discovery: "codex", models: [model],
+  } } });
+  const events = [];
+  const siem = async (event) => { events.push(event); };
+  const sensitiveBody = Buffer.from(JSON.stringify({
+    model, messages: [{ role: "user", content: "body-secret" }],
+  }));
+  await routeAndSend(router, { model, agentId: "capacity-test" },
+    "/v1/chat/completions", "POST", { authorization: "Bearer credential-secret" },
+    sensitiveBody, false, siem);
+
+  const due = Date.now();
+  capacity.recordSubscriptionExhausted("codex", {
+    now: due - 2000, retryAt: due - 1000, path: sharedStore,
+  });
+  await capacity.runDueCapacityProbes(
+    [{ provider: "codex", model }],
+    (_target, { signal, probeOwner }) => routeAndSend(
+      router, {
+        model, agentId: "skgateway-capacity-probe",
+        context: "public", capacityProbeOwner: probeOwner,
+      },
+      "/v1/chat/completions", "POST",
+      { "x-sk-context": "public", "x-sk-probe": "synthetic" }, sensitiveBody,
+      false, siem, signal,
+    ),
+    { now: due, path: sharedStore, deadlineMs: 1000 },
+  );
+
+  const audit = events.filter((event) => event.event_type === "capacity");
+  assert.deepEqual(audit.map((event) => event.details.action), [
+    "subscription_exhausted", "probe_attempt", "probe_recovered",
+  ]);
+  assert.deepEqual(audit.map((event) => event.details.probe_state), [
+    "pending", "in_progress", "succeeded",
+  ]);
+  assert.equal(audit[0].details.reason, "subscription_exhausted");
+  assert.ok(Number.isFinite(audit[0].details.retry_at));
+  assert.equal(audit[1].details.deadline_ms, 8000);
+  assert.equal(audit[2].details.state, "available");
+  assert.match(audit[1].request_id, /^[0-9a-f-]{36}$/);
+  assert.equal(audit[1].correlation_id, audit[1].request_id);
+  assert.equal(audit[2].correlation_id, audit[1].correlation_id);
+  const serialized = JSON.stringify(audit);
+  for (const secret of ["body-secret", "credential-secret", "response-secret", "authorization", "Bearer"]) {
+    assert.equal(serialized.includes(secret), false, `capacity audit leaked ${secret}`);
+  }
 });

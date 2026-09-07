@@ -40,6 +40,7 @@ import { recordModelOutcome, getLifecycle } from "../discovery/model_catalog_sto
 import {
   admitCapacity, capacityStatus, clearCapacity, finishCapacityProbe,
   isSubscriptionExhaustion, recordModelThrottled, recordSubscriptionExhausted,
+  releaseCapacityProbe,
 } from "../discovery/capacity_store.mjs";
 import { isRoutable, isEffectivelyRoutable } from "../discovery/lifecycle.mjs";
 import { applyReasoningFloor } from "./core.mjs";
@@ -3681,7 +3682,23 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     const capacityAdmission = providerName === "codex"
       ? admitCapacity(providerName, candidateModel, { publicSynthetic, probeOwner: capacityProbeOwner })
       : { admitted: true, probe: false };
-    if (capacityAdmission.probe) attemptTimeoutMs = Math.min(attemptTimeoutMs || PROBE_TIMEOUT_MS, PROBE_TIMEOUT_MS);
+    if (capacityAdmission.probe) {
+      attemptTimeoutMs = Math.min(attemptTimeoutMs || PROBE_TIMEOUT_MS, PROBE_TIMEOUT_MS);
+      try {
+        await emitSiem(EventType.CAPACITY, {
+          action: "probe_attempt",
+          state: "throttled",
+          scope: capacityAdmission.status.scope,
+          reason: capacityAdmission.status.reason,
+          retry_at: capacityAdmission.status.retry_at,
+          probe_state: "in_progress",
+          deadline_ms: PROBE_TIMEOUT_MS,
+        }, { backend: backendId, correlation_id: _siemRequestId });
+      } catch (error) {
+        releaseCapacityProbe(providerName, capacityProbeOwner);
+        throw error;
+      }
+    }
     const probeResponseLimit = capacityAdmission.probe ? 1024 * 1024 : 0;
     if (!capacityAdmission.admitted) {
       const remainingMs = Math.max(1000, (capacityAdmission.status.retry_at || Date.now() + 1000) - Date.now());
@@ -4053,6 +4070,14 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       const retryAfter = res.headers?.["retry-after"] ?? res.headers?.["Retry-After"];
       const retryAt = Date.now() + Math.min(parseRetryAfterMs(retryAfter) ?? DEFAULT_402_COOLDOWN_MS, MAX_THROTTLE_COOLDOWN_MS);
       if (isSubscriptionExhaustion(res.status, res.body)) {
+        await emitSiem(EventType.CAPACITY, {
+          action: "subscription_exhausted",
+          state: "throttled",
+          scope: "provider",
+          reason: "subscription_exhausted",
+          retry_at: retryAt,
+          probe_state: "pending",
+        }, { backend: backendId, correlation_id: _siemRequestId });
         if (capacityAdmission.probe) {
           finishCapacityProbe(providerName, false, {
             probeOwner: capacityProbeOwner, model: candidateModel, retryAt, providerWide: true,
@@ -4061,7 +4086,18 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           recordSubscriptionExhausted(providerName, { retryAt });
         }
       } else if (capacityAdmission.probe) {
-        finishCapacityProbe(providerName, res.status >= 200 && res.status < 300, {
+        const probeSucceeded = res.status >= 200 && res.status < 300;
+        if (probeSucceeded) {
+          await emitSiem(EventType.CAPACITY, {
+            action: "probe_recovered",
+            state: "available",
+            scope: "provider",
+            reason: null,
+            retry_at: null,
+            probe_state: "succeeded",
+          }, { backend: backendId, correlation_id: _siemRequestId });
+        }
+        finishCapacityProbe(providerName, probeSucceeded, {
           probeOwner: capacityProbeOwner, model: candidateModel, retryAt,
         });
       } else if (res.status === 429 || res.status === 402) {

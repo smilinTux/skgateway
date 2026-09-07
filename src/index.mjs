@@ -752,7 +752,7 @@ startCapacityProbeScheduler({
       "content-type": "application/json",
       "x-sk-context": "public",
       "x-sk-probe": "synthetic",
-    }, probeBody, true, null, signal);
+    }, probeBody, true, siemHook, signal);
   },
 });
 

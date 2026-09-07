@@ -101,6 +101,12 @@ export function finishCapacityProbe(provider, success, {
   return recordSubscriptionExhausted(provider, { retryAt, now, path });
 }
 
+export function releaseCapacityProbe(provider, probeOwner) {
+  if (!probeOwner || probes.get(provider) !== probeOwner) return false;
+  probes.delete(provider);
+  return true;
+}
+
 /** Run due capacity recovery probes. This scheduler acquires the exact
  * half-open owner token and passes it into the routed probe. */
 export async function runDueCapacityProbes(targets, probe, {

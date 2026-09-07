@@ -33,6 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Codex capacity transitions now require accepted append-only audit evidence
+  before persistent state changes, and a rejected probe-attempt event releases
+  only its exact in-memory probe owner so recovery can retry safely.
+
 - Codex subscription exhaustion now removes the provider from advertised
   models and buckets until one owned, bounded probe succeeds after the retry
   deadline. Model cooldowns cannot override the provider-wide state.
