@@ -3681,7 +3681,18 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     const capacityAdmission = providerName === "codex"
       ? admitCapacity(providerName, candidateModel, { publicSynthetic, probeOwner: capacityProbeOwner })
       : { admitted: true, probe: false };
-    if (capacityAdmission.probe) attemptTimeoutMs = Math.min(attemptTimeoutMs || PROBE_TIMEOUT_MS, PROBE_TIMEOUT_MS);
+    if (capacityAdmission.probe) {
+      attemptTimeoutMs = Math.min(attemptTimeoutMs || PROBE_TIMEOUT_MS, PROBE_TIMEOUT_MS);
+      await emitSiem(EventType.CAPACITY, {
+        action: "probe_attempt",
+        state: "throttled",
+        scope: capacityAdmission.status.scope,
+        reason: capacityAdmission.status.reason,
+        retry_at: capacityAdmission.status.retry_at,
+        probe_state: "in_progress",
+        deadline_ms: PROBE_TIMEOUT_MS,
+      }, { backend: backendId, correlation_id: _siemRequestId });
+    }
     const probeResponseLimit = capacityAdmission.probe ? 1024 * 1024 : 0;
     if (!capacityAdmission.admitted) {
       const remainingMs = Math.max(1000, (capacityAdmission.status.retry_at || Date.now() + 1000) - Date.now());
@@ -4053,17 +4064,37 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       const retryAfter = res.headers?.["retry-after"] ?? res.headers?.["Retry-After"];
       const retryAt = Date.now() + Math.min(parseRetryAfterMs(retryAfter) ?? DEFAULT_402_COOLDOWN_MS, MAX_THROTTLE_COOLDOWN_MS);
       if (isSubscriptionExhaustion(res.status, res.body)) {
+        let capacityRecord;
         if (capacityAdmission.probe) {
-          finishCapacityProbe(providerName, false, {
+          capacityRecord = finishCapacityProbe(providerName, false, {
             probeOwner: capacityProbeOwner, model: candidateModel, retryAt, providerWide: true,
           });
         } else {
-          recordSubscriptionExhausted(providerName, { retryAt });
+          capacityRecord = recordSubscriptionExhausted(providerName, { retryAt });
         }
+        await emitSiem(EventType.CAPACITY, {
+          action: "subscription_exhausted",
+          state: capacityRecord.state,
+          scope: capacityRecord.scope,
+          reason: capacityRecord.reason,
+          retry_at: capacityRecord.retry_at,
+          probe_state: capacityRecord.probe_state,
+        }, { backend: backendId, correlation_id: _siemRequestId });
       } else if (capacityAdmission.probe) {
-        finishCapacityProbe(providerName, res.status >= 200 && res.status < 300, {
+        const probeSucceeded = res.status >= 200 && res.status < 300;
+        const capacityRecord = finishCapacityProbe(providerName, probeSucceeded, {
           probeOwner: capacityProbeOwner, model: candidateModel, retryAt,
         });
+        if (probeSucceeded) {
+          await emitSiem(EventType.CAPACITY, {
+            action: "probe_recovered",
+            state: capacityRecord.state,
+            scope: capacityRecord.scope,
+            reason: capacityRecord.reason,
+            retry_at: capacityRecord.retry_at,
+            probe_state: capacityRecord.probe_state,
+          }, { backend: backendId, correlation_id: _siemRequestId });
+        }
       } else if (res.status === 429 || res.status === 402) {
         recordModelThrottled(providerName, candidateModel, { retryAt });
       } else if (res.status >= 200 && res.status < 300) {
