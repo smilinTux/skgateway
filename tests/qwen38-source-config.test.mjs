@@ -77,8 +77,8 @@ test('every locally served qwen38 id has the same bounded context and truthful s
   for (const id of CHIAP08_MODEL_IDS) {
     assert.deepEqual(
       config.model_limits[id],
-      { max_body_bytes: 800000, max_system_bytes: 320000 },
-      `${id} must retain the qualified 256K sanitizer limit`,
+      { max_body_bytes: 393216, max_system_bytes: 157286 },
+      `${id} must enforce the 131072-token ceil(body bytes / 3) sanitizer limit`,
     );
     assert.ok(cards[id], `${id} must have a committed model card`);
     assert.equal(cards[id].context_length, 131072); // card 9ed4a9f7: strongest real engine (vLLM 131072); per-door truth via backend context_limit

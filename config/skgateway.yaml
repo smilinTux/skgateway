@@ -238,14 +238,14 @@ sanitizer:
 # Per-model context limits.  Formula: max_body_bytes = context_tokens * 4 bytes * 0.80
 # max_system_bytes = max_body_bytes * 0.40.  Values from NVIDIA NIM model cards (2026-05-12).
 model_limits:
-  ## 256K context (Huihui Qwen3.8 27B on chiap08 :11439, CTX_SIZE=262144) —
-  ## the exact served id and all compatibility aliases carry the same limits.
-  qwen3.8-27b-huihui-abliterated-q4_k_m:      { max_body_bytes: 800000,   max_system_bytes: 320000  }
-  qwen3.8-chiap08:                            { max_body_bytes: 800000,   max_system_bytes: 320000  }
-  qwen3.8-vllm:                               { max_body_bytes: 800000,   max_system_bytes: 320000  }
-  qwen3.8-27b-ud-q5_k_xl:                     { max_body_bytes: 800000,   max_system_bytes: 320000  }
-  qwen3.8-27b:                                { max_body_bytes: 800000,   max_system_bytes: 320000  }  # short alias of the Huihui served id
-  qwen38-abliterated:                         { max_body_bytes: 800000,   max_system_bytes: 320000  }
+  ## 131072-token strongest replica; ceil(body bytes / 3) preflight, 40% system budget.
+  ## chiap01's 32768-token ceiling remains enforced by its selected backend door.
+  qwen3.8-27b-huihui-abliterated-q4_k_m:      { max_body_bytes: 393216,   max_system_bytes: 157286  }
+  qwen3.8-chiap08:                            { max_body_bytes: 393216,   max_system_bytes: 157286  }
+  qwen3.8-vllm:                               { max_body_bytes: 393216,   max_system_bytes: 157286  }
+  qwen3.8-27b-ud-q5_k_xl:                     { max_body_bytes: 393216,   max_system_bytes: 157286  }
+  qwen3.8-27b:                                { max_body_bytes: 393216,   max_system_bytes: 157286  }  # short alias of the Huihui served id
+  qwen38-abliterated:                         { max_body_bytes: 393216,   max_system_bytes: 157286  }
   ## 256K context (kimi-k2.6)
   moonshotai/kimi-k2.6:                       { max_body_bytes: 800000,   max_system_bytes: 320000  }
   ## 262K context (Qwen3 family, Mistral family, Gemma 4)

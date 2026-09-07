@@ -115,14 +115,14 @@ sanitizer:
   keep_end: 12
   strip_thinking: true
 
-## Model limits - exact profile 6073417e
+## Model limits - 131072-token strongest replica; 32768 chiap01 door remains enforced
 model_limits:
-  qwen3.8-27b-huihui-abliterated-q4_k_m: { max_body_bytes: 800000, max_system_bytes: 320000 }
-  qwen3.8-chiap08:                       { max_body_bytes: 800000, max_system_bytes: 320000 }
-  qwen3.8-vllm:                          { max_body_bytes: 800000, max_system_bytes: 320000 }
-  qwen3.8-27b-ud-q5_k_xl:                { max_body_bytes: 800000, max_system_bytes: 320000 }
-  qwen3.8-27b:                           { max_body_bytes: 800000, max_system_bytes: 320000 }
-  qwen38-abliterated:                    { max_body_bytes: 800000, max_system_bytes: 320000 }
+  qwen3.8-27b-huihui-abliterated-q4_k_m: { max_body_bytes: 393216, max_system_bytes: 157286 }
+  qwen3.8-chiap08:                       { max_body_bytes: 393216, max_system_bytes: 157286 }
+  qwen3.8-vllm:                          { max_body_bytes: 393216, max_system_bytes: 157286 }
+  qwen3.8-27b-ud-q5_k_xl:                { max_body_bytes: 393216, max_system_bytes: 157286 }
+  qwen3.8-27b:                           { max_body_bytes: 393216, max_system_bytes: 157286 }
+  qwen38-abliterated:                    { max_body_bytes: 393216, max_system_bytes: 157286 }
 
 ## Metrics - exact profile settings
 metrics:

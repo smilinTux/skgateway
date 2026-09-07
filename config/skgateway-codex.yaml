@@ -326,10 +326,11 @@ model_limits:
   ornith-1.5-9b:                              { max_body_bytes: 209715,   max_system_bytes: 83886   }
   ornith-1.0-35b:                             { max_body_bytes: 800000,   max_system_bytes: 320000  }
   ornith-big:                                 { max_body_bytes: 800000,   max_system_bytes: 320000  }
-  qwen3.8-27b-huihui-abliterated-q4_k_m:      { max_body_bytes: 800000,   max_system_bytes: 320000  }
-  qwen3.8-27b-ud-q5_k_xl:                     { max_body_bytes: 800000,   max_system_bytes: 320000  }
-  qwen3.8-27b:                                { max_body_bytes: 800000,   max_system_bytes: 320000  }
-  qwen38-abliterated:                         { max_body_bytes: 800000,   max_system_bytes: 320000  }
+  ## 131072-token strongest replica; ceil(body bytes / 3) preflight, 40% system budget.
+  qwen3.8-27b-huihui-abliterated-q4_k_m:      { max_body_bytes: 393216,   max_system_bytes: 157286  }
+  qwen3.8-27b-ud-q5_k_xl:                     { max_body_bytes: 393216,   max_system_bytes: 157286  }
+  qwen3.8-27b:                                { max_body_bytes: 393216,   max_system_bytes: 157286  }
+  qwen38-abliterated:                         { max_body_bytes: 393216,   max_system_bytes: 157286  }
   ## Codex family: 272K provider-declared context (272000*4*0.80 formula).
   gpt-5.6-sol:                                { max_body_bytes: 870400,   max_system_bytes: 348160  }
   gpt-5.6-terra:                              { max_body_bytes: 870400,   max_system_bytes: 348160  }
