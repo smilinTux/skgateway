@@ -224,49 +224,58 @@ function _openaiJsonToSSE(writer, resBody, chunkSize) {
     model: resBody.model,
   };
 
-  const choice = resBody.choices?.[0];
-  if (!choice) {
+  const choices = Array.isArray(resBody.choices) ? resBody.choices : [];
+  if (choices.length === 0) {
     writer.writeDone();
     return;
   }
 
-  const msg = choice.message || {};
+  for (const [ordinal, choice] of choices.entries()) {
+    const msg = choice?.message || {};
+    const choiceIndex = Number.isInteger(choice?.index) ? choice.index : ordinal;
+    writer.write({
+      ...base,
+      choices: [{ index: choiceIndex, delta: { role: msg.role || "assistant" }, finish_reason: null }],
+    });
 
-  // 1. Role chunk
-  writer.write({
-    ...base,
-    choices: [{ index: 0, delta: { role: msg.role || "assistant" }, finish_reason: null }],
-  });
-
-  // 2. Content chunks — split for realistic streaming feel
-  const content = msg.content || "";
-  if (content) {
+    const content = typeof msg.content === "string" ? msg.content : "";
     for (let i = 0; i < content.length; i += chunkSize) {
       writer.write({
         ...base,
-        choices: [{ index: 0, delta: { content: content.slice(i, i + chunkSize) }, finish_reason: null }],
+        choices: [{ index: choiceIndex, delta: { content: content.slice(i, i + chunkSize) }, finish_reason: null }],
       });
     }
-  }
 
-  // 3. Tool call chunk — emitted as a single delta containing all calls
-  if (msg.tool_calls && msg.tool_calls.length > 0) {
+    if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
+      writer.write({
+        ...base,
+        choices: [{ index: choiceIndex, delta: { tool_calls: msg.tool_calls }, finish_reason: null }],
+      });
+    }
+
     writer.write({
       ...base,
-      choices: [{ index: 0, delta: { tool_calls: msg.tool_calls }, finish_reason: null }],
+      choices: [{ index: choiceIndex, delta: {}, finish_reason: choice.finish_reason || "stop" }],
     });
   }
 
-  // 4. Finish chunk (with optional usage)
-  const finishChunk = {
-    ...base,
-    choices: [{ index: 0, delta: {}, finish_reason: choice.finish_reason || "stop" }],
-  };
-  if (resBody.usage) finishChunk.usage = resBody.usage;
-  writer.write(finishChunk);
+  if (resBody.usage) writer.write({ ...base, choices: [], usage: resBody.usage });
 
-  // 5. [DONE]
   writer.writeDone();
+}
+
+/** Serialize a complete OpenAI chat completion to canonical SSE bytes. */
+export function openAIJsonToSSEBuffer(resBody, opts = {}) {
+  const frames = [];
+  _openaiJsonToSSE({
+    write(payload) {
+      frames.push(`data: ${JSON.stringify(payload)}\n\n`);
+    },
+    writeDone() {
+      frames.push("data: [DONE]\n\n");
+    },
+  }, resBody, opts.chunkSize ?? CONTENT_CHUNK_SIZE);
+  return Buffer.from(frames.join(""), "utf8");
 }
 
 /**

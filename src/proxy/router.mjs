@@ -45,6 +45,7 @@ import { isRoutable, isEffectivelyRoutable } from "../discovery/lifecycle.mjs";
 import { applyReasoningFloor } from "./core.mjs";
 import { enforceResponseContract } from "./response-contract.mjs";
 import { shouldForceNonStream } from "../classifiers/classifier.mjs";
+import { openAIJsonToSSEBuffer } from "./stream.mjs";
 import { createDecisionCache, decisionKey } from "./decision-cache.mjs";
 // card P4.2 (@match routing): reuse the existing ranker + capability deriver
 // + discovery cache reader + allowlist/availability checks as-is, no
@@ -4016,12 +4017,8 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       exitMeter(meterUrl);
     }
 
-    // Validate the buffered JSON form FIRST (content, tool calls, reasoning
-    // evidence), then re-emit a passing completion as OpenAI SSE chunks when
-    // the original client asked to stream (mirrors fromCodexResponse
-    // clientStream in codex-adapter.mjs; card d9f96131). The streaming
-    // contract re-check is skipped for the synthesized stream because its
-    // source JSON was already validated.
+    // Validate the buffered JSON form first, then re-emit and validate the
+    // canonical OpenAI SSE form when the original client asked to stream.
     if (flippedToNonStream) {
       res = enforceResponseContract(res, requestedModel);
     }
@@ -4029,29 +4026,11 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       try {
         const completion = JSON.parse(res.body.toString("utf-8"));
         if (completion && Array.isArray(completion.choices) && completion.choices.length) {
-          const base = {
-            id: completion.id || ("chatcmpl-flip-" + Date.now()),
-            object: "chat.completion.chunk",
-            created: typeof completion.created === "number" ? completion.created : Math.floor(Date.now() / 1000),
-            model: completion.model || requestedModel || "unknown",
-          };
-          const chunks = [];
-          const choice = completion.choices[0] || {};
-          const message = choice.message || {};
-          const delta0 = { role: "assistant" };
-          chunks.push({ ...base, choices: [{ index: 0, delta: delta0, finish_reason: null }] });
-          const text = typeof message.content === "string" ? message.content : "";
-          for (let i = 0; i < text.length; i += 100) {
-            chunks.push({ ...base, choices: [{ index: 0, delta: { content: text.slice(i, i + 100) }, finish_reason: null }] });
-          }
-          if (Array.isArray(message.tool_calls) && message.tool_calls.length) {
-            for (const call of message.tool_calls) {
-              chunks.push({ ...base, choices: [{ index: 0, delta: { tool_calls: [call] }, finish_reason: null }] });
-            }
-          }
-          chunks.push({ ...base, choices: [{ index: 0, delta: {}, finish_reason: choice.finish_reason || "stop" }] });
-          if (completion.usage) chunks[chunks.length - 1].usage = completion.usage;
-          const sse = Buffer.from(chunks.map((c) => `data: ${JSON.stringify(c)}\n\n`).join("") + "data: [DONE]\n\n", "utf-8");
+          completion.id ||= ("chatcmpl-flip-" + Date.now());
+          completion.created = typeof completion.created === "number"
+            ? completion.created : Math.floor(Date.now() / 1000);
+          completion.model ||= requestedModel || "unknown";
+          const sse = openAIJsonToSSEBuffer(completion);
           res = {
             ...res,
             headers: { ...res.headers, "content-type": "text/event-stream", "cache-control": "no-store" },
@@ -4059,6 +4038,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           };
           delete res.headers["content-length"];
           delete res.headers["Content-Length"];
+          res = enforceResponseContract(res, requestedModel);
         }
       } catch (err) {
         console.warn(`[router] flip SSE re-emission skipped: ${err.message}`);
