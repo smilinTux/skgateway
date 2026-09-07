@@ -247,9 +247,13 @@ function _openaiJsonToSSE(writer, resBody, chunkSize) {
     }
 
     if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
+      const toolCalls = msg.tool_calls.map((toolCall, toolOrdinal) => ({
+        ...toolCall,
+        index: Number.isInteger(toolCall?.index) ? toolCall.index : toolOrdinal,
+      }));
       writer.write({
         ...base,
-        choices: [{ index: choiceIndex, delta: { tool_calls: msg.tool_calls }, finish_reason: null }],
+        choices: [{ index: choiceIndex, delta: { tool_calls: toolCalls }, finish_reason: null }],
       });
     }
 

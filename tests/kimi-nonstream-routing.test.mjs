@@ -88,3 +88,40 @@ test('routeAndSend preserves every Kimi choice and tool index in validated SSE',
     await new Promise((resolve) => upstream.close(resolve));
   }
 });
+
+test('routeAndSend assigns stable indices to buffered Kimi tool calls that omit them', async () => {
+  const completion = {
+    id: 'kimi-routed-no-index', object: 'chat.completion', created: 123, model: 'kimi-for-coding',
+    choices: [{ index: 0, message: { role: 'assistant', content: '', tool_calls: [
+      { id: 'call_a', type: 'function', function: { name: 'read_file', arguments: '{"path":"a"}' } },
+      { id: 'call_b', type: 'function', function: { name: 'write_file', arguments: '{"path":"b"}' } },
+    ] }, finish_reason: 'tool_calls' }],
+  };
+  const upstream = http.createServer((request, response) => {
+    request.resume();
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify(completion));
+  });
+  await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve));
+  try {
+    const router = createRouter({ backends: { kimi: {
+      url: `http://127.0.0.1:${upstream.address().port}/v1`, auth_type: 'none', models: ['kimi-for-coding'],
+    } }, failover: false, siem_log: false });
+    const result = await routeAndSend(
+      router, { model: 'kimi-for-coding', agentId: 'repair-no-index' }, '/chat/completions', 'POST',
+      { 'content-type': 'application/json', 'x-skgateway-nonstream': 'force' },
+      Buffer.from(JSON.stringify({
+        model: 'kimi-for-coding', stream: true, messages: [{ role: 'user', content: 'work' }],
+      })), false,
+    );
+    assert.equal(result.status, 200);
+    const frames = result.body.toString('utf8').split('\n')
+      .filter((line) => line.startsWith('data: {'))
+      .map((line) => JSON.parse(line.slice(6)));
+    const calls = frames.flatMap((frame) => frame.choices)
+      .flatMap((choice) => choice.delta.tool_calls || []);
+    assert.deepEqual(calls.map((call) => [call.index, call.id]), [[0, 'call_a'], [1, 'call_b']]);
+  } finally {
+    await new Promise((resolve) => upstream.close(resolve));
+  }
+});
