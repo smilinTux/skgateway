@@ -11,7 +11,17 @@ by the repository's [`tests`](tests).
 
 ## Shipped capabilities
 
-The following claims are limited to behavior present in this repository.
+The following claims are limited to behavior present in this repository. They
+do not claim that every component is enabled in a deployed gateway.
+
+> **Pipeline qualification:** The shipped `src/index.mjs` request path invokes
+> model-limit trimming before `routeAndSend` and response sanitization before
+> returning buffered responses. Repository tests exercise that source wiring.
+> The proposed bounded production runtime check was not authorized, so these
+> statements are source and synthetic-test evidence, not a live-runtime
+> qualification. The YAML policy engine, proactive tool reducer, and core retry
+> rate-limit handling remain library or observational components unless a caller
+> explicitly composes them. See [the policy guide](docs/POLICIES.md).
 
 | Capability | Shipped evidence |
 | --- | --- |
@@ -40,9 +50,16 @@ every deployment.
   reroute requests. See the `classification` defaults in
   [`src/config.mjs`](src/config.mjs) and the side effect guard in
   [`tests/classification-engine.test.mjs`](tests/classification-engine.test.mjs).
-* The YAML policy engine, tool reducer, sanitizer, and rate limiter are used by the
-  embeddable `handleRequest` path in [`src/proxy/core.mjs`](src/proxy/core.mjs).
-  They are not presented here as unconditional enforcement by the main runtime.
+* Model-limit system and conversation trimming are wired into the main
+  `src/index.mjs` request path before `routeAndSend`. Buffered response
+  sanitization is wired after `routeAndSend`; streaming responses skip that
+  sanitizer path. [`tests/live-pipeline-wiring.test.mjs`](tests/live-pipeline-wiring.test.mjs)
+  provides repository test evidence only. The bounded production runtime check
+  was denied for now, so neither stage is claimed as live-runtime qualified.
+* The YAML policy engine, proactive tool reducer, and core retry rate-limit
+  handling are used by the embeddable `handleRequest` path in
+  [`src/proxy/core.mjs`](src/proxy/core.mjs), but are not composed by the default
+  `src/index.mjs` request path. They are not claimed as live enforcement.
 * Syslog and Elasticsearch are optional sinks. The default SIEM output is a local
   JSONL file. See [`src/config.mjs`](src/config.mjs),
   [`tests/siem-syslog.test.mjs`](tests/siem-syslog.test.mjs), and
