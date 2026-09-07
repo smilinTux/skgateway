@@ -32,6 +32,11 @@ if (!process.env.SKGATEWAY_MODEL_CATALOG_STORE_PATH) {
   process.env.SKGATEWAY_MODEL_CATALOG_STORE_PATH = join(dir, 'model_catalog_store.json');
 }
 
+if (!process.env.SKGATEWAY_CAPACITY_STORE_PATH) {
+  const dir = mkdtempSync(join(tmpdir(), 'skgw-test-capacity-'));
+  process.env.SKGATEWAY_CAPACITY_STORE_PATH = join(dir, 'capacity_store.json');
+}
+
 // SAME CLASS OF BUG, SECOND FILE IN THE SAME DIRECTORY, found 2026-08-16.
 // discovery.mjs's saveCache() defaulted to the PRODUCTION discovery cache
 // (~/.config/skgateway/model_catalog_cache.json) with no env override and no

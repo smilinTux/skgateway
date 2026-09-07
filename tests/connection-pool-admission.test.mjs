@@ -29,6 +29,9 @@ describe("ConnectionPool capacity domains", () => {
     ]);
 
     assert.ok(tickets.every((ticket) => ticket.id === "chiap08-qwen38"));
+    assert.deepEqual(tickets.map((ticket) => ticket.queueWaitMs), [0, 0, 0, 0]);
+    assert.deepEqual(tickets.map((ticket) => ticket.inflightConcurrency), [1, 2, 3, 4]);
+    assert.ok(tickets.every((ticket) => ticket.admissionOutcome === "admitted"));
     assert.equal(new Set(tickets.map((ticket) => ticket.ticketId)).size, 4);
     assert.deepEqual(pool.getStats("reg:qwen38"), pool.getStats("chiap08-qwen38"));
     assert.equal(pool.getStats("reg:qwen38").active, 4);
@@ -82,6 +85,53 @@ describe("ConnectionPool capacity domains", () => {
     });
   });
 
+  test("configured per-backend pools are visible before traffic without double-counting domains", async () => {
+    const pool = new ConnectionPool({
+      defaultMaxConcurrent: 20,
+      perBackend: {
+        codex: { max: 7, maxQueue: 3, queueTimeoutMs: 12_000 },
+        "reg:qwen38": { max: 99 },
+      },
+      capacityDomains: QWEN_DOMAIN,
+    });
+
+    assert.deepEqual(Object.keys(pool.getAllStats()), ["codex", "chiap08-qwen38"]);
+    assert.deepEqual(pool.getAllStats().codex, {
+      capacityDomain: "codex",
+      members: ["codex"],
+      active: 0,
+      queued: 0,
+      max: 7,
+      maxQueue: 3,
+      queueTimeoutMs: 12_000,
+      totalProcessed: 0,
+      totalDropped: 0,
+      totalTimedOut: 0,
+      totalCancelled: 0,
+      peakActive: 0,
+      peakQueue: 0,
+    });
+    assert.equal(pool.getAllStats()["chiap08-qwen38"].max, 4);
+    assert.deepEqual(pool.getTotalStats(), {
+      totalActive: 0,
+      totalQueued: 0,
+      totalCapacity: 11,
+    });
+
+    const runtimeTicket = await pool.acquire("runtime-created");
+    assert.deepEqual(Object.keys(pool.getAllStats()), [
+      "codex",
+      "chiap08-qwen38",
+      "runtime-created",
+    ]);
+    assert.deepEqual(pool.getTotalStats(), {
+      totalActive: 1,
+      totalQueued: 0,
+      totalCapacity: 31,
+    });
+    assert.equal(pool.release(runtimeTicket), true);
+  });
+
   test("tickets are single-use and foreign, forged, or string releases cannot free a slot", async () => {
     const pool = new ConnectionPool({
       capacityDomains: {
@@ -109,6 +159,9 @@ describe("ConnectionPool capacity domains", () => {
     assert.equal(pool.release(holder), true);
     const queuedTicket = await queued;
     assert.notEqual(queuedTicket.ticketId, holder.ticketId);
+    assert.equal(queuedTicket.admissionOutcome, "admitted");
+    assert.equal(queuedTicket.inflightConcurrency, 1);
+    assert.ok(queuedTicket.queueWaitMs >= 0 && queuedTicket.queueWaitMs <= 1000);
     assert.equal(pool.release(holder), false, "duplicate release cannot free the promoted slot");
     assert.equal(pool.getStats("bounded").active, 1);
     assert.equal(pool.getStats("bounded").queued, 0);
@@ -163,6 +216,9 @@ describe("ConnectionPool capacity domains", () => {
         assert.equal(error.code, "capacity_exceeded");
         assert.equal(error.capacityDomain, "failFast");
         assert.equal(error.retryAfterSeconds, 1);
+        assert.equal(error.queueWaitMs, 0);
+        assert.equal(error.inflightConcurrency, 1);
+        assert.equal(error.admissionOutcome, "denied");
         return true;
       },
     );
@@ -185,6 +241,9 @@ describe("ConnectionPool capacity domains", () => {
         assert.ok(error instanceof PoolAdmissionError);
         assert.equal(error.code, "queue_timeout");
         assert.equal(error.capacityDomain, "bounded");
+        assert.equal(error.queueWaitMs, 20);
+        assert.equal(error.inflightConcurrency, 1);
+        assert.equal(error.admissionOutcome, "timeout");
         return true;
       },
     );
@@ -212,6 +271,9 @@ describe("ConnectionPool capacity domains", () => {
       (error) => {
         assert.ok(error instanceof PoolAdmissionError);
         assert.equal(error.code, "client_closed");
+        assert.ok(error.queueWaitMs >= 0 && error.queueWaitMs <= 40);
+        assert.equal(error.inflightConcurrency, 1);
+        assert.equal(error.admissionOutcome, "cancelled");
         return true;
       },
     );

@@ -263,6 +263,19 @@ export function toOpenAIResponse(anthropicRes, model) {
       prompt_tokens: msg.usage?.input_tokens ?? 0,
       completion_tokens: msg.usage?.output_tokens ?? 0,
       total_tokens: (msg.usage?.input_tokens ?? 0) + (msg.usage?.output_tokens ?? 0),
+      // Preserve Anthropic's prompt-cache fields on the translated usage
+      // object instead of dropping them. input_tokens/prompt_tokens above
+      // counts ONLY the uncached portion of the prompt; without these,
+      // anything reading the OpenAI-shaped usage (e.g. token-ratio.mjs)
+      // sees a prompt_tokens that silently omits the cached majority of a
+      // cache-hit request. Additive only: prompt_tokens/completion_tokens/
+      // total_tokens keep their existing meaning for other consumers.
+      // Only present when Anthropic reported them, matching collector.mjs's
+      // existing lookup of these same field names off body.usage.
+      ...(msg.usage?.cache_read_input_tokens != null
+        ? { cache_read_input_tokens: msg.usage.cache_read_input_tokens } : {}),
+      ...(msg.usage?.cache_creation_input_tokens != null
+        ? { cache_creation_input_tokens: msg.usage.cache_creation_input_tokens } : {}),
     },
   };
 

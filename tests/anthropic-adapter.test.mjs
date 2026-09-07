@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { toAnthropicRequest } from "../src/proxy/anthropic-adapter.mjs";
+import { toAnthropicRequest, toOpenAIResponse } from "../src/proxy/anthropic-adapter.mjs";
 
 /** Helper: build an OpenAI request buffer and translate it. */
 function tr(body) {
@@ -120,4 +120,39 @@ test("at least one message always survives (all-empty degenerate case)", () => {
   assert.ok(a.messages.length >= 1, "must keep at least one message");
   const c = a.messages[0].content;
   if (typeof c === "string") assert.notEqual(c.trim(), "");
+});
+
+/** Helper: wrap an Anthropic Messages response body and translate it to OpenAI shape. */
+function toOpenAI(anthropicMsg) {
+  const anthropicRes = {
+    status: 200,
+    headers: {},
+    body: Buffer.from(JSON.stringify(anthropicMsg), "utf-8"),
+  };
+  const out = toOpenAIResponse(anthropicRes, anthropicMsg.model);
+  return JSON.parse(out.body.toString("utf-8"));
+}
+
+test("toOpenAIResponse preserves cache_read/cache_creation usage fields", () => {
+  const openai = toOpenAI({
+    id: "msg_1", model: "claude-opus-5", type: "message",
+    content: [{ type: "text", text: "hi" }], stop_reason: "end_turn",
+    usage: { input_tokens: 500, output_tokens: 20, cache_read_input_tokens: 45000, cache_creation_input_tokens: 4500 },
+  });
+  assert.equal(openai.usage.prompt_tokens, 500, "prompt_tokens keeps its existing meaning");
+  assert.equal(openai.usage.completion_tokens, 20);
+  assert.equal(openai.usage.total_tokens, 520);
+  assert.equal(openai.usage.cache_read_input_tokens, 45000, "cache read tokens must survive translation");
+  assert.equal(openai.usage.cache_creation_input_tokens, 4500, "cache creation tokens must survive translation");
+});
+
+test("toOpenAIResponse usage omits cache fields when Anthropic didn't report them", () => {
+  const openai = toOpenAI({
+    id: "msg_2", model: "claude-opus-5", type: "message",
+    content: [{ type: "text", text: "hi" }], stop_reason: "end_turn",
+    usage: { input_tokens: 100, output_tokens: 10 },
+  });
+  assert.equal(openai.usage.prompt_tokens, 100);
+  assert.ok(!("cache_read_input_tokens" in openai.usage));
+  assert.ok(!("cache_creation_input_tokens" in openai.usage));
 });

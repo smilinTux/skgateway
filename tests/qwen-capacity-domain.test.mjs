@@ -13,13 +13,17 @@ import { after, afterEach, beforeEach, describe, test } from "node:test";
 const registryDir = mkdtempSync(join(tmpdir(), "skgw-qwen-capacity-"));
 const registryPath = join(registryDir, "registry.yaml");
 const previousRegistryPath = process.env.SKMODELS_REGISTRY;
+const previousCatalogStorePath = process.env.SKGATEWAY_MODEL_CATALOG_STORE_PATH;
 after(() => {
   if (previousRegistryPath === undefined) delete process.env.SKMODELS_REGISTRY;
   else process.env.SKMODELS_REGISTRY = previousRegistryPath;
+  if (previousCatalogStorePath === undefined) delete process.env.SKGATEWAY_MODEL_CATALOG_STORE_PATH;
+  else process.env.SKGATEWAY_MODEL_CATALOG_STORE_PATH = previousCatalogStorePath;
   rmSync(registryDir, { recursive: true, force: true });
 });
 writeFileSync(registryPath, "backends: {}\nroles: {}\n", "utf8");
 process.env.SKMODELS_REGISTRY = registryPath;
+process.env.SKGATEWAY_MODEL_CATALOG_STORE_PATH = join(registryDir, "model-catalog.json");
 
 const { ConnectionPool, getPool, resetPool } = await import(
   "../src/proxy/connection-pool.mjs"
@@ -109,7 +113,10 @@ function startHoldingServer() {
         releaseAll() {
           for (const release of state.pending.splice(0)) release();
         },
-        close: () => new Promise((done) => server.close(done)),
+        close: () => new Promise((done) => {
+          server.close(done);
+          server.closeAllConnections();
+        }),
       });
     });
   });
@@ -160,6 +167,15 @@ afterEach(async () => {
 
 
 describe("chiap08 Qwen shared capacity domain", () => {
+  test("fixture teardown closes a retained upstream socket", { timeout: 1000 }, async () => {
+    const retained = request("qwen3.8-27b");
+    await waitFor(() => upstream.state.active === 1, "retained upstream request");
+
+    await upstream.close();
+    upstream = null;
+    await retained;
+  });
+
   test("mixed direct and registry traffic never exceeds four combined upstream calls", async () => {
     getPool({ capacityDomains: DOMAIN });
     const firstFour = [
@@ -183,6 +199,10 @@ describe("chiap08 Qwen shared capacity domain", () => {
     upstream.releaseAll();
     const results = await Promise.all([...firstFour, fifth]);
     assert.ok(results.every((result) => result.status === 200));
+    assert.ok(results.every((result) => result.admissionOutcome === "admitted"));
+    assert.ok(results.every((result) => result.backoffClassification === "nonterminal"));
+    assert.ok(results.every((result) => result.inflightConcurrency >= 1 && result.inflightConcurrency <= 4));
+    assert.ok(results.every((result) => result.queueWaitMs >= 0 && result.queueWaitMs <= 30_000));
     assert.equal(upstream.state.maxActive, 4);
     assert.equal(pool.getStats("chiap08-qwen38").active, 0);
     assert.equal(pool.getStats("chiap08-qwen38").queued, 0);
@@ -207,6 +227,11 @@ describe("chiap08 Qwen shared capacity domain", () => {
     const full = await request("qwen3.8-27b");
     assert.equal(full.status, 503);
     assert.equal(full.headers["retry-after"], "1");
+    assert.equal(full.queueWaitMs, 0);
+    assert.equal(full.inflightConcurrency, 1);
+    assert.equal(full.admissionOutcome, "denied");
+    assert.equal(full.backoffClassification, "local_admission_denial");
+    assert.equal(full.retryAfterSeconds, 1);
     assert.deepEqual(JSON.parse(full.body).error, {
       message: "Capacity domain chiap08-qwen38 queue is full.",
       code: "capacity_exceeded",
@@ -221,6 +246,10 @@ describe("chiap08 Qwen shared capacity domain", () => {
     assert.equal(timedOut.headers["retry-after"], "1");
     assert.equal(JSON.parse(timedOut.body).error.code, "queue_timeout");
     assert.equal(JSON.parse(timedOut.body).error.capacity_domain, "chiap08-qwen38");
+    assert.equal(timedOut.queueWaitMs, 30);
+    assert.equal(timedOut.inflightConcurrency, 1);
+    assert.equal(timedOut.admissionOutcome, "timeout");
+    assert.equal(timedOut.backoffClassification, "timeout");
     assert.equal(getPool().getStats("chiap08-qwen38").totalDropped, 1);
     assert.equal(getPool().getStats("chiap08-qwen38").totalTimedOut, 1);
 
@@ -262,6 +291,10 @@ describe("chiap08 Qwen shared capacity domain", () => {
     assert.equal(result.status, 499);
     assert.equal(result.cancelled, true);
     assert.equal(result.failover, false);
+    assert.ok(result.queueWaitMs >= 0 && result.queueWaitMs <= 1000);
+    assert.equal(result.inflightConcurrency, 1);
+    assert.equal(result.admissionOutcome, "cancelled");
+    assert.equal(result.backoffClassification, "cancellation");
     assert.equal(upstream.state.totalCalls, 1, "cancelled waiter never reaches any upstream");
     assert.equal(getPool().getStats("chiap08-qwen38").totalCancelled, 1);
     assert.equal(getPool().getStats("chiap08-qwen38").queued, 0);
@@ -279,14 +312,14 @@ test("source config pins two independent Qwen replica capacity domains", async (
   const config = yamlLoad(readFileSync(new URL("../config/skgateway.yaml", import.meta.url), "utf8"));
   assert.deepEqual(config.pooling.capacity_domains["chiap08-qwen38"], {
     members: ["chiap08-qwen38", "reg:qwen38"],
-    max: 3,
-    maxQueue: 8,
-    queueTimeoutMs: 30_000,
+    max: 2,
+    maxQueue: 2,
+    queueTimeoutMs: 10_000,
   });
   assert.deepEqual(config.pooling.capacity_domains["chiap01-qwen38"], {
     members: ["chiap01-qwen38"],
-    max: 2,
-    maxQueue: 4,
-    queueTimeoutMs: 30_000,
+    max: 1,
+    maxQueue: 1,
+    queueTimeoutMs: 10_000,
   });
 });

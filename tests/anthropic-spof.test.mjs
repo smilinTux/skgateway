@@ -125,6 +125,17 @@ describe("sendUpstream idle timeout", () => {
       new URL(server.base));
     assert.equal(res.status, 200);
   });
+
+  test("local response bound stops a streaming provider that ignores token limits", async () => {
+    server = await startServer((_req, res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.end("x".repeat(2048));
+    });
+    const res = await sendUpstream("/v1/chat/completions", "POST", HEADERS, BODY,
+      new URL(server.base), 5000, null, 1024);
+    assert.equal(res.status, 502);
+    assert.equal(JSON.parse(res.body.toString()).error.code, "response_too_large");
+  });
 });
 
 // ── 2b. downstream cancellation: stop work, do not classify as failure ─────

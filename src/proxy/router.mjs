@@ -37,9 +37,16 @@ import { getFailoverConfig, isLocalUrl, probeLocalHealth, recordLocalOutcome } f
 import { readMeter } from "./meter-client.mjs";
 import { marginalJoules, imputeJoules, resolveBasis, coeffsForModel, backendIsLocal, usageFromSSE, resolveMeterUrl } from "../metrics/energy.mjs";
 import { recordModelOutcome, getLifecycle } from "../discovery/model_catalog_store.mjs";
+import {
+  admitCapacity, capacityStatus, clearCapacity, finishCapacityProbe,
+  isSubscriptionExhaustion, recordModelThrottled, recordSubscriptionExhausted,
+  releaseCapacityProbe,
+} from "../discovery/capacity_store.mjs";
 import { isRoutable, isEffectivelyRoutable } from "../discovery/lifecycle.mjs";
 import { applyReasoningFloor } from "./core.mjs";
 import { enforceResponseContract } from "./response-contract.mjs";
+import { shouldForceNonStream } from "../classifiers/classifier.mjs";
+import { openAIJsonToSSEBuffer } from "./stream.mjs";
 import { createDecisionCache, decisionKey } from "./decision-cache.mjs";
 // card P4.2 (@match routing): reuse the existing ranker + capability deriver
 // + discovery cache reader + allowlist/availability checks as-is, no
@@ -113,6 +120,7 @@ export const CLIENT_CREDENTIAL_HEADERS = [
 export const INTERNAL_CONTROL_HEADERS = [
   "x-sk-card-id",
   "x-sk-context",
+  "x-sk-probe",
   "x-sk-prefer",
   "x-sk-require",
   "x-sk-role",
@@ -211,6 +219,21 @@ export class ModelClaimQuarantinedError extends Error {
   }
 }
 
+export class ModelOwnerDownError extends Error {
+  /** Fail closed when a declared model's owning backend is down (purity). */
+  constructor(model, declaredBy) {
+    super(
+      `model "${model}" is declared by [${(declaredBy || []).join(", ")}] ` +
+        `but every owner backend is currently unavailable; refusing to route ` +
+        `to unrelated backends`,
+    );
+    this.name = "ModelOwnerDownError";
+    this.model = model;
+    this.declaredBy = declaredBy || [];
+    this.status = 503;
+  }
+}
+
 /**
  * Dead-alias auto-quarantine (card 2d1f3a2c).
  *
@@ -297,6 +320,54 @@ const MAX_THROTTLE_COOLDOWN_MS = 24 * 60 * 60 * 1000; // 24h
 
 function throttleKey(backendId, model) {
   return `${backendId}::${model}`;
+}
+
+/**
+ * Infer provider name from backend ID (card e19f88db / SKGW-ATTRIBUTION-01).
+ * Uses discovery backend flag if set, otherwise infers from known patterns.
+ *
+ * @param {string} backendId
+ * @returns {string|null} provider name or null if unknown
+ */
+function inferProviderFromBackend(backendId) {
+  if (!backendId) return null;
+  const id = String(backendId).toLowerCase();
+  if (id.includes('nvidia')) return 'nvidia';
+  if (id.includes('anthropic')) return 'anthropic';
+  if (id.includes('ollama')) return 'ollama';
+  if (id.includes('openrouter')) return 'openrouter';
+  if (id.includes('zai')) return 'zai';
+  if (id.includes('codex')) return 'codex';
+  // Local sovereign backends (chiap08-qwen38, chiap08-ornith, etc.)
+  if (id.includes('chiap') || id.includes('ornith') || id.includes('qwen') || id === 'local') {
+    return 'local';
+  }
+  return null; // Unknown provider
+}
+
+/**
+ * Infer rail type from backend (card e19f88db / SKGW-ATTRIBUTION-01).
+ * Rail describes whether the request served from local, cloud, or hybrid infrastructure.
+ *
+ * @param {string} backendId
+ * @param {string} backendUrl
+ * @param {Function} isLocalUrlFn
+ * @param {string|null} provider  Pre-computed provider value
+ * @returns {string|null} 'local', 'cloud', 'hybrid', or null if unknown
+ */
+function inferRailFromBackend(backendId, backendUrl, isLocalUrlFn, provider) {
+  if (!backendId) return null;
+  const resolvedProvider = provider || inferProviderFromBackend(backendId);
+  if (resolvedProvider === 'local') return 'local';
+  if (resolvedProvider === 'nvidia' || resolvedProvider === 'anthropic' || resolvedProvider === 'openrouter' || resolvedProvider === 'zai') {
+    return 'cloud';
+  }
+  // Check if URL is local for hybrid detection
+  if (backendUrl && typeof isLocalUrlFn === 'function' && isLocalUrlFn(backendUrl)) {
+    return 'local';
+  }
+  // Default to cloud for known providers, null for unknown
+  return resolvedProvider ? 'cloud' : null;
 }
 
 /**
@@ -757,6 +828,10 @@ export class Backend {
     // accepting the socket but never replying) so the router can fail over
     // instead of hanging the request. See sendUpstream(timeoutMs).
     this.timeout_ms = typeof config.timeout_ms === "number" ? config.timeout_ms : 0;
+    // Opt-in fail-closed admission for providers whose health has not yet been
+    // observed. Legacy providers retain warm-start behaviour; newly admitted
+    // external lanes must prove a bounded probe before receiving work.
+    this.require_observed_health = config.require_observed_health === true;
 
     // Dead-alias auto-quarantine tunables (card 2d1f3a2c). Per-backend config
     // overrides the router-level default which overrides the module default.
@@ -799,6 +874,14 @@ export class Backend {
     this._zaiAuth = null;
     this._zaiAuthMtime = -1;
     this._zaiAuthPath = this._credentials_file;
+    // Kimi Code subscription auth follows the same read-only file contract:
+    // the kimi CLI owns OAuth refresh and writes
+    // ~/.kimi-code/credentials/<env>.json. Access tokens are short lived
+    // (observed 900s), so a keepalive timer runs the CLI on the gateway
+    // host and this gateway re-reads the file on mtime change only.
+    this._kimiAuth = null;
+    this._kimiAuthMtime = -1;
+    this._kimiAuthPath = this._credentials_file;
 
     // Agent-level restrictions — set of agent IDs allowed to use this backend.
     // Empty set = no restrictions.
@@ -826,8 +909,19 @@ export class Backend {
     this._consecutiveFailures = 0;
     /** @type {boolean} true = out of rotation (skipped by selection) */
     this._quarantined = false;
+    // Provider purity (card fc22572b): when true, a model id this backend
+    // DECLARES fails closed with 503 model_owner_backend_down while every
+    // declaring backend is unavailable, instead of the legacy fall-through
+    // spray to unrelated providers. Opt-in: pinned contracts (lifecycle
+    // 410 attribution, fast-failure quarantine) keep the legacy behavior
+    // unless a backend explicitly claims purity.
+    this._providerPurity = config.provider_purity === true;
     /** @type {number} epoch ms (when quarantine started / cooldown last re-armed) */
     this._quarantinedSince = 0;
+    /** @type {number|null} true serving-engine token ceiling (card 9ed4a9f7) */
+    this.context_limit = Number.isFinite(config.context_limit) && config.context_limit > 0
+      ? config.context_limit
+      : null;
 
     this._totalRequests = 0;
     this._totalErrors = 0;
@@ -980,6 +1074,8 @@ export class Backend {
    * @returns {boolean}
    */
   isAvailable() {
+    if (this.require_observed_health && this._lastCheck === 0) return false;
+
     // Quarantine takes precedence over the error-rate status: a quarantined
     // alias is fully out of rotation until its cooldown elapses. After the
     // cooldown a single probe is admitted (quarantine stays armed until a
@@ -1182,6 +1278,23 @@ export class Backend {
         return headers;
       }
 
+      case "kimi_oauth": {
+        // Kimi Code subscription auth: bearer access token read read-only
+        // from the kimi CLI credentials file. The CLI on the gateway host
+        // owns refresh (tokens live ~15 minutes; a keepalive timer drives
+        // it), so this gateway never refreshes and never writes the file.
+        const headers = this._getKimiAuthHeaders();
+        if (!headers) {
+          console.warn(
+            `[router] backend=${this.id} kimi_oauth auth but no usable credentials at ` +
+              `${this._kimiAuthPath || "(no credentials_path/file set)"}. ` +
+              `Sending UNAUTHENTICATED (expect 401). Sync kimi CLI credentials there.`,
+          );
+          return {};
+        }
+        return headers;
+      }
+
       case "none":
       default:
         return {};
@@ -1257,6 +1370,38 @@ export class Backend {
     } catch (err) {
       console.error(
         `[router] backend=${this.id} failed to load codex credentials ${this._codexAuthPath}: ${err.message}`,
+      );
+      return null;
+    }
+  }
+
+  /**
+   * Return the z.ai subscription auth headers, re-reading the ZCode
+   * credentials file when its mtime changes. Never writes or refreshes.
+   *
+   * @returns {Record<string, string>|null}
+   */
+  _getKimiAuthHeaders() {
+    if (!this._kimiAuthPath) return null;
+    try {
+      const filePath = this._kimiAuthPath.replace(/^~/, process.env.HOME || "");
+      const mtime = statSync(filePath).mtimeMs;
+      if (!this._kimiAuth || mtime !== this._kimiAuthMtime) {
+        const raw = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+        const accessToken = raw && (raw.access_token || raw.accessToken);
+        if (!accessToken) {
+          console.warn(
+            `[router] backend=${this.id} kimi credentials file has no access token: ${filePath}`,
+          );
+          return null;
+        }
+        this._kimiAuth = { authorization: `Bearer ${accessToken}` };
+        this._kimiAuthMtime = mtime;
+      }
+      return this._kimiAuth;
+    } catch (err) {
+      console.error(
+        `[router] backend=${this.id} failed to load kimi credentials ${this._kimiAuthPath}: ${err.message}`,
       );
       return null;
     }
@@ -1517,7 +1662,7 @@ export function createRouter(config = {}) {
    * @param {string|undefined} agentId
    * @returns {Backend[]}
    */
-  function candidatesFor(model, agentId) {
+  function candidatesFor(model, agentId, expand = false, bootstrapProbe = false) {
     const available = availableByPriority().filter((b) => b.allowsAgent(agentId));
 
     if (!model) return available;
@@ -1529,6 +1674,18 @@ export function createRouter(config = {}) {
     const matched = available.filter(
       (b) => b.supportsModel(model) && b.isModelClaimAvailable(model),
     );
+
+    // Admission-gated providers start unknown after every gateway restart.
+    // Permit only an explicitly marked public-synthetic request to establish
+    // their first observation. Ordinary traffic remains fail closed, and the
+    // existing capacity domain still bounds this probe to one active request.
+    if (bootstrapProbe && matched.length === 0) {
+      const unobserved = declared
+        .filter((b) => b.require_observed_health && b.getHealth().observed === false)
+        .filter((b) => b.allowsAgent(agentId) && b.isModelClaimAvailable(model))
+        .sort((a, b) => a.priority - b.priority);
+      if (unobserved.length > 0) matched.push(unobserved[0]);
+    }
 
     // Balancing for equal-priority same-model replicas (card 786d9232).
     // Group backends by priority and apply round-robin within each group.
@@ -1602,6 +1759,52 @@ export function createRouter(config = {}) {
       const claimQuarantined = [];
       claimQuarantined.claimQuarantined = true;
       return claimQuarantined;
+    }
+
+    // Provider purity (card f361407c, incident 2026-09-03): a model id that
+    // some backend DECLARES must never spray to unrelated backends when the
+    // declaring backend is merely DOWN (error cooldown) or agent-restricted.
+    // Observed live: during a z.ai cooldown, glm-4.6 and glm-4.7 fell through
+    // to primary=codex, which can only answer "model not supported"; and a
+    // fresh kimi backend's first empty-content failure marked it DOWN, so k3
+    // requests sprayed to codex the same way. Requests for a declared id
+    // fail closed here so the client sees the owner backend's real state and
+    // the retry loop backs off instead of burning a codex 400 on every
+    // attempt. Undeclared ids keep the historic fall-through.
+    if (declared.length > 0 && expand !== true) {
+      // Precedence rules (independent review of PR108, 2026-09-03):
+      //   1. A known eol|dead id keeps its terminal lifecycle verdict even
+      //      when its declarer is down.
+      //   2. Claim-quarantined declarers keep the legacy fall-through: the
+      //      410-lifecycle and fast-failure quarantine machinery needs real
+      //      attempts to real doors.
+      //   3. A total outage (no available backends at all) keeps the legacy
+      //      attempt-all path so callers see the owner's own terminal
+      //      502/410 instead of a pre-emptive 503.
+      //   4. Purity is OPT-IN per backend (provider_purity: true): only
+      //      flagged backends' declared ids fail closed on transient
+      //      error-cooldown down. Unflagged backends keep the historic
+      //      fall-through contract everywhere.
+      const lcDeclared = getLifecycle(model);
+      if (!isRoutable(lcDeclared)) {
+        const gated = [];
+        gated.eolGated = true;
+        gated.eolReason = lcDeclared.eol_reason;
+        return gated;
+      }
+      const transientDown = available.length > 0
+        && declared.some((b) => b._providerPurity)
+        && declared.every((b) => !b.isAvailable() && !b._quarantined);
+      // Admission-gated owners must not be sprayed through unrelated fallback
+      // providers while health is still unknown, including as the only owner.
+      const unobservedRequired = declared.some((b) => b.require_observed_health)
+        && declared.every((b) => !b.isAvailable() && !b._quarantined);
+      if (transientDown || unobservedRequired) {
+        const ownerDown = [];
+        ownerDown.ownerDown = true;
+        ownerDown.declaredBy = declared.map((b) => b.id);
+        return ownerDown;
+      }
     }
 
     // No backend explicitly claims this model. A KNOWN eol|dead id (per the
@@ -1684,7 +1887,12 @@ export function createRouter(config = {}) {
       throw new Error("[router] No backends registered — cannot route request");
     }
 
-    const candidates = candidatesFor(model, agentId);
+    const candidates = candidatesFor(
+      model,
+      agentId,
+      request.expand === true,
+      request.bootstrapProbe === true,
+    );
 
     if (candidates.eolGated) {
       siemEvent("model_eol_gated", { model, agentId, eol_reason: candidates.eolReason });
@@ -1693,6 +1901,12 @@ export function createRouter(config = {}) {
     if (candidates.claimQuarantined) {
       siemEvent("model_claims_quarantined", { model, agentId });
       throw new ModelClaimQuarantinedError(model);
+    }
+    if (candidates.ownerDown) {
+      siemEvent("model_owner_backend_down", {
+        model, agentId, declared_by: candidates.declaredBy,
+      });
+      throw new ModelOwnerDownError(model, candidates.declaredBy);
     }
 
     if (candidates.length === 0) {
@@ -1774,7 +1988,11 @@ export function createRouter(config = {}) {
       out[id] = backend.getHealth();
     }
     for (const [id, backend] of backends) {
-      out[id] = backend.getHealth();
+      const health = backend.getHealth();
+      const provider = backend.discovery || inferProviderFromBackend(id);
+      out[id] = provider === "codex"
+        ? { ...health, capacity: capacityStatus("codex", null) }
+        : health;
     }
     return out;
   }
@@ -2243,6 +2461,25 @@ function claimQuarantinedResponse(err) {
   };
 }
 
+function ownerDownResponse(err) {
+  return {
+    status: 503,
+    headers: { "content-type": "application/json", "retry-after": "30" },
+    body: Buffer.from(JSON.stringify({
+      error: {
+        message: err.message,
+        code: 503,
+        type: "model_owner_backend_down",
+        model: err.model,
+        declared_by: err.declaredBy,
+        retryable: true,
+      },
+    }), "utf-8"),
+    backendId: null,
+    failover: false,
+  };
+}
+
 /**
  * High-level helper used by the proxy request handler.
  * Tries each candidate backend in order, acquires a pool slot, sends the
@@ -2517,7 +2754,8 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
           .filter((backend) => backend.supportsModel(e.id))
           .map((backend) => backend.id)
         : [];
-      return isEffectivelyRoutable(getLifecycle(e.id), claimers);
+      const capacity = capacityStatus(e.provider, e.id);
+      return isEffectivelyRoutable(getLifecycle(e.id), claimers) && capacity.state !== "throttled";
     },
   });
 
@@ -2676,6 +2914,43 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
         }, {});
         continue;
       }
+      // Provider purity in a bucket chain: a member whose declaring backend
+      // is down is retried as an expansion route (the bucket tier treats
+      // members as fungible across sibling backends, health-aware expansion).
+      // If expansion still yields nothing servable, the member is skipped and
+      // the next live member serves. Direct (non-bucket) requests never take
+      // this path: for them ModelOwnerDownError fails closed at route().
+      if (err instanceof ModelOwnerDownError) {
+        try {
+          results = await router.route({
+            ...request, model: member.id, agentId: request.agentId, expand: true,
+          });
+        } catch (expandErr) {
+          skipped.push(member.id);
+          await emitSiem(EventType.ANOMALY, {
+            type: "bucket_member_skipped",
+            outcome: "skipped",
+            bucket: addr.bucket,
+            member: member.id,
+            eol_reason: expandErr instanceof Error ? expandErr.message : String(expandErr),
+          }, {});
+          continue;
+        }
+        const list2 = Array.isArray(results) ? results : results ? [results] : [];
+        for (const result of list2) {
+          const key = `${result.backendId}:${member.id}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          candidates.push({
+            ...result,
+            bodyOverride: rewriteBodyModel(body, member.id),
+            model: member.id,
+            bucket: addr.bucket,
+            bucketMember: member.id,
+          });
+        }
+        continue;
+      }
       throw err;
     }
     const list = Array.isArray(results) ? results : results ? [results] : [];
@@ -2762,6 +3037,9 @@ export async function routeAndSend(router, request, upstreamPath, method, client
   const pool = usePool ? getPool() : null;
   const requestedModel = request?.model;
   const codexIntent = [requestedModel, request?.role, request?.context, request?.service];
+  const bootstrapProbe = clientHeaders?.["x-sk-context"] === "public" &&
+    clientHeaders?.["x-sk-probe"] === "synthetic";
+  if (bootstrapProbe) request = { ...request, bootstrapProbe: true };
 
   // Read fresh off getConfig() every request (not cached at module scope) so
   // a SIGHUP config reload picks up a flipped energy.enabled or an updated
@@ -2959,6 +3237,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         } catch (err) {
           if (err instanceof ModelEolError) return eolGatedResponse(err);
           if (err instanceof ModelClaimQuarantinedError) return claimQuarantinedResponse(err);
+          if (err instanceof ModelOwnerDownError) return ownerDownResponse(err);
           throw err;
         }
         if (!candidates || candidates.length === 0) {
@@ -3221,6 +3500,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         } catch (err) {
           if (err instanceof ModelEolError) return eolGatedResponse(err);
           if (err instanceof ModelClaimQuarantinedError) return claimQuarantinedResponse(err);
+          if (err instanceof ModelOwnerDownError) return ownerDownResponse(err);
           throw err;
         }
       }
@@ -3241,6 +3521,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     } catch (err) {
       if (err instanceof ModelEolError) return eolGatedResponse(err);
       if (err instanceof ModelClaimQuarantinedError) return claimQuarantinedResponse(err);
+      if (err instanceof ModelOwnerDownError) return ownerDownResponse(err);
       throw err;
     }
   }
@@ -3284,8 +3565,42 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     }, { backend: primary.backendId });
   }
 
+  // The live HTTP path reaches this router directly, bypassing core.mjs. Apply
+  // the same non-stream classifier here so kimi tool turns are buffered
+  // upstream while the original client SSE contract remains unchanged.
+  let attemptBodyBase = body;
+  let flippedToNonStream = false;
+  let clientStreamWanted = false;
+  try {
+    const parsedBody = JSON.parse(body.toString("utf-8"));
+    clientStreamWanted = parsedBody.stream === true;
+    const cfg = getConfig();
+    const decision = shouldForceNonStream(
+      parsedBody,
+      clientHeaders,
+      body.length,
+      cfg?.streaming || {},
+    );
+    if (decision.force && parsedBody.stream === true) {
+      parsedBody.stream = false;
+      delete parsedBody.stream_options;
+      attemptBodyBase = Buffer.from(JSON.stringify(parsedBody), "utf-8");
+      flippedToNonStream = true;
+      console.info(`[router] non-stream flip: model=${parsedBody.model || requestedModel || "?"} reason=${decision.reason}`);
+    }
+  } catch (err) {
+    console.warn(`[router] non-stream classifier skipped: ${err.message}`);
+  }
+
   let lastResult = null;
   let didFailover = false;
+  // Doors that refused the context preflight (card 9ed4a9f7), bounded one
+  // entry per candidate, used to synthesize the explicit 400 when EVERY
+  // door is too small for the request.
+  const contextRejections = [];
+  // Doors whose engine returned exceed_context_size_error (preflight missed
+  // it), advanced without health penalty.
+  const contextOverflows = [];
   // Every attempt that produced an energy observation, in attempt order.
   // Reads are per attempt (spec 4.5), so writes must be too: a local metered
   // attempt that burned real joules and then failed over to cloud gets its own
@@ -3304,7 +3619,40 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // A candidate may carry a per-attempt body (e.g. the cloud-fallback
     // candidate rewrites the model to a cloud-served id). Default to the shared
     // body when no override is present.
-    const attemptBody = candidates[i].bodyOverride || body;
+    const attemptBody = candidates[i].bodyOverride || attemptBodyBase;
+
+    // Context preflight (card 9ed4a9f7): a backend may declare context_limit,
+    // the true serving-engine token ceiling (e.g. llama.cpp --ctx-size 32768
+    // behind a shared model id whose vLLM replica serves 131072). Estimate
+    // the request size and SKIP doors that cannot hold it, failing over to a
+    // capable replica, instead of sending and letting the engine truncate or
+    // error. Never silently truncate: if every door is too small the request
+    // fails with an explicit 400 naming each limit. The estimate is a
+    // documented heuristic (~3 bytes per token for JSON chat payloads),
+    // deliberately coarse because it gates only obvious overflows.
+    if (backend && Number.isFinite(backend.context_limit) && backend.context_limit > 0) {
+      // ponytail: /3 heuristic over-estimates plain text ~25 percent; measured
+      // structured Pi prompts ran 3.0-3.5 bytes/token, so /4 undercounted and
+      // slipped real 16.6K-18.5K prompts past a 16384 slot. Upgrade path: a
+      // tokenizer when preflight false-negatives matter.
+      const estimatedTokens = Math.ceil(attemptBody.length / 3);
+      if (estimatedTokens > backend.context_limit) {
+        console.warn(
+          `[routeAndSend] context preflight rejected backend=${backendId}: ` +
+            `estimated ${estimatedTokens} tokens exceeds context_limit ${backend.context_limit}; ` +
+            `deferring to the next candidate`,
+        );
+        await emitSiem("error", {
+          type: "context_preflight_rejected",
+          backend: backendId,
+          estimated_tokens: estimatedTokens,
+          context_limit: backend.context_limit,
+          model: candidates[i].model || request.model,
+        }, { backend: backendId });
+        contextRejections.push({ backendId, estimatedTokens, context_limit: backend.context_limit });
+        continue;
+      }
+    }
     // The model THIS door actually serves. Only differs from request.model
     // for candidates that carry an explicit tag (the @match chain, card
     // 9e28de88 fix #5, and the cloud-fallback/local-registry candidates);
@@ -3312,7 +3660,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // in the list (candidatesFor() only ever matches on model id), so
     // request.model is the correct default.
     const candidateModel = candidates[i].model || request.model;
-    const attemptTimeoutMs = isBucketChain
+    let attemptTimeoutMs = isBucketChain
       ? bucketLivenessTimeoutMs(backend.timeout_ms)
       : backend.timeout_ms;
 
@@ -3345,7 +3693,41 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // still cooling down. Skip it with NO network call rather than paying
     // for a near-certain repeat 429, and record the skip as an attempt for
     // the attributable-429 synthesis below.
-    if (isThrottled(backendId, candidateModel)) {
+    const providerName = backend.discovery || inferProviderFromBackend(backendId);
+    const publicSynthetic = clientHeaders?.["x-sk-context"] === "public" &&
+      clientHeaders?.["x-sk-probe"] === "synthetic";
+    const capacityProbeOwner = publicSynthetic
+      ? (request.capacityProbeOwner || Symbol(providerName))
+      : null;
+    const capacityAdmission = providerName === "codex"
+      ? admitCapacity(providerName, candidateModel, { publicSynthetic, probeOwner: capacityProbeOwner })
+      : { admitted: true, probe: false };
+    if (capacityAdmission.probe) {
+      attemptTimeoutMs = Math.min(attemptTimeoutMs || PROBE_TIMEOUT_MS, PROBE_TIMEOUT_MS);
+      try {
+        await emitSiem(EventType.CAPACITY, {
+          action: "probe_attempt",
+          state: "throttled",
+          scope: capacityAdmission.status.scope,
+          reason: capacityAdmission.status.reason,
+          retry_at: capacityAdmission.status.retry_at,
+          probe_state: "in_progress",
+          deadline_ms: PROBE_TIMEOUT_MS,
+        }, { backend: backendId, correlation_id: _siemRequestId });
+      } catch (error) {
+        releaseCapacityProbe(providerName, capacityProbeOwner);
+        throw error;
+      }
+    }
+    const probeResponseLimit = capacityAdmission.probe ? 1024 * 1024 : 0;
+    if (!capacityAdmission.admitted) {
+      const remainingMs = Math.max(1000, (capacityAdmission.status.retry_at || Date.now() + 1000) - Date.now());
+      throttledAttempts.push({ backendId, model: candidateModel, status: 429,
+        cooldownMs: remainingMs, skipped: true, reason: capacityAdmission.status.reason });
+      continue;
+    }
+
+    if (isThrottled(backendId, candidateModel) && !capacityAdmission.probe) {
       const state = _throttleCooldowns.get(throttleKey(backendId, candidateModel));
       const remainingMs = Math.max(0, (state?.untilMs ?? 0) - Date.now());
       console.warn(
@@ -3415,14 +3797,23 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       try {
         slot = await pool.acquire(backendId, { signal: abortSignal });
       } catch (err) {
+        // Capacity admission owns a provider-wide half-open lock. Pool
+        // rejection happens before the upstream try/finally below, so it must
+        // explicitly re-arm and release the probe here on every early return.
+        if (capacityAdmission.probe) finishCapacityProbe(providerName, false, {
+          probeOwner: capacityProbeOwner, model: candidateModel,
+        });
         // A client which leaves while queued is the same neutral 499 as one
         // which leaves after dispatch: no failover and no backend-health write.
         if (err instanceof PoolAdmissionError && err.code === "client_closed") {
-          const queueWaitMs = Date.now() - queueStart;
+          const queueWaitMs = err.queueWaitMs;
           await emitSiem("response", {
             status: 499,
             latency_ms: queueWaitMs,
             queue_wait_ms: queueWaitMs,
+            inflight_concurrency: err.inflightConcurrency,
+            admission_outcome: err.admissionOutcome,
+            backoff_classification: "cancellation",
             failover: false,
             cancelled: true,
           }, { backend: backendId });
@@ -3438,6 +3829,9 @@ export async function routeAndSend(router, request, upstreamPath, method, client
             backendId,
             capacityDomain: err.capacityDomain,
             queueWaitMs,
+            inflightConcurrency: err.inflightConcurrency,
+            admissionOutcome: err.admissionOutcome,
+            backoffClassification: "cancellation",
             failover: false,
             cancelled: true,
           };
@@ -3463,11 +3857,26 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           retry_after_seconds: retryAfterSeconds,
           message: err.message,
         }, { backend: backendId });
-        const queueWaitMs = Date.now() - queueStart;
+        const queueWaitMs = err instanceof PoolAdmissionError
+          ? err.queueWaitMs
+          : Math.max(0, Date.now() - queueStart);
+        const inflightConcurrency = err instanceof PoolAdmissionError
+          ? err.inflightConcurrency
+          : 0;
+        const admissionOutcome = err instanceof PoolAdmissionError
+          ? err.admissionOutcome
+          : "denied";
+        const backoffClassification = code === "queue_timeout"
+          ? "timeout"
+          : "local_admission_denial";
         await emitSiem("response", {
           status: 503,
           latency_ms: queueWaitMs,
           queue_wait_ms: queueWaitMs,
+          inflight_concurrency: inflightConcurrency,
+          admission_outcome: admissionOutcome,
+          backoff_classification: backoffClassification,
+          retry_after_seconds: retryAfterSeconds,
           failover: false,
           admission_rejected: true,
           code,
@@ -3493,13 +3902,22 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           })),
           backendId,
           capacityDomain,
-          queueWaitMs: Date.now() - queueStart,
+          queueWaitMs,
+          inflightConcurrency,
+          admissionOutcome,
+          backoffClassification,
+          retryAfterSeconds,
           failover: didFailover,
         };
       }
     }
 
-    const queueWaitMs = Date.now() - queueStart;
+    // Pool tickets carry the admission snapshot. This avoids sampling after a
+    // concurrent release or promotion and bounds queue wait to the configured
+    // queue SLA. The no-pool path remains an admitted, zero-wait attempt.
+    const queueWaitMs = slot?.queueWaitMs ?? 0;
+    const inflightConcurrency = slot?.inflightConcurrency ?? 1;
+    const admissionOutcome = slot?.admissionOutcome ?? "admitted";
 
     // Meter read is per attempt, not per request: a failover attempt must be
     // attributed to the backend that actually served it. Fail-open, so a slow
@@ -3584,10 +4002,12 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           }
           const cHeaders = { ...forwardHeaders, ...tr.headers };
           delete cHeaders["content-length"];
-          const raw = await sendUpstream(tr.path, method, cHeaders, tr.body, targetUrl, attemptTimeoutMs, abortSignal);
+          const raw = await sendUpstream(tr.path, method, cHeaders, tr.body, targetUrl,
+            attemptTimeoutMs, abortSignal, probeResponseLimit);
           res = raw?.cancelled ? raw : fromCodexResponse(raw, candidateModel, tr.clientStream);
         } else {
-          res = await sendUpstream(upstreamPath, method, forwardHeaders, attemptBody, targetUrl, attemptTimeoutMs, abortSignal);
+          res = await sendUpstream(upstreamPath, method, forwardHeaders, attemptBody, targetUrl,
+            attemptTimeoutMs, abortSignal, probeResponseLimit);
         }
       } else if (isCodexBackend(backend)) {
         // Translate OpenAI chat-completions -> Codex Responses API (OpenAI
@@ -3634,19 +4054,95 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       exitMeter(meterUrl);
     }
 
-    res = enforceResponseContract(res, requestedModel);
+    // Validate the buffered JSON form first, then re-emit and validate the
+    // canonical OpenAI SSE form when the original client asked to stream.
+    if (flippedToNonStream) {
+      res = enforceResponseContract(res, requestedModel);
+    }
+    if (flippedToNonStream && clientStreamWanted && res?.status === 200) {
+      try {
+        const completion = JSON.parse(res.body.toString("utf-8"));
+        if (completion && Array.isArray(completion.choices) && completion.choices.length) {
+          completion.id ||= ("chatcmpl-flip-" + Date.now());
+          completion.created = typeof completion.created === "number"
+            ? completion.created : Math.floor(Date.now() / 1000);
+          completion.model ||= requestedModel || "unknown";
+          const sse = openAIJsonToSSEBuffer(completion);
+          res = {
+            ...res,
+            headers: { ...res.headers, "content-type": "text/event-stream", "cache-control": "no-store" },
+            body: sse,
+          };
+          delete res.headers["content-length"];
+          delete res.headers["Content-Length"];
+          res = enforceResponseContract(res, requestedModel);
+        }
+      } catch (err) {
+        console.warn(`[router] flip SSE re-emission skipped: ${err.message}`);
+      }
+    }
+    if (!flippedToNonStream) {
+      res = enforceResponseContract(res, requestedModel);
+    }
     const latencyMs = (Date.now() - queueStart) - meterBeforeMs;
+
+    if (providerName === "codex") {
+      const retryAfter = res.headers?.["retry-after"] ?? res.headers?.["Retry-After"];
+      const retryAt = Date.now() + Math.min(parseRetryAfterMs(retryAfter) ?? DEFAULT_402_COOLDOWN_MS, MAX_THROTTLE_COOLDOWN_MS);
+      if (isSubscriptionExhaustion(res.status, res.body)) {
+        await emitSiem(EventType.CAPACITY, {
+          action: "subscription_exhausted",
+          state: "throttled",
+          scope: "provider",
+          reason: "subscription_exhausted",
+          retry_at: retryAt,
+          probe_state: "pending",
+        }, { backend: backendId, correlation_id: _siemRequestId });
+        if (capacityAdmission.probe) {
+          finishCapacityProbe(providerName, false, {
+            probeOwner: capacityProbeOwner, model: candidateModel, retryAt, providerWide: true,
+          });
+        } else {
+          recordSubscriptionExhausted(providerName, { retryAt });
+        }
+      } else if (capacityAdmission.probe) {
+        const probeSucceeded = res.status >= 200 && res.status < 300;
+        if (probeSucceeded) {
+          await emitSiem(EventType.CAPACITY, {
+            action: "probe_recovered",
+            state: "available",
+            scope: "provider",
+            reason: null,
+            retry_at: null,
+            probe_state: "succeeded",
+          }, { backend: backendId, correlation_id: _siemRequestId });
+        }
+        finishCapacityProbe(providerName, probeSucceeded, {
+          probeOwner: capacityProbeOwner, model: candidateModel, retryAt,
+        });
+      } else if (res.status === 429 || res.status === 402) {
+        recordModelThrottled(providerName, candidateModel, { retryAt });
+      } else if (res.status >= 200 && res.status < 300) {
+        clearCapacity(providerName, candidateModel);
+      }
+    }
 
     // A downstream disconnect is not evidence about the backend or model.
     // Return immediately after releasing the pool/meter slot in `finally`,
     // before energy reads, health/lifecycle writes, or failover can run.
     if (res?.cancelled || res?.status === 499) {
+      // A cancellation is not evidence of what was served: keep the value
+      // enforceResponseContract observed (including null), never the
+      // routing candidate. Card bc908525 / review b62e19f8 findings 1-2.
       lastResult = {
         ...res,
         backendId,
-        servedModel: candidateModel,
         failover: didFailover,
         queueWaitMs,
+        inflightConcurrency,
+        admissionOutcome: "cancelled",
+        backoffClassification: "cancellation",
+        firstByteMs: Number.isFinite(res?.firstByteMs) ? queueWaitMs + res.firstByteMs : null,
         cancelled: true,
       };
       if (isBucketChain) {
@@ -3657,6 +4153,9 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         status: 499,
         latency_ms: latencyMs,
         queue_wait_ms: queueWaitMs,
+        inflight_concurrency: inflightConcurrency,
+        admission_outcome: "cancelled",
+        backoff_classification: "cancellation",
         failover: false,
         cancelled: true,
       }, { backend: backendId });
@@ -3805,15 +4304,28 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     lastResult = {
       ...res,
       backendId,
+      requestedModel,
       readinessRevision: backend.readinessRevision,
       discoveryRevision: backend.discoveryRevision,
       failover: didFailover,
       queueWaitMs,
+      inflightConcurrency,
+      admissionOutcome,
+      backoffClassification: "nonterminal",
+      firstByteMs: Number.isFinite(res?.firstByteMs) ? queueWaitMs + res.firstByteMs : null,
     };
     if (isBucketChain) {
       lastResult.bucket = bucketAddr.bucket;
       lastResult.bucketMember = candidateModel;
     }
+    // Provider-neutral rail attribution (card e19f88db / SKGW-ATTRIBUTION-01)
+    // Populate only facts known by the request path. NULL when unknown.
+    const inferredProvider = backend.discovery || inferProviderFromBackend(backendId);
+    lastResult.provider = inferredProvider;
+    lastResult.rail = inferRailFromBackend(backendId, backendUrl, isLocalUrl, inferredProvider);
+    lastResult.logicalRoute = isBucketChain ? bucketAddr.bucket : (isRegistryRouted(request) ? request.model : null);
+    // Runtime revision combines readiness and discovery for tracking
+    lastResult.runtimeRevision = `${backend.readinessRevision}:${backend.discoveryRevision}`;
     if (attemptEnergy) lastResult.energy = attemptEnergy;
     // Only attached when something was actually observed, so the disabled
     // path returns a result whose shape is unchanged, field for field.
@@ -3826,6 +4338,43 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     const retryElsewhere = isFailoverStatus(res.status) ||
       (isBucketChain && (res.status === 404 || res.status === 410));
     const throttled = isThrottleStatus(res.status);
+
+    // Narrow context-overflow failover (card 9ed4a9f7 amendment): a 400 whose
+    // parsed body is the engine's exceed_context_size_error is a DOOR limit,
+    // not a payload defect. Advance to a same-model candidate with a strictly
+    // larger context_limit (or no limit) WITHOUT a health penalty. Every other
+    // 400 stays terminal; nothing blanket-fails-over.
+    if (res.status === 400) {
+      let ctxOverflow = false;
+      try {
+        const parsedErr = JSON.parse(res.body?.toString("utf-8") || "{}");
+        const err = parsedErr?.error || parsedErr;
+        ctxOverflow = err?.type === "exceed_context_size_error"
+          || err?.code === "exceed_context_size_error";
+      } catch { /* not JSON: terminal 400 */ }
+      if (ctxOverflow) {
+        const currentLimit = Number.isFinite(backend?.context_limit) ? backend.context_limit : 0;
+        const larger = candidates.slice(i + 1).some((c) => {
+          if (c.model && c.model !== candidateModel) return false;
+          const lim = Number.isFinite(c.backend?.context_limit) ? c.backend.context_limit : Infinity;
+          return lim > currentLimit;
+        });
+        console.warn(
+          `[router] 400 context overflow backend=${backendId} model=${candidateModel}; ` +
+          `${larger ? "advancing to a larger-context same-model candidate" : "no larger door, terminal"}`,
+        );
+        await emitSiem("error", {
+          type: "context_overflow",
+          backend: backendId,
+          model: candidateModel,
+          advanced: larger,
+        }, { backend: backendId });
+        if (larger) {
+          contextOverflows.push({ backendId, model: candidateModel });
+          continue;  // no health write: the door is fine, the prompt is just big
+        }
+      }
+    }
 
     if (!retryElsewhere) {
       console.log(
@@ -3852,6 +4401,9 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         status: res.status,
         latency_ms: latencyMs,
         queue_wait_ms: queueWaitMs,
+        inflight_concurrency: inflightConcurrency,
+        admission_outcome: admissionOutcome,
+        backoff_classification: "nonterminal",
         failover: didFailover,
         requested_model: lastResult.requestedModel,
         chosen_backend: backendId,
@@ -3876,10 +4428,18 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         `cooldown=${cooldownMs}ms` +
         (i < candidates.length - 1 ? " (trying next door)" : " (no more candidates)")
       );
+      lastResult.backoffClassification = res.status === 429
+        ? "provider_429"
+        : "provider_backoff";
+      lastResult.retryAfterMs = cooldownMs;
       await emitSiem("anomaly", {
         type: "rate_limited",
         backend: backendId,
         status_code: res.status,
+        queue_wait_ms: queueWaitMs,
+        inflight_concurrency: inflightConcurrency,
+        admission_outcome: admissionOutcome,
+        backoff_classification: lastResult.backoffClassification,
         cooldown_ms: cooldownMs,
       }, { backend: backendId, severity: "info" });
       continue;
@@ -3908,6 +4468,23 @@ export async function routeAndSend(router, request, upstreamPath, method, client
   if (candidates.length > 0 && throttledAttempts.length === candidates.length) {
     const waitsMs = throttledAttempts.map((t) => t.cooldownMs ?? DEFAULT_429_COOLDOWN_MS);
     const retryAfterSec = Math.max(1, Math.ceil(Math.min(...waitsMs) / 1000));
+
+    // Card e7c2b4a9 repair #1: derive final backoff classification from attempts.
+    // If ALL throttled attempts are 402, preserve provider_backoff. Only if
+    // ANY attempt was a 429 should we classify as provider_429.
+    const all402 = throttledAttempts.every((t) => t.status === 402);
+    const backoffClassification = all402 ? "provider_backoff" : "provider_429";
+
+    // Card e7c2b4a9 repair #2: detect cooldown-only rejections (no admission occurred).
+    // When ALL doors were skipped via cooldown, lastResult is null and no pool
+    // admission ever happened. Report a truthful no-admission outcome rather
+    // than defaulting to "admitted" with zero inflight concurrency.
+    const allSkipped = throttledAttempts.every((t) => t.skipped);
+    const admissionOutcome = allSkipped ? "denied" : (lastResult?.admissionOutcome ?? "admitted");
+    const inflightConcurrency = allSkipped ? 0 : (lastResult?.inflightConcurrency ?? 0);
+    const queueWaitMs = lastResult?.queueWaitMs ?? 0;
+    const backendId = lastResult?.backendId ?? null;
+
     const payload = JSON.stringify({
       error: {
         message: "All candidate models are currently rate limited",
@@ -3918,20 +4495,62 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     });
     console.warn(
       `[router] 429 ALL CANDIDATES THROTTLED model=${request.model} ` +
-      `tried=[${throttledAttempts.map((t) => `${t.backendId}/${t.model}`).join(", ")}]`
+      `tried=[${throttledAttempts.map((t) => `${t.backendId}/${t.model}`).join(", ")}]` +
+      (allSkipped ? " (all doors cooling, no admission)" : "")
     );
     await emitSiem("response", {
       status: 429,
+      queue_wait_ms: queueWaitMs,
+      inflight_concurrency: inflightConcurrency,
+      admission_outcome: admissionOutcome,
+      backoff_classification: backoffClassification,
+      retry_after_seconds: retryAfterSec,
       failover: didFailover,
       all_backends_failed: true,
       all_throttled: true,
-    }, { backend: lastResult?.backendId ?? null });
+    }, { backend: backendId });
     return {
       status: 429,
       headers: { "content-type": "application/json", "retry-after": String(retryAfterSec) },
       body: Buffer.from(payload, "utf-8"),
-      backendId: lastResult?.backendId ?? null,
+      backendId,
+      queueWaitMs,
+      inflightConcurrency,
+      admissionOutcome,
+      backoffClassification,
+      retryAfterSeconds: retryAfterSec,
       failover: didFailover,
+    };
+  }
+
+  // Context preflight rejected every door (card 9ed4a9f7): the request can
+  // never fit. Fail EXPLICITLY instead of attempting, truncating, or
+  // returning a misleading upstream error. Never silently truncate.
+  if (!lastResult && contextRejections.length > 0) {
+    const payload = JSON.stringify({
+      error: {
+        message: `prompt exceeds every candidate backend context limit: `
+          + contextRejections.map((r) => `${r.backendId}=${r.context_limit}`).join(", ")
+          + ` (estimated ${contextRejections[0].estimatedTokens} tokens, heuristic 3 bytes/token)`,
+        code: "context_exceeded",
+        type: "invalid_request_error",
+        estimated_tokens: contextRejections[0].estimatedTokens,
+        backends: contextRejections.map((r) => ({ backend: r.backendId, context_limit: r.context_limit })),
+        retryable: false,
+      },
+    });
+    await emitSiem("response", {
+      status: 400,
+      failover: false,
+      context_exceeded: true,
+      backends: contextRejections.map((r) => r.backendId),
+    }, {});
+    return {
+      status: 400,
+      headers: { "content-type": "application/json" },
+      body: Buffer.from(payload, "utf-8"),
+      backendId: null,
+      failover: false,
     };
   }
 
