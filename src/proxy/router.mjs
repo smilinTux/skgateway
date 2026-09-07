@@ -1662,7 +1662,7 @@ export function createRouter(config = {}) {
    * @param {string|undefined} agentId
    * @returns {Backend[]}
    */
-  function candidatesFor(model, agentId, expand = false) {
+  function candidatesFor(model, agentId, expand = false, bootstrapProbe = false) {
     const available = availableByPriority().filter((b) => b.allowsAgent(agentId));
 
     if (!model) return available;
@@ -1674,6 +1674,18 @@ export function createRouter(config = {}) {
     const matched = available.filter(
       (b) => b.supportsModel(model) && b.isModelClaimAvailable(model),
     );
+
+    // Admission-gated providers start unknown after every gateway restart.
+    // Permit only an explicitly marked public-synthetic request to establish
+    // their first observation. Ordinary traffic remains fail closed, and the
+    // existing capacity domain still bounds this probe to one active request.
+    if (bootstrapProbe && matched.length === 0) {
+      const unobserved = declared
+        .filter((b) => b.require_observed_health && b.getHealth().observed === false)
+        .filter((b) => b.allowsAgent(agentId) && b.isModelClaimAvailable(model))
+        .sort((a, b) => a.priority - b.priority);
+      if (unobserved.length > 0) matched.push(unobserved[0]);
+    }
 
     // Balancing for equal-priority same-model replicas (card 786d9232).
     // Group backends by priority and apply round-robin within each group.
@@ -1875,7 +1887,12 @@ export function createRouter(config = {}) {
       throw new Error("[router] No backends registered — cannot route request");
     }
 
-    const candidates = candidatesFor(model, agentId, request.expand === true);
+    const candidates = candidatesFor(
+      model,
+      agentId,
+      request.expand === true,
+      request.bootstrapProbe === true,
+    );
 
     if (candidates.eolGated) {
       siemEvent("model_eol_gated", { model, agentId, eol_reason: candidates.eolReason });
@@ -3020,6 +3037,9 @@ export async function routeAndSend(router, request, upstreamPath, method, client
   const pool = usePool ? getPool() : null;
   const requestedModel = request?.model;
   const codexIntent = [requestedModel, request?.role, request?.context, request?.service];
+  const bootstrapProbe = clientHeaders?.["x-sk-context"] === "public" &&
+    clientHeaders?.["x-sk-probe"] === "synthetic";
+  if (bootstrapProbe) request = { ...request, bootstrapProbe: true };
 
   // Read fresh off getConfig() every request (not cached at module scope) so
   // a SIGHUP config reload picks up a flipped energy.enabled or an updated
