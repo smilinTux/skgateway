@@ -6,6 +6,7 @@ export const CAPACITY_STORE_PATH = process.env.SKGATEWAY_CAPACITY_STORE_PATH ||
   join(homedir(), ".config", "skgateway", "capacity_store.json");
 export const PRODUCTION_CAPACITY_STORE_PATH = join(homedir(), ".config", "skgateway", "capacity_store.json");
 const probes = new Set();
+const scheduledProbes = new Set();
 
 function load(path = CAPACITY_STORE_PATH) {
   try {
@@ -72,6 +73,44 @@ export function finishCapacityProbe(provider, success, { retryAt, now = Date.now
   return recordSubscriptionExhausted(provider, { retryAt, now, path });
 }
 
+/** Run due subscription recovery probes. The injected probe owns outcome
+ * recording on its normal response path; this wrapper only guarantees that a
+ * thrown transport/audit error cannot strand the single-flight lock. */
+export async function runDueCapacityProbes(targets, probe, {
+  now = Date.now(), path = CAPACITY_STORE_PATH,
+} = {}) {
+  const results = [];
+  for (const target of targets) {
+    const status = capacityStatus(target.provider, target.model, { now, path });
+    if (status.state !== "throttled" || !status.current ||
+        !Number.isFinite(status.retry_at) || now < status.retry_at || scheduledProbes.has(target.provider)) continue;
+    scheduledProbes.add(target.provider);
+    try {
+      results.push({ ...target, result: await probe(target) });
+    } catch (error) {
+      // A throw bypasses routeAndSend's normal outcome recorder. Re-arm the
+      // provider instead of retrying every scheduler tick.
+      finishCapacityProbe(target.provider, false, { now, path });
+      results.push({ ...target, error });
+    } finally {
+      // routeAndSend normally clears or re-arms this itself. This is the
+      // defensive transport-exception path that previously leaked the lock.
+      probes.delete(target.provider);
+      scheduledProbes.delete(target.provider);
+    }
+  }
+  return results;
+}
+
+export function startCapacityProbeScheduler({
+  targets, probe, intervalMs = 30_000, setIntervalFn = setInterval,
+}) {
+  const tick = () => runDueCapacityProbes(targets, probe);
+  const timer = setIntervalFn(tick, intervalMs);
+  timer?.unref?.();
+  return { tick, timer };
+}
+
 export function isSubscriptionExhaustion(status, body) {
   if (status !== 429 && status !== 402) return false;
   let text = "";
@@ -79,4 +118,4 @@ export function isSubscriptionExhaustion(status, body) {
   return /(?:subscription|usage|plan)[\s_-]*(?:limit|quota)|quota[\s_-]*(?:exhausted|reset)/i.test(text);
 }
 
-export function _resetCapacityProbesForTests() { probes.clear(); }
+export function _resetCapacityProbesForTests() { probes.clear(); scheduledProbes.clear(); }

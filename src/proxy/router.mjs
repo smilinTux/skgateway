@@ -3727,6 +3727,10 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       try {
         slot = await pool.acquire(backendId, { signal: abortSignal });
       } catch (err) {
+        // Capacity admission owns a provider-wide half-open lock. Pool
+        // rejection happens before the upstream try/finally below, so it must
+        // explicitly re-arm and release the probe here on every early return.
+        if (capacityAdmission.probe) finishCapacityProbe(providerName, false);
         // A client which leaves while queued is the same neutral 499 as one
         // which leaves after dispatch: no failover and no backend-health write.
         if (err instanceof PoolAdmissionError && err.code === "client_closed") {

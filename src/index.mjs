@@ -44,7 +44,7 @@ import { readCodexAuthHeaders } from "./proxy/codex-adapter.mjs";
 import { readZaiAuthHeaders, ZAI_CREDENTIALS_PATH } from "./proxy/zai-adapter.mjs";
 import { SSEWriter, jsonToSSE } from "./proxy/stream.mjs";
 import { getLifecycle } from "./discovery/model_catalog_store.mjs";
-import { capacityStatus } from "./discovery/capacity_store.mjs";
+import { capacityStatus, startCapacityProbeScheduler } from "./discovery/capacity_store.mjs";
 import { isRoutable, isEffectivelyRoutable, LIFECYCLE_STATES } from "./discovery/lifecycle.mjs";
 import { rankModels } from "./ranking/rank.mjs";
 import { deriveCapabilities } from "./ranking/capabilities.mjs";
@@ -725,6 +725,38 @@ const poolConfig = {
   capacityDomains: config.pooling?.capacity_domains || {},
 };
 const pool = getPool(poolConfig);
+
+// Subscription recovery is autonomous: once retry_at is due, one bounded,
+// public-synthetic request tests the exact provider/model. routeAndSend owns
+// all lifecycle writes, catalog/bucket truth, credential handling, and the
+// eight-second half-open timeout. No prompt or credential is logged here.
+const subscriptionProbeTargets = Object.entries(config.backends || {})
+  .filter(([, backend]) => backend?.auth_type === "codex_oauth" && backend.enabled !== false)
+  .map(([provider, backend]) => ({
+    provider,
+    model: (backend.models || []).find((model) => typeof model === "string" && !model.includes("*")),
+  }))
+  .filter((target) => target.model);
+
+startCapacityProbeScheduler({
+  targets: subscriptionProbeTargets,
+  probe: ({ model }) => {
+    const probeBody = Buffer.from(JSON.stringify({
+      model,
+      messages: [{ role: "user", content: "Reply with ok." }],
+      max_tokens: 4,
+      stream: false,
+    }));
+    return routeAndSend(router, {
+      model, messages: [{ role: "user", content: "Reply with ok." }],
+      agentId: "skgateway-capacity-probe", context: "public",
+    }, "/v1/chat/completions", "POST", {
+      "content-type": "application/json",
+      "x-sk-context": "public",
+      "x-sk-probe": "synthetic",
+    }, probeBody, true);
+  },
+});
 
 // ─── Operator-plane self-served facet data sources (epic c880017b, Phase 3.4) ───
 // The live objects the /operator/v1/* routes (below, near /health) read from.
