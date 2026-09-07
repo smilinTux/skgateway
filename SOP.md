@@ -342,7 +342,7 @@ drop-in strips it back off:
 |---|---|
 | Base unit `~/.config/systemd/user/skgateway.service` | `/usr/bin/node /home/YOUR_USER/skcapstone-repos/skgateway/src/index.mjs --port 18780 --config /home/YOUR_USER/skcapstone-repos/skgateway/config/skgateway.yaml` |
 | Drop-in `skgateway.service.d/config-path.conf` | clears `ExecStart=` (the empty assignment resets the list-typed setting) and re-declares it **without** `--config` |
-| **Effective, both nodes** | `/usr/bin/node /home/OPERATOR/clawd/skcapstone-repos/skgateway/src/index.mjs --port 18780` |
+| **Effective, both nodes** | `/usr/bin/node /home/YOUR_USER/skcapstone-repos/skgateway/src/index.mjs --port 18780` |
 
 That is not cosmetic. Dropping `--config` moves the service from precedence step 1 to
 step 3 in §6, so it loads the **Syncthing-synced** `~/.skcapstone/gateway/skgateway.yaml`
