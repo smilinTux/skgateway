@@ -346,14 +346,79 @@ overrides:
   # those fields remain absent until independently verified. This prevents an
   # attractive but unsupported size claim from placing a model in an XL bucket.
   glm-4.5:       { display_name: "GLM-4.5",       org: Z.ai, tier: paid-cloud }
-  glm-4.5-air:   { display_name: "GLM-4.5 Air",   org: Z.ai, tier: paid-cloud }
-  glm-4.6:       { display_name: "GLM-4.6",       org: Z.ai, tier: paid-cloud }
-  glm-4.7:       { display_name: "GLM-4.7",       org: Z.ai, tier: paid-cloud }
+  glm-4.5-air:   { display_name: "GLM-4.5 Air",   org: Z.ai, tier: paid-cloud, size_class: S, notes: "light/fast z.ai lane" }
+  glm-4.6:       { display_name: "GLM-4.6",       org: Z.ai, tier: paid-cloud, size_class: M, context_length: 200000, supported_parameters: [tools, tool_choice, reasoning], reasoning: true, notes: "fleet GLM S/M workhorse; account ceiling 10 concurrent" }
+  glm-4.7:       { display_name: "GLM-4.7",       org: Z.ai, tier: paid-cloud, size_class: L, context_length: 200000, supported_parameters: [tools, tool_choice, reasoning], reasoning: true, notes: "fleet GLM L level" }
   glm-5:         { display_name: "GLM-5",         org: Z.ai, tier: paid-cloud }
   glm-5-turbo:   { display_name: "GLM-5 Turbo",   org: Z.ai, tier: paid-cloud }
   glm-5.1:       { display_name: "GLM-5.1",       org: Z.ai, tier: paid-cloud }
   glm-5.2:       { display_name: "GLM-5.2",       org: Z.ai, tier: paid-cloud }
-  glm-5.3:       { display_name: "GLM-5.3",       org: Z.ai, tier: paid-cloud }
+  glm-5.3:       { display_name: "GLM-5.3",       org: Z.ai, tier: paid-cloud, size_class: XL, context_length: 200000, supported_parameters: [tools, tool_choice, reasoning], reasoning: true, notes: "fleet GLM XL level" }
+  glm-5.3-flash: { display_name: "GLM-5.3 Flash", org: Z.ai, tier: paid-cloud, size_class: S, notes: "fast z.ai lane; size left S pending measurement" }
+
+  # ───────────── KIMI CODE SUBSCRIPTION (kimi_oauth backend, 2026-09-03) ──────
+  # Ranked by capability and account family structure. Concurrency ceilings
+  # measured 2026-09-03 by stepped burst ramp: coding family 30, k3 family 16.
+  kimi-for-coding:
+    display_name: "Kimi K2.7 Coding"
+    org: Moonshot AI
+    summary: "Subscription coding workhorse of the Kimi Code plan."
+    good_at: [agentic coding, tool use]
+    context_length: 262144
+    supported_parameters: [tools, tool_choice, reasoning]
+    modality: "text+image->text"
+    tier: paid-cloud
+    speed: "standard coding lane; family ceiling 30 concurrent"
+    license: proprietary
+    size_class: M
+    latency_class: interactive
+    reasoning: true
+    notes: "kimi_oauth subscription. Emits reasoning_content interleaved; thinking-type only per /v1/models. Gateway cap 28."
+
+  kimi-for-coding-highspeed:
+    display_name: "Kimi K2.7 Coding Highspeed"
+    org: Moonshot AI
+    summary: "Fast lane of the Kimi coding subscription."
+    good_at: [quick edits, boilerplate, high-volume small tasks]
+    context_length: 262144
+    supported_parameters: [tools, tool_choice, reasoning]
+    modality: "text+image->text"
+    tier: paid-cloud
+    speed: "fastest in-plan; same 30-concurrent family ceiling"
+    license: proprietary
+    size_class: S
+    latency_class: interactive
+    reasoning: true
+
+  k3-256k:
+    display_name: "Kimi K3 256K"
+    org: Moonshot AI
+    summary: "K3 reasoning tier at 256K context."
+    good_at: [deep reasoning, long-context analysis, tool use]
+    context_length: 262144
+    supported_parameters: [tools, tool_choice, reasoning]
+    modality: "text+image->text"
+    tier: paid-cloud
+    license: proprietary
+    size_class: L
+    latency_class: interactive
+    reasoning: true
+    notes: "k3 family ceiling 16 concurrent; gateway cap 14."
+
+  k3:
+    display_name: "Kimi K3"
+    org: Moonshot AI
+    summary: "Flagship K3 reasoning model, 1M context."
+    good_at: [hardest reasoning, very-long-context synthesis, agentic coding]
+    context_length: 1048576
+    supported_parameters: [tools, tool_choice, reasoning]
+    modality: "text+image->text"
+    tier: paid-cloud
+    license: proprietary
+    size_class: XL
+    latency_class: interactive
+    reasoning: true
+    notes: "Fleet XL overflow target. k3 family ceiling 16 concurrent; gateway cap 14."
 
   # ──────────────────────── OUR ORNITH FLEET (local, sovereign) ───────────────
   # DeepReinforce Ornith 1.0, self-hosted on our own GPUs. Cloud-free, private.
@@ -365,7 +430,7 @@ overrides:
     org: DeepReinforce (self-hosted)
     summary: "Our sovereign 35B reasoning model on chiap08. The cloud-free brain behind sk-default."
     good_at: [reasoning, coding, tool use, sovereign/private work]
-    context_length: 262144
+    context_length: 131072
     max_output_tokens: 32768
     supported_parameters: [tools, tool_choice, reasoning]
     modality: "text->text"
@@ -392,7 +457,7 @@ overrides:
     org: DeepReinforce (self-hosted)
     summary: "Registry alias for the 35B, routed across chiap08 (primary) + standby with 5xx failover."
     good_at: [reasoning, coding, tool use, sovereign/private work]
-    context_length: 262144
+    context_length: 131072
     max_output_tokens: 32768
     supported_parameters: [tools, tool_choice, reasoning]
     modality: "text->text"
@@ -447,12 +512,10 @@ overrides:
 
   # qwen38 = one canonical Huihui Qwen3.8 27B abliterated Q4_K_M model served
   # by independent replicas on chiap01 :18810 and chiap08 :11439. Registry
-  # backend `qwen38` currently materializes through chiap08. Both servers report
-  # the full Huihui id. The
-  # former UD-Q5 id, short id, and qwen38-abliterated are compatibility request
-  # aliases; llama.cpp serves all four name-agnostically from the same loaded
-  # Huihui weights. Every card below therefore describes the ACTUAL Q4_K_M
-  # served model rather than inferring model identity from the requested alias.
+  # backend `qwen38` currently materializes through chiap08. chiap01 reports
+  # only the canonical id. chiap08 also reports qwen3.8-chiap08 and
+  # qwen3.8-vllm. The former UD-Q5, short, and qwen38-abliterated cards remain
+  # provider metadata but are not local backend claims.
   # It has the same <think>-starvation trait as the Ornith models above
   # (registry.yaml backends.qwen38.min_output_tokens: 8192).
   qwen3.8-27b-huihui-abliterated-q4_k_m:
@@ -460,7 +523,7 @@ overrides:
     org: "Huihui AI / Qwen (self-hosted)"
     summary: "Canonical model served by independent chiap01 and chiap08 replicas; sovereign abliterated reasoning, tool use, and vision."
     good_at: [reasoning, coding, tool use, vision, uncensored/creative text, sovereign/private work]
-    context_length: 262144
+    context_length: 131072
     max_output_tokens: 16384
     supported_parameters: [tools, tool_choice, reasoning]
     modality: "text+image->text"
@@ -474,14 +537,56 @@ overrides:
     latency_class: interactive
     reasoning: true
     min_output_tokens: 8192
-    notes: "Canonical served id for chiap01-qwen38 and chiap08-qwen38. Compatibility ids below are request aliases, never replicas or capacity domains."
+    notes: "Canonical served id for chiap01-qwen38 and chiap08-qwen38. context_length is the strongest replica (chiap08 vLLM --max-model-len 131072); chiap01 llama.cpp serves 32768 and is enforced per door by backend context_limit preflight, card 9ed4a9f7."
+
+  qwen3.8-chiap08:
+    display_name: "Huihui Qwen3.8 27B (chiap08 upstream id)"
+    org: "Huihui AI / Qwen (self-hosted)"
+    summary: "Exact model id reported and served by the chiap08 vLLM upstream."
+    good_at: [reasoning, coding, tool use, vision, uncensored/creative text, sovereign/private work]
+    context_length: 131072
+    max_output_tokens: 16384
+    supported_parameters: [tools, tool_choice, reasoning]
+    modality: "text+image->text"
+    vision: true
+    params: "27B"
+    quant: "Q4_K_M"
+    tier: local
+    speed: "fast"
+    params_b: 27
+    size_class: L
+    latency_class: interactive
+    reasoning: true
+    min_output_tokens: 8192
+    notes: "Exact chiap08 upstream id. The gateway forwards it unchanged."
+
+  qwen3.8-vllm:
+    display_name: "Huihui Qwen3.8 27B (vLLM upstream id)"
+    org: "Huihui AI / Qwen (self-hosted)"
+    summary: "Exact model id reported and served by the chiap08 vLLM upstream."
+    good_at: [reasoning, coding, tool use, vision, uncensored/creative text, sovereign/private work]
+    context_length: 131072
+    max_output_tokens: 16384
+    supported_parameters: [tools, tool_choice, reasoning]
+    modality: "text+image->text"
+    vision: true
+    params: "27B"
+    quant: "Q4_K_M"
+    tier: local
+    speed: "fast"
+    params_b: 27
+    size_class: L
+    latency_class: interactive
+    reasoning: true
+    min_output_tokens: 8192
+    notes: "Exact chiap08 upstream id. The gateway forwards it unchanged."
 
   qwen3.8-27b-ud-q5_k_xl:
     display_name: "Huihui Qwen3.8 27B (legacy UD-Q5 request alias)"
     org: "Huihui AI / Qwen (self-hosted)"
-    summary: "Pre-cutover request alias; both physical replicas serve the canonical Huihui abliterated Q4_K_M model."
+    summary: "Legacy provider metadata; neither local Qwen backend claims this id."
     good_at: [reasoning, coding, tool use, vision, uncensored/creative text, sovereign/private work]
-    context_length: 262144
+    context_length: 131072
     max_output_tokens: 16384
     supported_parameters: [tools, tool_choice, reasoning]
     modality: "text+image->text"
@@ -495,14 +600,14 @@ overrides:
     latency_class: interactive
     reasoning: true
     min_output_tokens: 8192
-    notes: "Alias only: response.model is qwen3.8-27b-huihui-abliterated-q4_k_m. Do not treat this id as evidence that UD-Q5 weights are loaded."
+    notes: "Not a local backend claim. Do not treat this id as evidence that UD-Q5 weights are loaded."
 
   qwen3.8-27b:
     display_name: "Qwen3.8 27B (short alias)"
     org: "Huihui AI / Qwen (self-hosted)"
-    summary: "Short request alias for the canonical Huihui abliterated Q4_K_M model."
+    summary: "Legacy provider metadata; neither local Qwen backend claims this id."
     good_at: [reasoning, coding, tool use, vision, uncensored/creative text, sovereign/private work]
-    context_length: 262144
+    context_length: 131072
     max_output_tokens: 16384
     supported_parameters: [tools, tool_choice, reasoning]
     modality: "text+image->text"
@@ -516,14 +621,14 @@ overrides:
     latency_class: interactive
     reasoning: true
     min_output_tokens: 8192
-    notes: "Alias only: response.model is qwen3.8-27b-huihui-abliterated-q4_k_m."
+    notes: "Not a local backend claim."
 
   qwen38-abliterated:
     display_name: "Huihui Qwen3.8 27B (qwen38-abliterated alias)"
     org: "Huihui AI / Qwen (self-hosted)"
-    summary: "Custom request alias claimed by both physical replicas; serves the canonical Huihui Q4_K_M model."
+    summary: "Legacy provider metadata; neither local Qwen backend claims this id."
     good_at: [reasoning, coding, tool use, vision, uncensored/creative text, sovereign/private work]
-    context_length: 262144
+    context_length: 131072
     max_output_tokens: 16384
     supported_parameters: [tools, tool_choice, reasoning]
     modality: "text+image->text"
@@ -537,7 +642,7 @@ overrides:
     latency_class: interactive
     reasoning: true
     min_output_tokens: 8192
-    notes: "Alias only and locally claimed; foreign provider lifecycle verdicts cannot retire it while chiap08-qwen38 serves it."
+    notes: "Not a local backend claim."
 
   # ───────────────────────── OUR VISION MODEL (local) ─────────────────────────
   qwen3.6-27b-abliterated:

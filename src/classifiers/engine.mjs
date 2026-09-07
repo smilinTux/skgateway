@@ -86,9 +86,28 @@ export const JAILBREAK_CATEGORY_THRESHOLD = 0.5;
  * @param {{ systemPrompt?: string, history?: Array }} [opts]
  * @returns {{ category: string, confidence: number, intent: object, risk: object, jailbreak: object, injection: object }}
  */
+// ponytail: hard input bound for the classifier. 8K head + 2K tail per
+// message preserves every real classification signal and caps the regex
+// work; upgrade path is per-pattern complexity analysis if that ever fails.
+const CLASSIFY_HEAD = 8_000;
+const CLASSIFY_TAIL = 2_000;
+
+function boundMessages(messages) {
+  if (!Array.isArray(messages)) return messages;
+  return messages.map((m) => {
+    if (!m || typeof m !== "object") return m;
+    if (typeof m.content === "string" && m.content.length > CLASSIFY_HEAD + CLASSIFY_TAIL) {
+      return { ...m, content: m.content.slice(0, CLASSIFY_HEAD) + "\n...[classification bound]\n" + m.content.slice(-CLASSIFY_TAIL) };
+    }
+    return m;
+  });
+}
+
 export function heuristicClassifier(messages, opts = {}) {
   const systemPrompt = opts.systemPrompt || "";
   const history = opts.history || [];
+
+  messages = boundMessages(messages);
 
   const intent = classifyPrompt(messages, systemPrompt);
   const risk = scoreRisk(messages);
@@ -200,16 +219,17 @@ export function classifyRequest(messages, opts = {}) {
     : "heuristic";
   const fn = CLASSIFIERS.get(engineName);
 
+  const bounded = boundMessages(messages);
   let base;
   try {
-    base = fn(messages, opts);
+    base = fn(bounded, opts);
     // Guard against a partial/misbehaving plugin — require the core fields.
     if (!base || typeof base.category !== "string" || !base.risk || !base.jailbreak) {
       throw new Error("classifier returned an incomplete result");
     }
   } catch {
     // Fail-open: never let classification break a request.
-    base = heuristicClassifier(messages, opts);
+    base = heuristicClassifier(bounded, opts);
     return finalize("heuristic", base, start);
   }
 

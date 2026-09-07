@@ -578,10 +578,12 @@ export function trimHistoryToBudget(body, options = {}) {
       JSON.stringify({ ...body, messages: candidate }), "utf-8",
     );
     if (candidateSize <= maxBodyBytes) {
-      body.messages = candidate;
+      const assembled = repairToolPairing(candidate);
+      body.messages = assembled;
       log(
         `trimmed history: dropped ${dropped} middle messages, keepEnd=${keepEnd}, bodyLen ~${candidateSize}` +
-        (tailRepaired ? ` (repaired tool pairing: ${rawTail.length}→${tail.length})` : ""),
+        (tailRepaired ? ` (repaired tool pairing: ${rawTail.length}→${tail.length})` : "") +
+        (assembled.length !== candidate.length ? ` (repaired head/tail boundary: ${candidate.length}→${assembled.length})` : ""),
       );
       return body;
     }
@@ -605,10 +607,12 @@ export function trimHistoryToBudget(body, options = {}) {
       JSON.stringify({ ...body, messages: minimal }), "utf-8",
     );
     if (candidateSize <= maxBodyBytes) {
-      body.messages = minimal;
+      const assembled = repairToolPairing(minimal);
+      body.messages = assembled;
       log(
         `trimmed history: AGGRESSIVE — kept system + first user + last ${tailSize}, bodyLen ~${candidateSize}` +
-        (tailRepaired ? ` (repaired tool pairing: ${rawLastN.length}→${lastN.length})` : ""),
+        (tailRepaired ? ` (repaired tool pairing: ${rawLastN.length}→${lastN.length})` : "") +
+        (assembled.length !== minimal.length ? ` (repaired head/tail boundary: ${minimal.length}→${assembled.length})` : ""),
       );
       return body;
     }
@@ -618,13 +622,13 @@ export function trimHistoryToBudget(body, options = {}) {
   const rawLastTwo = nonSystem.slice(-2);
   const lastTwo = repairToolPairing(rawLastTwo);
   const tailRepaired = lastTwo.length !== rawLastTwo.length;
-  body.messages = [
+  body.messages = repairToolPairing([
     ...system,
     ...(firstUser && !lastTwo.includes(firstUser)
       ? [firstUser, { role: "system", content: aggressiveNotice }]
       : []),
     ...lastTwo,
-  ];
+  ]);
   bodySize = Buffer.byteLength(JSON.stringify(body), "utf-8");
   log(
     `trimmed history: ABSOLUTE LAST RESORT — kept system + first user + last 2, bodyLen ~${bodySize}` +

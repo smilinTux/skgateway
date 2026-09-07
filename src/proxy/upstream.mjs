@@ -101,11 +101,14 @@ export function buildUpstreamUrl(reqUrl, targetUrl) {
  * @param {AbortSignal|null} [signal=null]
  *   Downstream-client lifetime. Aborting it destroys the active upstream
  *   request and resolves with `status: 499` / `client_closed`.
+ * @param {number} [maxResponseBytes=0]
+ *   Local buffered-response ceiling. Zero disables it. This bounds providers
+ *   whose native wire rejects token-limit parameters.
  * @returns {Promise<{ status: number, headers: Record<string, string>, body: Buffer }>}
  *   Always resolves.  Network failures resolve with `status: 502`; an idle
  *   timeout resolves with `status: 504`; both carry a JSON `{ error }` body.
  */
-export function sendUpstream(reqUrl, method, headers, body, targetUrl, timeoutMs = 0, signal = null) {
+export function sendUpstream(reqUrl, method, headers, body, targetUrl, timeoutMs = 0, signal = null, maxResponseBytes = 0) {
   return new Promise((resolve) => {
     const upstream = buildUpstreamUrl(reqUrl, targetUrl);
 
@@ -166,7 +169,22 @@ export function sendUpstream(reqUrl, method, headers, body, targetUrl, timeoutMs
         firstByteAt = Date.now();
         firstByteMs = firstByteAt - startedAt;
         const chunks = [];
-        upstreamRes.on("data", (chunk) => chunks.push(chunk));
+        let responseBytes = 0;
+        upstreamRes.on("data", (chunk) => {
+          responseBytes += chunk.length;
+          if (maxResponseBytes > 0 && responseBytes > maxResponseBytes) {
+            done({
+              status: 502,
+              headers: {},
+              body: Buffer.from(JSON.stringify({ error: { code: "response_too_large" } })),
+              ...terminalTiming(),
+            });
+            upstreamRes.destroy();
+            upstreamReq.destroy();
+            return;
+          }
+          chunks.push(chunk);
+        });
         upstreamRes.on("end", () => {
           done({
             status: upstreamRes.statusCode,

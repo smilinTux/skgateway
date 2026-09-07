@@ -29,6 +29,19 @@
 import { isAnthropicBackend, isAnthropicModelId } from "./anthropic-adapter.mjs";
 import { isZaiBackend } from "./zai-adapter.mjs";
 import { isCodexBackend } from "./codex-adapter.mjs";
+import { capacityStatus } from "../discovery/capacity_store.mjs";
+
+export function applyCapacityView(data, getCapacityFn = capacityStatus) {
+  return data.filter((m) => getCapacityFn(m.provider || m.owned_by, m.id).state !== "throttled");
+}
+
+export function availabilityState({ enabled = true, capacity, health } = {}) {
+  if (!enabled) return "disabled";
+  if (capacity?.state === "throttled") return "throttled";
+  if (health?.quarantined) return "quarantined";
+  if (!health || health.observed === false || health.status === "unknown") return "unknown";
+  return health.status === "down" ? "quarantined" : "available";
+}
 
 /** Valid reconcile modes. */
 export const RECONCILE_MODES = new Set(["flag", "hide", "off"]);

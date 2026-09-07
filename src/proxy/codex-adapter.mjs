@@ -450,13 +450,30 @@ export function fromCodexResponse(raw, model, clientStream = false) {
     });
   }
   if (toolCalls.length) {
-    chunks.push({ ...base, choices: [{ index: 0, delta: { tool_calls: toolCalls }, finish_reason: null }] });
+    // OpenAI stream shape: every tool_calls fragment must carry its own
+    // integer index. Without it the response contract (which validates
+    // fragment.index per fragment) rejects the whole streamed turn as
+    // invalid tool-call evidence and the client sees a 502. The non-stream
+    // message shape above intentionally has no index; only the stream
+    // fragments do.
+    chunks.push({
+      ...base,
+      choices: [{
+        index: 0,
+        delta: { tool_calls: toolCalls.map((call, i) => ({ index: i, ...call })) },
+        finish_reason: null,
+      }],
+    });
   }
   chunks.push({
     ...base,
     choices: [{ index: 0, delta: {}, finish_reason: finish }],
-    usage,
   });
+  // Canonical OpenAI tail: the usage chunk carries an EMPTY choices array and
+  // nothing else. Combining usage with the finish chunk violates the response
+  // contract (usage chunks must have choices.length === 0 and every choice
+  // state already complete), which 502'd every streamed Codex completion.
+  chunks.push({ ...base, choices: [], usage });
 
   const sse = chunks.map((c) => `data: ${JSON.stringify(c)}\n\n`).join("") + "data: [DONE]\n\n";
   const body = Buffer.from(sse, "utf-8");

@@ -57,6 +57,7 @@ export const EventType = Object.freeze({
   ANOMALY:          'anomaly',
   FAILOVER:         'failover',
   TOOL_USE:         'tool_use',
+  CAPACITY:         'capacity',
 });
 
 /**
@@ -94,6 +95,7 @@ const DEFAULT_SEVERITY = {
   [EventType.ANOMALY]:          Severity.WARNING,
   [EventType.FAILOVER]:         Severity.WARNING,
   [EventType.TOOL_USE]:         Severity.INFO,
+  [EventType.CAPACITY]:         Severity.INFO,
 };
 
 // ─── human-readable event names for CEF ──────────────────────────────────────
@@ -108,6 +110,7 @@ const EVENT_NAMES = {
   [EventType.ANOMALY]:          'Anomalous Behaviour Detected',
   [EventType.FAILOVER]:         'Backend Failover',
   [EventType.TOOL_USE]:         'Tool Invocation',
+  [EventType.CAPACITY]:         'Provider Capacity Transition',
 };
 
 // ─── event factory ────────────────────────────────────────────────────────────
@@ -122,6 +125,7 @@ const EVENT_NAMES = {
  * @property {string}  [agent_id]  - Identifying agent (e.g. "lumina").
  * @property {string}  [session_id]- Conversation/session UUID.
  * @property {string}  [request_id]- Per-request UUID.
+ * @property {string}  [correlation_id]- Correlation UUID for related capacity evidence.
  * @property {string}  [backend]   - Backend name (e.g. "nvidia", "anthropic").
  * @property {string}  [model]     - Model name targeted.
  * @property {object}  details     - Type-specific payload (see per-type JSDoc below).
@@ -165,6 +169,7 @@ export function createEvent(type, details = {}, context = {}) {
     ...(context.agent_id   !== undefined && { agent_id:   context.agent_id }),
     ...(context.session_id !== undefined && { session_id: context.session_id }),
     ...(context.request_id !== undefined && { request_id: context.request_id }),
+    ...(context.correlation_id !== undefined && { correlation_id: context.correlation_id }),
     ...(context.backend    !== undefined && { backend:    context.backend }),
     ...(context.model      !== undefined && { model:      context.model }),
 
