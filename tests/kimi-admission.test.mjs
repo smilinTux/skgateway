@@ -37,6 +37,12 @@ describe("Kimi admission contract", () => {
     const router = createRouter({ backends: { "kimi-for-coding": cfg }, siem_log: false });
     await assert.rejects(() => router.route({ model: "kimi-for-coding", agentId: "probe" }),
       (error) => error instanceof ModelOwnerDownError);
+    const probe = await router.route({
+      model: "kimi-for-coding", agentId: "probe", bootstrapProbe: true,
+    });
+    assert.equal(probe.length, 1);
+    assert.equal(probe[0].backendId, "kimi-for-coding");
+    assert.equal(router.getHealth()["kimi-for-coding"].observed, false);
     backend.recordOutcome(true, 1);
     assert.equal(backend.isAvailable(), true);
     rmSync(dir, { recursive: true, force: true });
@@ -77,9 +83,13 @@ describe("Kimi synthetic request probes", () => {
       tools: [{ type: "function", function: { name: "probe", parameters: { type: "object" } } }] }));
     const router = createRouter({ backends: { kimi: {
       url: `http://127.0.0.1:${port}/v1`, auth_type: "none", models: ["kimi-for-coding"], timeout_ms: 20,
+      require_observed_health: true,
     } }, failover: false, siem_log: false });
+    await assert.rejects(() => router.route({ model: "kimi-for-coding", agentId: "ordinary" }),
+      (error) => error instanceof ModelOwnerDownError);
     const ok = await routeAndSend(router, { model: "kimi-for-coding", agentId: "probe" }, "/chat/completions", "POST",
-      { "content-type": "application/json" }, body("kimi-for-coding"), false);
+      { "content-type": "application/json", "x-sk-context": "public", "x-sk-probe": "synthetic" },
+      body("kimi-for-coding"), false);
     assert.equal(ok.status, 200);
     assert.equal(state.body.tools[0].function.name, "probe");
     state.delay = 80;
