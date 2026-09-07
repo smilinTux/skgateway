@@ -1671,7 +1671,7 @@ export function createRouter(config = {}) {
     // quarantined claim must not turn into an unmatched-model spray, and one
     // bad claimer must not condemn another claimer or the global model id.
     const declared = [...backends.values()].filter((b) => b.supportsModel(model));
-    const matched = available.filter(
+    let matched = available.filter(
       (b) => b.supportsModel(model) && b.isModelClaimAvailable(model),
     );
 
@@ -1679,12 +1679,32 @@ export function createRouter(config = {}) {
     // Permit only an explicitly marked public-synthetic request to establish
     // their first observation. Ordinary traffic remains fail closed, and the
     // existing capacity domain still bounds this probe to one active request.
-    if (bootstrapProbe && matched.length === 0) {
-      const unobserved = declared
+    // Exact declarations identify the provider owner. Do not let a registry
+    // default or wildcard-capable foreign provider answer this probe: doing so
+    // would record health for the wrong backend and leave the owner unknown.
+    const admissionOwners = declared.filter((b) => b.require_observed_health &&
+      b.models.some((pattern) => pattern.toLowerCase() === model.toLowerCase()));
+    if (admissionOwners.length > 0) {
+      if (admissionOwners.every((b) => !b.isModelClaimAvailable(model))) {
+        const claimQuarantined = [];
+        claimQuarantined.claimQuarantined = true;
+        return claimQuarantined;
+      }
+      matched = available.filter((b) =>
+        admissionOwners.includes(b) && b.isModelClaimAvailable(model));
+      const unobserved = admissionOwners
         .filter((b) => b.require_observed_health && b.getHealth().observed === false)
         .filter((b) => b.allowsAgent(agentId) && b.isModelClaimAvailable(model))
         .sort((a, b) => a.priority - b.priority);
-      if (unobserved.length > 0) matched.push(unobserved[0]);
+      if (bootstrapProbe && matched.length === 0 && unobserved.length > 0) {
+        matched.push(unobserved[0]);
+      }
+      if (matched.length === 0) {
+        const ownerDown = [];
+        ownerDown.ownerDown = true;
+        ownerDown.declaredBy = admissionOwners.map((b) => b.id);
+        return ownerDown;
+      }
     }
 
     // Balancing for equal-priority same-model replicas (card 786d9232).
@@ -3033,6 +3053,24 @@ export function createRouteSiemEmitter(siem, requestSource = {}, requestId = ran
   };
 }
 
+/**
+ * Preserve logical routing for synthetic traffic unless the concrete model has
+ * an exact admission-gated owner whose initial health this request can prove.
+ */
+export function shouldUseRegistryRouting(router, request, bootstrapProbe = false) {
+  if (!isRegistryRouted(request)) return false;
+  if (!bootstrapProbe) return true;
+  const model = request?.model;
+  if (typeof model !== "string") return true;
+  const exactAdmissionOwner = (typeof router.getBackends === "function"
+    ? [...router.getBackends().values()]
+    : []
+  ).some((backend) => backend?.require_observed_health === true &&
+    backend.models?.some((pattern) =>
+      typeof pattern === "string" && pattern.toLowerCase() === model.toLowerCase()));
+  return !exactAdmissionOwner;
+}
+
 export async function routeAndSend(router, request, upstreamPath, method, clientHeaders, body, usePool = true, siem = null, abortSignal = null) {
   const pool = usePool ? getPool() : null;
   const requestedModel = request?.model;
@@ -3146,7 +3184,10 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     }
   }
 
-  if (!candidates && isRegistryRouted(request)) {
+  // A bootstrap probe measures the exact model owner, not the logical public
+  // default. Registry routing here previously rewrote Kimi probes to Qwen and
+  // produced a successful response without ever observing Kimi.
+  if (!candidates && shouldUseRegistryRouting(router, request, bootstrapProbe)) {
     let reg = resolveRegistry({
       model: request.model,
       context: request.context,
