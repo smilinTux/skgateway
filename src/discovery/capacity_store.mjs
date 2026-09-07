@@ -5,8 +5,8 @@ import { homedir } from "node:os";
 export const CAPACITY_STORE_PATH = process.env.SKGATEWAY_CAPACITY_STORE_PATH ||
   join(homedir(), ".config", "skgateway", "capacity_store.json");
 export const PRODUCTION_CAPACITY_STORE_PATH = join(homedir(), ".config", "skgateway", "capacity_store.json");
-const probes = new Set();
-const scheduledProbes = new Set();
+const probes = new Map();
+const scheduledProbes = new Map();
 
 function load(path = CAPACITY_STORE_PATH) {
   try {
@@ -46,6 +46,19 @@ export function recordSubscriptionExhausted(provider, { retryAt, now = Date.now(
   return record;
 }
 
+export function recordModelThrottled(provider, model, {
+  retryAt, now = Date.now(), path = CAPACITY_STORE_PATH,
+} = {}) {
+  const store = load(path);
+  const record = {
+    state: "throttled", scope: "model", reason: "rate_limited",
+    retry_at: Math.max(now + 1000, Number(retryAt) || now + 60_000),
+    probe_state: "none", observed_at: now,
+  };
+  save({ ...store, [`model:${provider}:${model}`]: record }, path);
+  return record;
+}
+
 export function clearCapacity(provider, model, { now = Date.now(), path = CAPACITY_STORE_PATH } = {}) {
   const store = load(path);
   const record = { state: "available", scope: "provider", reason: null, retry_at: null,
@@ -53,21 +66,26 @@ export function clearCapacity(provider, model, { now = Date.now(), path = CAPACI
   delete store[`model:${provider}:${model}`];
   store[`provider:${provider}`] = record;
   save(store, path);
-  probes.delete(provider);
   return record;
 }
 
-export function admitCapacity(provider, model, { publicSynthetic = false, now = Date.now(), path = CAPACITY_STORE_PATH } = {}) {
+export function admitCapacity(provider, model, {
+  publicSynthetic = false, probeOwner = null, now = Date.now(), path = CAPACITY_STORE_PATH,
+} = {}) {
   const status = capacityStatus(provider, model, { now, path });
   if (status.state !== "throttled") return { admitted: true, probe: false, status };
-  if (!status.current || !Number.isFinite(status.retry_at) || now < status.retry_at || !publicSynthetic || probes.has(provider)) {
+  if (!status.current || !Number.isFinite(status.retry_at) || now < status.retry_at ||
+      !publicSynthetic || !probeOwner || probes.has(provider)) {
     return { admitted: false, probe: false, status };
   }
-  probes.add(provider);
+  probes.set(provider, probeOwner);
   return { admitted: true, probe: true, status: { ...status, probe_state: "in_progress" } };
 }
 
-export function finishCapacityProbe(provider, success, { retryAt, now = Date.now(), path = CAPACITY_STORE_PATH } = {}) {
+export function finishCapacityProbe(provider, success, {
+  probeOwner = null, model = null, retryAt, now = Date.now(), path = CAPACITY_STORE_PATH,
+} = {}) {
+  if (!probeOwner || probes.get(provider) !== probeOwner) return capacityStatus(provider, model, { now, path });
   probes.delete(provider);
   if (success) return clearCapacity(provider, null, { now, path });
   return recordSubscriptionExhausted(provider, { retryAt, now, path });
@@ -77,35 +95,48 @@ export function finishCapacityProbe(provider, success, { retryAt, now = Date.now
  * recording on its normal response path; this wrapper only guarantees that a
  * thrown transport/audit error cannot strand the single-flight lock. */
 export async function runDueCapacityProbes(targets, probe, {
-  now = Date.now(), path = CAPACITY_STORE_PATH,
+  now = Date.now(), path = CAPACITY_STORE_PATH, deadlineMs = 8_000,
 } = {}) {
   const results = [];
   for (const target of targets) {
     const status = capacityStatus(target.provider, target.model, { now, path });
     if (status.state !== "throttled" || !status.current ||
-        !Number.isFinite(status.retry_at) || now < status.retry_at || scheduledProbes.has(target.provider)) continue;
-    scheduledProbes.add(target.provider);
+        status.scope !== "provider" || !Number.isFinite(status.retry_at) || now < status.retry_at ||
+        scheduledProbes.has(target.provider)) continue;
+    const owner = Symbol(target.provider);
+    scheduledProbes.set(target.provider, owner);
+    const controller = new AbortController();
+    let timer;
     try {
-      results.push({ ...target, result: await probe(target) });
+      const deadline = new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          controller.abort();
+          reject(new Error("capacity probe deadline exceeded"));
+        }, deadlineMs);
+      });
+      results.push({ ...target, result: await Promise.race([
+        probe(target, { signal: controller.signal }), deadline,
+      ]) });
     } catch (error) {
       // A throw bypasses routeAndSend's normal outcome recorder. Re-arm the
       // provider instead of retrying every scheduler tick.
-      finishCapacityProbe(target.provider, false, { now, path });
+      const probeOwner = probes.get(target.provider);
+      if (!probeOwner) recordSubscriptionExhausted(target.provider, { now, path });
       results.push({ ...target, error });
     } finally {
+      clearTimeout(timer);
       // routeAndSend normally clears or re-arms this itself. This is the
       // defensive transport-exception path that previously leaked the lock.
-      probes.delete(target.provider);
-      scheduledProbes.delete(target.provider);
+      if (scheduledProbes.get(target.provider) === owner) scheduledProbes.delete(target.provider);
     }
   }
   return results;
 }
 
 export function startCapacityProbeScheduler({
-  targets, probe, intervalMs = 30_000, setIntervalFn = setInterval,
+  targets, probe, intervalMs = 30_000, deadlineMs = 8_000, setIntervalFn = setInterval,
 }) {
-  const tick = () => runDueCapacityProbes(targets, probe);
+  const tick = () => runDueCapacityProbes(targets, probe, { deadlineMs });
   const timer = setIntervalFn(tick, intervalMs);
   timer?.unref?.();
   return { tick, timer };

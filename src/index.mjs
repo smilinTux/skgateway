@@ -740,11 +740,10 @@ const subscriptionProbeTargets = Object.entries(config.backends || {})
 
 startCapacityProbeScheduler({
   targets: subscriptionProbeTargets,
-  probe: ({ model }) => {
+  probe: ({ model }, { signal }) => {
     const probeBody = Buffer.from(JSON.stringify({
       model,
       messages: [{ role: "user", content: "Reply with ok." }],
-      max_tokens: 4,
       stream: false,
     }));
     return routeAndSend(router, {
@@ -754,7 +753,7 @@ startCapacityProbeScheduler({
       "content-type": "application/json",
       "x-sk-context": "public",
       "x-sk-probe": "synthetic",
-    }, probeBody, true);
+    }, probeBody, true, null, signal);
   },
 });
 

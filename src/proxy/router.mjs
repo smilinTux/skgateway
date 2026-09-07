@@ -39,7 +39,7 @@ import { marginalJoules, imputeJoules, resolveBasis, coeffsForModel, backendIsLo
 import { recordModelOutcome, getLifecycle } from "../discovery/model_catalog_store.mjs";
 import {
   admitCapacity, capacityStatus, clearCapacity, finishCapacityProbe,
-  isSubscriptionExhaustion, recordSubscriptionExhausted,
+  isSubscriptionExhaustion, recordModelThrottled, recordSubscriptionExhausted,
 } from "../discovery/capacity_store.mjs";
 import { isRoutable, isEffectivelyRoutable } from "../discovery/lifecycle.mjs";
 import { applyReasoningFloor } from "./core.mjs";
@@ -3646,10 +3646,12 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     const providerName = backend.discovery || inferProviderFromBackend(backendId);
     const publicSynthetic = clientHeaders?.["x-sk-context"] === "public" &&
       clientHeaders?.["x-sk-probe"] === "synthetic";
+    const capacityProbeOwner = publicSynthetic ? Symbol(providerName) : null;
     const capacityAdmission = providerName === "codex"
-      ? admitCapacity(providerName, candidateModel, { publicSynthetic })
+      ? admitCapacity(providerName, candidateModel, { publicSynthetic, probeOwner: capacityProbeOwner })
       : { admitted: true, probe: false };
     if (capacityAdmission.probe) attemptTimeoutMs = Math.min(attemptTimeoutMs || PROBE_TIMEOUT_MS, PROBE_TIMEOUT_MS);
+    const probeResponseLimit = capacityAdmission.probe ? 1024 * 1024 : 0;
     if (!capacityAdmission.admitted) {
       const remainingMs = Math.max(1000, (capacityAdmission.status.retry_at || Date.now() + 1000) - Date.now());
       throttledAttempts.push({ backendId, model: candidateModel, status: 429,
@@ -3730,7 +3732,9 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         // Capacity admission owns a provider-wide half-open lock. Pool
         // rejection happens before the upstream try/finally below, so it must
         // explicitly re-arm and release the probe here on every early return.
-        if (capacityAdmission.probe) finishCapacityProbe(providerName, false);
+        if (capacityAdmission.probe) finishCapacityProbe(providerName, false, {
+          probeOwner: capacityProbeOwner, model: candidateModel,
+        });
         // A client which leaves while queued is the same neutral 499 as one
         // which leaves after dispatch: no failover and no backend-health write.
         if (err instanceof PoolAdmissionError && err.code === "client_closed") {
@@ -3930,10 +3934,12 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           }
           const cHeaders = { ...forwardHeaders, ...tr.headers };
           delete cHeaders["content-length"];
-          const raw = await sendUpstream(tr.path, method, cHeaders, tr.body, targetUrl, attemptTimeoutMs, abortSignal);
+          const raw = await sendUpstream(tr.path, method, cHeaders, tr.body, targetUrl,
+            attemptTimeoutMs, abortSignal, probeResponseLimit);
           res = raw?.cancelled ? raw : fromCodexResponse(raw, candidateModel, tr.clientStream);
         } else {
-          res = await sendUpstream(upstreamPath, method, forwardHeaders, attemptBody, targetUrl, attemptTimeoutMs, abortSignal);
+          res = await sendUpstream(upstreamPath, method, forwardHeaders, attemptBody, targetUrl,
+            attemptTimeoutMs, abortSignal, probeResponseLimit);
         }
       } else if (isCodexBackend(backend)) {
         // Translate OpenAI chat-completions -> Codex Responses API (OpenAI
@@ -3989,7 +3995,11 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       if (isSubscriptionExhaustion(res.status, res.body)) {
         recordSubscriptionExhausted(providerName, { retryAt });
       } else if (capacityAdmission.probe) {
-        finishCapacityProbe(providerName, res.status >= 200 && res.status < 300, { retryAt });
+        finishCapacityProbe(providerName, res.status >= 200 && res.status < 300, {
+          probeOwner: capacityProbeOwner, model: candidateModel, retryAt,
+        });
+      } else if (res.status === 429 || res.status === 402) {
+        recordModelThrottled(providerName, candidateModel, { retryAt });
       } else if (res.status >= 200 && res.status < 300) {
         clearCapacity(providerName, candidateModel);
       }
