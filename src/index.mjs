@@ -14,7 +14,7 @@ import { loadConfig, getConfig } from "./config.mjs";
 import { createProxyServer, handleRequest, buildConfig, trimSystemMessages, trimConversationHistory } from "./proxy/core.mjs";
 import { createRouter, routeAndSend } from "./proxy/router.mjs";
 import { sanitizeResponse } from "./proxy/sanitizer.mjs";
-import { buildModelCatalog, reconcileModeFromConfig, tagLocalModels, mergeDiscoveredCatalog, isModelAvailable, excludedModelIds, withoutExcludedModels } from "./proxy/advertise.mjs";
+import { applyCapacityView, availabilityState, buildModelCatalog, reconcileModeFromConfig, tagLocalModels, mergeDiscoveredCatalog, isModelAvailable, excludedModelIds, withoutExcludedModels } from "./proxy/advertise.mjs";
 import { loadAllowlist, saveAllowlist, applyAllowlist } from "./advertise.mjs";
 import { discoverCatalog, loadCache, saveCache, fetchNvidia, fetchOpenRouter, fetchOpencode, fetchAnthropicWrapper, fetchCodex, fetchZai, catalogStatus, loadCardOverrides, applyCardOverlays, buildServingCatalog } from "./discovery.mjs";
 import { getPool, resetPool } from "./proxy/connection-pool.mjs";
@@ -44,6 +44,7 @@ import { readCodexAuthHeaders } from "./proxy/codex-adapter.mjs";
 import { readZaiAuthHeaders, ZAI_CREDENTIALS_PATH } from "./proxy/zai-adapter.mjs";
 import { SSEWriter, jsonToSSE } from "./proxy/stream.mjs";
 import { getLifecycle } from "./discovery/model_catalog_store.mjs";
+import { capacityStatus } from "./discovery/capacity_store.mjs";
 import { isRoutable, isEffectivelyRoutable, LIFECYCLE_STATES } from "./discovery/lifecycle.mjs";
 import { rankModels } from "./ranking/rank.mjs";
 import { deriveCapabilities } from "./ranking/capabilities.mjs";
@@ -532,13 +533,19 @@ export function stripInternalCardFields(data) {
  * @param {(id: string) => object} [getLifecycleFn]
  * @returns {Array<object>}
  */
-export function buildAdminModelsView(full, allow, getLifecycleFn = getLifecycle) {
+export function buildAdminModelsView(full, allow, getLifecycleFn = getLifecycle, getCapacityFn = capacityStatus) {
   const set = new Set(allow);
-  return full.map((m) => ({
-    ...m,
-    advertised: allow.length === 0 || set.has(m.id),
-    lifecycle: getLifecycleFn(m.id),
-  }));
+  return full.map((m) => {
+    const capacity = getCapacityFn(m.provider || m.owned_by, m.id);
+    const health = router.getHealth?.()[m.owned_by || m.provider];
+    return {
+      ...m,
+      advertised: allow.length === 0 || set.has(m.id),
+      lifecycle: getLifecycleFn(m.id),
+      capacity,
+      availability: availabilityState({ capacity, health }),
+    };
+  });
 }
 
 /**
@@ -1514,7 +1521,7 @@ export const server = http.createServer(async (req, res) => {
       const merged = withoutExcludedModels(
         mergeDiscoveredCatalog(reconciled, discovered, advertiseBackends), excluded);
       const allowlist = loadAllowlist();
-      const allowed = applyAllowlist(merged, allowlist);
+      const allowed = applyCapacityView(applyAllowlist(merged, allowlist));
       // Aliases (buckets + registry roles): additive, allowlist-aware,
       // dedupe concrete-first. Buckets only when buckets_enabled is true.
       const aliases = allowAliases(aliasCatalogEntries(getConfig()), allowlist);
@@ -1537,7 +1544,7 @@ export const server = http.createServer(async (req, res) => {
       const excluded = excludedModelIds(config);
       const fallback = buildModelCatalog(advertiseBackends, router, advertiseReconcileMode, excluded);
       const allowlist = loadAllowlist();
-      const allowed = applyAllowlist(fallback, allowlist);
+      const allowed = applyCapacityView(applyAllowlist(fallback, allowlist));
       const aliases = allowAliases(aliasCatalogEntries(getConfig()), allowlist);
       const seenIds = new Set(allowed.map((m) => m.id));
       let data = [...allowed, ...aliases.filter((e) => !seenIds.has(e.id))];
@@ -1576,7 +1583,7 @@ export const server = http.createServer(async (req, res) => {
       const reconciled = buildModelCatalog(advertiseBackends, router, advertiseReconcileMode, excluded);
       const merged = withoutExcludedModels(
         mergeDiscoveredCatalog(reconciled, discovered, advertiseBackends), excluded);
-      const data = applyAllowlist(merged, loadAllowlist());
+      const data = applyCapacityView(applyAllowlist(merged, loadAllowlist()));
       const entry = data.find((m) => m.id === id);
       // Registry role (sk-default/sk-auto/sk-creative/...): a valid routing
       // target resolved by ~/.skcapstone/models/registry.yaml, not a concrete
@@ -1841,7 +1848,8 @@ export const server = http.createServer(async (req, res) => {
         const claimers = router.getBackends()
           .filter((backend) => backend.supportsModel(e.id))
           .map((backend) => backend.id);
-        return isEffectivelyRoutable(getLifecycle(e.id), claimers);
+        return isEffectivelyRoutable(getLifecycle(e.id), claimers) &&
+          capacityStatus(e.provider, e.id).state !== "throttled";
       };
       const bucketsEnabled = cfg?.routing?.buckets_enabled === true;
       const all = allBuckets();

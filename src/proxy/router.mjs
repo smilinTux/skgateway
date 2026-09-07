@@ -37,6 +37,10 @@ import { getFailoverConfig, isLocalUrl, probeLocalHealth, recordLocalOutcome } f
 import { readMeter } from "./meter-client.mjs";
 import { marginalJoules, imputeJoules, resolveBasis, coeffsForModel, backendIsLocal, usageFromSSE, resolveMeterUrl } from "../metrics/energy.mjs";
 import { recordModelOutcome, getLifecycle } from "../discovery/model_catalog_store.mjs";
+import {
+  admitCapacity, capacityStatus, clearCapacity, finishCapacityProbe,
+  isSubscriptionExhaustion, recordSubscriptionExhausted,
+} from "../discovery/capacity_store.mjs";
 import { isRoutable, isEffectivelyRoutable } from "../discovery/lifecycle.mjs";
 import { applyReasoningFloor } from "./core.mjs";
 import { enforceResponseContract } from "./response-contract.mjs";
@@ -113,6 +117,7 @@ export const CLIENT_CREDENTIAL_HEADERS = [
 export const INTERNAL_CONTROL_HEADERS = [
   "x-sk-card-id",
   "x-sk-context",
+  "x-sk-probe",
   "x-sk-prefer",
   "x-sk-require",
   "x-sk-role",
@@ -1963,7 +1968,11 @@ export function createRouter(config = {}) {
       out[id] = backend.getHealth();
     }
     for (const [id, backend] of backends) {
-      out[id] = backend.getHealth();
+      const health = backend.getHealth();
+      const provider = backend.discovery || inferProviderFromBackend(id);
+      out[id] = provider === "codex"
+        ? { ...health, capacity: capacityStatus("codex", null) }
+        : health;
     }
     return out;
   }
@@ -2725,7 +2734,8 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
           .filter((backend) => backend.supportsModel(e.id))
           .map((backend) => backend.id)
         : [];
-      return isEffectivelyRoutable(getLifecycle(e.id), claimers);
+      const capacity = capacityStatus(e.provider, e.id);
+      return isEffectivelyRoutable(getLifecycle(e.id), claimers) && capacity.state !== "throttled";
     },
   });
 
@@ -3600,7 +3610,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // in the list (candidatesFor() only ever matches on model id), so
     // request.model is the correct default.
     const candidateModel = candidates[i].model || request.model;
-    const attemptTimeoutMs = isBucketChain
+    let attemptTimeoutMs = isBucketChain
       ? bucketLivenessTimeoutMs(backend.timeout_ms)
       : backend.timeout_ms;
 
@@ -3633,7 +3643,21 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // still cooling down. Skip it with NO network call rather than paying
     // for a near-certain repeat 429, and record the skip as an attempt for
     // the attributable-429 synthesis below.
-    if (isThrottled(backendId, candidateModel)) {
+    const providerName = backend.discovery || inferProviderFromBackend(backendId);
+    const publicSynthetic = clientHeaders?.["x-sk-context"] === "public" &&
+      clientHeaders?.["x-sk-probe"] === "synthetic";
+    const capacityAdmission = providerName === "codex"
+      ? admitCapacity(providerName, candidateModel, { publicSynthetic })
+      : { admitted: true, probe: false };
+    if (capacityAdmission.probe) attemptTimeoutMs = Math.min(attemptTimeoutMs || PROBE_TIMEOUT_MS, PROBE_TIMEOUT_MS);
+    if (!capacityAdmission.admitted) {
+      const remainingMs = Math.max(1000, (capacityAdmission.status.retry_at || Date.now() + 1000) - Date.now());
+      throttledAttempts.push({ backendId, model: candidateModel, status: 429,
+        cooldownMs: remainingMs, skipped: true, reason: capacityAdmission.status.reason });
+      continue;
+    }
+
+    if (isThrottled(backendId, candidateModel) && !capacityAdmission.probe) {
       const state = _throttleCooldowns.get(throttleKey(backendId, candidateModel));
       const remainingMs = Math.max(0, (state?.untilMs ?? 0) - Date.now());
       console.warn(
@@ -3954,6 +3978,18 @@ export async function routeAndSend(router, request, upstreamPath, method, client
 
     res = enforceResponseContract(res, requestedModel);
     const latencyMs = (Date.now() - queueStart) - meterBeforeMs;
+
+    if (providerName === "codex") {
+      const retryAfter = res.headers?.["retry-after"] ?? res.headers?.["Retry-After"];
+      const retryAt = Date.now() + Math.min(parseRetryAfterMs(retryAfter) ?? DEFAULT_402_COOLDOWN_MS, MAX_THROTTLE_COOLDOWN_MS);
+      if (isSubscriptionExhaustion(res.status, res.body)) {
+        recordSubscriptionExhausted(providerName, { retryAt });
+      } else if (capacityAdmission.probe) {
+        finishCapacityProbe(providerName, res.status >= 200 && res.status < 300, { retryAt });
+      } else if (res.status >= 200 && res.status < 300) {
+        clearCapacity(providerName, candidateModel);
+      }
+    }
 
     // A downstream disconnect is not evidence about the backend or model.
     // Return immediately after releasing the pool/meter slot in `finally`,
