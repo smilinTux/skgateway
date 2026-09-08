@@ -730,23 +730,38 @@ const pool = getPool(poolConfig);
 // public-synthetic request tests the exact provider/model. routeAndSend owns
 // all lifecycle writes, catalog/bucket truth, credential handling, and the
 // eight-second half-open timeout. No prompt or credential is logged here.
-const subscriptionProbeTargets = Object.entries(config.backends || {})
-  .filter(([, backend]) => backend?.auth_type === "codex_oauth" && backend.enabled !== false)
-  .flatMap(([provider, backend]) => (backend.models || [])
+const recoveryProbeTargets = () => Object.entries(config.backends || {})
+  .filter(([, backend]) => ["codex_oauth", "zai_oauth"].includes(backend?.auth_type) && backend.enabled !== false)
+  .flatMap(([provider]) => {
+    const live = router.getBackend(provider);
+    const health = live?.getHealth?.() || {};
+    return (live?.models || [])
     .filter((model) => typeof model === "string" && !model.includes("*"))
-    .map((model) => ({ provider, model })))
+    .map((model) => {
+      const claim = live?.getModelClaimHealth?.(model) || {};
+      return {
+        provider,
+        model,
+        unavailable: health.status === "down" || health.quarantined === true || claim.quarantined === true,
+        reason: claim.quarantined ? "quarantine"
+          : health.quarantined ? "quarantine" : health.lastFailureClass || "backend_cooldown",
+        retryAt: claim.retryAt || health.retryAt,
+      };
+    });
+  })
   .filter((target) => target.model);
 
 startCapacityProbeScheduler({
-  targets: subscriptionProbeTargets,
+  targets: recoveryProbeTargets,
   probe: ({ model }, { signal, probeOwner }) => {
     const probeBody = Buffer.from(JSON.stringify({
       model,
       messages: [{ role: "user", content: "Reply with ok." }],
+      max_tokens: 256,
       stream: false,
     }));
     return routeAndSend(router, {
-      model, messages: [{ role: "user", content: "Reply with ok." }],
+      model, messages: [{ role: "user", content: "Reply with ok." }], max_tokens: 256,
       agentId: "skgateway-capacity-probe", context: "public", capacityProbeOwner: probeOwner,
     }, "/v1/chat/completions", "POST", {
       "content-type": "application/json",

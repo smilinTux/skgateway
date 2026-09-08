@@ -40,7 +40,8 @@ import { observeProviderUsage, providerUsageSnapshot } from "../metrics/provider
 import { recordModelOutcome, getLifecycle } from "../discovery/model_catalog_store.mjs";
 import {
   admitCapacity, capacityStatus, clearCapacity, finishCapacityProbe,
-  isSubscriptionExhaustion, recordModelThrottled, recordSubscriptionExhausted,
+  isSubscriptionExhaustion, recordModelThrottled, recordProviderUnavailable,
+  recordSubscriptionExhausted,
   releaseCapacityProbe,
 } from "../discovery/capacity_store.mjs";
 import { isRoutable, isEffectivelyRoutable } from "../discovery/lifecycle.mjs";
@@ -925,6 +926,9 @@ export class Backend {
     this._window = [];
     this._windowHead = 0;
     this._windowErrors = 0; // count of `false` in window
+    /** @type {(string|null)[]} failure classification parallel to `_window` */
+    this._windowFailureClasses = [];
+    this._lastFailureClass = null;
 
     // ----- Quarantine state (consecutive-failure trip; independent of window) -----
     /** @type {number} consecutive failures since the last success */
@@ -985,6 +989,19 @@ export class Backend {
     const state = this._modelClaimFailures.get(model);
     if (!state?.quarantinedAt) return true;
     return Date.now() - state.quarantinedAt >= this.model_claim_quarantine_cooldown_ms;
+  }
+
+  /** Observable exact-claim state for the shared recovery scheduler. */
+  getModelClaimHealth(model) {
+    const state = this._modelClaimFailures.get(model);
+    if (!state?.quarantinedAt) {
+      return { quarantined: false, failures: state?.failures || 0, retryAt: null };
+    }
+    return {
+      quarantined: true,
+      failures: state.failures,
+      retryAt: state.quarantinedAt + this.model_claim_quarantine_cooldown_ms,
+    };
   }
 
   /**
@@ -1085,6 +1102,10 @@ export class Backend {
       totalErrors: this._totalErrors,
       quarantined: this._quarantined,
       consecutiveFailures: this._consecutiveFailures,
+      retryAt: this._quarantined
+        ? this._quarantinedSince + this.quarantine_cooldown_ms
+        : this._status === "down" ? this._downSince + this.cooldown_ms : null,
+      lastFailureClass: this._lastFailureClass,
     };
   }
 
@@ -1133,26 +1154,43 @@ export class Backend {
    *   or out of quarantine, else null. The caller (routeAndSend) emits the
    *   corresponding SIEM/log event; the Backend stays free of SIEM coupling.
    */
-  recordOutcome(success, latencyMs) {
+  recordOutcome(success, latencyMs, { failureClass = null, authoritativeRecovery = false } = {}) {
     this._lastCheck = Date.now();
     this._totalRequests++;
     if (!success) this._totalErrors++;
+    this._lastFailureClass = success ? null : failureClass;
     this._latency.record(latencyMs);
+
+    // A normal-budget schema-valid recovery proves that earlier tiny-budget
+    // empty answers were probe artefacts, not backend failures. Remove only
+    // those samples. Real transport, auth, quota, quarantine, and malformed
+    // response evidence remains in the health window.
+    if (success && authoritativeRecovery && this._windowFailureClasses.includes("response_budget")) {
+      const kept = this._window
+        .map((outcome, index) => ({ outcome, kind: this._windowFailureClasses[index] || null }))
+        .filter((sample) => sample.kind !== "response_budget");
+      this._window = kept.map((sample) => sample.outcome);
+      this._windowFailureClasses = kept.map((sample) => sample.kind);
+      this._windowHead = 0;
+      this._windowErrors = this._window.filter((outcome) => !outcome).length;
+    }
 
     // Update sliding window
     if (this._window.length < HEALTH_WINDOW) {
       this._window.push(success);
+      this._windowFailureClasses.push(success ? null : failureClass);
       if (!success) this._windowErrors++;
     } else {
       const evicted = this._window[this._windowHead];
       this._window[this._windowHead] = success;
+      this._windowFailureClasses[this._windowHead] = success ? null : failureClass;
       this._windowHead = (this._windowHead + 1) % HEALTH_WINDOW;
       if (!evicted) this._windowErrors--;
       if (!success) this._windowErrors++;
     }
 
     this._evaluateStatus();
-    return this._evaluateQuarantine(success);
+    return this._evaluateQuarantine(success, authoritativeRecovery);
   }
 
   /**
@@ -1163,7 +1201,7 @@ export class Backend {
    * @param {boolean} success
    * @returns {?{transition: 'quarantined'|'readmitted', consecutiveFailures: number, threshold: number}}
    */
-  _evaluateQuarantine(success) {
+  _evaluateQuarantine(success, preserveHealthEvidence = false) {
     if (this.quarantine_threshold <= 0) return null; // disabled
 
     if (success) {
@@ -1175,11 +1213,14 @@ export class Backend {
         // the successful probe is authoritative proof of liveness.
         this._quarantined = false;
         this._quarantinedSince = 0;
-        this._window = [];
-        this._windowHead = 0;
-        this._windowErrors = 0;
-        this._status = "up";
-        this._downSince = 0;
+        if (!preserveHealthEvidence) {
+          this._window = [];
+          this._windowFailureClasses = [];
+          this._windowHead = 0;
+          this._windowErrors = 0;
+          this._status = "up";
+          this._downSince = 0;
+        }
         console.log(`[router] backend=${this.id} probe OK, READMITTED from quarantine`);
         return { transition: "readmitted", consecutiveFailures: 0, threshold: this.quarantine_threshold };
       }
@@ -3819,7 +3860,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     const capacityProbeOwner = publicSynthetic
       ? (request.capacityProbeOwner || Symbol(providerName))
       : null;
-    const capacityAdmission = providerName === "codex"
+    const capacityAdmission = providerName === "codex" || providerName === "zai"
       ? admitCapacity(providerName, candidateModel, { publicSynthetic, probeOwner: capacityProbeOwner })
       : { admitted: true, probe: false };
     if (capacityAdmission.probe) {
@@ -4174,6 +4215,8 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       exitMeter(meterUrl);
     }
 
+    const upstreamStatus = res?.status;
+
     // Validate the buffered JSON form first, then re-emit and validate the
     // canonical OpenAI SSE form when the original client asked to stream.
     if (flippedToNonStream) {
@@ -4207,7 +4250,25 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     observeProviderUsage(providerName, res);
     const latencyMs = (Date.now() - queueStart) - meterBeforeMs;
 
-    if (providerName === "codex") {
+    const responseErrorCode = (() => {
+      try { return JSON.parse(res.body?.toString("utf8") || "{}").error?.code || null; }
+      catch { return null; }
+    })();
+    const requestedMaxTokens = (() => {
+      try {
+        const value = JSON.parse(attemptBody?.toString("utf8") || "{}").max_tokens;
+        return Number.isFinite(value) ? value : null;
+      } catch { return null; }
+    })();
+    const recoveryFailureClass = res.status === 401 || res.status === 403
+      ? "authentication_failure"
+      : upstreamStatus >= 200 && upstreamStatus < 300 && res.status === 502
+        ? responseErrorCode === "empty_upstream_response" && requestedMaxTokens !== null && requestedMaxTokens < 256
+          ? "response_budget"
+          : "malformed_response"
+        : res.status >= 500 ? "backend_cooldown" : null;
+
+    if (providerName === "codex" || providerName === "zai") {
       const retryAfter = res.headers?.["retry-after"] ?? res.headers?.["Retry-After"];
       const retryAt = Date.now() + Math.min(parseRetryAfterMs(retryAfter) ?? DEFAULT_402_COOLDOWN_MS, MAX_THROTTLE_COOLDOWN_MS);
       if (isSubscriptionExhaustion(res.status, res.body)) {
@@ -4240,11 +4301,14 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         }
         finishCapacityProbe(providerName, probeSucceeded, {
           probeOwner: capacityProbeOwner, model: candidateModel, retryAt,
+          reason: probeSucceeded ? null : recoveryFailureClass,
         });
       } else if (res.status === 429 || res.status === 402) {
         recordModelThrottled(providerName, candidateModel, { retryAt });
       } else if (res.status >= 200 && res.status < 300) {
         clearCapacity(providerName, candidateModel);
+      } else if (providerName === "zai" && recoveryFailureClass) {
+        recordProviderUnavailable(providerName, { reason: recoveryFailureClass });
       }
     }
 
@@ -4334,7 +4398,10 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // of this card, so a throttled model can fail over WITHOUT damaging
     // backend health or lifecycle state.
     const healthy = res.status < 500;
-    const qTransition = backend.recordOutcome(healthy, latencyMs);
+    const qTransition = backend.recordOutcome(healthy, latencyMs, {
+      failureClass: recoveryFailureClass,
+      authoritativeRecovery: capacityAdmission.probe && healthy,
+    });
     const claimTransition = backend.recordModelClaimOutcome(candidateModel, res.status);
     if (claimTransition) {
       const quarantined = claimTransition.transition === "quarantined";
