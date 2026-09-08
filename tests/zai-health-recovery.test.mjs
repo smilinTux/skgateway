@@ -155,11 +155,11 @@ test("only the owned schema-valid success clears recovery state", () => {
     "throttled");
 });
 
-test("the shared recovery probe gives GLM enough response budget", () => {
+test("the shared recovery probe gives reasoning GLM a verified response budget", () => {
   const source = readFileSync(new URL("../src/index.mjs", import.meta.url), "utf8");
   const matches = [...source.matchAll(/max_tokens:\s*(\d+)/g)].map((match) => Number(match[1]));
-  assert.ok(matches.includes(256));
-  assert.equal(matches.some((value) => value < 256), false);
+  assert.equal(matches.filter((value) => value === 512).length, 2);
+  assert.equal(matches.some((value) => value < 512), false);
 });
 
 test("raw GLM claim admission agrees after exact successful recovery", async () => {

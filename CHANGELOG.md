@@ -43,6 +43,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Raise the Z.ai recovery probe response budget to 512 tokens so reasoning
+  models can return visible completion evidence before capacity is restored.
+
 - Discovery-managed model namespaces now fail closed when an authoritative
   refresh returns no exact claim, preventing raw GLM routes from escaping to
   Qwen or NVIDIA. Manual catalog refresh starts one asynchronous generation
