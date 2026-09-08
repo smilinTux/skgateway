@@ -419,6 +419,23 @@ export function toolUseEvidence(entry) {
   return { ok: false, basis: score === 0 ? 'card declares no tools' : 'no tool_use signal' };
 }
 
+const SAFE_CAPACITY_REASONS = new Set([
+  'authentication_failure', 'backend_cooldown', 'malformed_response',
+  'quarantine', 'rate_limited', 'response_budget', 'subscription_exhausted',
+]);
+
+/** Return public-safe operator detail for a capacity-throttled model. */
+export function capacityRoutabilityRejection(capacity) {
+  if (capacity?.state !== 'throttled') return null;
+  return {
+    reason: 'not routable (capacity)',
+    capacity_reason: SAFE_CAPACITY_REASONS.has(capacity.reason) ? capacity.reason : 'throttled',
+    ...(Number.isFinite(capacity.retry_at) && capacity.retry_at >= 0
+      ? { retry_at: capacity.retry_at }
+      : {}),
+  };
+}
+
 /**
  * Resolve a bucket to its eligible members, with the rejects and why.
  *
@@ -431,11 +448,16 @@ export function toolUseEvidence(entry) {
  * @param {Array<object>} args.catalog merged catalog entries
  * @param {Record<string,number>} [args.sensitivityPolicy]
  * @param {(e:object)=>boolean} [args.isRoutable] lifecycle gate, injected
+ * @param {(e:object)=>object|null} [args.getRoutabilityRejection] optional
+ *   operator detail for a rejected entry; routing callers leave this unset
  * @param {boolean} [args.requireToolUse] when the caller sent a `tools` array,
  *   admit only models with affirmative tool-call evidence
  * @returns {{members: Array<object>, rejected: Array<object>, ceiling: number}}
  */
-export function resolveBucket({ bucket, catalog = [], sensitivityPolicy, isRoutable = () => true, requireToolUse = false }) {
+export function resolveBucket({
+  bucket, catalog = [], sensitivityPolicy, isRoutable = () => true,
+  getRoutabilityRejection, requireToolUse = false,
+}) {
   const { ceiling } = resolveZoneCeiling(bucket.sensitivity, sensitivityPolicy);
   const members = [];
   const rejected = [];
@@ -447,6 +469,11 @@ export function resolveBucket({ bucket, catalog = [], sensitivityPolicy, isRouta
     }
     if (!publicLSubscriptionOwns(entry, bucket)) {
       rejected.push({ id: entry.id, reason: 'sk-l-public admits only Z.ai, Kimi, or Codex subscription providers' });
+      continue;
+    }
+    const routabilityRejection = getRoutabilityRejection?.(entry);
+    if (routabilityRejection) {
+      rejected.push({ id: entry.id, ...routabilityRejection });
       continue;
     }
     if (!isRoutable(entry)) {

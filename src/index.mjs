@@ -53,7 +53,7 @@ import { REGISTRY_PATH } from "./proxy/registry.mjs";
 import { energyRowsFrom, energyHeaders } from "./metrics/energy.mjs";
 import { attributionHeaders } from "./metrics/attribution.mjs";
 import { sampleTokenRatio } from "./metrics/token-ratio.mjs";
-import { allBuckets, resolveBucket } from "./policy/buckets.mjs";
+import { allBuckets, capacityRoutabilityRejection, resolveBucket } from "./policy/buckets.mjs";
 import { loadRegistry, REGISTRY_PATH as _REGISTRY_PATH } from "./proxy/registry.mjs";
 import { policyFromRegistry } from "./policy/sensitivity.mjs";
 import { readFileSync } from "node:fs";
@@ -1927,12 +1927,14 @@ export const server = http.createServer(async (req, res) => {
         getLifecycleFn: getLifecycle,
       });
       const policy = policyFromRegistry(loadRegistry());
-      const isRoutableFn = (e) => {
+      const getRoutabilityRejection = (e) => {
         const claimers = router.getBackends()
           .filter((backend) => backend.supportsModel(e.id))
           .map((backend) => backend.id);
-        return isEffectivelyRoutable(getLifecycle(e.id), claimers) &&
-          capacityStatus(e.provider, e.id).state !== "throttled";
+        if (!isEffectivelyRoutable(getLifecycle(e.id), claimers)) {
+          return { reason: "not routable (lifecycle)" };
+        }
+        return capacityRoutabilityRejection(capacityStatus(e.provider, e.id));
       };
       const bucketsEnabled = cfg?.routing?.buckets_enabled === true;
       const all = allBuckets();
@@ -1943,7 +1945,7 @@ export const server = http.createServer(async (req, res) => {
             bucket: b,
             catalog,
             sensitivityPolicy: policy,
-            isRoutable: isRoutableFn,
+            getRoutabilityRejection,
           });
           const physicalResources = new Set(members.map((m) => m.physical_resource_id));
           out.push({

@@ -21,6 +21,7 @@ import {
   classRank,
   meetsClassFloor,
   resolveBucket,
+  capacityRoutabilityRejection,
   orderMembersByCost,
   selectMember,
   gradeVocabulary,
@@ -233,6 +234,41 @@ describe('C9: eligibility composes the floor with the sovereignty ceiling', () =
       isRoutable: (e) => e.id !== 'big-pickle',
     });
     assert.ok(!members.some((m) => m.id === 'big-pickle'));
+  });
+
+  test('operator rejection detail distinguishes lifecycle from sanitized capacity', () => {
+    const { rejected } = resolveBucket({
+      bucket: { model_class: 'L', sensitivity: 'public' },
+      catalog,
+      getRoutabilityRejection: (model) => model.id === 'big-pickle'
+        ? { reason: 'not routable (capacity)', capacity_reason: 'subscription_exhausted', retry_at: 1234 }
+        : model.id === 'claude-opus'
+          ? { reason: 'not routable (lifecycle)' }
+          : null,
+    });
+    assert.deepEqual(rejected.find(({ id }) => id === 'big-pickle'), {
+      id: 'big-pickle',
+      reason: 'not routable (capacity)',
+      capacity_reason: 'subscription_exhausted',
+      retry_at: 1234,
+    });
+    assert.deepEqual(rejected.find(({ id }) => id === 'claude-opus'), {
+      id: 'claude-opus', reason: 'not routable (lifecycle)',
+    });
+  });
+
+  test('capacity rejection detail allowlists reason and finite retry time only', () => {
+    assert.deepEqual(capacityRoutabilityRejection({
+      state: 'throttled', reason: 'subscription_exhausted', retry_at: 1234,
+    }), {
+      reason: 'not routable (capacity)', capacity_reason: 'subscription_exhausted', retry_at: 1234,
+    });
+    assert.deepEqual(capacityRoutabilityRejection({
+      state: 'throttled', reason: 'token=secret', retry_at: 'tomorrow', private: 'secret',
+    }), {
+      reason: 'not routable (capacity)', capacity_reason: 'throttled',
+    });
+    assert.equal(capacityRoutabilityRejection({ state: 'available' }), null);
   });
 
   test('NEGATIVE CONTROL: an empty pool is empty, never quietly widened', () => {
