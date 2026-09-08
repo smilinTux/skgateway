@@ -119,6 +119,26 @@ console.log(`[skgateway] advertised-catalog reconcile mode: ${advertiseReconcile
 // cache (loadCache/saveCache) and never blocks startup or breaks /v1/models.
 let _catalog = [];
 const _discoveryCache = loadCache();
+let _catalogRefreshInFlight = null;
+let _catalogRefreshGeneration = 0;
+
+/** Start, or join, one asynchronous catalog refresh without blocking HTTP. */
+export function beginCatalogRefresh(cfg, refreshFn = refreshCatalog) {
+  if (_catalogRefreshInFlight) {
+    return {
+      started: false,
+      generation: _catalogRefreshGeneration,
+      promise: _catalogRefreshInFlight,
+    };
+  }
+  _catalogRefreshGeneration += 1;
+  const generation = _catalogRefreshGeneration;
+  const promise = Promise.resolve().then(() => refreshFn(cfg));
+  _catalogRefreshInFlight = promise.finally(() => {
+    if (_catalogRefreshGeneration === generation) _catalogRefreshInFlight = null;
+  });
+  return { started: true, generation, promise: _catalogRefreshInFlight };
+}
 
 /**
  * The static/local backend model lists already declared in config.backends
@@ -676,16 +696,27 @@ export async function refreshCatalog(cfg, discoverCatalogFn = discoverCatalog) {
 export async function getDiscoveredStatus() {
   const cfg = getConfig();
   const refreshSeconds = cfg.discovery?.refresh_seconds || 3600;
-  let catalog = [];
-  try {
-    catalog = await getDiscoveredCatalog();
-  } catch {
-    catalog = _catalog;
+  let catalog = _catalog;
+  // During an operator-triggered refresh, status is a nonblocking readback of
+  // the last complete snapshot. It must not start a second network sweep.
+  if (!_catalogRefreshInFlight) {
+    try {
+      catalog = await getDiscoveredCatalog();
+    } catch {
+      catalog = _catalog;
+    }
   }
   const status = catalogStatus({ catalog, cache: _discoveryCache, refreshSeconds });
   // Lifecycle counts (card P1.4): additive field, does not change any
   // existing key catalogStatus() already returns.
-  return { ...status, lifecycle: lifecycleCounts(catalog) };
+  return {
+    ...status,
+    lifecycle: lifecycleCounts(catalog),
+    refresh: {
+      in_flight: Boolean(_catalogRefreshInFlight),
+      generation: _catalogRefreshGeneration,
+    },
+  };
 }
 
 /** Current merged discovery catalog, used by both /v1/models and /admin/models. */
@@ -1798,23 +1829,17 @@ export const server = http.createServer(async (req, res) => {
       }));
       return;
     }
-    try {
-      await refreshCatalog(getConfig());
-    } catch (e) {
-      // refreshCatalog is fail-soft internally, but guard the wiring around it
-      // (route registration, cache persistence) so the gateway never crashes on
-      // a forced refresh. We still return the best-effort status below.
+    const refresh = beginCatalogRefresh(getConfig());
+    refresh.promise.catch((e) => {
       console.warn("[skgateway] /admin/models/refresh discovery error (fail-soft):", e.message);
-    }
-    try {
-      const status = await getDiscoveredStatus();
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: true, ...status }));
-    } catch (e) {
-      console.warn("[skgateway] /admin/models/refresh status failed:", e.message);
-      res.writeHead(500, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: { message: "internal error building catalog status", code: 500 } }));
-    }
+    });
+    res.writeHead(202, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      ok: true,
+      refresh_started: refresh.started,
+      refresh_in_flight: true,
+      refresh_generation: refresh.generation,
+    }));
     return;
   }
 

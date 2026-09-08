@@ -3619,8 +3619,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     const claimsRequested = configured.some((backend) => backend.supportsModel?.(request.model));
     if (request.model && configured.length > 0 && !claimsRequested) {
       const awaiting = configured.find((backend) =>
-        backend.mayDiscoverModel?.(request.model) &&
-        (backend.discoveryStatus === "pending" || backend.discoveryStatus === "failed")
+        backend.mayDiscoverModel?.(request.model)
       );
       if (awaiting) {
         const result = {

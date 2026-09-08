@@ -320,4 +320,30 @@ describe("card C3: refreshCatalog wires discovery.probe_* into discoverCatalog",
     assert.ok(Array.isArray(models));
     assert.ok(models.some((m) => m.id === "c3-neutral"));
   });
+
+  test("manual refresh starts asynchronously and concurrent callers join one generation", async () => {
+    let release;
+    let calls = 0;
+    const held = new Promise((resolveHeld) => { release = resolveHeld; });
+    const refresh = async () => { calls += 1; await held; return []; };
+    const first = mod.beginCatalogRefresh({}, refresh);
+    const second = mod.beginCatalogRefresh({}, refresh);
+    assert.equal(first.started, true);
+    assert.equal(second.started, false);
+    assert.equal(second.generation, first.generation);
+    assert.equal(second.promise, first.promise);
+    await new Promise((resolveTick) => setImmediate(resolveTick));
+    assert.equal(calls, 1);
+    const status = await mod.getDiscoveredStatus();
+    assert.deepEqual(status.refresh, {
+      in_flight: true,
+      generation: first.generation,
+    });
+    release();
+    await first.promise;
+    assert.deepEqual((await mod.getDiscoveredStatus()).refresh, {
+      in_flight: false,
+      generation: first.generation,
+    });
+  });
 });
