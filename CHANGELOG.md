@@ -99,6 +99,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Bucket diagnostics now distinguish lifecycle exclusions from temporary
+  capacity exclusions and report a sanitized capacity reason and retry time.
+
 - Request classifier input is bounded (8K head + 2K tail per message).
   A single 420KB message drove catastrophic regex behavior in the heuristic
   classifier and froze the entire gateway event loop, including unrelated
