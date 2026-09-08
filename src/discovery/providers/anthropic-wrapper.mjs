@@ -23,6 +23,15 @@ export function normalize(json) {
       id: model.id,
       provider: 'anthropic',
       free: false,
+      capability: {
+        served_id: model.id,
+        revision: typeof model.revision === 'string' ? model.revision : null,
+        context_limit: typeof model.context_window === 'number' ? model.context_window : null,
+        availability: model.available === true,
+        provider_route: 'anthropic',
+        public_eligible: model.public_eligible === true,
+      },
       card: null,
-    }));
+    }))
+    .filter((model) => model.capability.availability && model.capability.public_eligible);
 }
