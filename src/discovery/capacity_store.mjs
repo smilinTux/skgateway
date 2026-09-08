@@ -7,6 +7,8 @@ export const CAPACITY_STORE_PATH = process.env.SKGATEWAY_CAPACITY_STORE_PATH ||
 export const PRODUCTION_CAPACITY_STORE_PATH = join(homedir(), ".config", "skgateway", "capacity_store.json");
 const probes = new Map();
 const scheduledProbes = new Map();
+const TRANSIENT_RETRY_MS = 5 * 60 * 1000;
+const TERMINAL_RETRY_MS = 30 * 60 * 1000;
 
 function load(path = CAPACITY_STORE_PATH) {
   try {
@@ -42,6 +44,23 @@ export function recordSubscriptionExhausted(provider, { retryAt, now = Date.now(
   const record = {
     state: "throttled", scope: "provider", reason: "subscription_exhausted",
     retry_at: Math.max(now + 1000, Number(retryAt) || now + 6 * 60 * 60 * 1000),
+    probe_state: "pending", observed_at: now,
+  };
+  save({ ...store, [`provider:${provider}`]: record }, path);
+  return record;
+}
+
+/** Record a fail-closed provider recovery deadline without changing credentials. */
+export function recordProviderUnavailable(provider, {
+  reason = "backend_cooldown", retryAt, now = Date.now(), path = CAPACITY_STORE_PATH,
+} = {}) {
+  const store = load(path);
+  const longer = new Set(["authentication_failure", "subscription_exhausted", "quarantine", "malformed_response"]);
+  const retryMs = longer.has(reason) ? TERMINAL_RETRY_MS : TRANSIENT_RETRY_MS;
+  const suppliedRetryAt = Number(retryAt);
+  const record = {
+    state: "throttled", scope: "provider", reason,
+    retry_at: Math.max(now + retryMs, Number.isFinite(suppliedRetryAt) ? suppliedRetryAt : 0),
     probe_state: "pending", observed_at: now,
   };
   save({ ...store, [`provider:${provider}`]: record }, path);
@@ -88,15 +107,21 @@ export function admitCapacity(provider, model, {
 }
 
 export function finishCapacityProbe(provider, success, {
-  probeOwner = null, model = null, retryAt, providerWide = false,
+  probeOwner = null, model = null, retryAt, providerWide = false, reason = null,
   now = Date.now(), path = CAPACITY_STORE_PATH,
 } = {}) {
   const status = capacityStatus(provider, model, { now, path });
   if (!probeOwner || probes.get(provider) !== probeOwner) return status;
   probes.delete(provider);
   if (success) return clearCapacity(provider, model, { now, path });
+  if (providerWide) return recordSubscriptionExhausted(provider, { retryAt, now, path });
   if (!providerWide && status.scope === "model") {
     return recordModelThrottled(provider, model, { retryAt, now, path });
+  }
+  if (reason || status.reason !== "subscription_exhausted") {
+    return recordProviderUnavailable(provider, {
+      reason: reason || status.reason || "backend_cooldown", retryAt, now, path,
+    });
   }
   return recordSubscriptionExhausted(provider, { retryAt, now, path });
 }
@@ -113,8 +138,17 @@ export async function runDueCapacityProbes(targets, probe, {
   now = Date.now(), path = CAPACITY_STORE_PATH, deadlineMs = 8_000,
 } = {}) {
   const results = [];
+  if (typeof targets === "function") targets = targets();
   for (const target of targets) {
-    const status = capacityStatus(target.provider, target.model, { now, path });
+    let status = capacityStatus(target.provider, target.model, { now, path });
+    if (status.state !== "throttled" && target.unavailable === true) {
+      status = recordProviderUnavailable(target.provider, {
+        reason: target.reason || "backend_cooldown",
+        retryAt: target.retryAt,
+        now,
+        path,
+      });
+    }
     if (status.state !== "throttled" || !status.current ||
         !Number.isFinite(status.retry_at) || now < status.retry_at ||
         scheduledProbes.has(target.provider)) continue;
@@ -168,8 +202,12 @@ export function startCapacityProbeScheduler({
 export function isSubscriptionExhaustion(status, body) {
   if (status !== 429 && status !== 402) return false;
   let text = "";
-  try { text = Buffer.isBuffer(body) ? body.toString("utf8") : String(body || ""); } catch { return false; }
-  return /(?:subscription|usage|plan)[\s_-]*(?:limit|quota)|quota[\s_-]*(?:exhausted|reset)/i.test(text);
+  try {
+    text = Buffer.isBuffer(body)
+      ? body.toString("utf8")
+      : typeof body === "object" && body !== null ? JSON.stringify(body) : String(body || "");
+  } catch { return false; }
+  return /(?:subscription(?:[\s_-]+usage)?|usage|plan)[\s_-]*(?:limit|quota)|quota[\s_-]*(?:exhausted|reset)/i.test(text);
 }
 
 export function _resetCapacityProbesForTests() { probes.clear(); scheduledProbes.clear(); }
