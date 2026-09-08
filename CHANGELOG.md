@@ -43,6 +43,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Restrict Z.ai capacity recovery to the three canonical fleet GLM claims so
+  newly discovered provider variants cannot poison shared recovery state.
+
 - Raise the Z.ai recovery probe response budget to 512 tokens so reasoning
   models can return visible completion evidence before capacity is restored.
 

@@ -13,6 +13,7 @@ import {
   finishCapacityProbe,
   recordProviderUnavailable,
   runDueCapacityProbes,
+  selectProviderRecoveryModels,
 } from "../src/discovery/capacity_store.mjs";
 
 function store(name) {
@@ -160,6 +161,18 @@ test("the shared recovery probe gives reasoning GLM a verified response budget",
   const matches = [...source.matchAll(/max_tokens:\s*(\d+)/g)].map((match) => Number(match[1]));
   assert.equal(matches.filter((value) => value === 512).length, 2);
   assert.equal(matches.some((value) => value < 512), false);
+});
+
+test("Z.ai recovery selects only canonical fleet claims from discovery", () => {
+  assert.deepEqual(selectProviderRecoveryModels("zai", [
+    "glm-4.5", "glm-4.5-air", "glm-4.6", "glm-4.7", "glm-5",
+    "glm-5.1", "glm-5.2", "glm-5.3", "glm-5.3-flash",
+  ]), ["glm-4.6", "glm-4.7", "glm-5.3"]);
+  assert.deepEqual(selectProviderRecoveryModels("zai", ["glm-4.5", "glm-5.3-flash"]), []);
+});
+
+test("other provider recovery keeps its configured exact models", () => {
+  assert.deepEqual(selectProviderRecoveryModels("codex", ["gpt-5", "gpt-*", "gpt-5"]), ["gpt-5"]);
 });
 
 test("raw GLM claim admission agrees after exact successful recovery", async () => {

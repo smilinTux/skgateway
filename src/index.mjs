@@ -44,7 +44,11 @@ import { readCodexAuthHeaders } from "./proxy/codex-adapter.mjs";
 import { readZaiAuthHeaders, ZAI_CREDENTIALS_PATH } from "./proxy/zai-adapter.mjs";
 import { SSEWriter, jsonToSSE } from "./proxy/stream.mjs";
 import { getLifecycle } from "./discovery/model_catalog_store.mjs";
-import { capacityStatus, startCapacityProbeScheduler } from "./discovery/capacity_store.mjs";
+import {
+  capacityStatus,
+  selectProviderRecoveryModels,
+  startCapacityProbeScheduler,
+} from "./discovery/capacity_store.mjs";
 import { isRoutable, isEffectivelyRoutable, LIFECYCLE_STATES } from "./discovery/lifecycle.mjs";
 import { rankModels } from "./ranking/rank.mjs";
 import { deriveCapabilities } from "./ranking/capabilities.mjs";
@@ -766,8 +770,7 @@ const recoveryProbeTargets = () => Object.entries(config.backends || {})
   .flatMap(([provider]) => {
     const live = router.getBackend(provider);
     const health = live?.getHealth?.() || {};
-    return (live?.models || [])
-    .filter((model) => typeof model === "string" && !model.includes("*"))
+    return selectProviderRecoveryModels(provider, live?.models)
     .map((model) => {
       const claim = live?.getModelClaimHealth?.(model) || {};
       return {
