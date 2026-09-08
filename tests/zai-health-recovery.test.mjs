@@ -186,3 +186,80 @@ test("raw GLM claim admission agrees after exact successful recovery", async () 
   }
   assert.equal(router.getHealth().zai.status, "unknown");
 });
+
+test("scheduled provider recovery attempts every exact GLM claim", async () => {
+  _resetCapacityProbesForTests();
+  const path = store("all-exact-claims");
+  const models = ["glm-4.6", "glm-4.7", "glm-5.3"];
+  const router = createRouter({ backends: { zai: {
+    url: "http://127.0.0.1:9/v1", models, provider_purity: true,
+    model_claim_quarantine_threshold: 2, model_claim_quarantine_cooldown_ms: 1,
+  } } });
+  const zai = router.getBackend("zai");
+  for (const model of models) {
+    zai.recordModelClaimOutcome(model, 502);
+    zai.recordModelClaimOutcome(model, 502);
+  }
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  recordProviderUnavailable("zai", {
+    reason: "backend_cooldown", now: 1_000, retryAt: 301_000, path,
+  });
+
+  const calls = [];
+  const results = await runDueCapacityProbes(
+    models.map((model) => ({ provider: "zai", model })),
+    async (target, { probeOwner }) => {
+      calls.push(target.model);
+      zai.recordModelClaimOutcome(target.model, 200);
+      finishCapacityProbe("zai", true, {
+        probeOwner, model: target.model, now: 301_000, path,
+      });
+      return { status: 200 };
+    },
+    { now: 301_000, path },
+  );
+
+  assert.deepEqual(calls, models);
+  assert.equal(results.length, models.length);
+  for (const model of models) assert.equal(zai.getModelClaimHealth(model).quarantined, false);
+});
+
+test("scheduled mixed recovery leaves unproven exact claims quarantined", async () => {
+  _resetCapacityProbesForTests();
+  const path = store("mixed-exact-claims");
+  const models = ["glm-4.6", "glm-4.7", "glm-5.3"];
+  const router = createRouter({ backends: { zai: {
+    url: "http://127.0.0.1:9/v1", models, provider_purity: true,
+    model_claim_quarantine_threshold: 2, model_claim_quarantine_cooldown_ms: 1,
+  } } });
+  const zai = router.getBackend("zai");
+  for (const model of models) {
+    zai.recordModelClaimOutcome(model, 502);
+    zai.recordModelClaimOutcome(model, 502);
+  }
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  recordProviderUnavailable("zai", {
+    reason: "backend_cooldown", now: 1_000, retryAt: 301_000, path,
+  });
+
+  const calls = [];
+  await runDueCapacityProbes(
+    models.map((model) => ({ provider: "zai", model })),
+    async (target, { probeOwner }) => {
+      calls.push(target.model);
+      const success = target.model !== "glm-4.7";
+      zai.recordModelClaimOutcome(target.model, success ? 200 : 502);
+      finishCapacityProbe("zai", success, {
+        probeOwner, model: target.model, reason: success ? null : "backend_cooldown",
+        now: 301_000, path,
+      });
+      return { status: success ? 200 : 502 };
+    },
+    { now: 301_000, path },
+  );
+
+  assert.deepEqual(calls, models);
+  assert.equal(zai.getModelClaimHealth("glm-4.6").quarantined, false);
+  assert.equal(zai.getModelClaimHealth("glm-4.7").quarantined, true);
+  assert.equal(zai.getModelClaimHealth("glm-5.3").quarantined, false);
+});
