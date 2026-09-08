@@ -32,6 +32,30 @@ test("kimi_oauth returns a current bearer without refreshing", async () => {
   } finally { globalThis.fetch = originalFetch; }
 });
 
+test("kimi_oauth reevaluates cached expiry when credential mtime is unchanged", async () => {
+  const originalNow = Date.now;
+  const originalFetch = globalThis.fetch;
+  let now = 2_000_000_000_000;
+  let calls = 0;
+  Date.now = () => now;
+  writeCreds({ expiresIn: 120 });
+  globalThis.fetch = async () => {
+    calls += 1;
+    return new Response(JSON.stringify({ access_token: "renewed", expires_in: 900 }), { status: 200 });
+  };
+  try {
+    const candidate = backend();
+    assert.deepEqual(await candidate.buildAuthHeaders(), { authorization: "Bearer old-access" });
+    assert.equal(calls, 0);
+    now += 70_000;
+    assert.deepEqual(await candidate.buildAuthHeaders(), { authorization: "Bearer renewed" });
+    assert.equal(calls, 1);
+  } finally {
+    Date.now = originalNow;
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("kimi_oauth refreshes near expiry and atomically writes mode 0600", async () => {
   writeCreds({ expiresIn: 1 });
   chmodSync(credsPath, 0o644);

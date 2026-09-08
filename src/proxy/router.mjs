@@ -900,6 +900,7 @@ export class Backend {
     // Kimi Code subscription auth refreshes short-lived tokens in place.
     this._kimiAuth = null;
     this._kimiAuthMtime = -1;
+    this._kimiAuthExpiry = 0;
     this._kimiAuthPath = this._credentials_file;
 
     // Agent-level restrictions — set of agent IDs allowed to use this backend.
@@ -1400,7 +1401,7 @@ export class Backend {
     try {
       const filePath = this._kimiAuthPath.replace(/^~/, process.env.HOME || "");
       const mtime = statSync(filePath).mtimeMs;
-      if (!this._kimiAuth || mtime !== this._kimiAuthMtime) {
+      if (!this._kimiAuth || mtime !== this._kimiAuthMtime || Date.now() >= this._kimiAuthExpiry - KIMI_REFRESH_BUFFER_MS) {
         const raw = JSON.parse(fs.readFileSync(filePath, "utf-8"));
         const accessToken = raw && (raw.access_token || raw.accessToken);
         if (!accessToken) {
@@ -1421,11 +1422,13 @@ export class Backend {
           }
           const refreshed = await refresh;
           if (!refreshed) return null;
-          this._kimiAuth = { authorization: `Bearer ${refreshed}` };
+          this._kimiAuth = { authorization: `Bearer ${refreshed.accessToken}` };
+          this._kimiAuthExpiry = refreshed.expiryMs;
           this._kimiAuthMtime = statSync(filePath).mtimeMs;
           return this._kimiAuth;
         }
         this._kimiAuth = { authorization: `Bearer ${accessToken}` };
+        this._kimiAuthExpiry = expiryMs || Infinity;
         this._kimiAuthMtime = mtime;
       }
       return this._kimiAuth;
@@ -1465,7 +1468,10 @@ export class Backend {
         token_type: tokens.token_type || credentials.token_type || "Bearer",
       };
       writeJsonAtomic(filePath, updated);
-      return tokens.access_token;
+      return {
+        accessToken: tokens.access_token,
+        expiryMs: updated.expires_at * 1000,
+      };
     } catch (error) {
       console.error(`[router] backend=${this.id} kimi oauth refresh failed: ${error.message}`);
       return null;
