@@ -6,7 +6,9 @@ import { readFileSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { load as loadYaml } from "js-yaml";
-import { Backend, createRouter, routeAndSend, ModelOwnerDownError } from "../src/proxy/router.mjs";
+import {
+  Backend, createRouter, routeAndSend, ModelOwnerDownError, shouldUseRegistryRouting,
+} from "../src/proxy/router.mjs";
 import { ConnectionPool } from "../src/proxy/connection-pool.mjs";
 
 const config = loadYaml(readFileSync(new URL("../config/skgateway-codex.yaml", import.meta.url), "utf8"));
@@ -64,6 +66,22 @@ describe("Kimi admission contract", () => {
 });
 
 describe("Kimi synthetic request probes", () => {
+  test("only an exact admission-owner bootstrap bypasses public registry routing", () => {
+    const router = createRouter({ backends: {
+      kimi: {
+        url: "http://127.0.0.1:9/v1", auth_type: "none", models: ["kimi-for-coding"],
+        require_observed_health: true,
+      },
+    }, siem_log: false });
+
+    assert.equal(shouldUseRegistryRouting(router, {
+      model: "kimi-for-coding", context: "public",
+    }, true), false);
+    assert.equal(shouldUseRegistryRouting(router, {
+      model: "ordinary-synthetic", context: "public",
+    }, true), true);
+  });
+
   test("chat and tool schema succeed; timeout is bounded", async () => {
     const state = { delay: 0, body: null };
     const server = http.createServer((req, res) => {
@@ -81,16 +99,24 @@ describe("Kimi synthetic request probes", () => {
     const port = server.address().port;
     const body = (model) => Buffer.from(JSON.stringify({ model, messages: [{ role: "user", content: "ready" }],
       tools: [{ type: "function", function: { name: "probe", parameters: { type: "object" } } }] }));
-    const router = createRouter({ backends: { kimi: {
-      url: `http://127.0.0.1:${port}/v1`, auth_type: "none", models: ["kimi-for-coding"], timeout_ms: 20,
-      require_observed_health: true,
-    } }, failover: false, siem_log: false });
+    const router = createRouter({ backends: {
+      kimi: {
+        url: `http://127.0.0.1:${port}/v1`, auth_type: "none", models: ["kimi-for-coding"], timeout_ms: 20,
+        require_observed_health: true,
+      },
+      foreign: {
+        url: "http://127.0.0.1:9/v1", auth_type: "none", models: ["*"], priority: 1,
+      },
+    }, failover: true, siem_log: false });
     await assert.rejects(() => router.route({ model: "kimi-for-coding", agentId: "ordinary" }),
       (error) => error instanceof ModelOwnerDownError);
-    const ok = await routeAndSend(router, { model: "kimi-for-coding", agentId: "probe" }, "/chat/completions", "POST",
+    const ok = await routeAndSend(router, {
+      model: "kimi-for-coding", agentId: "probe", context: "public",
+    }, "/chat/completions", "POST",
       { "content-type": "application/json", "x-sk-context": "public", "x-sk-probe": "synthetic" },
       body("kimi-for-coding"), false);
     assert.equal(ok.status, 200);
+    assert.equal(ok.backendId, "kimi");
     assert.equal(state.body.tools[0].function.name, "probe");
     state.delay = 80;
     const timeout = await routeAndSend(router, { model: "kimi-for-coding", agentId: "probe" }, "/chat/completions", "POST",
