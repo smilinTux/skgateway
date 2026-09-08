@@ -47,6 +47,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refresh returns no exact claim, preventing raw GLM routes from escaping to
   Qwen or NVIDIA. Manual catalog refresh starts one asynchronous generation
   and returns immediately instead of blocking the request handler.
+- Card `49148f4b`: one provider-owned Z.ai recovery transaction now attempts
+  every configured exact GLM claim, while unsuccessful claims remain
+  quarantined.
 
 - Z.ai health recovery now uses one owned public-synthetic probe with a
   realistic GLM response budget. Schema-valid success clears only transient

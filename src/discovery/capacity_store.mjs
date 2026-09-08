@@ -139,7 +139,9 @@ export async function runDueCapacityProbes(targets, probe, {
 } = {}) {
   const results = [];
   if (typeof targets === "function") targets = targets();
+  const handledProviders = new Set();
   for (const target of targets) {
+    if (handledProviders.has(target.provider)) continue;
     let status = capacityStatus(target.provider, target.model, { now, path });
     if (status.state !== "throttled" && target.unavailable === true) {
       status = recordProviderUnavailable(target.provider, {
@@ -157,33 +159,46 @@ export async function runDueCapacityProbes(targets, probe, {
       publicSynthetic: true, probeOwner: owner, now, path,
     });
     if (!admission.probe) continue;
+    handledProviders.add(target.provider);
     scheduledProbes.set(target.provider, owner);
-    const controller = new AbortController();
-    let timer;
+    const providerTargets = targets.filter((candidate) => candidate.provider === target.provider);
     try {
-      const deadline = new Promise((_, reject) => {
-        timer = setTimeout(() => {
-          controller.abort();
-          reject(new Error("capacity probe deadline exceeded"));
-        }, deadlineMs);
-      });
-      results.push({ ...target, result: await Promise.race([
-        probe(target, { signal: controller.signal, probeOwner: owner }), deadline,
-      ]) });
-    } catch (error) {
-      if (probes.get(target.provider) === owner) {
-        finishCapacityProbe(target.provider, false, {
-          probeOwner: owner, model: target.model, now, path,
-        });
+      for (const exactTarget of providerTargets) {
+        // routeAndSend settles and releases this token after each exact model.
+        // Reuse the same transaction owner so one result cannot suppress the
+        // remaining exact claims, while scheduledProbes still excludes every
+        // concurrent provider recovery transaction.
+        probes.set(target.provider, owner);
+        const controller = new AbortController();
+        let timer;
+        try {
+          const deadline = new Promise((_, reject) => {
+            timer = setTimeout(() => {
+              controller.abort();
+              reject(new Error("capacity probe deadline exceeded"));
+            }, deadlineMs);
+          });
+          results.push({ ...exactTarget, result: await Promise.race([
+            probe(exactTarget, { signal: controller.signal, probeOwner: owner }), deadline,
+          ]) });
+        } catch (error) {
+          if (probes.get(target.provider) === owner) {
+            finishCapacityProbe(target.provider, false, {
+              probeOwner: owner, model: exactTarget.model, now, path,
+            });
+          }
+          results.push({ ...exactTarget, error });
+        } finally {
+          clearTimeout(timer);
+          if (probes.get(target.provider) === owner) {
+            finishCapacityProbe(target.provider, false, {
+              probeOwner: owner, model: exactTarget.model, now, path,
+            });
+          }
+        }
       }
-      results.push({ ...target, error });
     } finally {
-      clearTimeout(timer);
-      if (probes.get(target.provider) === owner) {
-        finishCapacityProbe(target.provider, false, {
-          probeOwner: owner, model: target.model, now, path,
-        });
-      }
+      releaseCapacityProbe(target.provider, owner);
       if (scheduledProbes.get(target.provider) === owner) scheduledProbes.delete(target.provider);
     }
   }
