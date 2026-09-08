@@ -2087,6 +2087,32 @@ export function createRouter(config = {}) {
     return failoverEnabled ? results : [results[0]];
   }
 
+  /**
+   * Resolve one exact backend for an internal recovery probe.
+   *
+   * This deliberately bypasses registry aliases and ordinary failover. A
+   * provider recovery result is authoritative only when the named provider
+   * answered it. The caller owns the public-synthetic and singleflight gates.
+   */
+  async function routeExactBackend(request, backendId) {
+    const backend = backends.get(backendId);
+    if (!backend) {
+      throw new Error(`[router] Unknown exact backend: ${backendId}`);
+    }
+    if (!backend.allowsAgent(request.agentId) || !backend.supportsModel(request.model)) {
+      throw new Error(
+        `[router] Exact backend ${backendId} does not allow model=${request.model} ` +
+        `agent=${request.agentId}`,
+      );
+    }
+    return [{
+      backendId: backend.id,
+      backendUrl: backend.url,
+      authHeaders: await backend.buildAuthHeaders(),
+      backend,
+    }];
+  }
+
   // -------------------------------------------------------------------------
   // getHealth()
   // -------------------------------------------------------------------------
@@ -2215,7 +2241,7 @@ export function createRouter(config = {}) {
     return true;
   }
 
-  return { route, getHealth, getProviderUsage: providerUsageSnapshot, addBackend, removeBackend, getBackend, getBackends, registerDiscoveredModels, resolveAgentTarget };
+  return { route, routeExactBackend, getHealth, getProviderUsage: providerUsageSnapshot, addBackend, removeBackend, getBackend, getBackends, registerDiscoveredModels, resolveAgentTarget };
 }
 
 // ---------------------------------------------------------------------------
@@ -3197,7 +3223,7 @@ export function shouldUseRegistryRouting(router, request, bootstrapProbe = false
   return !exactAdmissionOwner;
 }
 
-export async function routeAndSend(router, request, upstreamPath, method, clientHeaders, body, usePool = true, siem = null, abortSignal = null) {
+export async function routeAndSend(router, request, upstreamPath, method, clientHeaders, body, usePool = true, siem = null, abortSignal = null, exactBackendId = null) {
   const pool = usePool ? getPool() : null;
   const requestedModel = request?.model;
   const codexIntent = [requestedModel, request?.role, request?.context, request?.service];
@@ -3246,7 +3272,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
   const agentTarget = typeof router.resolveAgentTarget === "function"
     ? router.resolveAgentTarget(request.agentId)
     : null;
-  if (agentTarget && !request.context && !request.service && !request.role) {
+  if (!exactBackendId && agentTarget && !request.context && !request.service && !request.role) {
     if (request.model !== agentTarget) {
       console.log(
         `[router] per-agent route agent=${request.agentId} ` +
@@ -3268,6 +3294,19 @@ export async function routeAndSend(router, request, upstreamPath, method, client
   // model-name routing (full backward-compat).
   let candidates = null;
   let isBucketChain = false;
+
+  // Recovery probes must measure the provider named by the capacity domain.
+  // Keep this as a function argument rather than a request field so an HTTP
+  // client cannot choose a backend or bypass normal routing. The exact route
+  // has one candidate, therefore a failed Z.ai probe cannot fall back to a
+  // Qwen or NVIDIA backend and falsely change Z.ai capacity state.
+  if (exactBackendId) {
+    if (!bootstrapProbe || !request.capacityProbeOwner ||
+        typeof router.routeExactBackend !== "function") {
+      throw new Error("[router] Exact backend routing is restricted to owned synthetic probes");
+    }
+    candidates = await router.routeExactBackend(request, exactBackendId);
+  }
 
   // ── Bucket pools (card 2ba73bf9 / C9) ──
   // `sk-<class>-<sensitivity>` addresses a POOL, not a model. Checked BEFORE

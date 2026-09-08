@@ -787,7 +787,7 @@ const recoveryProbeTargets = () => Object.entries(config.backends || {})
 
 startCapacityProbeScheduler({
   targets: recoveryProbeTargets,
-  probe: ({ model }, { signal, probeOwner }) => {
+  probe: ({ provider, model }, { signal, probeOwner }) => {
     const probeBody = Buffer.from(JSON.stringify({
       model,
       messages: [{ role: "user", content: "Reply with ok." }],
@@ -801,7 +801,7 @@ startCapacityProbeScheduler({
       "content-type": "application/json",
       "x-sk-context": "public",
       "x-sk-probe": "synthetic",
-    }, probeBody, true, siemHook, signal);
+    }, probeBody, true, siemHook, signal, provider);
   },
 });
 

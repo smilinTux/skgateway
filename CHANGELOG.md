@@ -43,6 +43,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Bind each capacity recovery probe to its named backend with no registry
+  substitution or cross-provider fallback.
+
 - Restrict Z.ai capacity recovery to the three canonical fleet GLM claims so
   newly discovered provider variants cannot poison shared recovery state.
 

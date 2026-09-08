@@ -175,6 +175,99 @@ test("other provider recovery keeps its configured exact models", () => {
   assert.deepEqual(selectProviderRecoveryModels("codex", ["gpt-5", "gpt-*", "gpt-5"]), ["gpt-5"]);
 });
 
+test("owned recovery probe cannot escape to colliding foreign backends", async (t) => {
+  const calls = { owner: 0, qwen: 0, nvidia: 0 };
+  const servers = {};
+  for (const [name, servedModel] of [
+    ["owner", "glm-4.6"],
+    ["qwen", "qwen3.8"],
+    ["nvidia", "glm-4.6-nvidia"],
+  ]) {
+    servers[name] = http.createServer((_req, res) => {
+      calls[name]++;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        id: `response-${name}`,
+        object: "chat.completion",
+        choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+        model: servedModel,
+      }));
+    });
+    await new Promise((resolve) => servers[name].listen(0, "127.0.0.1", resolve));
+    t.after(() => new Promise((resolve) => servers[name].close(resolve)));
+  }
+
+  const router = createRouter({ backends: {
+    qwen: {
+      url: `http://127.0.0.1:${servers.qwen.address().port}/v1`,
+      models: ["glm-4.6"], priority: 1,
+    },
+    nvidia: {
+      url: `http://127.0.0.1:${servers.nvidia.address().port}/v1`,
+      models: ["glm-4.6"], priority: 2,
+    },
+    owner: {
+      url: `http://127.0.0.1:${servers.owner.address().port}/v1`,
+      models: ["glm-4.6"], priority: 99,
+    },
+  } });
+  const request = {
+    model: "glm-4.6", context: "public", capacityProbeOwner: {},
+    agentId: "skgateway-capacity-probe",
+  };
+  const result = await routeAndSend(
+    router, request, "/v1/chat/completions", "POST",
+    { "x-sk-context": "public", "x-sk-probe": "synthetic" },
+    Buffer.from(JSON.stringify({
+      model: "glm-4.6", messages: [{ role: "user", content: "Reply with ok." }],
+      max_tokens: 512, stream: false,
+    })), false, null, null, "owner",
+  );
+
+  assert.equal(result.status, 200);
+  assert.deepEqual(calls, { owner: 1, qwen: 0, nvidia: 0 });
+});
+
+test("failed owned recovery probe has no foreign fallback", async (t) => {
+  const calls = { owner: 0, qwen: 0 };
+  const owner = http.createServer((_req, res) => {
+    calls.owner++;
+    res.writeHead(502, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { message: "synthetic failure" } }));
+  });
+  const qwen = http.createServer((_req, res) => {
+    calls.qwen++;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ choices: [{ message: { content: "ok" } }] }));
+  });
+  await new Promise((resolve) => owner.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve) => qwen.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => owner.close(resolve)));
+  t.after(() => new Promise((resolve) => qwen.close(resolve)));
+
+  const router = createRouter({ backends: {
+    qwen: { url: `http://127.0.0.1:${qwen.address().port}/v1`, models: ["glm-4.7"], priority: 1 },
+    owner: { url: `http://127.0.0.1:${owner.address().port}/v1`, models: ["glm-4.7"], priority: 99 },
+  } });
+  const result = await routeAndSend(
+    router,
+    { model: "glm-4.7", context: "public", capacityProbeOwner: {} },
+    "/v1/chat/completions", "POST",
+    { "x-sk-context": "public", "x-sk-probe": "synthetic" },
+    Buffer.from(JSON.stringify({ model: "glm-4.7", messages: [], max_tokens: 512 })),
+    false, null, null, "owner",
+  );
+
+  assert.equal(result.status, 502);
+  assert.deepEqual(calls, { owner: 1, qwen: 0 });
+});
+
+test("scheduler passes the provider as the private exact-backend constraint", () => {
+  const source = readFileSync(new URL("../src/index.mjs", import.meta.url), "utf8");
+  assert.match(source, /probe:\s*\(\{ provider, model \}/);
+  assert.match(source, /siemHook, signal, provider\)/);
+});
+
 test("raw GLM claim admission agrees after exact successful recovery", async () => {
   const models = ["glm-4.6", "glm-4.7", "glm-5.3"];
   const router = createRouter({ backends: { zai: {
