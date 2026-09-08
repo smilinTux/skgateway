@@ -40,6 +40,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Z.ai health recovery now uses one owned public-synthetic probe with a
+  realistic GLM response budget. Schema-valid success clears only transient
+  response-budget failures, while authentication, subscription, quarantine,
+  malformed-response, lifecycle, and real error-rate evidence remain fail
+  closed.
+
 - Card `e240fe09`: an admission-gated Kimi backend with unknown health can now
   receive one bounded public-synthetic bootstrap probe while ordinary traffic,
   down backends, and quarantined backends remain fail closed.
