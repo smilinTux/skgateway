@@ -1750,6 +1750,19 @@ export const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Provider-owned quota headers and gateway-observed outcomes are deliberately
+  // separate. This read-only surface never probes a provider or exposes raw headers.
+  if (req.url === "/admin/providers/usage" && req.method === "GET") {
+    if (!isLoopback(req)) {
+      res.writeHead(403, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "Admin routes are loopback only", code: 403 } }));
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ providers: router.getProviderUsage() }));
+    return;
+  }
+
   // ── Admin: force an immediate re-discovery, bypassing the refresh interval ──
   // Kicks a fresh NVIDIA+OpenRouter fetch now and returns the updated status
   // (lastRefreshedAt advances on success). Fail-soft: refreshCatalog() is built

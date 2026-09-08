@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Expose sanitized provider-reported quota separately from gateway-observed
+  capacity, errors, and cooldown at loopback-only `/admin/providers/usage`.
 - Refresh cached Kimi OAuth credentials as they enter the expiry window,
   with singleflight and atomic mode-0600 persistence.
 - Add public provider-focused S, M, and L routing aliases for Z.ai, Kimi,

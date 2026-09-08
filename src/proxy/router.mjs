@@ -36,6 +36,7 @@ import { isRegistryRouted, resolve as resolveRegistry, getAutoConfig, getConfigE
 import { getFailoverConfig, isLocalUrl, probeLocalHealth, recordLocalOutcome } from "./local-failover.mjs";
 import { readMeter } from "./meter-client.mjs";
 import { marginalJoules, imputeJoules, resolveBasis, coeffsForModel, backendIsLocal, usageFromSSE, resolveMeterUrl } from "../metrics/energy.mjs";
+import { observeProviderUsage, providerUsageSnapshot } from "../metrics/provider-usage.mjs";
 import { recordModelOutcome, getLifecycle } from "../discovery/model_catalog_store.mjs";
 import {
   admitCapacity, capacityStatus, clearCapacity, finishCapacityProbe,
@@ -361,6 +362,7 @@ function inferProviderFromBackend(backendId) {
   if (id.includes('openrouter')) return 'openrouter';
   if (id.includes('zai')) return 'zai';
   if (id.includes('codex')) return 'codex';
+  if (id.includes('kimi')) return 'kimi';
   // Local sovereign backends (chiap08-qwen38, chiap08-ornith, etc.)
   if (id.includes('chiap') || id.includes('ornith') || id.includes('qwen') || id === 'local') {
     return 'local';
@@ -2171,7 +2173,7 @@ export function createRouter(config = {}) {
     return true;
   }
 
-  return { route, getHealth, addBackend, removeBackend, getBackend, getBackends, registerDiscoveredModels, resolveAgentTarget };
+  return { route, getHealth, getProviderUsage: providerUsageSnapshot, addBackend, removeBackend, getBackend, getBackends, registerDiscoveredModels, resolveAgentTarget };
 }
 
 // ---------------------------------------------------------------------------
@@ -4202,6 +4204,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     if (!flippedToNonStream) {
       res = enforceResponseContract(res, requestedModel);
     }
+    observeProviderUsage(providerName, res);
     const latencyMs = (Date.now() - queueStart) - meterBeforeMs;
 
     if (providerName === "codex") {
