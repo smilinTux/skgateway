@@ -27,7 +27,7 @@ describe("Kimi admission contract", () => {
     assert.equal(config.backends["kimi-k3"].require_observed_health, true);
   });
 
-  test("unknown Kimi health fails closed and auth is read-only", async () => {
+  test("unknown Kimi health fails closed and current auth is readable", async () => {
     const dir = mkdtempSync(join(tmpdir(), "kimi-admission-"));
     const creds = join(dir, "credentials.json");
     writeFileSync(creds, JSON.stringify({ access_token: "fixture-token" }));

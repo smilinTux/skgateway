@@ -78,6 +78,29 @@ import {
 } from "../policy/buckets.mjs";
 import { codexPurityProblems } from "../policy/codex-purity.mjs";
 
+const KIMI_OAUTH_HOST = "https://auth.kimi.com";
+const KIMI_OAUTH_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098";
+const KIMI_REFRESH_BUFFER_MS = 60_000;
+const kimiRefreshes = new Map();
+
+function writeJsonAtomic(filePath, value) {
+  const temporaryPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  let descriptor;
+  try {
+    descriptor = fs.openSync(temporaryPath, "wx", 0o600);
+    fs.writeFileSync(descriptor, `${JSON.stringify(value)}\n`, "utf8");
+    fs.fsyncSync(descriptor);
+    fs.closeSync(descriptor);
+    descriptor = undefined;
+    fs.renameSync(temporaryPath, filePath);
+    fs.chmodSync(filePath, 0o600);
+  } catch (error) {
+    if (descriptor !== undefined) fs.closeSync(descriptor);
+    try { fs.unlinkSync(temporaryPath); } catch {}
+    throw error;
+  }
+}
+
 // sk-auto routing decision cache (TTL+LRU); keyed by request fingerprint + config epoch.
 const _autoDecisionCache = createDecisionCache({ ttlMs: 60_000, maxEntries: 500 });
 // @match ranked-pick decision cache (card P4.2). Separate from the sk-auto
@@ -874,11 +897,7 @@ export class Backend {
     this._zaiAuth = null;
     this._zaiAuthMtime = -1;
     this._zaiAuthPath = this._credentials_file;
-    // Kimi Code subscription auth follows the same read-only file contract:
-    // the kimi CLI owns OAuth refresh and writes
-    // ~/.kimi-code/credentials/<env>.json. Access tokens are short lived
-    // (observed 900s), so a keepalive timer runs the CLI on the gateway
-    // host and this gateway re-reads the file on mtime change only.
+    // Kimi Code subscription auth refreshes short-lived tokens in place.
     this._kimiAuth = null;
     this._kimiAuthMtime = -1;
     this._kimiAuthPath = this._credentials_file;
@@ -1279,16 +1298,12 @@ export class Backend {
       }
 
       case "kimi_oauth": {
-        // Kimi Code subscription auth: bearer access token read read-only
-        // from the kimi CLI credentials file. The CLI on the gateway host
-        // owns refresh (tokens live ~15 minutes; a keepalive timer drives
-        // it), so this gateway never refreshes and never writes the file.
-        const headers = this._getKimiAuthHeaders();
+        const headers = await this._getKimiAuthHeaders();
         if (!headers) {
           console.warn(
             `[router] backend=${this.id} kimi_oauth auth but no usable credentials at ` +
               `${this._kimiAuthPath || "(no credentials_path/file set)"}. ` +
-              `Sending UNAUTHENTICATED (expect 401). Sync kimi CLI credentials there.`,
+              `Sending UNAUTHENTICATED (expect 401). Re-authenticate Kimi if refresh is unavailable.`,
           );
           return {};
         }
@@ -1376,12 +1391,11 @@ export class Backend {
   }
 
   /**
-   * Return the z.ai subscription auth headers, re-reading the ZCode
-   * credentials file when its mtime changes. Never writes or refreshes.
+   * Return Kimi subscription auth headers, refreshing near expiry.
    *
-   * @returns {Record<string, string>|null}
+   * @returns {Promise<Record<string, string>|null>}
    */
-  _getKimiAuthHeaders() {
+  async _getKimiAuthHeaders() {
     if (!this._kimiAuthPath) return null;
     try {
       const filePath = this._kimiAuthPath.replace(/^~/, process.env.HOME || "");
@@ -1395,6 +1409,22 @@ export class Backend {
           );
           return null;
         }
+        const expiresAt = Number(raw.expires_at || raw.expiresAt || 0);
+        const expiryMs = expiresAt > 1e12 ? expiresAt : expiresAt * 1000;
+        if (expiryMs && Date.now() >= expiryMs - KIMI_REFRESH_BUFFER_MS) {
+          if (!raw.refresh_token && !raw.refreshToken) return null;
+          let refresh = kimiRefreshes.get(filePath);
+          if (!refresh) {
+            refresh = this._refreshKimiOAuth(filePath, raw)
+              .finally(() => { kimiRefreshes.delete(filePath); });
+            kimiRefreshes.set(filePath, refresh);
+          }
+          const refreshed = await refresh;
+          if (!refreshed) return null;
+          this._kimiAuth = { authorization: `Bearer ${refreshed}` };
+          this._kimiAuthMtime = statSync(filePath).mtimeMs;
+          return this._kimiAuth;
+        }
         this._kimiAuth = { authorization: `Bearer ${accessToken}` };
         this._kimiAuthMtime = mtime;
       }
@@ -1403,6 +1433,41 @@ export class Backend {
       console.error(
         `[router] backend=${this.id} failed to load kimi credentials ${this._kimiAuthPath}: ${err.message}`,
       );
+      return null;
+    }
+  }
+
+  async _refreshKimiOAuth(filePath, credentials) {
+    try {
+      const refreshToken = credentials.refresh_token || credentials.refreshToken;
+      const response = await fetch(`${KIMI_OAUTH_HOST}/api/oauth/token`, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
+        body: new URLSearchParams({
+          client_id: KIMI_OAUTH_CLIENT_ID,
+          grant_type: "refresh_token",
+          refresh_token: refreshToken,
+        }),
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (!response.ok) return null;
+      const tokens = await response.json();
+      if (!tokens.access_token || !Number.isFinite(Number(tokens.expires_in)) || Number(tokens.expires_in) <= 0) {
+        return null;
+      }
+      const updated = {
+        ...credentials,
+        access_token: tokens.access_token,
+        refresh_token: tokens.refresh_token || refreshToken,
+        expires_at: Math.floor(Date.now() / 1000) + Number(tokens.expires_in),
+        expires_in: Number(tokens.expires_in),
+        scope: tokens.scope || credentials.scope,
+        token_type: tokens.token_type || credentials.token_type || "Bearer",
+      };
+      writeJsonAtomic(filePath, updated);
+      return tokens.access_token;
+    } catch (error) {
+      console.error(`[router] backend=${this.id} kimi oauth refresh failed: ${error.message}`);
       return null;
     }
   }
