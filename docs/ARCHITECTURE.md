@@ -264,6 +264,13 @@ flowchart LR
   `/queue` exposes configured domains even while idle plus timeout, drop, and
   cancellation counters. Each admitted slot has a pool-owned, single-use
   object ticket; release by string, copy, duplicate, or foreign pool is inert.
+- Generic `sk-l-public` and its short alias `sk-l` admit only eligible Z.ai,
+  Kimi, and Codex subscription models. Provider-focused aliases remain exact:
+  `sk-glm-l` and `sk-zai-l` cannot cross into Kimi, Codex, or local backends.
+  The provider check is repeated on final and owner-down expansion candidates,
+  so a permitted model name cannot escape through an unrelated backend.
+  Other public sizes retain their existing exposure-ceiling behavior for
+  compatibility, and internal or secret buckets retain sovereign-local access.
 - **`upstream.mjs`** is the only module that does network I/O to the model. It buffers the full
   response, strips hop-by-hop headers, and **always resolves** (synthetic `502` on failure).
 

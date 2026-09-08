@@ -340,6 +340,62 @@ ${extraRoles}defaults:
     assert.equal(pool.state.count, 0, 'foreign backend must not receive the request');
   });
 
+  test('sk-l-public skips local Qwen and falls through a down subscription member', async () => {
+    writeFileSync(CATALOG_CACHE_PATH, JSON.stringify({ models: [
+      { id: 'qwen3.8-27b', provider: 'local', card: { tier: 'local', size_class: 'L' } },
+      { id: 'glm-4.7', provider: 'zai', card: { tier: 'paid-cloud', size_class: 'L' } },
+      { id: 'kimi-for-coding', provider: 'kimi-for-coding', card: { tier: 'paid-cloud', size_class: 'L' } },
+      { id: 'gpt-5.6-luna', provider: 'codex', card: { tier: 'paid-cloud', size_class: 'L' } },
+    ] }), 'utf8');
+    _resetCacheForTests();
+    const attempts = [];
+    let downMember = null;
+    const subscriptionBackends = Object.fromEntries(['zai', 'kimi', 'codex'].map((provider) => [
+      provider,
+      createRouter({ backends: {
+        [`${provider}-subscription`]: {
+          url: pool.base, auth_type: 'none', models: [`${provider}-pool-l`], discovery: provider,
+        },
+      } }),
+    ]));
+    const policyRouter = {
+      route: async (request) => {
+        attempts.push(request.model);
+        assert.notEqual(request.model, 'qwen3.8-27b', 'local Qwen must not enter the candidate chain');
+        downMember ||= request.model;
+        if (request.model === downMember && !request.expand) {
+          throw new ModelOwnerDownError(request.model, ['subscription']);
+        }
+        if (request.model === downMember) return {
+          backendId: 'local-qwen', backendUrl: hanging.base, authHeaders: {},
+          backend: { discovery: 'local' }, model: request.model,
+        };
+        const provider = request.model.startsWith('glm-')
+          ? 'zai' : request.model.startsWith('kimi-') ? 'kimi' : 'codex';
+        const routed = await subscriptionBackends[provider].route({
+          ...request, model: `${provider}-pool-l`,
+        });
+        const candidate = Array.isArray(routed) ? routed[0] : routed;
+        return { ...candidate, model: request.model };
+      },
+    };
+    await applyConfig({ buckets_enabled: true });
+
+    const result = await routeAndSend(
+      policyRouter, { model: 'sk-l-public', agentId: 't' },
+      '/chat/completions', 'POST', HEADERS, bodyFor('sk-l-public'), false,
+    );
+
+    assert.equal(result.status, 200);
+    assert.ok(['glm-4.7', 'kimi-for-coding', 'gpt-5.6-luna'].includes(result.bucketMember));
+    assert.notEqual(result.bucketMember, downMember);
+    assert.deepEqual(attempts.slice(0, 2), [downMember, downMember]);
+    assert.equal(attempts.includes('qwen3.8-27b'), false);
+    assert.match(result.backendId, /^(zai|kimi|codex)-subscription$/);
+    assert.equal(pool.state.lastModel, result.bucketMember);
+    assert.equal(hanging.state.count, 0, 'filtered local expansion must never reach its upstream');
+  });
+
   test('every enabled provider S/M/L route completes a bounded public request', async () => {
     const providers = {
       zai: ['glm-s', 'glm-m', 'glm-l'],

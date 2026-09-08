@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Keep `sk-l-public` and `sk-l` on eligible Z.ai, Kimi, or Codex subscription
+  providers, including final failover candidates, while preserving
+  exact-provider and protected local bucket rules.
 - Expose sanitized provider-reported quota separately from gateway-observed
   capacity, errors, and cooldown at loopback-only `/admin/providers/usage`.
 - Refresh cached Kimi OAuth credentials as they enter the expiry window,
