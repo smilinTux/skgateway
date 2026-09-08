@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Refresh cached Kimi OAuth credentials as they enter the expiry window,
+  with singleflight and atomic mode-0600 persistence.
 - Add public provider-focused S, M, and L routing aliases for Z.ai, Kimi,
   and Codex while preserving health-gated generic bucket failover. Cursor
   aliases remain unadvertised until its transport adapter is qualified.
