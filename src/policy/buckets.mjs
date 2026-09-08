@@ -82,6 +82,18 @@ export function classRank(cls, vocab = gradeVocabulary()) {
 
 /** Bucket ids look like `sk-<class>-<sensitivity>`, case-insensitive. */
 const BUCKET_RE = /^sk-(s|m|l|xl)-(public|internal|secret)$/i;
+const SHORT_BUCKET_RE = /^sk-(s|m|l|xl)$/i;
+const PROVIDER_BUCKET_RE = /^sk-(zai|glm|kimi|codex|cursor)-(s|m|l)$/i;
+
+const PROVIDER_ALIASES = Object.freeze({ glm: 'zai' });
+
+function providerOwns(entry, requested) {
+  if (!requested) return true;
+  const provider = String(entry?.provider || '').toLowerCase();
+  const owner = PROVIDER_ALIASES[requested] || requested;
+  if (owner === 'kimi') return provider === 'kimi' || provider.startsWith('kimi-');
+  return provider === owner;
+}
 
 /**
  * Parse a model id as a bucket address, or null when it is an ordinary id.
@@ -108,12 +120,26 @@ const BUCKET_RE = /^sk-(s|m|l|xl)-(public|internal|secret)$/i;
  */
 export function parseBucketId(id) {
   if (typeof id !== 'string') return null;
-  const m = BUCKET_RE.exec(id.trim());
-  if (!m) return null;
-  return {
+  const value = id.trim();
+  const m = BUCKET_RE.exec(value);
+  if (m) return {
     bucket: `sk-${m[1].toLowerCase()}-${m[2].toLowerCase()}`,
     model_class: m[1].toUpperCase(),
     sensitivity: m[2].toLowerCase(),
+  };
+  const short = SHORT_BUCKET_RE.exec(value);
+  if (short) return {
+    bucket: `sk-${short[1].toLowerCase()}`,
+    model_class: short[1].toUpperCase(),
+    sensitivity: 'public',
+  };
+  const focused = PROVIDER_BUCKET_RE.exec(value);
+  if (!focused) return null;
+  return {
+    bucket: `sk-${focused[1].toLowerCase()}-${focused[2].toLowerCase()}`,
+    model_class: focused[2].toUpperCase(),
+    sensitivity: 'public',
+    provider: PROVIDER_ALIASES[focused[1].toLowerCase()] || focused[1].toLowerCase(),
   };
 }
 
@@ -128,6 +154,7 @@ export function isBucketId(id) {
  * `sk-code-review-fast` has four and never matches.
  */
 const BUCKET_SHAPE_RE = /^sk-([^-]*)-([^-]*)$/i;
+const FOCUSED_BUCKET_SHAPE_RE = /^sk-(zai|glm|kimi|codex|cursor)-([^-]+)$/i;
 
 /**
  * Did the caller MEAN to address a bucket and get it wrong?
@@ -174,6 +201,13 @@ export function looksLikeBucketAttempt(id, vocab = gradeVocabulary()) {
   if (typeof id !== 'string') return { attempted: false, reason: null };
   const trimmed = id.trim();
   if (parseBucketId(trimmed)) return { attempted: false, reason: null };
+  const focused = FOCUSED_BUCKET_SHAPE_RE.exec(trimmed);
+  if (focused) {
+    return {
+      attempted: true,
+      reason: `provider-focused buckets support only S, M, or L; received "${focused[2]}"`,
+    };
+  }
   const m = BUCKET_SHAPE_RE.exec(trimmed);
   if (!m) return { attempted: false, reason: null };
 
@@ -212,6 +246,19 @@ export function allBuckets(vocab = gradeVocabulary()) {
   for (const c of classes) {
     for (const s of sens) {
       out.push({ bucket: `sk-${String(c).toLowerCase()}-${s}`, model_class: String(c).toUpperCase(), sensitivity: s });
+    }
+  }
+  for (const c of classes) out.push({ bucket: `sk-${String(c).toLowerCase()}`, model_class: String(c).toUpperCase(), sensitivity: 'public' });
+  // Cursor parses fail-closed now but is advertised only after its transport
+  // adapter and health probes qualify it.
+  for (const provider of ['zai', 'glm', 'kimi', 'codex']) {
+    for (const c of classes.filter((value) => value !== 'XL')) {
+      out.push({
+        bucket: `sk-${provider}-${String(c).toLowerCase()}`,
+        model_class: String(c).toUpperCase(),
+        sensitivity: 'public',
+        provider: PROVIDER_ALIASES[provider] || provider,
+      });
     }
   }
   return out;
@@ -387,6 +434,10 @@ export function resolveBucket({ bucket, catalog = [], sensitivityPolicy, isRouta
   const rejected = [];
 
   for (const entry of catalog) {
+    if (!providerOwns(entry, bucket.provider)) {
+      rejected.push({ id: entry.id, reason: `provider ${entry?.provider || 'unknown'} does not match ${bucket.provider}` });
+      continue;
+    }
     if (!isRoutable(entry)) {
       rejected.push({ id: entry.id, reason: 'not routable (lifecycle)' });
       continue;

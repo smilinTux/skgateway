@@ -76,7 +76,7 @@ test('evaluated catalog carries capabilities and an explicit decision for every 
   const [entry] = buildEvaluatedCatalog([card], [probe]);
   assert.equal(entry.capabilities.tool_use.score, 1);
   assert.equal(entry.capabilities.trust_zone, 2);
-  assert.equal(entry.bucket_placement.length, 12);
+  assert.equal(entry.bucket_placement.length, 28);
   assert.equal(entry.bucket_placement.find((item) => item.bucket === 'sk-l-public').eligible, true);
   assert.match(
     entry.bucket_placement.find((item) => item.bucket === 'sk-l-internal').reason,

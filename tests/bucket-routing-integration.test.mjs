@@ -46,9 +46,11 @@ const FIX_DIR = mkdtempSync(join(tmpdir(), 'skgw-bucket-integration-'));
 const REGISTRY_PATH = join(FIX_DIR, 'registry.yaml');
 const STORE_PATH = join(FIX_DIR, 'model_catalog_store.json');
 const CATALOG_CACHE_PATH = join(FIX_DIR, 'model_catalog_cache.json');
+const CAPACITY_PATH = join(FIX_DIR, 'capacity_store.json');
 process.env.SKMODELS_REGISTRY = REGISTRY_PATH;
 process.env.SKGATEWAY_MODEL_CATALOG_STORE_PATH = STORE_PATH;
 process.env.SKGATEWAY_MODEL_CATALOG_CACHE_PATH = CATALOG_CACHE_PATH;
+process.env.SKGATEWAY_CAPACITY_STORE_PATH = CAPACITY_PATH;
 
 const {
   createRouter,
@@ -57,6 +59,7 @@ const {
   bucketLivenessTimeoutMs,
   DEFAULT_BUCKET_LIVENESS_TIMEOUT_MS,
   ModelEolError,
+  ModelOwnerDownError,
 } = await import('../src/proxy/router.mjs');
 const { loadConfig } = await import('../src/config.mjs');
 const { _resetCacheForTests } = await import('../src/discovery/model_catalog_store.mjs');
@@ -230,6 +233,7 @@ ${extraRoles}defaults:
     _resetCacheForTests();
     writeFileSync(STORE_PATH, JSON.stringify({}), 'utf8');
     writeFileSync(CATALOG_CACHE_PATH, JSON.stringify({ models: CATALOG }), 'utf8');
+    writeFileSync(CAPACITY_PATH, JSON.stringify({}), 'utf8');
     writeFileSync(REGISTRY_PATH, REGISTRY(), 'utf8');
     pool.state.count = 0;
     pool.state.lastModel = null;
@@ -306,6 +310,97 @@ ${extraRoles}defaults:
     assert.equal(lines[0].agent_id, 'lumina');
     assert.equal(lines[0].session_id, 'sess-skip');
     assert.ok(lines[0].request_id);
+  });
+
+  test('a provider-focused bucket never escapes through owner-down expansion', async () => {
+    writeFileSync(CATALOG_CACHE_PATH, JSON.stringify({ models: [
+      { id: 'glm-4.7', provider: 'zai', card: { tier: 'paid-cloud', size_class: 'L' } },
+    ] }), 'utf8');
+    _resetCacheForTests();
+    let expanded = false;
+    const focusedRouter = {
+      route: async (request) => {
+        if (request.expand) {
+          expanded = true;
+          return { backendId: 'foreign', backendUrl: pool.base, authHeaders: {} };
+        }
+        throw new ModelOwnerDownError(request.model, ['zai']);
+      },
+    };
+    await applyConfig({ buckets_enabled: true });
+
+    const r = await routeAndSend(
+      focusedRouter,
+      { model: 'sk-zai-l', agentId: 't' },
+      '/chat/completions', 'POST', HEADERS, bodyFor('sk-zai-l'), false,
+    );
+
+    assert.equal(r.status, 503);
+    assert.equal(expanded, false, 'provider focus must suppress broad expansion');
+    assert.equal(pool.state.count, 0, 'foreign backend must not receive the request');
+  });
+
+  test('every enabled provider S/M/L route completes a bounded public request', async () => {
+    const providers = {
+      zai: ['glm-s', 'glm-m', 'glm-l'],
+      kimi: ['kimi-s', 'kimi-m', 'kimi-l'],
+      codex: ['gpt-test-s', 'gpt-test-m', 'gpt-test-l'],
+    };
+    const classes = ['S', 'M', 'L'];
+    const models = [];
+    for (const [provider, ids] of Object.entries(providers)) {
+      ids.forEach((id, index) => models.push({
+        id,
+        provider: provider === 'kimi' ? 'kimi-for-coding' : provider,
+        card: { tier: 'paid-cloud', size_class: classes[index] },
+      }));
+    }
+    writeFileSync(CATALOG_CACHE_PATH, JSON.stringify({ models }), 'utf8');
+    _resetCacheForTests();
+    const backing = createRouter({
+      backends: {
+        poolbackend: { url: pool.base, auth_type: 'none', models: ['pool-l-local'], priority: 1 },
+      },
+    });
+    const focusedRouter = {
+      route: async (request) => {
+        const routed = await backing.route({ ...request, model: 'pool-l-local' });
+        const candidate = Array.isArray(routed) ? routed[0] : routed;
+        if (request.model.startsWith('gpt-')) candidate.backend.provider = 'codex';
+        return { ...candidate, model: request.model };
+      },
+    };
+    await applyConfig({ buckets_enabled: true });
+
+    for (const provider of Object.keys(providers)) {
+      for (const cls of ['s', 'm', 'l']) {
+        const model = `sk-${provider}-${cls}`;
+        const r = await routeAndSend(
+          focusedRouter,
+          { model, agentId: 'synthetic-provider-validation' },
+          '/chat/completions', 'POST', {
+            ...HEADERS,
+            'x-sk-context': 'public',
+            'x-sk-probe': 'synthetic',
+          }, bodyFor(model), false,
+        );
+        assert.equal(r.status, 200, model);
+        const prefix = provider === 'zai' ? 'glm-' : provider === 'codex' ? 'gpt-' : `${provider}-`;
+        assert.ok(pool.state.lastModel.startsWith(prefix));
+      }
+    }
+  });
+
+  test('unsupported provider XL is rejected instead of falling through', async () => {
+    await applyConfig({ buckets_enabled: true });
+    const r = await routeAndSend(
+      router,
+      { model: 'sk-kimi-xl', agentId: 't' },
+      '/chat/completions', 'POST', HEADERS, bodyFor('sk-kimi-xl'), false,
+    );
+    assert.equal(r.status, 400);
+    assert.equal(parseBody(r).error.type, 'invalid_bucket_id');
+    assert.equal(pool.state.count, 0);
   });
 
   test('flag ON: an S-graded public request prefers sovereign local over a costlier coin flip', async () => {
@@ -453,7 +548,7 @@ ${extraRoles}defaults:
     assert.equal(error.model, 'sk-xl-secrets');
     assert.match(error.reason, /sensitivity "secrets" is not/);
     assert.ok(error.valid_buckets.includes('sk-xl-secret'), 'the caller is told the correction, not left guessing');
-    assert.equal(error.valid_buckets.length, 12);
+    assert.equal(error.valid_buckets.length, 28);
     assert.equal(pool.state.count, 0, 'nothing was routed');
 
     const lines = audit.read();
