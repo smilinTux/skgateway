@@ -788,11 +788,11 @@ startCapacityProbeScheduler({
     const probeBody = Buffer.from(JSON.stringify({
       model,
       messages: [{ role: "user", content: "Reply with ok." }],
-      max_tokens: 256,
+      max_tokens: 512,
       stream: false,
     }));
     return routeAndSend(router, {
-      model, messages: [{ role: "user", content: "Reply with ok." }], max_tokens: 256,
+      model, messages: [{ role: "user", content: "Reply with ok." }], max_tokens: 512,
       agentId: "skgateway-capacity-probe", context: "public", capacityProbeOwner: probeOwner,
     }, "/v1/chat/completions", "POST", {
       "content-type": "application/json",
