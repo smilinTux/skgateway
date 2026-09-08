@@ -1,9 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { load as loadYaml } from "js-yaml";
 
 const dir = mkdtempSync(join(tmpdir(), "skgw-zai-coldstart-"));
 process.env.SKMODELS_REGISTRY = join(dir, "no-registry.yaml");
@@ -12,6 +13,15 @@ const { createRouter, routeAndSend } = await import("../src/proxy/router.mjs");
 
 const headers = { "content-type": "application/json" };
 const body = Buffer.from(JSON.stringify({ model: "glm-4.6", messages: [{ role: "user", content: "hi" }] }));
+
+test("production profile keeps Z.ai namespace discovery managed", () => {
+  const config = loadYaml(readFileSync(
+    new URL("../config/skgateway-codex.yaml", import.meta.url), "utf8",
+  ));
+  assert.equal(config.backends.zai.discovery, "zai");
+  assert.deepEqual(config.backends.zai.models, []);
+  assert.equal(config.discovery.providers.zai.enabled, true);
+});
 
 function upstream(name) {
   let calls = 0;
@@ -95,4 +105,29 @@ test("Z.ai discovery timeout remains pending and fail-closed", async () => {
   } finally {
     await nvidia.close();
   }
+});
+
+test("successful empty Z.ai discovery still owns raw GLM namespace fail closed", async (t) => {
+  const qwen = await upstream("qwen");
+  const nvidia = await upstream("nvidia");
+  t.after(() => Promise.all([qwen.close(), nvidia.close()]));
+  const router = createRouter({ backends: {
+    qwen: { url: qwen.url, auth_type: "none", models: ["qwen-model"], priority: 1 },
+    nvidia: { url: nvidia.url, auth_type: "none", models: ["nvidia-model"], priority: 1 },
+    zai: {
+      url: "http://127.0.0.1:1/v1", auth_type: "zai_oauth", discovery: "zai",
+      models: [], priority: 2,
+    },
+  }});
+  router.registerDiscoveredModels("zai", [], { ok: true, at: 300 });
+  for (const model of ["glm-4.6", "glm-4.7", "glm-5.3"]) {
+    const result = await routeAndSend(router, { model, agentId: "production-config-test" },
+      "/chat/completions", "POST", headers,
+      Buffer.from(JSON.stringify({ model, messages: [{ role: "user", content: "hi" }] })),
+      false);
+    assert.equal(result.status, 503);
+    assert.equal(JSON.parse(result.body).error.code, "model_discovery_not_ready");
+  }
+  assert.equal(qwen.calls(), 0);
+  assert.equal(nvidia.calls(), 0);
 });

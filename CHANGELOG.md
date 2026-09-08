@@ -43,6 +43,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Discovery-managed model namespaces now fail closed when an authoritative
+  refresh returns no exact claim, preventing raw GLM routes from escaping to
+  Qwen or NVIDIA. Manual catalog refresh starts one asynchronous generation
+  and returns immediately instead of blocking the request handler.
+
 - Z.ai health recovery now uses one owned public-synthetic probe with a
   realistic GLM response budget. Schema-valid success clears only transient
   response-budget failures, while authentication, subscription, quarantine,
