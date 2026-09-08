@@ -1,12 +1,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import http from "node:http";
 import { readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-import { Backend, createRouter } from "../src/proxy/router.mjs";
+import { Backend, createRouter, routeAndSend } from "../src/proxy/router.mjs";
 import {
   _resetCapacityProbesForTests,
+  CAPACITY_STORE_PATH,
   capacityStatus,
   finishCapacityProbe,
   recordProviderUnavailable,
@@ -59,6 +61,12 @@ test("provider recovery uses five-minute transient and longer terminal deadlines
   assert.equal(recordProviderUnavailable("zai", {
     reason: "authentication_failure", now: 1_000, path: terminalStore,
   }).retry_at, 1_801_000);
+  assert.equal(recordProviderUnavailable("zai", {
+    reason: "backend_cooldown", now: 1_000, retryAt: 61_000, path: transientStore,
+  }).retry_at, 301_000);
+  assert.equal(recordProviderUnavailable("zai", {
+    reason: "authentication_failure", now: 1_000, retryAt: 61_000, path: terminalStore,
+  }).retry_at, 1_801_000);
 });
 
 test("due Z.ai recovery remains provider-singleflight and preserves terminal reason", async () => {
@@ -73,14 +81,65 @@ test("due Z.ai recovery remains provider-singleflight and preserves terminal rea
   const probe = async () => { calls++; await held; return { status: 502 }; };
   const target = () => [{ provider: "zai", model: "glm-5.3-flash" }];
 
-  const first = runDueCapacityProbes(target, probe, { now: 2_000, path });
+  const first = runDueCapacityProbes(target, probe, { now: 1_801_000, path });
   await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(await runDueCapacityProbes(target, probe, { now: 2_000, path }), []);
+  assert.deepEqual(await runDueCapacityProbes(target, probe, { now: 1_801_000, path }), []);
   release();
   await first;
   assert.equal(calls, 1);
-  assert.equal(capacityStatus("zai", "glm-5.3-flash", { now: 2_001, path }).reason,
+  assert.equal(capacityStatus("zai", "glm-5.3-flash", { now: 1_801_001, path }).reason,
     "malformed_response");
+});
+
+test("non-2xx probe attempts cannot clear response-budget health evidence", () => {
+  for (const status of [401, 403, 429]) {
+    const backend = new Backend({
+      id: `zai-${status}`,
+      url: "http://127.0.0.1:9/v1",
+      models: ["glm-4.7"],
+      quarantine_threshold: 0,
+    });
+    backend.recordOutcome(false, 1, { failureClass: "response_budget" });
+    backend.recordOutcome(status < 500, 1, {
+      failureClass: status === 401 || status === 403 ? "authentication_failure" : null,
+      authoritativeRecovery: false,
+    });
+    assert.equal(backend.getHealth().status, "down");
+    assert.ok(backend.getHealth().errorRate > 0);
+  }
+});
+
+test("routed 401 recovery attempt remains fail closed", async (t) => {
+  _resetCapacityProbesForTests();
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(401, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { code: "unauthorized" } }));
+  });
+  await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => upstream.close(resolve)));
+  const router = createRouter({ backends: { zai: {
+    url: `http://127.0.0.1:${upstream.address().port}/v1`, auth_type: "none",
+    discovery: "zai", models: ["glm-4.7"], quarantine_threshold: 0,
+  } } });
+  const backend = router.getBackend("zai");
+  backend.recordOutcome(false, 1, { failureClass: "response_budget" });
+  const oldNow = Date.now() - 31 * 60_000;
+  recordProviderUnavailable("zai", {
+    reason: "authentication_failure", now: oldNow, path: CAPACITY_STORE_PATH,
+  });
+  const result = await routeAndSend(router, {
+    model: "glm-4.7", context: "public", capacityProbeOwner: {},
+  }, "/v1/chat/completions", "POST", {
+    "x-sk-context": "public", "x-sk-probe": "synthetic",
+  }, Buffer.from(JSON.stringify({
+    model: "glm-4.7", messages: [{ role: "user", content: "Reply ok." }],
+    max_tokens: 256, stream: false,
+  })), false);
+  assert.equal(result.status, 401);
+  assert.equal(backend.getHealth().status, "down");
+  assert.ok(backend.getHealth().errorRate > 0);
+  assert.equal(capacityStatus("zai", "glm-4.7", { path: CAPACITY_STORE_PATH }).reason,
+    "authentication_failure");
 });
 
 test("only the owned schema-valid success clears recovery state", () => {

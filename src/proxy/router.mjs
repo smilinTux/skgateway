@@ -4267,6 +4267,10 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           ? "response_budget"
           : "malformed_response"
         : res.status >= 500 ? "backend_cooldown" : null;
+    // The response contract rewrites malformed upstream 2xx responses to a
+    // non-2xx status, so this is also the schema-valid recovery boundary.
+    const recoveryProbeSucceeded = capacityAdmission.probe &&
+      res.status >= 200 && res.status < 300;
 
     if (providerName === "codex" || providerName === "zai") {
       const retryAfter = res.headers?.["retry-after"] ?? res.headers?.["Retry-After"];
@@ -4288,7 +4292,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           recordSubscriptionExhausted(providerName, { retryAt });
         }
       } else if (capacityAdmission.probe) {
-        const probeSucceeded = res.status >= 200 && res.status < 300;
+        const probeSucceeded = recoveryProbeSucceeded;
         if (probeSucceeded) {
           await emitSiem(EventType.CAPACITY, {
             action: "probe_recovered",
@@ -4400,7 +4404,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     const healthy = res.status < 500;
     const qTransition = backend.recordOutcome(healthy, latencyMs, {
       failureClass: recoveryFailureClass,
-      authoritativeRecovery: capacityAdmission.probe && healthy,
+      authoritativeRecovery: recoveryProbeSucceeded,
     });
     const claimTransition = backend.recordModelClaimOutcome(candidateModel, res.status);
     if (claimTransition) {

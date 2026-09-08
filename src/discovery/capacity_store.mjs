@@ -57,9 +57,10 @@ export function recordProviderUnavailable(provider, {
   const store = load(path);
   const longer = new Set(["authentication_failure", "subscription_exhausted", "quarantine", "malformed_response"]);
   const retryMs = longer.has(reason) ? TERMINAL_RETRY_MS : TRANSIENT_RETRY_MS;
+  const suppliedRetryAt = Number(retryAt);
   const record = {
     state: "throttled", scope: "provider", reason,
-    retry_at: Math.max(now + 1000, Number(retryAt) || now + retryMs),
+    retry_at: Math.max(now + retryMs, Number.isFinite(suppliedRetryAt) ? suppliedRetryAt : 0),
     probe_state: "pending", observed_at: now,
   };
   save({ ...store, [`provider:${provider}`]: record }, path);
