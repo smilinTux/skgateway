@@ -15,6 +15,7 @@ import assert from 'node:assert/strict';
 
 import {
   parseBucketId,
+  looksLikeBucketAttempt,
   isBucketId,
   allBuckets,
   classRank,
@@ -56,6 +57,18 @@ describe('C9: bucket addressing', () => {
     const b = parseBucketId('sk-xl-secret');
     assert.deepEqual(b, { bucket: 'sk-xl-secret', model_class: 'XL', sensitivity: 'secret' });
     assert.equal(isBucketId('sk-s-public'), true);
+    assert.deepEqual(parseBucketId('sk-m'), {
+      bucket: 'sk-m', model_class: 'M', sensitivity: 'public',
+    });
+    assert.deepEqual(parseBucketId('sk-glm-l'), {
+      bucket: 'sk-glm-l', model_class: 'L', sensitivity: 'public', provider: 'zai',
+    });
+    assert.deepEqual(parseBucketId('sk-zai-l'), {
+      bucket: 'sk-zai-l', model_class: 'L', sensitivity: 'public', provider: 'zai',
+    });
+    assert.deepEqual(parseBucketId('sk-kimi-m'), {
+      bucket: 'sk-kimi-m', model_class: 'M', sensitivity: 'public', provider: 'kimi',
+    });
   });
 
   test('an ordinary model id is not a bucket', () => {
@@ -81,7 +94,10 @@ describe('C9: bucket addressing', () => {
     assert.deepEqual(v.sensitivity.values, ['public', 'internal', 'secret']);
     // risk is a SEPARATE axis and must not have been folded into the bucket id
     assert.deepEqual(v.risk.values, ['low', 'med', 'high', 'crit']);
-    assert.equal(allBuckets().length, 12, '4 classes x 3 sensitivities');
+    assert.equal(allBuckets().length, 28, '12 scoped, 4 short public, and 12 provider-focused S/M/L buckets');
+    assert.equal(parseBucketId('sk-kimi-xl'), null);
+    assert.equal(looksLikeBucketAttempt('sk-kimi-xl').attempted, true);
+    assert.equal(allBuckets().some(({ bucket }) => bucket.startsWith('sk-cursor-')), false);
   });
 });
 
@@ -194,6 +210,42 @@ describe('C9: eligibility composes the floor with the sovereignty ceiling', () =
     });
     assert.equal(members.length, 0);
     assert.ok(rejected.length > 0, 'and it must be able to explain why');
+  });
+});
+
+describe('provider-focused buckets', () => {
+  const catalog = [
+    { ...entry('glm-4.7', { zone: 2, declared: 'L' }), provider: 'zai' },
+    { ...entry('kimi-for-coding', { zone: 2, declared: 'M' }), provider: 'kimi-for-coding' },
+    { ...entry('gpt-5.6-luna', { zone: 2, declared: 'L' }), provider: 'codex' },
+    { ...entry('cursor-model', { zone: 2, declared: 'L' }), provider: 'cursor' },
+  ];
+
+  test('provider routes never cross ownership', () => {
+    for (const id of ['sk-zai-m', 'sk-glm-m', 'sk-kimi-m', 'sk-codex-m', 'sk-cursor-m']) {
+      const bucket = parseBucketId(id);
+      const { members } = resolveBucket({ bucket, catalog });
+      assert.ok(members.length > 0, `${id} has an eligible member`);
+      const expected = bucket.provider === 'zai'
+        ? ['glm-4.7']
+        : bucket.provider === 'kimi'
+          ? ['kimi-for-coding']
+          : bucket.provider === 'codex'
+            ? ['gpt-5.6-luna']
+            : ['cursor-model'];
+      assert.deepEqual(members.map(({ id: memberId }) => memberId), expected, `${id} stays with its provider`);
+    }
+  });
+
+  test('health and lifecycle gates still fail closed', () => {
+    const bucket = parseBucketId('sk-kimi-m');
+    const { members, rejected } = resolveBucket({
+      bucket,
+      catalog,
+      isRoutable: (model) => model.id !== 'kimi-for-coding',
+    });
+    assert.deepEqual(members, []);
+    assert.match(rejected.find((item) => item.id === 'kimi-for-coding').reason, /not routable/);
   });
 });
 

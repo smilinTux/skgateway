@@ -2941,6 +2941,12 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
       // the next live member serves. Direct (non-bucket) requests never take
       // this path: for them ModelOwnerDownError fails closed at route().
       if (err instanceof ModelOwnerDownError) {
+        // A provider-focused bucket is an explicit ownership boundary. Never
+        // use broad model expansion to escape it when that provider is down.
+        if (addr.provider) {
+          skipped.push(member.id);
+          continue;
+        }
         try {
           results = await router.route({
             ...request, model: member.id, agentId: request.agentId, expand: true,
