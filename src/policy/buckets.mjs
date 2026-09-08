@@ -86,6 +86,7 @@ const SHORT_BUCKET_RE = /^sk-(s|m|l|xl)$/i;
 const PROVIDER_BUCKET_RE = /^sk-(zai|glm|kimi|codex|cursor)-(s|m|l)$/i;
 
 const PROVIDER_ALIASES = Object.freeze({ glm: 'zai' });
+const PUBLIC_L_SUBSCRIPTION_PROVIDERS = new Set(['zai', 'codex']);
 
 function providerOwns(entry, requested) {
   if (!requested) return true;
@@ -93,6 +94,12 @@ function providerOwns(entry, requested) {
   const owner = PROVIDER_ALIASES[requested] || requested;
   if (owner === 'kimi') return provider === 'kimi' || provider.startsWith('kimi-');
   return provider === owner;
+}
+
+export function publicLSubscriptionOwns(entry, bucket) {
+  if (bucket.provider || !['sk-l-public', 'sk-l'].includes(bucket.bucket)) return true;
+  const provider = String(entry?.provider || '').toLowerCase();
+  return PUBLIC_L_SUBSCRIPTION_PROVIDERS.has(provider) || provider === 'kimi' || provider.startsWith('kimi-');
 }
 
 /**
@@ -436,6 +443,10 @@ export function resolveBucket({ bucket, catalog = [], sensitivityPolicy, isRouta
   for (const entry of catalog) {
     if (!providerOwns(entry, bucket.provider)) {
       rejected.push({ id: entry.id, reason: `provider ${entry?.provider || 'unknown'} does not match ${bucket.provider}` });
+      continue;
+    }
+    if (!publicLSubscriptionOwns(entry, bucket)) {
+      rejected.push({ id: entry.id, reason: 'sk-l-public admits only Z.ai, Kimi, or Codex subscription providers' });
       continue;
     }
     if (!isRoutable(entry)) {

@@ -154,10 +154,47 @@ describe('C9: eligibility composes the floor with the sovereignty ceiling', () =
   });
 
   test('a public bucket still enforces the capability floor', () => {
-    const { members, rejected } = resolveBucket({ bucket: { model_class: 'L', sensitivity: 'public' }, catalog });
+    const { members, rejected } = resolveBucket({ bucket: { model_class: 'M', sensitivity: 'public' }, catalog });
     assert.ok(members.some((m) => m.id === 'big-pickle'));
     assert.ok(!members.some((m) => m.id === 'tiny-free'), 'S cannot serve an L bucket');
-    assert.ok(rejected.find((r) => r.id === 'tiny-free').reason.includes('below floor L'));
+    assert.ok(rejected.find((r) => r.id === 'tiny-free').reason.includes('below floor M'));
+  });
+
+  test('sk-l-public excludes local Qwen and keeps eligible subscription providers', () => {
+    const cloudCatalog = [
+      { ...entry('qwen3.8-27b', { zone: TRUST_ZONES.SOVEREIGN_LOCAL, declared: 'L' }), provider: 'local' },
+      { ...entry('glm-4.7', { zone: TRUST_ZONES.FREE_REMOTE, declared: 'L' }), provider: 'zai' },
+      { ...entry('kimi-for-coding', { zone: TRUST_ZONES.FREE_REMOTE, declared: 'L' }), provider: 'kimi-for-coding' },
+      { ...entry('gpt-5.6-luna', { zone: TRUST_ZONES.FREE_REMOTE, declared: 'L' }), provider: 'codex' },
+    ];
+    for (const id of ['sk-l-public', 'sk-l']) {
+      const { members, rejected } = resolveBucket({ bucket: parseBucketId(id), catalog: cloudCatalog });
+      assert.deepEqual(members.map((model) => model.id), ['glm-4.7', 'kimi-for-coding', 'gpt-5.6-luna']);
+      assert.match(rejected.find((model) => model.id === 'qwen3.8-27b').reason, /subscription providers/);
+    }
+  });
+
+  test('a down subscription provider falls through without widening to local', () => {
+    const cloudCatalog = [
+      { ...entry('qwen3.8-27b', { zone: TRUST_ZONES.SOVEREIGN_LOCAL, declared: 'L' }), provider: 'local' },
+      { ...entry('glm-4.7', { zone: TRUST_ZONES.FREE_REMOTE, declared: 'L' }), provider: 'zai' },
+      { ...entry('kimi-for-coding', { zone: TRUST_ZONES.FREE_REMOTE, declared: 'L' }), provider: 'kimi-for-coding' },
+      { ...entry('gpt-5.6-luna', { zone: TRUST_ZONES.FREE_REMOTE, declared: 'L' }), provider: 'codex' },
+    ];
+    const { members, rejected } = resolveBucket({
+      bucket: parseBucketId('sk-l-public'), catalog: cloudCatalog,
+      isRoutable: (model) => model.id !== 'glm-4.7',
+    });
+    assert.deepEqual(members.map((model) => model.id), ['kimi-for-coding', 'gpt-5.6-luna']);
+    assert.match(rejected.find((model) => model.id === 'glm-4.7').reason, /not routable/);
+    assert.equal(members.some((model) => model.id === 'qwen3.8-27b'), false);
+  });
+
+  test('other public sizes and protected buckets preserve sovereign-local eligibility', () => {
+    for (const bucket of [parseBucketId('sk-s-public'), parseBucketId('sk-m-public'), parseBucketId('sk-l-secret')]) {
+      const { members } = resolveBucket({ bucket, catalog });
+      assert.ok(members.some((model) => model.id === 'ornith-35b'));
+    }
   });
 
   test('an unknown trust zone is excluded from anything but public', () => {
@@ -234,6 +271,13 @@ describe('provider-focused buckets', () => {
             ? ['gpt-5.6-luna']
             : ['cursor-model'];
       assert.deepEqual(members.map(({ id: memberId }) => memberId), expected, `${id} stays with its provider`);
+    }
+  });
+
+  test('sk-glm-l and sk-zai-l remain exact Z.ai-only', () => {
+    for (const id of ['sk-glm-l', 'sk-zai-l']) {
+      const { members } = resolveBucket({ bucket: parseBucketId(id), catalog });
+      assert.deepEqual(members.map((model) => model.id), ['glm-4.7']);
     }
   });
 

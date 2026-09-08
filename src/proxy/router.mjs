@@ -77,6 +77,7 @@ import {
   requiresToolUse,
   looksLikeBucketAttempt,
   allBuckets,
+  publicLSubscriptionOwns,
 } from "../policy/buckets.mjs";
 import { codexPurityProblems } from "../policy/codex-purity.mjs";
 
@@ -3032,6 +3033,9 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
   const candidates = [];
   const seen = new Set();
   const skipped = [];
+  const candidateAllowed = (result) => publicLSubscriptionOwns({
+    provider: result?.backend?.discovery || inferProviderFromBackend(result?.backendId),
+  }, addr);
   for (const member of orderedMembers) {
     let results;
     try {
@@ -3078,6 +3082,7 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
         }
         const list2 = Array.isArray(results) ? results : results ? [results] : [];
         for (const result of list2) {
+          if (!candidateAllowed(result)) continue;
           const key = `${result.backendId}:${member.id}`;
           if (seen.has(key)) continue;
           seen.add(key);
@@ -3095,6 +3100,7 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
     }
     const list = Array.isArray(results) ? results : results ? [results] : [];
     for (const result of list) {
+      if (!candidateAllowed(result)) continue;
       const key = `${result.backendId}:${member.id}`;
       if (seen.has(key)) continue;
       seen.add(key);
