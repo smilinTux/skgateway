@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add public provider-focused S, M, and L routing aliases for Z.ai, Kimi,
+  and Codex while preserving health-gated generic bucket failover. Cursor
+  aliases remain unadvertised until its transport adapter is qualified.
 - Persist provider-neutral request attribution with explicit unknown values for client, application, route, rail, provider, backend node, requested model, served model, and runtime revision.
 
 ### Added
