@@ -40,7 +40,7 @@ import { observeProviderUsage, providerUsageSnapshot } from "../metrics/provider
 import { recordModelOutcome, getLifecycle } from "../discovery/model_catalog_store.mjs";
 import {
   admitCapacity, capacityStatus, clearCapacity, finishCapacityProbe,
-  isSubscriptionExhaustion, recordModelThrottled, recordProviderUnavailable,
+  isSubscriptionExhaustion, recordModelThrottled, recordModelUnavailable, recordProviderUnavailable,
   recordSubscriptionExhausted,
   releaseCapacityProbe,
 } from "../discovery/capacity_store.mjs";
@@ -4314,7 +4314,8 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     })();
     const requestedMaxTokens = (() => {
       try {
-        const value = JSON.parse(attemptBody?.toString("utf8") || "{}").max_tokens;
+        const parsed = JSON.parse(attemptBody?.toString("utf8") || "{}");
+        const value = parsed.max_tokens ?? parsed.max_completion_tokens;
         return Number.isFinite(value) ? value : null;
       } catch { return null; }
     })();
@@ -4369,8 +4370,13 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         recordModelThrottled(providerName, candidateModel, { retryAt });
       } else if (res.status >= 200 && res.status < 300) {
         clearCapacity(providerName, candidateModel);
-      } else if (providerName === "zai" && recoveryFailureClass) {
+      } else if (providerName === "zai" && recoveryFailureClass === "authentication_failure") {
         recordProviderUnavailable(providerName, { reason: recoveryFailureClass });
+      } else if (providerName === "zai" && recoveryFailureClass) {
+        recordModelUnavailable(providerName, candidateModel, {
+          reason: recoveryFailureClass,
+          retryAt: Date.now() + DEFAULT_402_COOLDOWN_MS,
+        });
       }
     }
 
