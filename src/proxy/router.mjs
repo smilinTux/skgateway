@@ -649,6 +649,11 @@ function applyBodyFloor(body, model, floor) {
   try {
     const obj = JSON.parse(body.toString("utf-8"));
     const cfg = { reasoningFloorMaxTokens: floor, reasoningModels: [model] };
+    if (obj && typeof obj === "object" && obj.max_tokens == null && obj.max_completion_tokens == null) {
+      obj.max_completion_tokens = floor;
+      console.log(`[router] reasoning floor: model=${model} max_completion_tokens omitted -> ${floor}`);
+      return Buffer.from(JSON.stringify(obj), "utf-8");
+    }
     if (obj && typeof obj === "object" &&
         applyReasoningFloor(obj, cfg, model, (m) => console.log(`[router] ${m}`))) {
       return Buffer.from(JSON.stringify(obj), "utf-8");
