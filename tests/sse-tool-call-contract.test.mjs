@@ -209,6 +209,16 @@ describe("completed SSE tool-call structure", () => {
     assertCompletionRejected(rawResponse([contentFrame("stop"), valid, valid, "data: [DONE]"]));
   });
 
+  test("accepts bounded reasoning-token usage details", () => {
+    const usage = `data: ${JSON.stringify({ model: MODEL, choices: [], usage: {
+        prompt_tokens: 10, completion_tokens: 7, total_tokens: 17,
+        prompt_tokens_details: { cached_tokens: 2 },
+        completion_tokens_details: { reasoning_tokens: 5 },
+      } })}`;
+    const result = rawResponse([contentFrame("stop", "OK"), usage, "data: [DONE]"]);
+    assert.equal(result.status, 200);
+  });
+
   test("rejects malformed concrete-Qwen prompt token details", () => {
     const usageFrame = (promptTokensDetails) => `data: ${JSON.stringify({
       model: MODEL,
