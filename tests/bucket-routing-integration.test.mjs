@@ -344,6 +344,31 @@ ${extraRoles}defaults:
     assert.equal(pool.state.lastMaxTokens, null);
   });
 
+  test('a backend output floor protects Pi follow-up requests with an omitted cap', async () => {
+    await applyConfig({ buckets_enabled: true });
+    const floorRouter = createRouter({
+      backends: {
+        poolbackend: {
+          url: pool.base,
+          auth_type: 'none',
+          models: ['pool-l-local'],
+          priority: 1,
+          min_output_tokens: 256,
+        },
+      },
+    });
+
+    const r = await routeAndSend(
+      floorRouter,
+      { model: 'sk-l-secret', agentId: 'pi-uncapped-floor-test' },
+      '/chat/completions', 'POST', HEADERS, bodyFor('sk-l-secret'), false,
+    );
+
+    assert.equal(r.status, 200);
+    assert.equal(pool.state.lastMaxCompletionTokens, 256);
+    assert.equal(pool.state.lastMaxTokens, null);
+  });
+
   test('SIEM call site 2: an EOL bucket member skip writes one anomaly outcome line', async () => {
     const audit = auditSink('bucket-member-skipped');
     writeFileSync(CATALOG_CACHE_PATH, JSON.stringify({ models: [
