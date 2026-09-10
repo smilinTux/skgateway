@@ -24,6 +24,14 @@ describe("applyReasoningFloor", () => {
     assert.equal(parsed.max_tokens, 2048);
   });
 
+  test("raises the newer max_completion_tokens cap used by Pi workers", () => {
+    const parsed = { max_completion_tokens: 32 };
+    const changed = applyReasoningFloor(parsed, cfg, "ornith-1.0-9b");
+    assert.equal(changed, true);
+    assert.equal(parsed.max_completion_tokens, 2048);
+    assert.equal(parsed.max_tokens, undefined);
+  });
+
   test("leaves a higher cap unchanged", () => {
     const parsed = { max_tokens: 8000 };
     const changed = applyReasoningFloor(parsed, cfg, "ornith-1.0-9b");
