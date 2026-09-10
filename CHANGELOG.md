@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- The OpenRouter free-tier backend is enabled (`backends.openrouter` and
+  `discovery.providers.openrouter`), discovery-only with no static model list,
+  keyed from `OPENROUTER_API_KEY` in the service EnvironmentFile and never
+  inlined in config. Priority 4, behind the sovereign and NVIDIA backends, so
+  it is a fallback rather than a default route. Verified live 2026-09-04: 427
+  models advertised, 26 on the free tier. Enabled for the nor estate only; the
+  chi cluster runs production work and kept its own hold.
+
 - Keep `sk-l-public` and `sk-l` on eligible Z.ai, Kimi, or Codex subscription
   providers, including final failover candidates, while preserving
   exact-provider and protected local bucket rules.
