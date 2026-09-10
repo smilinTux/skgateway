@@ -131,6 +131,10 @@ export function finishCapacityProbe(provider, success, {
   probes.delete(provider);
   if (success) return clearCapacity(provider, model, { now, path });
   if (providerWide) return recordSubscriptionExhausted(provider, { retryAt, now, path });
+  if (model && (reason === "malformed_response" || reason === "response_budget")) {
+    clearCapacity(provider, model, { now, path });
+    return recordModelUnavailable(provider, model, { reason, retryAt, now, path });
+  }
   if (!providerWide && status.scope === "model") {
     return recordModelThrottled(provider, model, { retryAt, now, path });
   }

@@ -10,6 +10,7 @@ import {
   _resetCapacityProbesForTests,
   CAPACITY_STORE_PATH,
   capacityStatus,
+  clearCapacity,
   finishCapacityProbe,
   recordProviderUnavailable,
   runDueCapacityProbes,
@@ -141,6 +142,33 @@ test("routed 401 recovery attempt remains fail closed", async (t) => {
   assert.ok(backend.getHealth().errorRate > 0);
   assert.equal(capacityStatus("zai", "glm-4.7", { path: CAPACITY_STORE_PATH }).reason,
     "authentication_failure");
+});
+
+test("malformed GLM output does not poison shared backend lifecycle", async (t) => {
+  _resetCapacityProbesForTests();
+  clearCapacity("zai", null, { path: CAPACITY_STORE_PATH });
+  t.after(() => clearCapacity("zai", null, { path: CAPACITY_STORE_PATH }));
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ model: "glm-4.7", choices: [] }));
+  });
+  await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => upstream.close(resolve)));
+  const router = createRouter({ backends: { zai: {
+    url: `http://127.0.0.1:${upstream.address().port}/v1`, auth_type: "none",
+    discovery: "zai", models: ["glm-4.7", "glm-5.3"],
+    quarantine_threshold: 1, model_claim_quarantine_threshold: 1,
+  } } });
+  const result = await routeAndSend(router, { model: "glm-4.7" },
+    "/v1/chat/completions", "POST", {}, Buffer.from(JSON.stringify({
+      model: "glm-4.7", messages: [{ role: "user", content: "Reply ok." }],
+      max_tokens: 256, stream: false,
+    })), false);
+  assert.equal(result.status, 502);
+  assert.equal(router.getBackend("zai").getHealth().status, "up");
+  assert.equal(router.getBackend("zai").getModelClaimHealth("glm-4.7").quarantined, false);
+  assert.equal(capacityStatus("zai", "glm-4.7", { path: CAPACITY_STORE_PATH }).scope, "model");
+  assert.equal(capacityStatus("zai", "glm-5.3", { path: CAPACITY_STORE_PATH }).state, "available");
 });
 
 test("only the owned schema-valid success clears recovery state", () => {
