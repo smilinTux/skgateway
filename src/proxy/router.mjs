@@ -4456,21 +4456,22 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       energyAttempts.push(attemptEnergy);
     }
 
-    // `healthy` drives every BACKEND-health side effect below (quarantine,
-    // local-health, the error-rate window inside recordOutcome itself) and
-    // is deliberately unchanged from the original `success = res.status <
-    // 500`: a 429/402 is not evidence the backend is broken (card 9e28de88
-    // fix #4). `retryElsewhere`/`throttled` (below, after these health
-    // writes) is the SEPARATE routing decision of whether to keep this
-    // response or try the next door; splitting the two is the whole point
-    // of this card, so a throttled model can fail over WITHOUT damaging
-    // backend health or lifecycle state.
-    const healthy = res.status < 500;
+    // `healthy` drives shared backend health and lifecycle state. A contract
+    // failure after an upstream 2xx belongs to the exact model's capacity
+    // record, not the shared provider transport. The invalid response still
+    // fails closed and can fail over without hiding every sibling model.
+    const modelContractFailure = upstreamStatus >= 200 && upstreamStatus < 300 &&
+      res.status === 502 &&
+      (recoveryFailureClass === "malformed_response" || recoveryFailureClass === "response_budget");
+    const healthy = res.status < 500 || modelContractFailure;
     const qTransition = backend.recordOutcome(healthy, latencyMs, {
       failureClass: recoveryFailureClass,
       authoritativeRecovery: recoveryProbeSucceeded,
     });
-    const claimTransition = backend.recordModelClaimOutcome(candidateModel, res.status);
+    const claimTransition = backend.recordModelClaimOutcome(
+      candidateModel,
+      modelContractFailure ? upstreamStatus : res.status,
+    );
     if (claimTransition) {
       const quarantined = claimTransition.transition === "quarantined";
       process.stdout.write(JSON.stringify({
