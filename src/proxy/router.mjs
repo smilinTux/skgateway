@@ -4277,7 +4277,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
 
     if (providerName === "zai" && upstreamStatus >= 200 && upstreamStatus < 300 &&
         String(res?.headers?.["content-type"] || "").includes("text/event-stream")) {
-      const shape = { frames: 0, done: 0, content_chars: 0, reasoning_chars: 0, tool_fragments: 0, finish_reasons: [] };
+      const shape = { frames: 0, done: 0, content_chars: 0, reasoning_chars: 0, tool_fragments: 0, finish_reasons: [], usage_keys: [], usage_detail_keys: [] };
       for (const line of res.body.toString("utf8").split("\n")) {
         if (!line.startsWith("data:")) continue;
         const payload = line.slice(5).trim();
@@ -4285,6 +4285,12 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         try {
           const frame = JSON.parse(payload);
           shape.frames++;
+          if (frame?.usage && typeof frame.usage === "object") {
+            shape.usage_keys = Object.keys(frame.usage).sort();
+            shape.usage_detail_keys = Object.entries(frame.usage)
+              .filter(([, value]) => value && typeof value === "object" && !Array.isArray(value))
+              .flatMap(([key, value]) => Object.keys(value).map((child) => `${key}.${child}`)).sort();
+          }
           for (const choice of frame.choices || []) {
             const delta = choice?.delta || {};
             if (typeof delta.content === "string") shape.content_chars += delta.content.length;
