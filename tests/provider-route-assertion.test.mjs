@@ -80,6 +80,13 @@ backends:
 // ── 1. direct assertion unit checks ──────────────────────────────────────────
 
 describe("assertProviderRoutes() rule coverage", () => {
+  test("rejects an invalid backend min_output_tokens floor", () => {
+    const errs = assertProviderRoutes({
+      backends: { zai: { auth_type: "none", min_output_tokens: 0 } },
+    });
+    assert.ok(errs.some((e) => e.includes("backends.zai.min_output_tokens must be a positive number")));
+  });
+
   const baseBackends = {
     local: { url: "http://x/v1", auth_type: "none", models: ["good-model", "glob-*"], priority: 1 },
   };

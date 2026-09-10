@@ -761,6 +761,10 @@ export function assertProviderRoutes(
     if ('context_limit' in backend && (!Number.isFinite(backend.context_limit) || backend.context_limit <= 0)) {
       errs.push(`backends.${name}.context_limit must be a positive number of tokens`);
     }
+    if ('min_output_tokens' in backend &&
+        (!Number.isFinite(backend.min_output_tokens) || backend.min_output_tokens <= 0)) {
+      errs.push(`backends.${name}.min_output_tokens must be a positive number of tokens`);
+    }
     if ('require_observed_health' in backend && typeof backend.require_observed_health !== 'boolean') {
       errs.push(`backends.${name}.require_observed_health must be a boolean`);
     }
