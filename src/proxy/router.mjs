@@ -4326,6 +4326,9 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           ? "response_budget"
           : "malformed_response"
         : res.status >= 500 ? "backend_cooldown" : null;
+    if (providerName === "zai" && recoveryFailureClass === "malformed_response") {
+      console.warn(`[router] malformed GLM response model=${candidateModel} code=${responseErrorCode || "unknown"}`);
+    }
     // The response contract rewrites malformed upstream 2xx responses to a
     // non-2xx status, so this is also the schema-valid recovery boundary.
     const recoveryProbeSucceeded = capacityAdmission.probe &&
