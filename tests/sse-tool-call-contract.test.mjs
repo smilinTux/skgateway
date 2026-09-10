@@ -310,10 +310,15 @@ describe("completed SSE tool-call structure", () => {
     assertBoundedRejected(rawResponse([tooLongKey, "data: [DONE]"]));
   });
 
-  test("rejects every usage frame with nonempty choices", () => {
+  test("accepts terminal-only attached usage and rejects semantic usage frames", () => {
     const usage = { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 };
     const usageFrame = (choices) => `data: ${JSON.stringify({ model: MODEL, choices, usage })}`;
     const tool = { index: 0, id: "call_1", type: "function", function: { name: "lookup", arguments: "{}" } };
+    assert.equal(rawResponse([
+      contentFrame(null, "PUBLIC_SYNTHETIC_OK"),
+      usageFrame([{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: "stop" }]),
+      "data: [DONE]",
+    ]).status, 200);
     const cases = [
       [usageFrame([{ index: 0, delta: { content: "PUBLIC_SYNTHETIC_OK" }, finish_reason: "stop" }])],
       [usageFrame([{ index: 0, delta: { reasoning_content: "private chain" }, finish_reason: null }]), contentFrame("stop")],
