@@ -207,7 +207,7 @@ function hasValidUsage(usage) {
   if (!usage || typeof usage !== "object" || Array.isArray(usage)) return false;
   const keys = Object.keys(usage);
   if (!keys.includes("prompt_tokens") || !keys.includes("completion_tokens")
-      || keys.some((key) => !["prompt_tokens", "completion_tokens", "total_tokens", "prompt_tokens_details"].includes(key))) return false;
+      || keys.some((key) => !["prompt_tokens", "completion_tokens", "total_tokens", "prompt_tokens_details", "completion_tokens_details"].includes(key))) return false;
   const values = [usage.prompt_tokens, usage.completion_tokens, usage.total_tokens]
     .filter((value) => value !== undefined);
   if (values.some((value) => !Number.isSafeInteger(value) || value < 0 || value > MAX_USAGE_TOKENS)) return false;
@@ -220,6 +220,13 @@ function hasValidUsage(usage) {
         || Object.keys(details).length !== 1 || !Object.hasOwn(details, "cached_tokens")
         || !Number.isSafeInteger(details.cached_tokens) || details.cached_tokens < 0
         || details.cached_tokens > usage.prompt_tokens) return false;
+  }
+  if (Object.hasOwn(usage, "completion_tokens_details")) {
+    const details = usage.completion_tokens_details;
+    if (!details || typeof details !== "object" || Array.isArray(details)
+        || Object.keys(details).length !== 1 || !Object.hasOwn(details, "reasoning_tokens")
+        || !Number.isSafeInteger(details.reasoning_tokens) || details.reasoning_tokens < 0
+        || details.reasoning_tokens > usage.completion_tokens) return false;
   }
   return true;
 }
