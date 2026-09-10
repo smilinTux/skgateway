@@ -4275,6 +4275,28 @@ export async function routeAndSend(router, request, upstreamPath, method, client
 
     const upstreamStatus = res?.status;
 
+    if (providerName === "zai" && upstreamStatus >= 200 && upstreamStatus < 300 &&
+        String(res?.headers?.["content-type"] || "").includes("text/event-stream")) {
+      const shape = { frames: 0, done: 0, content_chars: 0, reasoning_chars: 0, tool_fragments: 0, finish_reasons: [] };
+      for (const line of res.body.toString("utf8").split("\n")) {
+        if (!line.startsWith("data:")) continue;
+        const payload = line.slice(5).trim();
+        if (payload === "[DONE]") { shape.done++; continue; }
+        try {
+          const frame = JSON.parse(payload);
+          shape.frames++;
+          for (const choice of frame.choices || []) {
+            const delta = choice?.delta || {};
+            if (typeof delta.content === "string") shape.content_chars += delta.content.length;
+            if (typeof delta.reasoning_content === "string") shape.reasoning_chars += delta.reasoning_content.length;
+            if (Array.isArray(delta.tool_calls)) shape.tool_fragments += delta.tool_calls.length;
+            if (choice?.finish_reason != null) shape.finish_reasons.push(choice.finish_reason);
+          }
+        } catch {}
+      }
+      console.log(`[router] GLM SSE shape ${JSON.stringify(shape)}`);
+    }
+
     // Validate the buffered JSON form first, then re-emit and validate the
     // canonical OpenAI SSE form when the original client asked to stream.
     if (flippedToNonStream) {
