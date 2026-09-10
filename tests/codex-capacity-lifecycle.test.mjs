@@ -252,6 +252,19 @@ test("model cooldown is visible without suppressing sibling Codex models", () =>
   ], lookup).map((entry) => entry.id), ["gpt-5.1"]);
 });
 
+test("a malformed model response does not suppress sibling GLM models", () => {
+  capacity.clearCapacity("zai", null, { now: 9100, path: store });
+  capacity.recordModelUnavailable("zai", "glm-5.3", {
+    reason: "malformed_response", now: 9101, retryAt: 10101, path: store,
+  });
+  const failed = capacity.capacityStatus("zai", "glm-5.3", { now: 9102, path: store });
+  const sibling = capacity.capacityStatus("zai", "glm-4.7", { now: 9102, path: store });
+  assert.equal(failed.state, "throttled");
+  assert.equal(failed.scope, "model");
+  assert.equal(failed.reason, "malformed_response");
+  assert.equal(sibling.state, "available");
+});
+
 test("provider exhaustion dominates an earlier model retry deadline", () => {
   capacity._resetCapacityProbesForTests();
   capacity.clearCapacity("codex", "gpt-5", { now: 9500, path: store });

@@ -78,9 +78,17 @@ export function recordProviderUnavailable(provider, {
 export function recordModelThrottled(provider, model, {
   retryAt, now = Date.now(), path = CAPACITY_STORE_PATH,
 } = {}) {
+  return recordModelUnavailable(provider, model, {
+    reason: "rate_limited", retryAt, now, path,
+  });
+}
+
+export function recordModelUnavailable(provider, model, {
+  reason = "backend_cooldown", retryAt, now = Date.now(), path = CAPACITY_STORE_PATH,
+} = {}) {
   const store = load(path);
   const record = {
-    state: "throttled", scope: "model", reason: "rate_limited",
+    state: "throttled", scope: "model", reason,
     retry_at: Math.max(now + 1000, Number(retryAt) || now + 60_000),
     probe_state: "none", observed_at: now,
   };
