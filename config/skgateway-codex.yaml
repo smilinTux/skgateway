@@ -261,6 +261,7 @@ backends:
     models: []
     priority: 2
     timeout_ms: 300000
+    min_output_tokens: 256
 
   ## DISABLED 2026-08-26 by Chef: NVIDIA NIM is reserved for future use.
   ## The config loader deep-merges built-in defaults when this key is absent,

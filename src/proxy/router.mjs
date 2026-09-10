@@ -949,6 +949,10 @@ export class Backend {
     this.context_limit = Number.isFinite(config.context_limit) && config.context_limit > 0
       ? config.context_limit
       : null;
+    /** @type {number} minimum explicit output budget for reasoning models */
+    this.min_output_tokens = Number.isFinite(config.min_output_tokens) && config.min_output_tokens > 0
+      ? config.min_output_tokens
+      : 0;
 
     this._totalRequests = 0;
     this._totalErrors = 0;
@@ -3824,7 +3828,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // A candidate may carry a per-attempt body (e.g. the cloud-fallback
     // candidate rewrites the model to a cloud-served id). Default to the shared
     // body when no override is present.
-    const attemptBody = candidates[i].bodyOverride || attemptBodyBase;
+    let attemptBody = candidates[i].bodyOverride || attemptBodyBase;
 
     // Context preflight (card 9ed4a9f7): a backend may declare context_limit,
     // the true serving-engine token ceiling (e.g. llama.cpp --ctx-size 32768
@@ -3865,6 +3869,11 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // in the list (candidatesFor() only ever matches on model id), so
     // request.model is the correct default.
     const candidateModel = candidates[i].model || request.model;
+    attemptBody = applyBodyFloor(
+      attemptBody,
+      candidateModel,
+      Number.isFinite(backend?.min_output_tokens) ? backend.min_output_tokens : 0,
+    );
     let attemptTimeoutMs = isBucketChain
       ? bucketLivenessTimeoutMs(backend.timeout_ms)
       : backend.timeout_ms;

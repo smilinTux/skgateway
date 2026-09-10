@@ -90,7 +90,7 @@ const applyConfig = (flags) => loadConfig({ configPath: writeConfig(flags), sile
 
 /** A fake upstream that answers 200 and records what model it was asked for. */
 function startUpstream(name) {
-  const state = { count: 0, lastModel: null, modelsStatus: 200, hangCompletions: false };
+  const state = { count: 0, lastModel: null, lastMaxTokens: null, modelsStatus: 200, hangCompletions: false };
   return new Promise((resolve) => {
     const server = http.createServer((req, res) => {
       if (req.url.endsWith('/models') && req.method === 'GET') {
@@ -102,8 +102,14 @@ function startUpstream(name) {
       req.on('data', (c) => chunks.push(c));
       req.on('end', () => {
         state.count++;
-        try { state.lastModel = JSON.parse(Buffer.concat(chunks).toString('utf-8')).model ?? null; }
-        catch { state.lastModel = null; }
+        try {
+          const body = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
+          state.lastModel = body.model ?? null;
+          state.lastMaxTokens = body.max_tokens ?? null;
+        } catch {
+          state.lastModel = null;
+          state.lastMaxTokens = null;
+        }
         if (state.hangCompletions) return;
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ served: name, model: state.lastModel }));
@@ -237,6 +243,7 @@ ${extraRoles}defaults:
     writeFileSync(REGISTRY_PATH, REGISTRY(), 'utf8');
     pool.state.count = 0;
     pool.state.lastModel = null;
+    pool.state.lastMaxTokens = null;
   });
 
   test('SIEM call sites 1 + 3: both bucket_resolve decisions write one typed, attributable line', async () => {
@@ -272,6 +279,36 @@ ${extraRoles}defaults:
       assert.ok(event.request_id);
     }
     assert.equal(new Set(decisions.map((e) => e.request_id)).size, 1);
+  });
+
+  test('a backend output floor protects bucket-routed reasoning responses', async () => {
+    await applyConfig({ buckets_enabled: true });
+    const floorRouter = createRouter({
+      backends: {
+        poolbackend: {
+          url: pool.base,
+          auth_type: 'none',
+          models: ['pool-l-local'],
+          priority: 1,
+          min_output_tokens: 256,
+        },
+      },
+    });
+    const body = Buffer.from(JSON.stringify({
+      model: 'sk-l-secret',
+      max_tokens: 32,
+      messages: [{ role: 'user', content: 'hi' }],
+    }));
+
+    const r = await routeAndSend(
+      floorRouter,
+      { model: 'sk-l-secret', agentId: 'floor-test' },
+      '/chat/completions', 'POST', HEADERS, body, false,
+    );
+
+    assert.equal(r.status, 200);
+    assert.equal(pool.state.lastModel, 'pool-l-local');
+    assert.equal(pool.state.lastMaxTokens, 256);
   });
 
   test('SIEM call site 2: an EOL bucket member skip writes one anomaly outcome line', async () => {
