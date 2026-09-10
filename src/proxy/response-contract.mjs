@@ -329,10 +329,16 @@ export function enforceResponseContract(response, requestedModel) {
         const parsed = JSON.parse(payload);
         if (!servedModel && typeof parsed.model === "string" && parsed.model) servedModel = parsed.model;
         if (Object.hasOwn(parsed, "usage")) {
+          const choices = Array.isArray(parsed.choices) ? parsed.choices : null;
+          const attachedTerminalUsage = choices?.length > 0 && choices.every((choice) => {
+            const output = choice?.delta || {};
+            return choice?.finish_reason != null && !hasVisibleContent(output)
+              && (!Array.isArray(output.tool_calls) || output.tool_calls.length === 0);
+          });
           if (stream.usageSeen || !hasValidUsage(parsed.usage)
-              || !Array.isArray(parsed.choices) || parsed.choices.length !== 0
-              || choiceStates.size === 0
-              || [...choiceStates.values()].some((state) => !hasValidCompletion(state))) stream.invalidCompletion = true;
+              || !choices || (choices.length !== 0 && !attachedTerminalUsage)
+              || (choices.length === 0 && (choiceStates.size === 0
+                || [...choiceStates.values()].some((state) => !hasValidCompletion(state))))) stream.invalidCompletion = true;
           stream.usageSeen = true;
         }
         const clean = stripReasoning(parsed);
