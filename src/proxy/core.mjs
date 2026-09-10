@@ -635,9 +635,9 @@ function stopSSEKeepAlive(state) {
  * @returns {Promise<void>}
  */
 /**
- * Raise an explicit sub-floor `max_tokens` to a reasoning floor for thinking
+ * Raise explicit sub-floor chat-completion token caps to a reasoning floor for thinking
  * models, so <think> tokens do not starve the visible answer to empty. Mutates
- * `parsed` in place. Never lowers a higher cap; leaves an omitted max_tokens
+ * `parsed` in place. Never lowers a higher cap; leaves omitted token caps
  * untouched. Returns true when it changed the value.
  *
  * @param {object} parsed  Parsed request body (mutated).
@@ -647,18 +647,18 @@ function stopSSEKeepAlive(state) {
  * @returns {boolean}
  */
 export function applyReasoningFloor(parsed, cfg, model, log = () => {}) {
-  if (
-    cfg.reasoningFloorMaxTokens > 0 &&
-    Array.isArray(cfg.reasoningModels) &&
-    cfg.reasoningModels.includes(model) &&
-    parsed.max_tokens != null &&
-    parsed.max_tokens < cfg.reasoningFloorMaxTokens
-  ) {
-    log(`reasoning floor: model=${model} max_tokens ${parsed.max_tokens} -> ${cfg.reasoningFloorMaxTokens}`);
-    parsed.max_tokens = cfg.reasoningFloorMaxTokens;
-    return true;
+  if (!(cfg.reasoningFloorMaxTokens > 0) ||
+      !Array.isArray(cfg.reasoningModels) ||
+      !cfg.reasoningModels.includes(model)) return false;
+  let changed = false;
+  for (const key of ["max_tokens", "max_completion_tokens"]) {
+    if (parsed[key] != null && parsed[key] < cfg.reasoningFloorMaxTokens) {
+      log(`reasoning floor: model=${model} ${key} ${parsed[key]} -> ${cfg.reasoningFloorMaxTokens}`);
+      parsed[key] = cfg.reasoningFloorMaxTokens;
+      changed = true;
+    }
   }
-  return false;
+  return changed;
 }
 
 export async function handleRequest(clientReq, clientRes, cfg) {
