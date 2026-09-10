@@ -65,9 +65,11 @@ pooling:
     nvidia:
       max: 20                     # NVIDIA NIM: 20 concurrent
       maxQueue: 500               # Queue up to 500 requests for NVIDIA
-    ollama:
-      max: 50                     # Ollama local: more lenient
-      maxQueue: 200
+    # The old `ollama` override (max 50) was removed 2026-09-04 with the
+    # backend rename to `ornith`. Config validation rejects a per_backend key
+    # for a disabled backend, so when `ornith` is re-enabled add
+    #   ornith: { max: 4, maxQueue: 200 }
+    # here (llama-server on the .100 16 GB card; keep admission small).
     anthropic:
       max: 10                     # Anthropic API limit
       maxQueue: 200
@@ -80,6 +82,9 @@ backends:
   ## Qwen3.8 27B Huihui abliterated Q4_K_M canonical model. chiap01 B70 card 1
   ## is an independent replica at :18810. It claims only the exact model id
   ## reported by its upstream.
+  ## Confirmed live 2026-09-04 (card 0e010200): GET /v1/models reports exactly
+  ## qwen3.8-27b-huihui-abliterated-q4_k_m (owned_by llamacpp, n_ctx 32768) and
+  ## a real chat completion returned 200 with that model id.
   chiap01-qwen38:
     url: http://chiap01:18810/v1
     auth_type: none
@@ -102,8 +107,16 @@ backends:
   ## emitting content, so a low max_tokens returns an EMPTY string with
   ## finish_reason=stop. Observed: 121 completion tokens to answer "say alive".
   ## The registry entry carries min_output_tokens: 8192 for exactly this reason.
+  ##
+  ## 2026-09-04 (card 0e010200): the url was the literal, never-substituted
+  ## placeholder `http://TAILNET_HOST:11439/v1` left by the publication scrub
+  ## (#53), so this block was dead as written. `chiap08` is the bare MagicDNS
+  ## host name; #53 deliberately KEEPS real host names and strips only the
+  ## tailnet address, so the name is publication-safe and it is what resolves.
+  ## Probed live before this edit: GET http://chiap08:11439/v1/models reports
+  ## qwen3.8-27b-huihui-abliterated-q4_k_m (owned_by vllm, max_model_len 131072).
   chiap08-qwen38:
-    url: http://TAILNET_HOST:11439/v1
+    url: http://chiap08:11439/v1
     auth_type: none
     models:
       - qwen3.8-27b-huihui-abliterated-q4_k_m
@@ -180,11 +193,40 @@ backends:
     # each chunk, so only a truly stalled upstream trips it.
     timeout_ms: 120000
 
-  ollama:
-    url: http://192.168.0.100:11434/v1
+  ## ornith = Ornith 1.5 9B on the .100 RTX 5060 Ti (llama-server :8082,
+  ## name-agnostic OpenAI /v1; the same box the registry `ornith` entry and
+  ## the `reg:ornith` synthetic route point at). This block REPLACES the old
+  ## `ollama` backend (.100:11434, glob `dolphin-*`): that listener had been
+  ## dead for about two days, no dolphin model has ever been requested through
+  ## this gateway (audit log: zero hits), and .100 is the ornith host, so the
+  ## backend is now named for what it serves.
+  ##
+  ## DISABLED 2026-09-04 (card 0e010200) because the host did not answer.
+  ## Probed live from the gateway node before this edit:
+  ##   ping 192.168.0.100                         2/2 replies
+  ##   tcp 22 and 11434                           open, but the SSH banner
+  ##                                              exchange times out and an HTTP
+  ##                                              GET on :11434 returns 0 bytes
+  ##                                              in 15 s
+  ##   GET http://192.168.0.100:8082/v1/models    connect timed out after 15 s
+  ##   GET http://192.168.0.100:11438/v1/models   no answer
+  ##   tailscale status (skworld-100)             offline, last seen 2 days ago
+  ## The kernel answers and every service on it is wedged. The gateway journal
+  ## shows this same :8082 endpoint 502ing after 132 s and being QUARANTINED
+  ## at 04:37 the same morning. A declared-but-dead backend is exactly the
+  ## defect this card removes (a retired NVIDIA id left in config broke the
+  ## operator every run), so the block is kept complete and switched OFF.
+  ## To re-enable: verify GET /v1/models AND a real completion on :8082, then
+  ## flip `enabled: true`. There is no discovery provider for this backend, so
+  ## `enabled` here is the only flag; `models` stays non-empty on purpose so
+  ## Backend.matches() can never fall into its empty-list accept-everything
+  ## behaviour.
+  ornith:
+    enabled: false
+    url: http://192.168.0.100:8082/v1
     auth_type: none
     models:
-      - "dolphin-*"
+      - ornith-1.5-9b
     priority: 3
 
   openrouter:
