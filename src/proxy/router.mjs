@@ -4284,6 +4284,13 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       try {
         const completion = JSON.parse(res.body.toString("utf-8"));
         if (completion && Array.isArray(completion.choices) && completion.choices.length) {
+          if (providerName === "zai") {
+            console.log(`[router] GLM flip shape ${JSON.stringify(completion.choices.map((choice) => ({
+              finish_reason: choice?.finish_reason ?? null,
+              content_chars: typeof choice?.message?.content === "string" ? choice.message.content.length : 0,
+              tool_calls: Array.isArray(choice?.message?.tool_calls) ? choice.message.tool_calls.length : 0,
+            })))}`);
+          }
           completion.id ||= ("chatcmpl-flip-" + Date.now());
           completion.created = typeof completion.created === "number"
             ? completion.created : Math.floor(Date.now() / 1000);
