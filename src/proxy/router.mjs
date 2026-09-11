@@ -55,6 +55,7 @@ import { createDecisionCache, decisionKey } from "./decision-cache.mjs";
 // reimplementation. getConfig() gates the whole branch behind
 // routing.match_enabled (config.mjs, unmodified: the DEFAULTS already carry
 // a `routing:` block, card P4.4 adds match_enabled to it later).
+import { getConfig } from "../config.mjs";
 import { buildServingCatalog } from "../discovery.mjs";
 import { rankModels } from "../ranking/rank.mjs";
 import { buildCapabilityCatalog } from "../ranking/catalog.mjs";
