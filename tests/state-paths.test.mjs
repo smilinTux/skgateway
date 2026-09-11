@@ -1,8 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, lstatSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { spawnSync } from "node:child_process";
 import { mkdtempSync } from "node:fs";
 import { ensurePrivateFile, resolveStatePaths, validateStateRoot, ensureStatePaths, writePrivateFileAtomic } from "../src/state/paths.mjs";
 
@@ -53,4 +54,12 @@ test("unsafe existing mutable modes reject before mutation", () => {
       assert.equal(lstatSync(path).mode & 0o777, mode);
     }
   }
+});
+
+test("default XDG state root is validated before production file creation", () => {
+  const base = mkdtempSync(join(tmpdir(), "skgw-default-root-")), root = join(base, "skgateway"); mkdirSync(root, { mode: 0o700 }); chmodSync(root, 0o777);
+  const modulePath = new URL("../src/state/paths.mjs", import.meta.url).href;
+  const result = spawnSync(process.execPath, ["--input-type=module", "-e", `import { DEFAULT_STATE_PATHS, ensurePrivateFile } from ${JSON.stringify(modulePath)}; ensurePrivateFile(DEFAULT_STATE_PATHS.metricsDb);`], { env: { ...process.env, XDG_STATE_HOME: base }, encoding: "utf8" });
+  assert.notEqual(result.status, 0);
+  assert.equal(existsSync(join(root, "metrics.db")), false);
 });

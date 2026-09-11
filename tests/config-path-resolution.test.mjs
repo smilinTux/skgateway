@@ -16,7 +16,7 @@ import { existsSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { resolveConfigPath, SYNCED_CONFIG_PATH } from "../src/config.mjs";
+import { resolveConfigPath, SYNCED_CONFIG_PATH, XDG_CONFIG_PATH } from "../src/config.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "..");
@@ -73,5 +73,9 @@ describe("resolveConfigPath precedence (CR-1.5)", () => {
       SYNCED_CONFIG_PATH.endsWith("/.skcapstone/gateway/skgateway.yaml"),
       `unexpected synced path: ${SYNCED_CONFIG_PATH}`,
     );
+  });
+
+  test("XDG_CONFIG_PATH uses the provider-neutral skgateway root", () => {
+    assert.ok(XDG_CONFIG_PATH.endsWith("/skgateway/skgateway.yaml"));
   });
 });

@@ -72,7 +72,16 @@ function ensureFileParent(path) {
   return parent;
 }
 
+function validateProductionRoot(path, uid) {
+  for (const root of [DEFAULT_STATE_PATHS.configRoot, DEFAULT_STATE_PATHS.stateRoot]) {
+    if (!within(path, root)) continue;
+    validateStateRoot(root, { uid });
+    if (!existsSync(root)) ensurePrivateDirectory(root, uid);
+  }
+}
+
 export function ensurePrivateFile(path, { uid = process.getuid?.() } = {}) {
+  validateProductionRoot(path, uid);
   ensureFileParent(path);
   if (existsSync(path)) {
     const before = lstatSync(path);
@@ -91,6 +100,7 @@ export function ensurePrivateFile(path, { uid = process.getuid?.() } = {}) {
 }
 
 export function writePrivateFileAtomic(path, bytes, { uid = process.getuid?.() } = {}) {
+  validateProductionRoot(path, uid);
   const parent = ensureFileParent(path);
   if (existsSync(path)) {
     const current = lstatSync(path);

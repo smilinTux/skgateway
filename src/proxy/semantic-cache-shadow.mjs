@@ -21,7 +21,7 @@ import { createMxbaiEmbedder } from "./embedders/mxbai.mjs";
  * @param {{emit: (evt:object)=>void, embed?: (t:string)=>Promise<number[]>,
  *          store?: object}} deps  embed/store are injected by tests
  */
-export function createShadowRecorder(cfg, { emit, embed, store } = {}) {
+export function createShadowRecorder(cfg, { emit, embed, store, statePath } = {}) {
   const eligibleSet = new Set(cfg.categories || []);
   const embedFn = embed || createMxbaiEmbedder({
     url: cfg.embed_url,
@@ -36,6 +36,7 @@ export function createShadowRecorder(cfg, { emit, embed, store } = {}) {
     ttlMs: (cfg.ttl_seconds ?? 3600) * 1000,
   });
   const counters = { observed: 0, wouldHit: 0, errors: 0 };
+  const storagePath = statePath ?? cfg.state_path ?? null;
 
   const safeEmit = (evt) => { try { emit?.(evt); } catch { /* never break the path */ } };
 
@@ -98,7 +99,7 @@ export function createShadowRecorder(cfg, { emit, embed, store } = {}) {
     },
 
     stats() {
-      return { ...counters, size: backing.size ?? 0 };
+      return { ...counters, size: backing.size ?? 0, storage_path: storagePath };
     },
   };
 }

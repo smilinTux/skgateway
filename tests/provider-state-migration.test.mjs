@@ -105,3 +105,23 @@ test("rollback preserves repeated ID-less events and rejects a replaced hardlink
   const victim = join(root, "victim"); writeFileSync(victim, "outside\n", { mode: 0o600 }); unlinkSync(input2); linkSync(victim, input2); const before = readFileSync(victim, "utf8");
   assert.notEqual(cli("--rollback", target2).status, 0); assert.equal(readFileSync(victim, "utf8"), before);
 });
+
+test("rollback tracks identical ID-less events by active audit position", () => {
+  const root = mkdtempSync(join(tmpdir(), "skgw-occurrence-")), source = join(root, "source"), target = join(root, "target"); mkdirSync(source);
+  const input = join(source, "audit.jsonl"), line = '{"message":"repeat"}'; writeFileSync(input, `${line}\n`, { mode: 0o600 });
+  migrateProviderState({ sources: [source], target }); const active = join(target, "audit.jsonl");
+  appendFileSync(active, `${line}\n`); assert.equal(JSON.parse(cli("--rollback", target).stdout).replayed, 1);
+  assert.equal(JSON.parse(cli("--rollback", target).stdout).replayed, 0);
+  appendFileSync(active, `${line}\n`); assert.equal(JSON.parse(cli("--rollback", target).stdout).replayed, 1);
+  assert.equal(readFileSync(input, "utf8").split("\n").filter((row) => row === line).length, 3);
+});
+
+test("activation rejects a known input that appeared after staging", () => {
+  const root = mkdtempSync(join(tmpdir(), "skgw-input-set-")), source = join(root, "source"), target = join(root, "target"); mkdirSync(source);
+  writeFileSync(join(source, "audit.jsonl"), '{"event_id":"before"}\n', { mode: 0o600 });
+  assert.throws(() => migrateProviderState({ sources: [source], target, crashAt: "before-activate" }), /injected crash/);
+  writeFileSync(join(source, "capacity_store.json"), '{}\n', { mode: 0o600 });
+  assert.equal(verifyMigration(`${target}.staging`).valid, false);
+  assert.notEqual(cli("--activate", target).status, 0);
+  assert.equal(existsSync(target), false);
+});

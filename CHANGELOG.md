@@ -9,7 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Move mutable gateway metrics, audit, capacity, health, and cache state to
   provider-neutral XDG paths with private file handling and a crash-safe,
-  provenance-preserving staged migration and rollback-forward tool.
+  provenance-preserving staged migration and rollback-forward tool. Migration
+  activation now binds absent known inputs, rollback tracks duplicate audit
+  occurrences by position, and production writes reject unsafe XDG roots.
 
 - Restore router access to the loaded configuration and keep OpenRouter lifecycle fixtures explicit while its production default remains disabled.
 

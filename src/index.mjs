@@ -1166,7 +1166,7 @@ let _shadowCache = null;
 function shadowCache(config) {
   const cfg = config.semantic_cache;
   if (!cfg?.enabled) return null;
-  if (!_shadowCache) _shadowCache = createShadowRecorder(cfg, { emit: siemHook });
+  if (!_shadowCache) _shadowCache = createShadowRecorder(cfg, { emit: siemHook, statePath: config.state_paths.semanticCache });
   return _shadowCache;
 }
 

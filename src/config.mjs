@@ -54,13 +54,15 @@ function expandHome(p) {
  * @type {string}
  */
 export const SYNCED_CONFIG_PATH = resolve(homedir(), '.skcapstone', 'gateway', 'skgateway.yaml');
+export const XDG_CONFIG_PATH = resolve(DEFAULT_STATE_PATHS.configRoot, 'skgateway.yaml');
 
 /**
  * Resolve which skgateway.yaml to load, in precedence order:
  *   1. `explicit` (a function-arg / --config override) if provided
  *   2. `$SKGATEWAY_CONFIG` if set
- *   3. the Syncthing-synced path (SYNCED_CONFIG_PATH) if it exists on disk
- *   4. the in-repo `config/skgateway.yaml` (pre-migration fallback)
+ *   3. the provider-neutral XDG config path if it exists on disk
+ *   4. the Syncthing-synced path (SYNCED_CONFIG_PATH) if it exists on disk
+ *   5. the in-repo `config/skgateway.yaml` (pre-migration fallback)
  * `~/` is expanded in 1 and 2 (systemd Environment= does not expand it).
  *
  * @param {string} [explicit]  Optional explicit override.
@@ -69,6 +71,7 @@ export const SYNCED_CONFIG_PATH = resolve(homedir(), '.skcapstone', 'gateway', '
 export function resolveConfigPath(explicit) {
   if (explicit) return expandHome(explicit);
   if (process.env.SKGATEWAY_CONFIG) return expandHome(process.env.SKGATEWAY_CONFIG);
+  if (existsSync(XDG_CONFIG_PATH)) return XDG_CONFIG_PATH;
   if (existsSync(SYNCED_CONFIG_PATH)) return SYNCED_CONFIG_PATH;
   return resolve(REPO_ROOT, 'config', 'skgateway.yaml');
 }
@@ -77,6 +80,7 @@ export function resolveConfigPath(explicit) {
 
 /** @type {import('./config-types.d.ts').GatewayConfig} */
 const DEFAULTS = {
+  state_paths: { ...DEFAULT_STATE_PATHS },
   server: {
     port: 18780,
     dashboard_port: 18781,
@@ -590,6 +594,7 @@ function normalizeSemanticCache(raw = {}) {
     embed_model: typeof sc.embed_model === "string" && sc.embed_model
       ? sc.embed_model : "mxbai-embed-large",
     embed_timeout_ms: Number.isFinite(sc.embed_timeout_ms) ? sc.embed_timeout_ms : 5000,
+    state_path: typeof sc.state_path === "string" && sc.state_path ? expandHome(sc.state_path) : DEFAULT_STATE_PATHS.semanticCache,
     categories: Array.isArray(sc.categories) && sc.categories.length
       ? sc.categories.filter((c) => typeof c === "string")
       : ["administrative", "system", "data_query"],

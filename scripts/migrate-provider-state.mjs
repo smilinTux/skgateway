@@ -4,6 +4,7 @@ import { chmodSync, closeSync, constants, copyFileSync, existsSync, fstatSync, f
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import Database from "better-sqlite3";
+import { writePrivateFileAtomic } from "../src/state/paths.mjs";
 
 const ROOT_FILES = [["metrics.db", "sqlite"], ["audit.jsonl", "jsonl"], ["capacity-state.json", "json"], ["capacity_store.json", "json"], ["provider-health.json", "json"], ["model_catalog_store.json", "json"], ["model_catalog_cache.json", "json"], ["skgateway.yaml", "yaml"], ["registry.yaml", "yaml"], ["model-registry.yaml", "yaml"], ["model-cards.overrides.yaml", "yaml"]];
 const hashBytes = (bytes) => createHash("sha256").update(bytes).digest("hex");
@@ -108,7 +109,7 @@ function mergeJsonObjects(paths, output) {
 function inventoryRoots(roots) {
   const inventory = [];
   for (const root of roots) {
-    for (const [file, kind] of ROOT_FILES) { const path = join(root, file); if (existsSync(path)) inventory.push({ name: `${basename(root)}:${file}`, kind, path }); }
+    for (const [file, kind] of ROOT_FILES) { const path = join(root, file); inventory.push({ name: `${basename(root)}:${file}`, kind, path }); }
     const cacheRoot = join(root, "semantic-cache");
     if (existsSync(cacheRoot)) for (const entry of readdirSync(cacheRoot, { recursive: true, withFileTypes: true })) { if (entry.isFile()) { const path = join(entry.parentPath || entry.path, entry.name); inventory.push({ name: `${basename(root)}:semantic-cache/${relative(cacheRoot, path)}`, kind: "cache", path }); } }
   }
@@ -116,7 +117,7 @@ function inventoryRoots(roots) {
   return inventory;
 }
 function copyInventoryFiles(inventory, stage) {
-  const files = inventory.filter((item) => ["yaml", "cache"].includes(item.kind) && item.path);
+  const files = inventory.filter((item) => ["yaml", "cache"].includes(item.kind) && item.path && existsSync(item.path));
   files.forEach((item, index) => { const directory = item.kind === "cache" ? join(stage, "semantic-cache") : join(stage, "inventory"); mkdirSync(directory, { recursive: true, mode: 0o700 }); const output = join(directory, `${index}-${basename(item.path)}`); copyFileSync(item.path, output, constants.COPYFILE_EXCL); chmodSync(output, 0o600); syncFile(output); });
 }
 function describeOutputs(stage) {
@@ -132,9 +133,9 @@ function stageProviderState({ sources, target }) {
   const destination = resolve(target), stage = `${destination}.staging`;
   if (existsSync(stage)) { ownedManifest(stage, destination); rmSync(stage, { recursive: true }); }
   mkdirSync(stage, { mode: 0o700 });
-  const inventory = inventoryRoots(roots), migrationId = randomUUID(), snapshot = buildMigrationManifest(inventory, { migrationId, target: destination }), metrics = inventory.filter((i) => i.kind === "sqlite").map((i) => i.path), audits = inventory.filter((i) => i.kind === "jsonl").map((i) => i.path);
+  const inventory = inventoryRoots(roots), migrationId = randomUUID(), snapshot = buildMigrationManifest(inventory, { migrationId, target: destination }), metrics = inventory.filter((i) => i.kind === "sqlite" && existsSync(i.path)).map((i) => i.path), audits = inventory.filter((i) => i.kind === "jsonl" && existsSync(i.path)).map((i) => i.path);
   if (metrics.length) mergeSqlite(metrics, join(stage, "metrics.db")); if (audits.length) writeAudit(audits, join(stage, "audit.jsonl"));
-  for (const [output, names] of [["capacity-state.json", ["capacity-state.json", "capacity_store.json"]], ["provider-health.json", ["provider-health.json"]], ["model_catalog_store.json", ["model_catalog_store.json"]], ["model_catalog_cache.json", ["model_catalog_cache.json"]]]) { const paths = inventory.filter((i) => i.kind === "json" && names.includes(basename(i.path))).map((i) => i.path); if (paths.length) mergeJsonObjects(paths, join(stage, output)); }
+  for (const [output, names] of [["capacity-state.json", ["capacity-state.json", "capacity_store.json"]], ["provider-health.json", ["provider-health.json"]], ["model_catalog_store.json", ["model_catalog_store.json"]], ["model_catalog_cache.json", ["model_catalog_cache.json"]]]) { const paths = inventory.filter((i) => i.kind === "json" && existsSync(i.path) && names.includes(basename(i.path))).map((i) => i.path); if (paths.length) mergeJsonObjects(paths, join(stage, output)); }
   copyInventoryFiles(inventory, stage);
   const outputs = describeOutputs(stage);
   for (const source of snapshot.sources.filter((item) => item.status === "present")) if (!sourceUnchanged(source)) throw new Error(`source changed during staging: ${source.path}`);
@@ -142,6 +143,7 @@ function stageProviderState({ sources, target }) {
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 }); syncFile(manifestPath); syncDirectory(stage); return { stage, manifest };
 }
 function sourceUnchanged(source) {
+  if (source.status === "missing") return !existsSync(source.path);
   if (source.status !== "present" || !existsSync(source.path)) return false;
   const current = lstatSync(source.path);
   if (!current.isFile() || current.nlink !== source.links || current.dev !== source.device || current.ino !== source.inode || current.uid !== source.uid || (current.mode & 0o777) !== source.mode || hashFile(source.path) !== source.sha256) return false;
@@ -153,7 +155,7 @@ export function verifyMigration(root) {
   try {
     const manifest = JSON.parse(readFileSync(join(root, "migration-manifest.json"), "utf8"));
     if (manifest.version !== 2 || !manifest.migration_id || !manifest.target) return { valid: false, reason: "manifest_identity" };
-    for (const source of manifest.sources.filter((i) => i.status === "present")) if (!sourceUnchanged(source)) return { valid: false, reason: "source_changed" };
+    for (const source of manifest.sources.filter((i) => i.status !== "no_source")) if (!sourceUnchanged(source)) return { valid: false, reason: "source_changed" };
     for (const output of manifest.outputs) { const path = join(root, output.path); if (!existsSync(path)) return { valid: false, reason: "output_missing" }; const stat = assertRegularSingleLink(path); if (stat.size !== output.bytes || hashFile(path) !== output.sha256) return { valid: false, reason: "output_changed" }; if (output.kind === "sqlite") { const details = sqliteDetails(path); if (JSON.stringify(details.tables) !== JSON.stringify(output.tables)) return { valid: false, reason: "output_counts_changed" }; } else if (output.kind === "jsonl") { const records = readFileSync(path, "utf8").split("\n").filter(Boolean).map(JSON.parse).length; if (records !== output.records) return { valid: false, reason: "output_counts_changed" }; } else if (output.kind === "json") JSON.parse(readFileSync(path, "utf8")); }
     return { valid: true, manifest };
   } catch (error) { return { valid: false, reason: error.message }; }
@@ -171,7 +173,7 @@ function rollback(target) {
   const destination = resolve(target), stage = `${destination}.staging`;
   if (!existsSync(destination)) { if (!existsSync(stage)) throw new Error("no owned migration to roll back"); ownedManifest(stage, destination); rmSync(stage, { recursive: true }); syncDirectory(dirname(destination)); return { staged_removed: true }; }
   const manifest = ownedManifest(destination, destination), activeAudit = join(destination, "audit.jsonl"), sourceAudit = manifest.sources.find((i) => i.kind === "jsonl" && i.status === "present")?.path; let replayed = 0;
-  if (sourceAudit && existsSync(activeAudit)) { const sourceRecord = manifest.sources.find((item) => item.path === sourceAudit), existing = new Set(readFileSync(sourceAudit, "utf8").split("\n").filter(Boolean).map(hashBytes)), additions = []; for (const line of readFileSync(activeAudit, "utf8").split("\n").filter(Boolean)) { const event = JSON.parse(line); if (!event.migration_provenance && !existing.has(hashBytes(line))) additions.push(line); } if (additions.length) { const fd = openSync(sourceAudit, constants.O_WRONLY | constants.O_APPEND | constants.O_NOFOLLOW); try { const opened = fstatSync(fd); if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== sourceRecord.device || opened.ino !== sourceRecord.inode || opened.uid !== sourceRecord.uid || (opened.mode & 0o777) !== sourceRecord.mode) throw new Error("rollback source identity changed"); writeFileSync(fd, `${additions.join("\n")}\n`); fsyncSync(fd); } finally { closeSync(fd); } replayed = additions.length; } }
+  if (sourceAudit && existsSync(activeAudit)) { const sourceRecord = manifest.sources.find((item) => item.path === sourceAudit), activeLines = readFileSync(activeAudit, "utf8").split("\n").filter(Boolean), cursorPath = join(dirname(sourceAudit), `.skgateway-rollback-${manifest.migration_id}.json`); let cursor = manifest.outputs.find((item) => item.path === "audit.jsonl")?.records ?? 0; if (existsSync(cursorPath)) { const saved = JSON.parse(readFileSync(cursorPath, "utf8")); if (saved.migration_id !== manifest.migration_id || !Number.isSafeInteger(saved.active_records)) throw new Error("invalid rollback cursor"); cursor = saved.active_records; } if (cursor > activeLines.length) throw new Error("active audit truncated after rollback"); const additions = activeLines.slice(cursor).filter((line) => !JSON.parse(line).migration_provenance); if (additions.length) { const fd = openSync(sourceAudit, constants.O_WRONLY | constants.O_APPEND | constants.O_NOFOLLOW); try { const opened = fstatSync(fd); if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== sourceRecord.device || opened.ino !== sourceRecord.inode || opened.uid !== sourceRecord.uid || (opened.mode & 0o777) !== sourceRecord.mode) throw new Error("rollback source identity changed"); writeFileSync(fd, `${additions.join("\n")}\n`); fsyncSync(fd); } finally { closeSync(fd); } replayed = additions.length; } writePrivateFileAtomic(cursorPath, `${JSON.stringify({ migration_id: manifest.migration_id, active_records: activeLines.length })}\n`); }
   return { active_preserved: true, replayed };
 }
 function usage() { process.stderr.write("usage: migrate-provider-state.mjs --inventory SOURCE... | --stage TARGET SOURCE... | --verify TARGET | --activate TARGET | --rollback TARGET\n"); }
