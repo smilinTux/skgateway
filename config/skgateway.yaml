@@ -71,7 +71,17 @@ pooling:
     #   ornith: { max: 4, maxQueue: 200 }
     # here (llama-server on the .100 16 GB card; keep admission small).
     anthropic:
-      max: 10                     # Anthropic API limit
+      # MUST equal CCAPI_MAX_CONCURRENT in ~/.config/claude-code-api.env.
+      # This is not "the Anthropic API limit" (that comment was stale from when
+      # this backend pointed at api.anthropic.com); the backend is the local
+      # `claude --print` wrapper, whose semaphore is the real ceiling. On
+      # 2026-09-11 this said 10 while the wrapper allowed 3, so the gateway
+      # overdrove it, requests blew the wrapper's 90s QUEUE_TIMEOUT, and the
+      # resulting 500s tripped the error-rate breaker and took claude-* down.
+      # Wrapper raised to 10 the same day to match. Each wrapper slot is a
+      # ~300MB `claude --print` plus MCP servers, so raising this pair further
+      # needs a look at free memory first.
+      max: 10
       maxQueue: 200
 
 backends:
