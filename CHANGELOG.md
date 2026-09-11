@@ -14,7 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   occurrences by position, durable cache directory inventories reject any
   post-stage change including dangling symlink creation, and production writes
   reject unsafe XDG roots. Rollback-forward audit replay uses a durable
-  write-ahead journal to recover exactly once after process interruption.
+  write-ahead journal to recover exactly once after process interruption, with
+  a canonical digest and active-occurrence binding that rejects corruption.
 
 - Restore router access to the loaded configuration and keep OpenRouter lifecycle fixtures explicit while its production default remains disabled.
 

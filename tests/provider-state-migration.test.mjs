@@ -168,3 +168,18 @@ test("rollback journal recovers exactly once across SIGKILL windows", () => {
     assert.equal(readFileSync(input, "utf8").split("\n").filter((row) => row === line).length, 1, phase);
   }
 });
+
+test("rollback rejects a changed journal payload without mutating source or cursor", () => {
+  const root = mkdtempSync(join(tmpdir(), "skgw-replay-corrupt-")), source = join(root, "source"), target = join(root, "target"); mkdirSync(source);
+  const input = join(source, "audit.jsonl"), before = '{"event_id":"before"}'; writeFileSync(input, `${before}\n`, { mode: 0o600 });
+  migrateProviderState({ sources: [source], target }); appendFileSync(join(target, "audit.jsonl"), '{"message":"intended"}\n');
+  const preload = new URL("./fixtures/rollback-crash-after-fsync.mjs", import.meta.url).pathname;
+  const crashed = spawnSync(process.execPath, ["--import", preload, migrationScript, "--rollback", target], { encoding: "utf8", env: { ...process.env, SKGW_TEST_CRASH_SOURCE: input, SKGW_TEST_CRASH_PHASE: "preappend" } });
+  assert.equal(crashed.signal, "SIGKILL");
+  const journal = join(source, fs.readdirSync(source).find((name) => name.endsWith(".journal"))), value = JSON.parse(readFileSync(journal, "utf8"));
+  value.payload_base64 = Buffer.from('{"message":"substituted"}\n').toString("base64"); writeFileSync(journal, `${JSON.stringify(value)}\n`, { mode: 0o600 });
+  assert.notEqual(cli("--rollback", target).status, 0);
+  assert.equal(readFileSync(input, "utf8"), `${before}\n`);
+  assert.equal(existsSync(journal), true);
+  assert.equal(fs.readdirSync(source).some((name) => name.endsWith(".json")), false);
+});

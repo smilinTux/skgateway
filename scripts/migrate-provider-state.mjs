@@ -190,6 +190,21 @@ function persistPrivateJson(path, value) {
   syncFile(path);
   syncDirectory(dirname(path));
 }
+const REPLAY_JOURNAL_FIELDS = ["migration_id", "active_start", "active_records", "replayed_records", "active_device", "active_inode", "source_device", "source_inode", "source_offset", "payload_base64"];
+function sealReplayJournal(fields) { return { ...fields, digest: hashBytes(Buffer.from(JSON.stringify(fields))) }; }
+function validateReplayJournal(journal, manifest, activeAudit, cursor) {
+  const keys = Object.keys(journal).sort(), expectedKeys = [...REPLAY_JOURNAL_FIELDS, "digest"].sort();
+  if (JSON.stringify(keys) !== JSON.stringify(expectedKeys)) throw new Error("invalid rollback journal fields");
+  const fields = Object.fromEntries(REPLAY_JOURNAL_FIELDS.map((key) => [key, journal[key]]));
+  if (journal.digest !== hashBytes(Buffer.from(JSON.stringify(fields)))) throw new Error("invalid rollback journal digest");
+  if (journal.migration_id !== manifest.migration_id || !Number.isSafeInteger(journal.active_start) || !Number.isSafeInteger(journal.active_records) || !Number.isSafeInteger(journal.replayed_records) || !Number.isSafeInteger(journal.source_offset) || !Number.isSafeInteger(journal.active_device) || !Number.isSafeInteger(journal.active_inode) || !Number.isSafeInteger(journal.source_device) || !Number.isSafeInteger(journal.source_inode) || ![journal.active_start, journal.active_records].includes(cursor)) throw new Error("invalid rollback journal identity");
+  const activeStat = assertRegularSingleLink(activeAudit);
+  if (activeStat.dev !== journal.active_device || activeStat.ino !== journal.active_inode) throw new Error("rollback active audit identity changed");
+  const lines = readFileSync(activeAudit, "utf8").split("\n").filter(Boolean);
+  if (journal.active_start > journal.active_records || journal.active_records > lines.length) throw new Error("rollback active occurrence range changed");
+  const expectedPayload = Buffer.from(`${lines.slice(journal.active_start, journal.active_records).filter((line) => !JSON.parse(line).migration_provenance).join("\n")}\n`);
+  if (journal.replayed_records !== lines.slice(journal.active_start, journal.active_records).filter((line) => !JSON.parse(line).migration_provenance).length || !Buffer.from(journal.payload_base64, "base64").equals(expectedPayload)) throw new Error("rollback journal payload changed");
+}
 function validateReplaySource(sourceAudit, sourceRecord) {
   const stat = lstatSync(sourceAudit);
   if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.dev !== sourceRecord.device || stat.ino !== sourceRecord.inode || stat.uid !== sourceRecord.uid || (stat.mode & 0o777) !== sourceRecord.mode) throw new Error("rollback source identity changed");
@@ -217,14 +232,14 @@ function rollback(target) {
     if (existsSync(cursorPath)) { const saved = JSON.parse(readFileSync(cursorPath, "utf8")); if (saved.migration_id !== manifest.migration_id || !Number.isSafeInteger(saved.active_records)) throw new Error("invalid rollback cursor"); cursor = saved.active_records; }
     if (pathEntryExists(journalPath)) {
       const journal = JSON.parse(readFileSync(journalPath, "utf8"));
-      if (journal.migration_id !== manifest.migration_id || !Number.isSafeInteger(journal.active_records) || journal.active_records > activeLines.length) throw new Error("invalid rollback journal");
+      validateReplayJournal(journal, manifest, activeAudit, cursor);
       if (cursor < journal.active_records) { const appended = reconcileReplayJournal(journal, sourceAudit, sourceRecord); replayed += appended ? journal.replayed_records : 0; persistPrivateJson(cursorPath, { migration_id: manifest.migration_id, active_records: journal.active_records }); cursor = journal.active_records; }
       unlinkSync(journalPath); syncDirectory(parent);
     }
     if (cursor > activeLines.length) throw new Error("active audit truncated after rollback");
     const additions = activeLines.slice(cursor).filter((line) => !JSON.parse(line).migration_provenance);
     if (additions.length) {
-      const payload = Buffer.from(`${additions.join("\n")}\n`), sourceStat = validateReplaySource(sourceAudit, sourceRecord), journal = { migration_id: manifest.migration_id, active_records: activeLines.length, replayed_records: additions.length, source_device: sourceStat.dev, source_inode: sourceStat.ino, source_offset: sourceStat.size, payload_base64: payload.toString("base64") };
+      const payload = Buffer.from(`${additions.join("\n")}\n`), sourceStat = validateReplaySource(sourceAudit, sourceRecord), activeStat = assertRegularSingleLink(activeAudit), journal = sealReplayJournal({ migration_id: manifest.migration_id, active_start: cursor, active_records: activeLines.length, replayed_records: additions.length, active_device: activeStat.dev, active_inode: activeStat.ino, source_device: sourceStat.dev, source_inode: sourceStat.ino, source_offset: sourceStat.size, payload_base64: payload.toString("base64") });
       persistPrivateJson(journalPath, journal);
       if (reconcileReplayJournal(journal, sourceAudit, sourceRecord)) replayed += additions.length;
       persistPrivateJson(cursorPath, { migration_id: manifest.migration_id, active_records: activeLines.length });
