@@ -285,31 +285,37 @@ ${extraRoles}defaults:
     assert.equal(new Set(decisions.map((e) => e.request_id)).size, 1);
   });
 
-  test('a bucket skips a member whose exact model claims are quarantined', async () => {
-    const dead = await startUpstream('dead');
+  test('a bucket skips multiple members whose exact model claims are quarantined', async () => {
+    const deadFirst = await startUpstream('dead-first');
+    const deadSecond = await startUpstream('dead-second');
     const live = await startUpstream('live');
-    dead.state.status = 404;
+    deadFirst.state.status = 404;
+    deadSecond.state.status = 404;
     try {
       await applyConfig({ buckets_enabled: true });
       writeFileSync(CATALOG_CACHE_PATH, JSON.stringify({ models: [
-        { id: 'dead-l-local', provider: 'local', free: true, card: { tier: 'local', size_class: 'L' } },
+        { id: 'dead-first-l-local', provider: 'local', free: true, card: { tier: 'local', size_class: 'L' } },
+        { id: 'dead-second-l-local', provider: 'local', free: true, card: { tier: 'local', size_class: 'L' } },
         { id: 'live-l-local', provider: 'local', free: true, card: { tier: 'local', size_class: 'L' } },
       ] }), 'utf8');
       const failoverRouter = createRouter({ backends: {
-        dead: { url: dead.base, auth_type: 'none', models: ['dead-l-local'], priority: 1 },
-        live: { url: live.base, auth_type: 'none', models: ['live-l-local'], priority: 2 },
+        deadFirst: { url: deadFirst.base, auth_type: 'none', models: ['dead-first-l-local'], priority: 1 },
+        deadSecond: { url: deadSecond.base, auth_type: 'none', models: ['dead-second-l-local'], priority: 2 },
+        live: { url: live.base, auth_type: 'none', models: ['live-l-local'], priority: 3 },
       }});
 
-      for (let i = 0; i < 3; i++) {
-        const failed = await routeAndSend(
-          failoverRouter,
-          { model: 'dead-l-local', agentId: 'quarantine-fixture' },
-          '/chat/completions', 'POST', HEADERS, bodyFor('dead-l-local'), false,
-        );
-        assert.equal(failed.status, 404);
+      for (const model of ['dead-first-l-local', 'dead-second-l-local']) {
+        for (let i = 0; i < 3; i++) {
+          const failed = await routeAndSend(
+            failoverRouter,
+            { model, agentId: 'quarantine-fixture' },
+            '/chat/completions', 'POST', HEADERS, bodyFor(model), false,
+          );
+          assert.equal(failed.status, 404);
+        }
       }
       await assert.rejects(
-        failoverRouter.route({ model: 'dead-l-local', agentId: 'direct-request' }),
+        failoverRouter.route({ model: 'dead-first-l-local', agentId: 'direct-request' }),
         ModelClaimQuarantinedError,
         'a direct concrete request remains fail closed',
       );
@@ -323,7 +329,8 @@ ${extraRoles}defaults:
       assert.equal(result.bucketMember, 'live-l-local');
       assert.equal(live.state.lastModel, 'live-l-local');
     } finally {
-      await dead.close();
+      await deadFirst.close();
+      await deadSecond.close();
       await live.close();
     }
   });
