@@ -142,6 +142,31 @@ test("autonomous scheduler probes only after retry_at and stays single-flight", 
   assert.equal(calls, 1);
 });
 
+test("scheduled owner remains a probe after the first exact model recovers", async () => {
+  capacity._resetCapacityProbesForTests();
+  const path = join(mkdtempSync(join(tmpdir(), "skgw-multimodel-probe-")), "capacity.json");
+  const models = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
+  capacity.recordSubscriptionExhausted("codex", { now: 1000, retryAt: 2000, path });
+
+  await capacity.runDueCapacityProbes(
+    models.map((model) => ({ provider: "codex", model })),
+    async ({ model }, { probeOwner }) => {
+      const admission = capacity.admitCapacity("codex", model, {
+        now: 2000, publicSynthetic: true, probeOwner, path,
+      });
+      assert.equal(admission.probe, true);
+      capacity.finishCapacityProbe("codex", true, {
+        probeOwner, model, now: 2000, path,
+      });
+      return { status: 200 };
+    },
+    { now: 2000, path },
+  );
+
+  assert.equal(capacity.capacityStatus("codex", models.at(-1), { now: 2000, path }).state, "available");
+  assert.equal(capacity.capacityStatus("codex", models.at(-1), { now: 2000, path }).probe_state, "succeeded");
+});
+
 test("autonomous probe can clear provider capacity through the routed outcome contract", async () => {
   capacity._resetCapacityProbesForTests();
   capacity.recordSubscriptionExhausted("codex", { now: 2000, retryAt: 3000, path: store });

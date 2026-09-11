@@ -51,6 +51,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Preserve the scheduled provider probe owner across every exact recovery
+  model so a later successful target cannot re-arm provider throttling.
+
 - Bind each capacity recovery probe to its named backend with no registry
   substitution or cross-provider fallback.
 
