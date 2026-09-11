@@ -192,6 +192,20 @@ backends:
     # enough for a real `claude --print` completion; a live stream resets it on
     # each chunk, so only a truly stalled upstream trips it.
     timeout_ms: 120000
+    # The "no failover target" above was a COMMENT, not a constraint, until
+    # 2026-09-11. Purity is opt-in per backend (card f361407c) and this flag was
+    # never set, so the design was unenforced. Live that morning: the wrapper ran
+    # out of slots (CCAPI_MAX_CONCURRENT=3) and 500'd, error_rate hit 100%, the
+    # backend was marked DOWN for a 60s cooldown, and claude-opus-5 then fell
+    # through to `primary=nvidia`. NVIDIA NIM has no such model, so its Go mux
+    # answered a bare `404 page not found`, which Hermes surfaced in Telegram as
+    # "The model provider failed after retries." A transient local cooldown
+    # became a hard 404 on a model that was never NVIDIA's to serve. With purity
+    # on, a down wrapper fails closed as 503 model_owner_backend_down naming this
+    # backend, so callers back off against the real owner instead of burning
+    # retries on doors that structurally cannot answer claude-*.
+    # Pinned by tests/claude-subscription-purity.test.mjs.
+    provider_purity: true
 
   ## ornith = Ornith 1.5 9B on the .100 RTX 5060 Ti (llama-server :8082,
   ## name-agnostic OpenAI /v1; the same box the registry `ornith` entry and
