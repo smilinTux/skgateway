@@ -242,7 +242,7 @@ ${extraRoles}defaults:
     _resetCacheForTests();
     writeFileSync(STORE_PATH, JSON.stringify({}), 'utf8');
     writeFileSync(CATALOG_CACHE_PATH, JSON.stringify({ models: CATALOG }), 'utf8');
-    writeFileSync(CAPACITY_PATH, JSON.stringify({}), 'utf8');
+    writeFileSync(CAPACITY_PATH, JSON.stringify({}), { encoding: 'utf8', mode: 0o600 });
     writeFileSync(REGISTRY_PATH, REGISTRY(), 'utf8');
     pool.state.count = 0;
     pool.state.lastModel = null;

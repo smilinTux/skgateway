@@ -60,6 +60,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Bind state migration activation to one exact source snapshot and target,
+  authenticate output metadata, preserve repeated rollback events, and reject
+  unsafe mutable files before any write.
+
 - Normalize only legacy model-local Z.ai malformed-response and transport
   recovery deadlines at read time without rewriting persisted capacity state.
 

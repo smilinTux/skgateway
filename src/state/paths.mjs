@@ -79,6 +79,7 @@ export function ensurePrivateFile(path, { uid = process.getuid?.() } = {}) {
     if (before.isSymbolicLink()) throw new Error(`state file is a symlink: ${path}`);
     if (!before.isFile() || before.nlink !== 1) throw new Error(`state file must be a regular single-link file: ${path}`);
     if (uid != null && before.uid !== uid) throw new Error(`state file has wrong owner: ${path}`);
+    if ((before.mode & 0o777) !== 0o600) throw new Error(`state file has unsafe permissions: ${path}`);
   }
   const fd = openSync(path, constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW, 0o600);
   try {
@@ -97,6 +98,7 @@ export function writePrivateFileAtomic(path, bytes, { uid = process.getuid?.() }
       throw new Error(`state file must be a regular single-link file: ${path}`);
     }
     if (uid != null && current.uid !== uid) throw new Error(`state file has wrong owner: ${path}`);
+    if ((current.mode & 0o777) !== 0o600) throw new Error(`state file has unsafe permissions: ${path}`);
   }
   const temp = join(parent, `.${process.pid}.${Date.now()}.tmp`);
   const fd = openSync(temp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);

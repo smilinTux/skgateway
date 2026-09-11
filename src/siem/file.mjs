@@ -45,7 +45,6 @@ import {
   stat,
   rename,
   unlink,
-  mkdir,
   readdir,
 } from 'node:fs/promises';
 import { constants } from 'node:fs';
@@ -229,8 +228,6 @@ export function createFileOutput(config) {
    */
   async function _openFile() {
     if (_fd) return;
-    const dir = dirname(logPath);
-    await mkdir(dir, { recursive: true, mode: 0o700 });
     ensurePrivateFile(logPath);
     _fd = await open(logPath, constants.O_WRONLY | constants.O_APPEND | constants.O_NOFOLLOW);
     await _fd.chmod(0o600);
@@ -339,10 +336,11 @@ export function createFileOutput(config) {
    * @returns {Promise<void>}
    */
   function _schedule(work) {
-    _chain = _chain.then(work).catch((err) => {
+    const run = _chain.then(work);
+    _chain = run.catch((err) => {
       process.stderr.write(`[skgateway:siem:file] I/O error: ${err.message}\n`);
     });
-    return _chain;
+    return run;
   }
 
   // ── timer ─────────────────────────────────────────────────────────────────

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, closeSync, constants, copyFileSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, constants, copyFileSync, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import Database from "better-sqlite3";
@@ -37,7 +37,7 @@ function describeSource(source) {
   const path = resolve(source.path);
   if (!existsSync(path)) return { name: source.name, kind: source.kind, path, status: "missing" };
   const stat = assertRegularSingleLink(path);
-  const item = { name: source.name, kind: source.kind, path, status: "present", bytes: stat.size, sha256: hashFile(path) };
+  const item = { name: source.name, kind: source.kind, path, status: "present", bytes: stat.size, sha256: hashFile(path), device: stat.dev, inode: stat.ino, uid: stat.uid, mode: stat.mode & 0o777, links: stat.nlink };
   const companions = [];
   for (const suffix of source.kind === "sqlite" ? ["-wal", "-shm"] : []) {
     const companion = `${path}${suffix}`;
@@ -77,7 +77,7 @@ function mergeSqlite(paths, output) {
             if (existing && equalRows(existing, row, columns)) disposition = "deduplicated";
             else if (existing) { disposition = "rekeyed_conflict"; if (integerPrimary) delete row[primary[0].name]; else row[primary[0].name] = `${row[primary[0].name]}#migration:${sourceHash.slice(0, 12)}:${sourceIndex}`; }
           }
-          if (disposition !== "deduplicated") { const names = columns.filter((c) => Object.hasOwn(row, c)); db.prepare(`INSERT INTO ${quote(table.name)} (${names.map(quote).join(",")}) VALUES (${names.map(() => "?").join(",")})`).run(...names.map((c) => row[c])); }
+          if (disposition !== "deduplicated") { const names = columns.filter((c) => Object.hasOwn(row, c)); const inserted = db.prepare(`INSERT INTO ${quote(table.name)} (${names.map(quote).join(",")}) VALUES (${names.map(() => "?").join(",")})`).run(...names.map((c) => row[c])); if (integerPrimary && !Object.hasOwn(row, primary[0].name)) row[primary[0].name] = Number(inserted.lastInsertRowid); }
           db.prepare("INSERT INTO migration_provenance VALUES (?, ?, ?, ?, ?, ?)").run(table.name, sourcePath, sourceHash, sourceIdentity, primary.length ? rowKey(row, primary.map((c) => c.name)) : null, disposition);
         }
       }
@@ -132,15 +132,19 @@ function stageProviderState({ sources, target }) {
   const destination = resolve(target), stage = `${destination}.staging`;
   if (existsSync(stage)) { ownedManifest(stage, destination); rmSync(stage, { recursive: true }); }
   mkdirSync(stage, { mode: 0o700 });
-  const inventory = inventoryRoots(roots), migrationId = randomUUID(), metrics = inventory.filter((i) => i.kind === "sqlite").map((i) => i.path), audits = inventory.filter((i) => i.kind === "jsonl").map((i) => i.path);
+  const inventory = inventoryRoots(roots), migrationId = randomUUID(), snapshot = buildMigrationManifest(inventory, { migrationId, target: destination }), metrics = inventory.filter((i) => i.kind === "sqlite").map((i) => i.path), audits = inventory.filter((i) => i.kind === "jsonl").map((i) => i.path);
   if (metrics.length) mergeSqlite(metrics, join(stage, "metrics.db")); if (audits.length) writeAudit(audits, join(stage, "audit.jsonl"));
   for (const [output, names] of [["capacity-state.json", ["capacity-state.json", "capacity_store.json"]], ["provider-health.json", ["provider-health.json"]], ["model_catalog_store.json", ["model_catalog_store.json"]], ["model_catalog_cache.json", ["model_catalog_cache.json"]]]) { const paths = inventory.filter((i) => i.kind === "json" && names.includes(basename(i.path))).map((i) => i.path); if (paths.length) mergeJsonObjects(paths, join(stage, output)); }
   copyInventoryFiles(inventory, stage);
-  const manifest = buildMigrationManifest(inventory, { migrationId, target: destination, outputs: describeOutputs(stage) }), manifestPath = join(stage, "migration-manifest.json");
+  const outputs = describeOutputs(stage);
+  for (const source of snapshot.sources.filter((item) => item.status === "present")) if (!sourceUnchanged(source)) throw new Error(`source changed during staging: ${source.path}`);
+  const manifest = { ...snapshot, outputs }, manifestPath = join(stage, "migration-manifest.json");
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 }); syncFile(manifestPath); syncDirectory(stage); return { stage, manifest };
 }
 function sourceUnchanged(source) {
-  if (source.status !== "present" || !existsSync(source.path) || hashFile(source.path) !== source.sha256) return false;
+  if (source.status !== "present" || !existsSync(source.path)) return false;
+  const current = lstatSync(source.path);
+  if (!current.isFile() || current.nlink !== source.links || current.dev !== source.device || current.ino !== source.inode || current.uid !== source.uid || (current.mode & 0o777) !== source.mode || hashFile(source.path) !== source.sha256) return false;
   const expected = new Map((source.companions || []).map((item) => [item.path, item.sha256]));
   for (const suffix of source.kind === "sqlite" ? ["-wal", "-shm"] : []) { const path = `${source.path}${suffix}`; if (existsSync(path) !== expected.has(path) || (existsSync(path) && hashFile(path) !== expected.get(path))) return false; }
   return true;
@@ -150,13 +154,14 @@ export function verifyMigration(root) {
     const manifest = JSON.parse(readFileSync(join(root, "migration-manifest.json"), "utf8"));
     if (manifest.version !== 2 || !manifest.migration_id || !manifest.target) return { valid: false, reason: "manifest_identity" };
     for (const source of manifest.sources.filter((i) => i.status === "present")) if (!sourceUnchanged(source)) return { valid: false, reason: "source_changed" };
-    for (const output of manifest.outputs) { const path = join(root, output.path); if (!existsSync(path)) return { valid: false, reason: "output_missing" }; assertRegularSingleLink(path); if (hashFile(path) !== output.sha256) return { valid: false, reason: "output_changed" }; if (output.kind === "sqlite") { const details = sqliteDetails(path); if (JSON.stringify(details.tables) !== JSON.stringify(output.tables)) return { valid: false, reason: "output_counts_changed" }; } else if (output.kind === "jsonl") readFileSync(path, "utf8").split("\n").filter(Boolean).map(JSON.parse); else if (output.kind === "json") JSON.parse(readFileSync(path, "utf8")); }
+    for (const output of manifest.outputs) { const path = join(root, output.path); if (!existsSync(path)) return { valid: false, reason: "output_missing" }; const stat = assertRegularSingleLink(path); if (stat.size !== output.bytes || hashFile(path) !== output.sha256) return { valid: false, reason: "output_changed" }; if (output.kind === "sqlite") { const details = sqliteDetails(path); if (JSON.stringify(details.tables) !== JSON.stringify(output.tables)) return { valid: false, reason: "output_counts_changed" }; } else if (output.kind === "jsonl") { const records = readFileSync(path, "utf8").split("\n").filter(Boolean).map(JSON.parse).length; if (records !== output.records) return { valid: false, reason: "output_counts_changed" }; } else if (output.kind === "json") JSON.parse(readFileSync(path, "utf8")); }
     return { valid: true, manifest };
   } catch (error) { return { valid: false, reason: error.message }; }
 }
 function activateStage(target) {
   const destination = resolve(target), stage = `${destination}.staging`;
   if (existsSync(destination)) throw new Error(`target already exists: ${destination}`);
+  ownedManifest(stage, destination);
   const verified = verifyMigration(stage); if (!verified.valid) throw new Error(`migration verification failed: ${verified.reason}`);
   const manifest = { ...verified.manifest, activated_at: new Date().toISOString() }, manifestPath = join(stage, "migration-manifest.json");
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 }); syncFile(manifestPath); syncDirectory(stage); renameSync(stage, destination); syncDirectory(dirname(destination)); return manifest;
@@ -166,7 +171,7 @@ function rollback(target) {
   const destination = resolve(target), stage = `${destination}.staging`;
   if (!existsSync(destination)) { if (!existsSync(stage)) throw new Error("no owned migration to roll back"); ownedManifest(stage, destination); rmSync(stage, { recursive: true }); syncDirectory(dirname(destination)); return { staged_removed: true }; }
   const manifest = ownedManifest(destination, destination), activeAudit = join(destination, "audit.jsonl"), sourceAudit = manifest.sources.find((i) => i.kind === "jsonl" && i.status === "present")?.path; let replayed = 0;
-  if (sourceAudit && existsSync(activeAudit)) { const existing = new Set(readFileSync(sourceAudit, "utf8").split("\n").filter(Boolean).map(hashBytes)), additions = []; for (const line of readFileSync(activeAudit, "utf8").split("\n").filter(Boolean)) { const event = JSON.parse(line); if (!event.migration_provenance && !existing.has(hashBytes(line))) { additions.push(line); existing.add(hashBytes(line)); } } if (additions.length) { const fd = openSync(sourceAudit, constants.O_WRONLY | constants.O_APPEND | constants.O_NOFOLLOW); try { writeFileSync(fd, `${additions.join("\n")}\n`); fsyncSync(fd); } finally { closeSync(fd); } replayed = additions.length; } }
+  if (sourceAudit && existsSync(activeAudit)) { const sourceRecord = manifest.sources.find((item) => item.path === sourceAudit), existing = new Set(readFileSync(sourceAudit, "utf8").split("\n").filter(Boolean).map(hashBytes)), additions = []; for (const line of readFileSync(activeAudit, "utf8").split("\n").filter(Boolean)) { const event = JSON.parse(line); if (!event.migration_provenance && !existing.has(hashBytes(line))) additions.push(line); } if (additions.length) { const fd = openSync(sourceAudit, constants.O_WRONLY | constants.O_APPEND | constants.O_NOFOLLOW); try { const opened = fstatSync(fd); if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== sourceRecord.device || opened.ino !== sourceRecord.inode || opened.uid !== sourceRecord.uid || (opened.mode & 0o777) !== sourceRecord.mode) throw new Error("rollback source identity changed"); writeFileSync(fd, `${additions.join("\n")}\n`); fsyncSync(fd); } finally { closeSync(fd); } replayed = additions.length; } }
   return { active_preserved: true, replayed };
 }
 function usage() { process.stderr.write("usage: migrate-provider-state.mjs --inventory SOURCE... | --stage TARGET SOURCE... | --verify TARGET | --activate TARGET | --rollback TARGET\n"); }

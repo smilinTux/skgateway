@@ -1,11 +1,16 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import fs, { appendFileSync, chmodSync, existsSync, linkSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { mkdtempSync } from "node:fs";
 import Database from "better-sqlite3";
 import { buildMigrationManifest, migrateProviderState, verifyMigration } from "../scripts/migrate-provider-state.mjs";
+
+const migrationScript = new URL("../scripts/migrate-provider-state.mjs", import.meta.url).pathname;
+const cli = (...args) => spawnSync(process.execPath, [migrationScript, ...args], { encoding: "utf8" });
 
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), "skgw-migrate-"));
@@ -55,4 +60,48 @@ test("pre-activation crash leaves old paths authoritative and resume succeeds", 
   const result = migrateProviderState({ sources: [a, b], target });
   assert.equal(result.activated, true);
   assert.equal(readFileSync(join(target, "audit.jsonl"), "utf8").trim().split("\n").length, 3);
+});
+
+test("copy snapshot and activation stay bound to exact source and target", () => {
+  const root = mkdtempSync(join(tmpdir(), "skgw-bind-"));
+  const source = join(root, "source"), target = join(root, "target"); mkdirSync(source);
+  const input = join(source, "audit.jsonl"); writeFileSync(input, '{"event_id":"first"}\n', { mode: 0o600 });
+  const originalWrite = fs.writeFileSync;
+  fs.writeFileSync = function(path, ...args) { const result = originalWrite.call(this, path, ...args); if (path === `${target}.staging/audit.jsonl`) originalWrite(input, '{"event_id":"late"}\n', { flag: "a" }); return result; };
+  syncBuiltinESMExports();
+  try { assert.throws(() => migrateProviderState({ sources: [source], target }), /changed during staging/); }
+  finally { fs.writeFileSync = originalWrite; syncBuiltinESMExports(); }
+  assert.equal(existsSync(target), false);
+  const intended = join(root, "intended"), substituted = join(root, "substituted");
+  assert.throws(() => migrateProviderState({ sources: [source], target: intended, crashAt: "before-activate" }), /injected crash/);
+  renameSync(`${intended}.staging`, `${substituted}.staging`);
+  assert.notEqual(cli("--activate", substituted).status, 0);
+  assert.equal(existsSync(substituted), false);
+});
+
+test("integer rekey records actual output identity and output metadata is authenticated", () => {
+  const { root, a, b } = fixture();
+  for (const dir of [a, b]) { unlinkSync(join(dir, "metrics.db")); const db = new Database(join(dir, "metrics.db")); db.exec("CREATE TABLE token_usage(id INTEGER PRIMARY KEY AUTOINCREMENT, req_id TEXT, ts INTEGER)"); db.prepare("INSERT INTO token_usage VALUES (1,?,?)").run(dir === a ? "a" : "b", 1); db.close(); }
+  const target = join(root, "integer-target"); migrateProviderState({ sources: [a, b], target });
+  const db = new Database(join(target, "metrics.db"));
+  const row = db.prepare("SELECT id FROM token_usage WHERE req_id='b'").get();
+  const provenance = db.prepare("SELECT output_identity FROM migration_provenance WHERE disposition='rekeyed_conflict'").get(); db.close();
+  assert.equal(JSON.parse(provenance.output_identity)[0], row.id);
+  const stagedTarget = join(root, "metadata-target"); assert.throws(() => migrateProviderState({ sources: [a], target: stagedTarget, crashAt: "before-activate" }), /injected crash/);
+  const manifestPath = join(`${stagedTarget}.staging`, "migration-manifest.json"), manifest = JSON.parse(readFileSync(manifestPath));
+  manifest.outputs[0].bytes += 1; writeFileSync(manifestPath, JSON.stringify(manifest), { mode: 0o600 });
+  assert.equal(verifyMigration(`${stagedTarget}.staging`).valid, false);
+  assert.notEqual(cli("--activate", stagedTarget).status, 0);
+});
+
+test("rollback preserves repeated ID-less events and rejects a replaced hardlink", () => {
+  const root = mkdtempSync(join(tmpdir(), "skgw-rollback-")), source = join(root, "source"), target = join(root, "target"); mkdirSync(source);
+  const input = join(source, "audit.jsonl"); writeFileSync(input, '{"event_id":"before"}\n', { mode: 0o600 });
+  migrateProviderState({ sources: [source], target }); appendFileSync(join(target, "audit.jsonl"), '{"message":"repeat"}\n{"message":"repeat"}\n');
+  assert.equal(cli("--rollback", target).status, 0);
+  assert.equal(readFileSync(input, "utf8").split("\n").filter((line) => line === '{"message":"repeat"}').length, 2);
+  const source2 = join(root, "source2"), target2 = join(root, "target2"); mkdirSync(source2); const input2 = join(source2, "audit.jsonl"); writeFileSync(input2, '{"event_id":"before"}\n', { mode: 0o600 });
+  migrateProviderState({ sources: [source2], target: target2 }); appendFileSync(join(target2, "audit.jsonl"), '{"event_id":"late"}\n');
+  const victim = join(root, "victim"); writeFileSync(victim, "outside\n", { mode: 0o600 }); unlinkSync(input2); linkSync(victim, input2); const before = readFileSync(victim, "utf8");
+  assert.notEqual(cli("--rollback", target2).status, 0); assert.equal(readFileSync(victim, "utf8"), before);
 });

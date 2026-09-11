@@ -1,10 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, lstatSync, mkdirSync, symlinkSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { mkdtempSync } from "node:fs";
-import { resolveStatePaths, validateStateRoot, ensureStatePaths } from "../src/state/paths.mjs";
+import { ensurePrivateFile, resolveStatePaths, validateStateRoot, ensureStatePaths, writePrivateFileAtomic } from "../src/state/paths.mjs";
 
 test("state paths are provider neutral and absolute", () => {
   const paths = resolveStatePaths({
@@ -39,4 +39,18 @@ test("ensureStatePaths creates private directories", () => {
   assert.equal(lstatSync(paths.configRoot).mode & 0o777, 0o700);
   assert.equal(lstatSync(paths.stateRoot).mode & 0o777, 0o700);
   assert.equal(lstatSync(paths.semanticCache).mode & 0o777, 0o700);
+});
+
+test("unsafe existing mutable modes reject before mutation", () => {
+  const base = mkdtempSync(join(tmpdir(), "skgw-modes-"));
+  for (const mode of [0o644, 0o660, 0o666]) {
+    for (const writer of [ensurePrivateFile, (path) => writePrivateFileAtomic(path, "replacement")]) {
+      const path = join(base, `${mode}-${Math.random()}`);
+      writeFileSync(path, "original", { mode });
+      chmodSync(path, mode);
+      assert.throws(() => writer(path), /unsafe permissions/);
+      assert.equal(readFileSync(path, "utf8"), "original");
+      assert.equal(lstatSync(path).mode & 0o777, mode);
+    }
+  }
 });
