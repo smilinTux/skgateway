@@ -28,8 +28,14 @@ UNIT_DST="${UNIT_DIR}/skgateway.service"
 
 SECRETS_DIR="${HOME}/.config/skgateway"
 SECRETS_FILE="${SECRETS_DIR}/secrets.env"
+STATE_HOME="${XDG_STATE_HOME:-${HOME}/.local/state}"
+STATE_DIR="${STATE_HOME}/skgateway"
 
 log() { printf '[install] %s\n' "$*"; }
+
+# Create only the private release-neutral destination. Migration and
+# activation remain separate gated operations.
+install -d -m 0700 "${STATE_DIR}" "${STATE_DIR}/semantic-cache"
 
 # --- 1. render + install the unit ---
 mkdir -p "${UNIT_DIR}"

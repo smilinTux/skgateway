@@ -332,7 +332,7 @@ model_limits:
 
 metrics:
   enabled: true
-  db_path: ./data/metrics.db
+  db_path: xdg:metrics.db
   retention_days: 90
   token_tracking: true
   cost_tracking: true
@@ -385,7 +385,7 @@ siem:
   enabled: true
   outputs:
     - type: file
-      path: ./logs/audit.jsonl
+      path: xdg:audit.jsonl
       rotate_mb: 100
 
 ## Capability-aware routing master gate (design doc 2026-08-08, cards

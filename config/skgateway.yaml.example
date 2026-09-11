@@ -299,7 +299,7 @@ model_limits:
 
 metrics:
   enabled: true
-  db_path: ./data/metrics.db                   # relative resolves under repo root
+  db_path: xdg:metrics.db                      # $XDG_STATE_HOME/skgateway
   retention_days: 90
   token_tracking: true
   cost_tracking: true
@@ -333,7 +333,7 @@ siem:
   enabled: true
   outputs:
     - type: file
-      path: ./logs/audit.jsonl                 # relative resolves under repo root
+      path: xdg:audit.jsonl                    # $XDG_STATE_HOME/skgateway
       rotate_mb: 100
     ## Optional remote syslog sink (SIEM). Disabled unless present + enabled,
     ## or turned on via SKGATEWAY_SYSLOG_* env vars. See docs/SIEM.md.

@@ -228,8 +228,9 @@ export function createFileOutput(config) {
   async function _openFile() {
     if (_fd) return;
     const dir = dirname(logPath);
-    await mkdir(dir, { recursive: true });
-    _fd = await open(logPath, 'a');                  // O_WRONLY | O_CREAT | O_APPEND
+    await mkdir(dir, { recursive: true, mode: 0o700 });
+    _fd = await open(logPath, 'a', 0o600);           // O_WRONLY | O_CREAT | O_APPEND
+    await _fd.chmod(0o600);
     try {
       const s = await stat(logPath);
       _fdSize = s.size;

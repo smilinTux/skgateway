@@ -28,6 +28,7 @@ import { homedir } from 'node:os';
 import { load as yamlLoad } from 'js-yaml';
 import { isRegistryRouted, loadRegistry } from './proxy/registry.mjs';
 import { assertCodexConfigPurity, assertCodexRegistryPurity } from './policy/codex-purity.mjs';
+import { DEFAULT_STATE_PATHS } from './state/paths.mjs';
 
 // ─── paths ────────────────────────────────────────────────────────────────────
 
@@ -196,7 +197,7 @@ const DEFAULTS = {
 
   metrics: {
     enabled: true,
-    db_path: './data/metrics.db',
+    db_path: DEFAULT_STATE_PATHS.metricsDb,
     retention_days: 90,
     token_tracking: true,
     cost_tracking: true,
@@ -213,7 +214,7 @@ const DEFAULTS = {
   siem: {
     enabled: true,
     outputs: [
-      { type: 'file', path: './logs/audit.jsonl', rotate_mb: 100 },
+      { type: 'file', path: DEFAULT_STATE_PATHS.auditLog, rotate_mb: 100 },
     ],
   },
 
@@ -1147,7 +1148,9 @@ class ConfigError extends Error {
 function resolvePaths(cfg) {
   // metrics.db_path
   if (cfg.metrics.db_path) {
-    cfg.metrics.db_path = cfg.metrics.db_path.startsWith('~')
+    cfg.metrics.db_path = cfg.metrics.db_path === 'xdg:metrics.db'
+      ? DEFAULT_STATE_PATHS.metricsDb
+      : cfg.metrics.db_path.startsWith('~')
       ? expandHome(cfg.metrics.db_path)
       : resolve(REPO_ROOT, cfg.metrics.db_path);
   }
@@ -1166,7 +1169,9 @@ function resolvePaths(cfg) {
   // siem output paths
   for (const out of (cfg.siem?.outputs ?? [])) {
     if (out.path) {
-      out.path = out.path.startsWith('~')
+      out.path = out.path === 'xdg:audit.jsonl'
+        ? DEFAULT_STATE_PATHS.auditLog
+        : out.path.startsWith('~')
         ? expandHome(out.path)
         : resolve(REPO_ROOT, out.path);
     }

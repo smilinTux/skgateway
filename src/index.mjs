@@ -63,6 +63,7 @@ import { policyFromRegistry } from "./policy/sensitivity.mjs";
 import { readFileSync } from "node:fs";
 import { load as yamlLoad } from "js-yaml";
 import { createShadowRecorder } from "./proxy/semantic-cache-shadow.mjs";
+import { ensurePrivateFile, DEFAULT_STATE_PATHS } from "./state/paths.mjs";
 
 // ─── Parse CLI args ───
 const args = process.argv.slice(2);
@@ -898,6 +899,7 @@ const operatorHttpDeps = {
 let metrics = null;
 if (config.metrics?.enabled === true) {
   try {
+    ensurePrivateFile(config.metrics.db_path);
     const { createMetricsCollector } = await import("./metrics/collector.mjs");
     metrics = createMetricsCollector(config.metrics);
     console.log("[skgateway] metrics collector initialized");
@@ -1085,10 +1087,10 @@ const siemEnabled = config.siem?.enabled === true;
 const siemPath = path.resolve(
   path.dirname(new URL(import.meta.url).pathname),
   "..",
-  config.siem?.outputs?.[0]?.path || "./logs/audit.jsonl",
+  config.siem?.outputs?.[0]?.path || DEFAULT_STATE_PATHS.auditLog,
 );
 if (siemEnabled) {
-  try { fs.mkdirSync(path.dirname(siemPath), { recursive: true }); } catch {}
+  ensurePrivateFile(siemPath);
 }
 // Optional skcapstone bridge — shares warn+ SIEM events on the mesh-wide
 // sk-alert bus when ~/.skcapstone is present; no-op otherwise.

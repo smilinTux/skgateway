@@ -1,10 +1,10 @@
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
-import { homedir } from "node:os";
+import { dirname, resolve } from "node:path";
+import { DEFAULT_STATE_PATHS } from "../state/paths.mjs";
 
 export const CAPACITY_STORE_PATH = process.env.SKGATEWAY_CAPACITY_STORE_PATH ||
-  join(homedir(), ".config", "skgateway", "capacity_store.json");
-export const PRODUCTION_CAPACITY_STORE_PATH = join(homedir(), ".config", "skgateway", "capacity_store.json");
+  DEFAULT_STATE_PATHS.capacityState;
+export const PRODUCTION_CAPACITY_STORE_PATH = DEFAULT_STATE_PATHS.capacityState;
 const probes = new Map();
 const scheduledProbes = new Map();
 const TRANSIENT_RETRY_MS = 5 * 60 * 1000;
@@ -32,8 +32,8 @@ function save(value, path = CAPACITY_STORE_PATH) {
     throw new Error("refusing to write the production capacity store from a test run");
   }
   try {
-    mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, JSON.stringify(value, null, 2));
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    writeFileSync(path, JSON.stringify(value, null, 2), { mode: 0o600 });
   } catch { /* capacity evidence must not break the response path */ }
 }
 
