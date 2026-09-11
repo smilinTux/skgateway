@@ -230,8 +230,21 @@ describe("completed SSE tool-call structure", () => {
         prompt_tokens_details: promptTokensDetails,
       },
     })}`;
+    // `null` is deliberately NOT in this list. It was swept in when 73dc195
+    // widened the contract to permit prompt_tokens_details at all (before that,
+    // ANY unknown usage key was rejected); the subject of that change was
+    // accepting a bounded {cached_tokens: N}, not ruling on null. Live on
+    // 2026-09-11 the qwen3.8 vLLM on chiap08 was observed sending
+    // prompt_tokens_details: null / completion_tokens_details: null, the normal
+    // OpenAI-compatible way to say "no details". Rejecting that failed
+    // hasValidUsage, set stream.invalidCompletion, and rewrote 200s carrying
+    // perfectly valid tool_calls into 502 invalid_upstream_completion -- for
+    // STREAMING callers only, since the non-stream path never runs this check.
+    // Every agentic hermes cron failed 5/5 retries while an identical non-stream
+    // curl returned 200. An uninformative accounting field is not evidence of a
+    // bad completion, and null carries exactly as much information as omitting
+    // the key, which this contract already accepts. See tests/usage-null-details.
     for (const details of [
-      null,
       [],
       {},
       { cached_tokens: -1 },
@@ -239,6 +252,12 @@ describe("completed SSE tool-call structure", () => {
       { cached_tokens: "0" },
       { cached_tokens: 0, extra: 0 },
     ]) assertCompletionRejected(rawResponse([contentFrame("stop"), usageFrame(details), "data: [DONE]"]));
+
+    // null == absent, and absent is accepted.
+    assert.equal(
+      rawResponse([contentFrame("stop", "OK"), usageFrame(null), "data: [DONE]"]).status, 200,
+      "prompt_tokens_details: null must validate like an omitted key",
+    );
   });
 
   test("rejects duplicate semantic JSON members before parsing", () => {
