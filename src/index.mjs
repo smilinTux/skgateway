@@ -137,6 +137,8 @@ function registryProviderAdmission(target, purpose) {
   try {
     const current = _cfgEmitter.current();
     const targetUrl = canonicalHttpUrl(target?.url);
+    // Anthropic roles resolve through configured backends without a target URL.
+    if (!targetUrl && !target?.anthropic) return false;
     const owners = new Set();
     for (const [id, backend] of Object.entries(current.backends || {})) {
       if (id === target?.backend || (targetUrl && canonicalHttpUrl(backend?.url) === targetUrl)) owners.add(id);
