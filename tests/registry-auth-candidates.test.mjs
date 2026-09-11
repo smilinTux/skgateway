@@ -133,9 +133,21 @@ test("registry role -> UNCONFIGURED url keeps the synthetic reg: pool (no auth, 
 });
 
 test("provider admission callback denies and callback failures fail closed", async () => {
-  for (const providerAdmission of [() => false, () => { throw new Error("fixture"); }]) {
-    const router = createRouter({ backends: {}, failover: false, siem_log: false, providerAdmission });
-    assert.equal(router.providerAdmissionAllowed({ backend: "fixture" }, "inference"), false);
+  const { server, captured } = await captureServer();
+  try {
+    writeFileSync(REGISTRY, JSON.stringify({
+      backends: { fixture: { url: `http://127.0.0.1:${server.address().port}/v1`, model: "fixture-model" } },
+      roles: { "sk-review": "fixture" },
+    }));
+    for (const providerAdmission of [() => false, () => { throw new Error("fixture"); }]) {
+      const router = createRouter({ backends: {}, failover: false, siem_log: false, providerAdmission });
+      assert.equal(router.providerAdmissionAllowed({ backend: "fixture" }, "inference"), false);
+      const response = await routeAndSend(router, { model: "sk-review" }, "/v1/chat/completions", "POST", {}, CHAT_BODY("sk-review"), false);
+      assert.equal(response.status, 503);
+      assert.equal(captured.path, null, "denied callback must prevent dispatch");
+    }
+  } finally {
+    server.close();
   }
 });
 

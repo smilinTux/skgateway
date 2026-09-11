@@ -531,6 +531,93 @@ test("reload blocks a newly disabled OpenRouter registry backend before another 
   }
 });
 
+test("registry provider ownership follows final targets and current configuration", async (t) => {
+  const cases = [
+    { name: "disabled alias", mode: "disabled", status: 503 },
+    { name: "active alias", mode: "active", status: 200 },
+    { name: "ambiguous active owners", mode: "active", ambiguous: true, status: 503 },
+    { name: "default port and trailing slash", mode: "disabled", configuredUrl: "http://127.0.0.1:80/v1///", targetUrl: "http://127.0.0.1/v1", status: 503 },
+    { name: "HTTPS default port and trailing slash", mode: "disabled", configuredUrl: "https://127.0.0.1:443/v1/", targetUrl: "https://127.0.0.1/v1", status: 503 },
+    { name: "query distinct target", mode: "disabled", queryDistinct: true, status: 200 },
+    { name: "unowned sovereign target", mode: "disabled", unowned: true, status: 200 },
+    { name: "malformed target URL", mode: "disabled", targetUrl: "not-a-url", unowned: true, status: 503 },
+    { name: "non HTTP target URL", mode: "disabled", targetUrl: "file:///tmp/fixture", unowned: true, status: 503 },
+    { name: "invalid configured URL rejects startup", mode: "disabled", configuredUrl: "not-a-url", invalidConfig: true },
+    { name: "alias policy after SIGHUP", mode: "active", status: 200, reload: true },
+  ];
+  for (const entry of cases) await t.test(entry.name, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "skgw-registry-owner-"));
+    let gateway;
+    let upstream;
+    let calls = 0;
+    try {
+      upstream = await startJsonServer(async (req, res) => {
+        calls++;
+        for await (const _chunk of req) { /* drain synthetic request */ }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ choices: [{ message: { content: "fixture" } }] }));
+      });
+      const url = `http://127.0.0.1:${upstream.port}/v1`;
+      const configuredUrl = entry.configuredUrl || (entry.queryDistinct ? `${url}?tenant=owner` : url);
+      const targetUrl = entry.targetUrl || (entry.queryDistinct ? `${url}?tenant=other` : url);
+      const port = await freePort();
+      const registryPath = join(dir, "registry.json");
+      writeFileSync(registryPath, JSON.stringify({
+        backends: { "sovereign-alias": { url: targetUrl, model: "fixture-model", no_failover: true } },
+        roles: { "sk-review": "sovereign-alias", "sk-default": "sovereign-alias", "sk-auto": "auto" },
+      }));
+      const backend = { url: configuredUrl, auth_type: "none", models: ["fixture-model"], priority: 1 };
+      const configPath = join(dir, "config.json");
+      const config = {
+        server: { bind: "127.0.0.1", port, dashboard_port: await freePort() },
+        dashboard: { enabled: false }, metrics: { enabled: false }, identity: { enabled: false },
+        classification: { enabled: false }, siem: { enabled: false, outputs: [] }, discovery: { enabled: false },
+        providers: { openrouter: { configured_mode: entry.mode } },
+        backends: entry.unowned ? {} : { openrouter: backend, ...(entry.ambiguous ? { second: backend } : {}) },
+      };
+      writeFileSync(configPath, JSON.stringify(config));
+      if (entry.invalidConfig) {
+        await assert.rejects(() => bootGateway({ configPath, env: {
+          SKMODELS_REGISTRY: registryPath, SK_STANDALONE: "1", SKCAPSTONE_HOME: join(dir, "skcapstone"),
+        } }), /Invalid URL/);
+        assert.equal(calls, 0);
+        return;
+      }
+      gateway = await bootGateway({ configPath, env: {
+        SKMODELS_REGISTRY: registryPath, SK_STANDALONE: "1", SKCAPSTONE_HOME: join(dir, "skcapstone"),
+      } });
+      async function checkRoutes(expectedStatus) {
+        for (const model of ["sk-review", "sk-default", "sk-auto"]) {
+          const before = calls;
+          const response = await request(port, "/v1/chat/completions", {
+            method: "POST", headers: { "content-type": "application/json" },
+            body: JSON.stringify({ model, messages: [{ role: "user", content: "fixture" }] }),
+          });
+          await response.arrayBuffer();
+          assert.equal(response.status, expectedStatus, `${entry.name}: ${model}`);
+          assert.equal(calls - before, expectedStatus === 200 ? 1 : 0, `${model} upstream count`);
+        }
+      }
+      await checkRoutes(entry.status);
+      if (entry.reload) {
+        config.providers.openrouter.configured_mode = "disabled";
+        writeFileSync(configPath, JSON.stringify(config));
+        gateway.child.kill("SIGHUP");
+        const deadline = Date.now() + 5_000;
+        while (!gateway.output().includes("[skgateway] config reloaded") && Date.now() < deadline) {
+          await new Promise((resolvePoll) => setTimeout(resolvePoll, 10));
+        }
+        assert.match(gateway.output(), /\[skgateway\] config reloaded/);
+        await checkRoutes(503);
+      }
+    } finally {
+      await stopGateway(gateway);
+      await closeServer(upstream?.server);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("enabled startup compatibility", () => {
   let dir;
   let gateway;
