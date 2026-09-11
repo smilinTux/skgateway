@@ -128,7 +128,6 @@ function canonicalHttpUrl(value) {
     const url = new URL(value);
     if (url.protocol !== "http:" && url.protocol !== "https:") return null;
     url.hash = "";
-    url.search = "";
     url.pathname = url.pathname.replace(/\/+$/, "") || "/";
     return url.toString();
   } catch { return null; }
@@ -142,6 +141,7 @@ function registryProviderAdmission(target, purpose) {
     for (const [id, backend] of Object.entries(current.backends || {})) {
       if (id === target?.backend || (targetUrl && canonicalHttpUrl(backend?.url) === targetUrl)) owners.add(id);
     }
+    if (owners.size === 0) return true;
     if (owners.size !== 1) return false;
     const provider = [...owners][0];
     return providerNetworkPermission(providerConfiguredMode(current, provider), purpose);
