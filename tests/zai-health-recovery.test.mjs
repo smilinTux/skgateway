@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { readFileSync, rmSync } from "node:fs";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { load as yamlLoad } from "js-yaml";
@@ -70,6 +70,32 @@ test("provider recovery uses five-minute transient and longer terminal deadlines
   assert.equal(recordProviderUnavailable("zai", {
     reason: "authentication_failure", now: 1_000, retryAt: 61_000, path: terminalStore,
   }).retry_at, 1_801_000);
+});
+
+test("legacy model-local GLM recovery deadlines normalize without touching policy state", () => {
+  const now = 2_000_000;
+  const cases = [
+    ["zai", "model", "malformed_response", now + 6 * 60 * 60 * 1000, now + 60_000],
+    ["zai", "model", "backend_cooldown", now + 6 * 60 * 60 * 1000, now + 60_000],
+    ["zai", "model", "rate_limited", now + 6 * 60 * 60 * 1000, now + 6 * 60 * 60 * 1000],
+    ["zai", "model", "quarantine", now + 6 * 60 * 60 * 1000, now + 6 * 60 * 60 * 1000],
+    ["codex", "model", "malformed_response", now + 6 * 60 * 60 * 1000, now + 6 * 60 * 60 * 1000],
+    ["zai", "provider", "authentication_failure", now + 30 * 60 * 1000, now + 30 * 60 * 1000],
+    ["zai", "provider", "subscription_exhausted", now + 6 * 60 * 60 * 1000, now + 6 * 60 * 60 * 1000],
+  ];
+  for (const [provider, scope, reason, retryAt, expected] of cases) {
+    const path = store(`${provider}-${scope}-${reason}`);
+    writeFileSync(path, JSON.stringify({
+      [`${scope}:${provider}${scope === "model" ? ":glm-4.7" : ""}`]: {
+        state: "throttled", scope, reason, retry_at: retryAt,
+        probe_state: "pending", observed_at: now,
+      },
+    }));
+    assert.equal(capacityStatus(provider, "glm-4.7", { now: now + 1, path }).retry_at, expected);
+    assert.equal(JSON.parse(readFileSync(path, "utf8"))[
+      `${scope}:${provider}${scope === "model" ? ":glm-4.7" : ""}`
+    ].retry_at, retryAt);
+  }
 });
 
 test("due Z.ai recovery remains provider-singleflight and preserves terminal reason", async () => {
