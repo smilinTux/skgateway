@@ -55,7 +55,6 @@ import { createDecisionCache, decisionKey } from "./decision-cache.mjs";
 // reimplementation. getConfig() gates the whole branch behind
 // routing.match_enabled (config.mjs, unmodified: the DEFAULTS already carry
 // a `routing:` block, card P4.4 adds match_enabled to it later).
-import { getConfig, providerConfiguredMode, providerNetworkPermission } from "../config.mjs";
 import { buildServingCatalog } from "../discovery.mjs";
 import { rankModels } from "../ranking/rank.mjs";
 import { buildCapabilityCatalog } from "../ranking/catalog.mjs";
@@ -1723,6 +1722,7 @@ export class Backend {
  * }}
  */
 export function createRouter(config = {}) {
+  const providerAdmission = typeof config.providerAdmission === "function" ? config.providerAdmission : null;
   const failoverEnabled = config.failover !== false;
   const siemLog = config.siem_log !== false;
 
@@ -2250,7 +2250,7 @@ export function createRouter(config = {}) {
     return true;
   }
 
-  return { route, routeExactBackend, getHealth, getProviderUsage: providerUsageSnapshot, addBackend, removeBackend, getBackend, getBackends, registerDiscoveredModels, resolveAgentTarget };
+  return { route, routeExactBackend, getHealth, getProviderUsage: providerUsageSnapshot, addBackend, removeBackend, getBackend, getBackends, registerDiscoveredModels, resolveAgentTarget, providerAdmission };
 }
 
 // ---------------------------------------------------------------------------
@@ -3460,7 +3460,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     }
 
     if (reg) {
-      if (!providerNetworkPermission(providerConfiguredMode(getConfig(), reg.backend), "inference")) {
+      if (router.providerAdmission && !router.providerAdmission(reg, "inference")) {
         return {
           status: 503,
           headers: { "content-type": "application/json" },

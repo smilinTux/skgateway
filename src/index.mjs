@@ -123,6 +123,14 @@ function registryProviderAllowsInference(cfg, request) {
   );
 }
 
+function registryProviderAdmission(target, purpose) {
+  const targetUrl = String(target?.url || "").replace(/\/$/, "");
+  const provider = Object.entries(config.backends || {}).find(([id, backend]) =>
+    id === target?.backend || String(backend?.url || "").replace(/\/$/, "") === targetUrl,
+  )?.[0] || target?.backend;
+  return providerNetworkPermission(providerConfiguredMode(config, provider), purpose);
+}
+
 function disabledRegistryProviderResponse() {
   return {
     status: 503,
@@ -135,7 +143,7 @@ function disabledRegistryProviderResponse() {
 
 const _routerBackends = routerBackendsForConfig(config);
 let routerConfiguredBackendIds = new Set(Object.keys(config.backends || {}));
-const router = createRouter({ backends: _routerBackends, quarantine: config.quarantine, routing: config.routing });
+const router = createRouter({ backends: _routerBackends, quarantine: config.quarantine, routing: config.routing, providerAdmission: registryProviderAdmission });
 
 // Advertised-vs-working reconciliation mode (card 5c680ee9). The /v1/models
 // catalog is reconciled against live backend health so callers are not offered
