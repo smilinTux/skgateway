@@ -10,6 +10,7 @@ const ROOT_FILES = [["metrics.db", "sqlite"], ["audit.jsonl", "jsonl"], ["capaci
 const hashBytes = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const hashFile = (path) => hashBytes(readFileSync(path));
 const quote = (id) => `"${String(id).replaceAll('"', '""')}"`;
+function pathEntryExists(path) { try { lstatSync(path); return true; } catch (error) { if (error?.code === "ENOENT") return false; throw error; } }
 
 function syncFile(path) { const fd = openSync(path, "r"); try { fsyncSync(fd); } finally { closeSync(fd); } }
 function syncDirectory(path) { const fd = openSync(path, "r"); try { fsyncSync(fd); } finally { closeSync(fd); } }
@@ -46,7 +47,7 @@ function cacheRootDetails(path) {
 function describeSource(source) {
   if (!source.path || source.kind === "memory") return { name: source.name, kind: source.kind, status: "no_source" };
   const path = resolve(source.path);
-  if (!existsSync(path)) return { name: source.name, kind: source.kind, path, status: "missing" };
+  if (!pathEntryExists(path)) return { name: source.name, kind: source.kind, path, status: "missing" };
   if (source.kind === "cache-root") return { name: source.name, kind: source.kind, path, status: "present", ...cacheRootDetails(path) };
   const stat = assertRegularSingleLink(path);
   const item = { name: source.name, kind: source.kind, path, status: "present", bytes: stat.size, sha256: hashFile(path), device: stat.dev, inode: stat.ino, uid: stat.uid, mode: stat.mode & 0o777, links: stat.nlink };
@@ -155,8 +156,8 @@ function stageProviderState({ sources, target }) {
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 }); syncFile(manifestPath); syncDirectory(stage); return { stage, manifest };
 }
 function sourceUnchanged(source) {
-  if (source.status === "missing") return !existsSync(source.path);
-  if (source.status !== "present" || !existsSync(source.path)) return false;
+  if (source.status === "missing") return !pathEntryExists(source.path);
+  if (source.status !== "present" || !pathEntryExists(source.path)) return false;
   if (source.kind === "cache-root") {
     try { const current = cacheRootDetails(source.path); return JSON.stringify(current) === JSON.stringify({ device: source.device, inode: source.inode, uid: source.uid, mode: source.mode, links: source.links, entries: source.entries }); } catch { return false; }
   }

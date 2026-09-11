@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import fs, { appendFileSync, chmodSync, existsSync, linkSync, mkdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import fs, { appendFileSync, chmodSync, existsSync, linkSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
@@ -143,4 +143,14 @@ test("cache inventory binds directory absence and every durable entry", () => {
     assert.equal(verifyMigration(`${target}.staging`).valid, false, name);
     assert.notEqual(cli("--activate", target).status, 0, name);
   }
+});
+
+test("dangling cache-root symlink does not satisfy an absence declaration", () => {
+  const root = mkdtempSync(join(tmpdir(), "skgw-cache-dangling-")), source = join(root, "source"), target = join(root, "target"); mkdirSync(source);
+  writeFileSync(join(source, "audit.jsonl"), '{"event_id":"before"}\n', { mode: 0o600 });
+  assert.throws(() => migrateProviderState({ sources: [source], target, crashAt: "before-activate" }), /injected crash/);
+  symlinkSync(join(root, "missing-target"), join(source, "semantic-cache"));
+  assert.equal(verifyMigration(`${target}.staging`).valid, false);
+  assert.notEqual(cli("--activate", target).status, 0);
+  assert.equal(existsSync(target), false);
 });
