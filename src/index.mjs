@@ -123,12 +123,29 @@ function registryProviderAllowsInference(cfg, request) {
   );
 }
 
+function canonicalHttpUrl(value) {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+    url.hash = "";
+    url.search = "";
+    url.pathname = url.pathname.replace(/\/+$/, "") || "/";
+    return url.toString();
+  } catch { return null; }
+}
+
 function registryProviderAdmission(target, purpose) {
-  const targetUrl = String(target?.url || "").replace(/\/$/, "");
-  const provider = Object.entries(config.backends || {}).find(([id, backend]) =>
-    id === target?.backend || String(backend?.url || "").replace(/\/$/, "") === targetUrl,
-  )?.[0] || target?.backend;
-  return providerNetworkPermission(providerConfiguredMode(config, provider), purpose);
+  try {
+    const current = _cfgEmitter.current();
+    const targetUrl = canonicalHttpUrl(target?.url);
+    const owners = new Set();
+    for (const [id, backend] of Object.entries(current.backends || {})) {
+      if (id === target?.backend || (targetUrl && canonicalHttpUrl(backend?.url) === targetUrl)) owners.add(id);
+    }
+    if (owners.size !== 1) return false;
+    const provider = [...owners][0];
+    return providerNetworkPermission(providerConfiguredMode(current, provider), purpose);
+  } catch { return false; }
 }
 
 function disabledRegistryProviderResponse() {

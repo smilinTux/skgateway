@@ -2239,6 +2239,11 @@ export function createRouter(config = {}) {
     return typeof target === "string" && target.trim() ? target.trim() : null;
   }
 
+  function providerAdmissionAllowed(target, purpose) {
+    if (!providerAdmission) return true;
+    try { return providerAdmission(target, purpose) === true; } catch { return false; }
+  }
+
   // -------------------------------------------------------------------------
   // Return router interface
   // -------------------------------------------------------------------------
@@ -2250,7 +2255,7 @@ export function createRouter(config = {}) {
     return true;
   }
 
-  return { route, routeExactBackend, getHealth, getProviderUsage: providerUsageSnapshot, addBackend, removeBackend, getBackend, getBackends, registerDiscoveredModels, resolveAgentTarget, providerAdmission };
+  return { route, routeExactBackend, getHealth, getProviderUsage: providerUsageSnapshot, addBackend, removeBackend, getBackend, getBackends, registerDiscoveredModels, resolveAgentTarget, providerAdmissionAllowed };
 }
 
 // ---------------------------------------------------------------------------
@@ -3460,7 +3465,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     }
 
     if (reg) {
-      if (router.providerAdmission && !router.providerAdmission(reg, "inference")) {
+      if (!router.providerAdmissionAllowed(reg, "inference")) {
         return {
           status: 503,
           headers: { "content-type": "application/json" },
