@@ -3232,9 +3232,28 @@ export function shouldUseRegistryRouting(router, request, bootstrapProbe = false
   return !exactAdmissionOwner;
 }
 
+export function configuredModelAlias(model, config = null) {
+  if (typeof model !== "string" || !model) return null;
+  let aliases = config?.model_aliases;
+  if (!aliases) {
+    try {
+      aliases = getConfig()?.model_aliases;
+    } catch {
+      return null;
+    }
+  }
+  const target = aliases?.[model];
+  return typeof target === "string" && target && target !== model ? target : null;
+}
+
 export async function routeAndSend(router, request, upstreamPath, method, clientHeaders, body, usePool = true, siem = null, abortSignal = null, exactBackendId = null) {
   const pool = usePool ? getPool() : null;
   const requestedModel = request?.model;
+  const aliasTarget = configuredModelAlias(requestedModel);
+  if (!exactBackendId && aliasTarget) {
+    request = { ...request, model: aliasTarget };
+    body = rewriteBodyModel(body, aliasTarget);
+  }
   const codexIntent = [requestedModel, request?.role, request?.context, request?.service];
   const bootstrapProbe = clientHeaders?.["x-sk-context"] === "public" &&
     clientHeaders?.["x-sk-probe"] === "synthetic";

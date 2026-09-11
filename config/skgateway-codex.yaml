@@ -319,6 +319,11 @@ sanitizer:
   keep_end: 12
   strip_thinking: true
 
+model_aliases:
+  qwen3.8-27b: qwen3.8-27b-huihui-abliterated-q4_k_m
+  qwen3.8-27b-ud-q5_k_xl: qwen3.8-27b-huihui-abliterated-q4_k_m
+  qwen38-abliterated: qwen3.8-27b-huihui-abliterated-q4_k_m
+
 model_limits:
   ## Kimi Code subscription routes. These stay admission-gated until observed
   ## health is established by the bounded compatibility probes.
