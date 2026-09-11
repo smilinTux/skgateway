@@ -35,6 +35,28 @@ log() { printf '[install] %s\n' "$*"; }
 
 # Create only the private release-neutral destination. Migration and
 # activation remain separate gated operations.
+case "${STATE_HOME}" in
+  /*) ;;
+  *) echo "[install] ERROR: XDG_STATE_HOME must be absolute" >&2; exit 1 ;;
+esac
+state_component="/"
+IFS='/' read -r -a state_parts <<< "${STATE_DIR#/}"
+for state_part in "${state_parts[@]}"; do
+  [[ -n "${state_part}" ]] || continue
+  state_component="${state_component%/}/${state_part}"
+  if [[ -L "${state_component}" ]]; then
+    echo "[install] ERROR: state path contains a symlink: ${state_component}" >&2
+    exit 1
+  fi
+done
+if [[ -e "${STATE_DIR}" ]]; then
+  state_owner="$(stat -c '%u' "${STATE_DIR}")"
+  state_mode="$(stat -c '%a' "${STATE_DIR}")"
+  if [[ "${state_owner}" != "$(id -u)" || "${state_mode}" != "700" ]]; then
+    echo "[install] ERROR: existing state directory must be owned by this user with mode 700" >&2
+    exit 1
+  fi
+fi
 install -d -m 0700 "${STATE_DIR}" "${STATE_DIR}/semantic-cache"
 
 # --- 1. render + install the unit ---

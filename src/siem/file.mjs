@@ -48,6 +48,8 @@ import {
   mkdir,
   readdir,
 } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { ensurePrivateFile } from '../state/paths.mjs';
 import { dirname, basename, join } from 'node:path';
 
 // ─── constants ────────────────────────────────────────────────────────────────
@@ -229,7 +231,8 @@ export function createFileOutput(config) {
     if (_fd) return;
     const dir = dirname(logPath);
     await mkdir(dir, { recursive: true, mode: 0o700 });
-    _fd = await open(logPath, 'a', 0o600);           // O_WRONLY | O_CREAT | O_APPEND
+    ensurePrivateFile(logPath);
+    _fd = await open(logPath, constants.O_WRONLY | constants.O_APPEND | constants.O_NOFOLLOW);
     await _fd.chmod(0o600);
     try {
       const s = await stat(logPath);

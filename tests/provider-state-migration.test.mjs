@@ -29,7 +29,7 @@ test("manifest records hashes, counts, bounds, and no-source entries", () => {
     { name: "metrics-a", kind: "sqlite", path: join(a, "metrics.db") },
     { name: "cache", kind: "memory", path: null },
   ]);
-  assert.equal(manifest.version, 1);
+  assert.equal(manifest.version, 2);
   assert.match(manifest.sources[0].sha256, /^[a-f0-9]{64}$/);
   assert.equal(manifest.sources[0].tables.request_log.rows, 2);
   assert.equal(manifest.sources[1].status, "no_source");

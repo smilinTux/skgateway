@@ -1,4 +1,7 @@
-import { chmodSync, existsSync, lstatSync, mkdirSync, openSync, closeSync } from "node:fs";
+import {
+  chmodSync, closeSync, constants, existsSync, fchmodSync, fstatSync, lstatSync,
+  mkdirSync, openSync, renameSync, unlinkSync, writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
@@ -50,18 +53,58 @@ export function validateStateRoot(path, { uid = process.getuid?.(), parent } = {
 }
 
 function ensurePrivateDirectory(path, uid) {
-  if (existsSync(path)) validateStateRoot(path, { uid });
-  mkdirSync(path, { recursive: true, mode: 0o700 });
+  validateStateRoot(path, { uid });
+  if (!existsSync(path)) mkdirSync(path, { recursive: true, mode: 0o700 });
   chmodSync(path, 0o700);
   validateStateRoot(path, { uid });
 }
 
-export function ensurePrivateFile(path, { uid = process.getuid?.() } = {}) {
+function ensureFileParent(path) {
   const parent = resolve(path, "..");
-  ensurePrivateDirectory(parent, uid);
-  const fd = openSync(path, "a", 0o600);
-  closeSync(fd);
-  chmodSync(path, 0o600);
+  const parts = parent.split(sep).filter(Boolean);
+  let cursor = sep;
+  for (const part of parts) {
+    cursor = join(cursor, part);
+    if (existsSync(cursor) && lstatSync(cursor).isSymbolicLink()) throw new Error(`state path contains a symlink: ${cursor}`);
+  }
+  if (!existsSync(parent)) mkdirSync(parent, { recursive: true, mode: 0o700 });
+  if (!lstatSync(parent).isDirectory()) throw new Error(`state file parent is not a directory: ${parent}`);
+  return parent;
+}
+
+export function ensurePrivateFile(path, { uid = process.getuid?.() } = {}) {
+  ensureFileParent(path);
+  if (existsSync(path)) {
+    const before = lstatSync(path);
+    if (before.isSymbolicLink()) throw new Error(`state file is a symlink: ${path}`);
+    if (!before.isFile() || before.nlink !== 1) throw new Error(`state file must be a regular single-link file: ${path}`);
+    if (uid != null && before.uid !== uid) throw new Error(`state file has wrong owner: ${path}`);
+  }
+  const fd = openSync(path, constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW, 0o600);
+  try {
+    const opened = fstatSync(fd);
+    if (!opened.isFile() || opened.nlink !== 1) throw new Error(`state file must be a regular single-link file: ${path}`);
+    if (uid != null && opened.uid !== uid) throw new Error(`state file has wrong owner: ${path}`);
+    fchmodSync(fd, 0o600);
+  } finally { closeSync(fd); }
+}
+
+export function writePrivateFileAtomic(path, bytes, { uid = process.getuid?.() } = {}) {
+  const parent = ensureFileParent(path);
+  if (existsSync(path)) {
+    const current = lstatSync(path);
+    if (current.isSymbolicLink() || !current.isFile() || current.nlink !== 1) {
+      throw new Error(`state file must be a regular single-link file: ${path}`);
+    }
+    if (uid != null && current.uid !== uid) throw new Error(`state file has wrong owner: ${path}`);
+  }
+  const temp = join(parent, `.${process.pid}.${Date.now()}.tmp`);
+  const fd = openSync(temp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+  try {
+    writeFileSync(fd, bytes);
+    fchmodSync(fd, 0o600);
+  } finally { closeSync(fd); }
+  try { renameSync(temp, path); } catch (error) { try { unlinkSync(temp); } catch {} throw error; }
 }
 
 export function ensureStatePaths(paths, { uid = process.getuid?.() } = {}) {

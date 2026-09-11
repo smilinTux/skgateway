@@ -1,6 +1,7 @@
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { DEFAULT_STATE_PATHS } from "../state/paths.mjs";
+import { writePrivateFileAtomic } from "../state/paths.mjs";
 
 export const CAPACITY_STORE_PATH = process.env.SKGATEWAY_CAPACITY_STORE_PATH ||
   DEFAULT_STATE_PATHS.capacityState;
@@ -31,10 +32,7 @@ function save(value, path = CAPACITY_STORE_PATH) {
       resolve(path) === resolve(PRODUCTION_CAPACITY_STORE_PATH)) {
     throw new Error("refusing to write the production capacity store from a test run");
   }
-  try {
-    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-    writeFileSync(path, JSON.stringify(value, null, 2), { mode: 0o600 });
-  } catch { /* capacity evidence must not break the response path */ }
+  writePrivateFileAtomic(path, JSON.stringify(value, null, 2));
 }
 
 export function capacityStatus(provider, model, { now = Date.now(), path = CAPACITY_STORE_PATH } = {}) {

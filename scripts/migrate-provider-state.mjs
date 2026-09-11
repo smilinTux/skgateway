@@ -1,170 +1,173 @@
 #!/usr/bin/env node
-import { createHash } from "node:crypto";
-import {
-  chmodSync, closeSync, existsSync, fsyncSync, lstatSync, mkdirSync,
-  openSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync,
-} from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { chmodSync, closeSync, constants, copyFileSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import Database from "better-sqlite3";
 
-const FILES = [
-  "metrics.db", "audit.jsonl", "capacity-state.json", "provider-health.json",
-  "model_catalog_store.json", "model_catalog_cache.json",
-];
+const ROOT_FILES = [["metrics.db", "sqlite"], ["audit.jsonl", "jsonl"], ["capacity-state.json", "json"], ["capacity_store.json", "json"], ["provider-health.json", "json"], ["model_catalog_store.json", "json"], ["model_catalog_cache.json", "json"], ["skgateway.yaml", "yaml"], ["registry.yaml", "yaml"], ["model-registry.yaml", "yaml"], ["model-cards.overrides.yaml", "yaml"]];
+const hashBytes = (bytes) => createHash("sha256").update(bytes).digest("hex");
+const hashFile = (path) => hashBytes(readFileSync(path));
+const quote = (id) => `"${String(id).replaceAll('"', '""')}"`;
 
-function hashFile(path) {
-  return createHash("sha256").update(readFileSync(path)).digest("hex");
+function syncFile(path) { const fd = openSync(path, "r"); try { fsyncSync(fd); } finally { closeSync(fd); } }
+function syncDirectory(path) { const fd = openSync(path, "r"); try { fsyncSync(fd); } finally { closeSync(fd); } }
+function assertRegularSingleLink(path) {
+  const stat = lstatSync(path);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) throw new Error(`source must be a regular single-link file: ${path}`);
+  return stat;
 }
-
 function sqliteDetails(path) {
   const db = new Database(path, { readonly: true, fileMustExist: true });
   try {
+    const integrity = db.pragma("quick_check", { simple: true });
+    if (integrity !== "ok") throw new Error(`SQLite integrity failed for ${path}: ${integrity}`);
     const tables = {};
     for (const { name } of db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all()) {
-      const columns = db.prepare(`PRAGMA table_info(${JSON.stringify(name)})`).all();
-      const time = columns.find((c) => ["ts", "timestamp", "created_at", "observed_at"].includes(c.name));
-      const bounds = time ? db.prepare(`SELECT min(${JSON.stringify(time.name)}) AS first, max(${JSON.stringify(time.name)}) AS last FROM ${JSON.stringify(name)}`).get() : {};
-      tables[name] = { rows: db.prepare(`SELECT count(*) AS n FROM ${JSON.stringify(name)}`).get().n, ...bounds };
+      const columns = db.prepare(`PRAGMA table_info(${quote(name)})`).all();
+      const time = columns.find((c) => ["ts", "timestamp", "started_at", "created_at", "observed_at"].includes(c.name));
+      const bounds = time ? db.prepare(`SELECT min(${quote(time.name)}) AS first, max(${quote(time.name)}) AS last FROM ${quote(name)}`).get() : {};
+      tables[name] = { rows: db.prepare(`SELECT count(*) AS n FROM ${quote(name)}`).get().n, ...bounds };
     }
-    return tables;
+    return { integrity, schema_version: db.pragma("schema_version", { simple: true }), user_version: db.pragma("user_version", { simple: true }), tables };
   } finally { db.close(); }
 }
-
-export function buildMigrationManifest(inventory) {
-  const sources = inventory.map((source) => {
-    if (!source.path || source.kind === "memory") return { name: source.name, kind: source.kind, status: "no_source" };
-    const path = resolve(source.path);
-    if (!existsSync(path)) return { name: source.name, kind: source.kind, path, status: "missing" };
-    const item = { name: source.name, kind: source.kind, path, status: "present", bytes: statSync(path).size, sha256: hashFile(path) };
-    if (source.kind === "sqlite") item.tables = sqliteDetails(path);
-    if (source.kind === "jsonl") item.records = readFileSync(path, "utf8").split("\n").filter(Boolean).length;
-    return item;
-  });
-  return { version: 1, created_at: new Date().toISOString(), sources };
+function describeSource(source) {
+  if (!source.path || source.kind === "memory") return { name: source.name, kind: source.kind, status: "no_source" };
+  const path = resolve(source.path);
+  if (!existsSync(path)) return { name: source.name, kind: source.kind, path, status: "missing" };
+  const stat = assertRegularSingleLink(path);
+  const item = { name: source.name, kind: source.kind, path, status: "present", bytes: stat.size, sha256: hashFile(path) };
+  const companions = [];
+  for (const suffix of source.kind === "sqlite" ? ["-wal", "-shm"] : []) {
+    const companion = `${path}${suffix}`;
+    if (existsSync(companion)) { const s = assertRegularSingleLink(companion); companions.push({ path: companion, bytes: s.size, sha256: hashFile(companion) }); }
+  }
+  if (companions.length) item.companions = companions;
+  if (source.kind === "sqlite") Object.assign(item, sqliteDetails(path));
+  if (source.kind === "jsonl") item.records = readFileSync(path, "utf8").split("\n").filter(Boolean).map(JSON.parse).length;
+  if (source.kind === "json") JSON.parse(readFileSync(path, "utf8"));
+  return item;
 }
-
-function quote(id) { return `"${String(id).replaceAll('"', '""')}"`; }
-
+export function buildMigrationManifest(inventory, metadata = {}) {
+  return { version: 2, migration_id: metadata.migrationId || randomUUID(), created_at: new Date().toISOString(), target: metadata.target ? resolve(metadata.target) : null, source_precedence: "later_sources_override_earlier_sources", sources: inventory.map(describeSource), outputs: metadata.outputs || [], activated_at: metadata.activatedAt || null };
+}
+const rowKey = (row, columns) => JSON.stringify(columns.map((column) => row[column]));
+const equalRows = (a, b, columns) => columns.every((column) => a[column] === b[column]);
 function mergeSqlite(paths, output) {
-  const db = new Database(output);
+  const db = new Database(output); const indexes = new Map();
   try {
     db.pragma("journal_mode = DELETE");
-    for (let i = 0; i < paths.length; i += 1) {
-      const alias = `source_${i}`;
-      db.prepare(`ATTACH DATABASE ? AS ${quote(alias)}`).run(paths[i]);
+    db.exec("CREATE TABLE migration_provenance(table_name TEXT NOT NULL, source_path TEXT NOT NULL, source_sha256 TEXT NOT NULL, source_identity TEXT, output_identity TEXT, disposition TEXT NOT NULL)");
+    for (let sourceIndex = 0; sourceIndex < paths.length; sourceIndex += 1) {
+      const sourcePath = paths[sourceIndex], alias = `source_${sourceIndex}`, sourceHash = hashFile(sourcePath);
+      db.prepare(`ATTACH DATABASE ? AS ${quote(alias)}`).run(sourcePath);
       const tables = db.prepare(`SELECT name, sql FROM ${quote(alias)}.sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name`).all();
       for (const table of tables) {
-        const local = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table.name);
-        if (!local) db.exec(table.sql);
-        const columns = db.prepare(`PRAGMA ${quote(alias)}.table_info(${quote(table.name)})`).all().map((c) => c.name);
-        if (columns.length) {
-          const list = columns.map(quote).join(", ");
-          db.exec(`INSERT OR IGNORE INTO ${quote(table.name)} (${list}) SELECT ${list} FROM ${quote(alias)}.${quote(table.name)}`);
+        if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table.name)) db.exec(table.sql);
+        for (const index of db.prepare(`SELECT name, sql FROM ${quote(alias)}.sqlite_master WHERE type='index' AND tbl_name=? AND sql IS NOT NULL`).all(table.name)) indexes.set(index.name, index.sql);
+        const info = db.prepare(`PRAGMA ${quote(alias)}.table_info(${quote(table.name)})`).all(), columns = info.map((c) => c.name), primary = info.filter((c) => c.pk).sort((a, b) => a.pk - b.pk);
+        const integerPrimary = primary.length === 1 && /INT/i.test(primary[0].type);
+        const selectExisting = primary.length ? db.prepare(`SELECT * FROM ${quote(table.name)} WHERE ${primary.map((c) => `${quote(c.name)} IS ?`).join(" AND ")}`) : null;
+        for (const sourceRow of db.prepare(`SELECT * FROM ${quote(alias)}.${quote(table.name)}`).all()) {
+          const row = { ...sourceRow }, sourceIdentity = primary.length ? rowKey(row, primary.map((c) => c.name)) : null;
+          let disposition = "inserted";
+          if (selectExisting) {
+            const existing = selectExisting.get(...primary.map((c) => row[c.name]));
+            if (existing && equalRows(existing, row, columns)) disposition = "deduplicated";
+            else if (existing) { disposition = "rekeyed_conflict"; if (integerPrimary) delete row[primary[0].name]; else row[primary[0].name] = `${row[primary[0].name]}#migration:${sourceHash.slice(0, 12)}:${sourceIndex}`; }
+          }
+          if (disposition !== "deduplicated") { const names = columns.filter((c) => Object.hasOwn(row, c)); db.prepare(`INSERT INTO ${quote(table.name)} (${names.map(quote).join(",")}) VALUES (${names.map(() => "?").join(",")})`).run(...names.map((c) => row[c])); }
+          db.prepare("INSERT INTO migration_provenance VALUES (?, ?, ?, ?, ?, ?)").run(table.name, sourcePath, sourceHash, sourceIdentity, primary.length ? rowKey(row, primary.map((c) => c.name)) : null, disposition);
         }
       }
       db.prepare(`DETACH DATABASE ${quote(alias)}`).run();
     }
+    for (const sql of indexes.values()) { try { db.exec(sql); } catch (error) { if (!/already exists/i.test(error.message)) throw error; } }
+    if (db.pragma("quick_check", { simple: true }) !== "ok") throw new Error("merged SQLite integrity check failed");
   } finally { db.close(); }
-  chmodSync(output, 0o600);
+  chmodSync(output, 0o600); syncFile(output);
 }
-
 function writeAudit(paths, output) {
-  const fd = openSync(output, "w", 0o600);
-  try {
-    for (const path of paths) {
-      const sourceHash = hashFile(path);
-      const lines = readFileSync(path, "utf8").split("\n").filter(Boolean);
-      for (let index = 0; index < lines.length; index += 1) {
-        const event = JSON.parse(lines[index]);
-        event.migration_provenance = { source_sha256: sourceHash, source_record: index + 1 };
-        writeFileSync(fd, `${JSON.stringify(event)}\n`);
-      }
+  const seenStable = new Map(), records = [];
+  for (const sourcePath of paths) {
+    const sourceHash = hashFile(sourcePath), lines = readFileSync(sourcePath, "utf8").split("\n").filter(Boolean);
+    for (let index = 0; index < lines.length; index += 1) {
+      const event = JSON.parse(lines[index]), stableId = event.event_id ?? event.id ?? null;
+      if (stableId != null) { const canonical = JSON.stringify(event); if (seenStable.get(String(stableId)) === canonical) continue; if (seenStable.has(String(stableId))) event.event_id = `${stableId}#migration:${sourceHash.slice(0, 12)}:${index + 1}`; seenStable.set(String(stableId), canonical); }
+      event.migration_provenance = { source_path: sourcePath, source_sha256: sourceHash, source_record: index + 1 }; records.push(event);
     }
-    fsyncSync(fd);
-  } finally { closeSync(fd); }
-  chmodSync(output, 0o600);
+  }
+  writeFileSync(output, records.map(JSON.stringify).join("\n") + (records.length ? "\n" : ""), { mode: 0o600 }); syncFile(output);
 }
-
 function mergeJsonObjects(paths, output) {
   const merged = {};
-  for (const path of paths) {
-    const value = JSON.parse(readFileSync(path, "utf8"));
-    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`expected JSON object: ${path}`);
-    Object.assign(merged, value);
-  }
-  writeFileSync(output, `${JSON.stringify(merged, null, 2)}\n`, { mode: 0o600 });
+  for (const path of paths) { const value = JSON.parse(readFileSync(path, "utf8")); if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`expected JSON object: ${path}`); Object.assign(merged, value); }
+  writeFileSync(output, `${JSON.stringify(merged, null, 2)}\n`, { mode: 0o600 }); syncFile(output);
 }
-
-function stageProviderState({ sources, target }) {
-  if (!Array.isArray(sources) || sources.length === 0) throw new Error("at least one source is required");
-  const resolvedSources = sources.map((source) => resolve(source));
-  for (const source of resolvedSources) {
-    const stat = lstatSync(source);
-    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`unsafe source: ${source}`);
-  }
-  const stage = `${resolve(target)}.staging`;
-  rmSync(stage, { recursive: true, force: true });
-  mkdirSync(stage, { recursive: true, mode: 0o700 });
+function inventoryRoots(roots) {
   const inventory = [];
-  for (const source of resolvedSources) {
-    for (const file of FILES) {
-      const path = join(source, file);
-      if (existsSync(path)) inventory.push({ name: `${basename(source)}:${file}`, kind: file.endsWith(".db") ? "sqlite" : file.endsWith(".jsonl") ? "jsonl" : "json", path });
-    }
+  for (const root of roots) {
+    for (const [file, kind] of ROOT_FILES) { const path = join(root, file); if (existsSync(path)) inventory.push({ name: `${basename(root)}:${file}`, kind, path }); }
+    const cacheRoot = join(root, "semantic-cache");
+    if (existsSync(cacheRoot)) for (const entry of readdirSync(cacheRoot, { recursive: true, withFileTypes: true })) { if (entry.isFile()) { const path = join(entry.parentPath || entry.path, entry.name); inventory.push({ name: `${basename(root)}:semantic-cache/${relative(cacheRoot, path)}`, kind: "cache", path }); } }
   }
-  inventory.push({ name: "semantic-cache-memory", kind: "memory", path: null });
-  const manifest = buildMigrationManifest(inventory);
-  const metrics = inventory.filter((x) => x.kind === "sqlite" && x.path).map((x) => x.path);
-  const audits = inventory.filter((x) => x.kind === "jsonl" && x.path).map((x) => x.path);
-  if (metrics.length) mergeSqlite(metrics, join(stage, "metrics.db"));
-  if (audits.length) writeAudit(audits, join(stage, "audit.jsonl"));
-  for (const file of ["capacity-state.json", "provider-health.json", "model_catalog_store.json", "model_catalog_cache.json"]) {
-    const candidates = resolvedSources.map((root) => join(root, file)).filter(existsSync);
-    if (candidates.length) mergeJsonObjects(candidates, join(stage, file));
-  }
-  writeFileSync(join(stage, "migration-manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 });
-  const fd = openSync(stage, "r"); try { fsyncSync(fd); } finally { closeSync(fd); }
-  return { stage, manifest };
+  if (!inventory.some((entry) => entry.kind === "cache")) inventory.push({ name: "semantic-cache-memory", kind: "memory", path: null });
+  return inventory;
 }
-
+function copyInventoryFiles(inventory, stage) {
+  const files = inventory.filter((item) => ["yaml", "cache"].includes(item.kind) && item.path);
+  files.forEach((item, index) => { const directory = item.kind === "cache" ? join(stage, "semantic-cache") : join(stage, "inventory"); mkdirSync(directory, { recursive: true, mode: 0o700 }); const output = join(directory, `${index}-${basename(item.path)}`); copyFileSync(item.path, output, constants.COPYFILE_EXCL); chmodSync(output, 0o600); syncFile(output); });
+}
+function describeOutputs(stage) {
+  const outputs = [];
+  const walk = (directory) => { for (const entry of readdirSync(directory, { withFileTypes: true })) { const path = join(directory, entry.name); if (entry.isDirectory()) walk(path); else if (entry.name !== "migration-manifest.json") { assertRegularSingleLink(path); const kind = entry.name.endsWith(".db") ? "sqlite" : entry.name.endsWith(".jsonl") ? "jsonl" : entry.name.endsWith(".json") ? "json" : "file"; const item = { path: relative(stage, path), kind, bytes: statSync(path).size, sha256: hashFile(path) }; if (kind === "sqlite") Object.assign(item, sqliteDetails(path)); if (kind === "jsonl") item.records = readFileSync(path, "utf8").split("\n").filter(Boolean).map(JSON.parse).length; if (kind === "json") JSON.parse(readFileSync(path, "utf8")); outputs.push(item); } } };
+  walk(stage); return outputs.sort((a, b) => a.path.localeCompare(b.path));
+}
+function ownedManifest(root, target) { const path = join(root, "migration-manifest.json"); if (!existsSync(path)) throw new Error(`refusing unowned migration directory: ${root}`); const manifest = JSON.parse(readFileSync(path, "utf8")); if (manifest.version !== 2 || manifest.target !== resolve(target) || !manifest.migration_id) throw new Error(`invalid migration ownership: ${root}`); return manifest; }
+function stageProviderState({ sources, target }) {
+  if (!Array.isArray(sources) || !sources.length) throw new Error("at least one source is required");
+  const roots = sources.map((source) => resolve(source));
+  for (const source of roots) { const stat = lstatSync(source); if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`unsafe source: ${source}`); }
+  const destination = resolve(target), stage = `${destination}.staging`;
+  if (existsSync(stage)) { ownedManifest(stage, destination); rmSync(stage, { recursive: true }); }
+  mkdirSync(stage, { mode: 0o700 });
+  const inventory = inventoryRoots(roots), migrationId = randomUUID(), metrics = inventory.filter((i) => i.kind === "sqlite").map((i) => i.path), audits = inventory.filter((i) => i.kind === "jsonl").map((i) => i.path);
+  if (metrics.length) mergeSqlite(metrics, join(stage, "metrics.db")); if (audits.length) writeAudit(audits, join(stage, "audit.jsonl"));
+  for (const [output, names] of [["capacity-state.json", ["capacity-state.json", "capacity_store.json"]], ["provider-health.json", ["provider-health.json"]], ["model_catalog_store.json", ["model_catalog_store.json"]], ["model_catalog_cache.json", ["model_catalog_cache.json"]]]) { const paths = inventory.filter((i) => i.kind === "json" && names.includes(basename(i.path))).map((i) => i.path); if (paths.length) mergeJsonObjects(paths, join(stage, output)); }
+  copyInventoryFiles(inventory, stage);
+  const manifest = buildMigrationManifest(inventory, { migrationId, target: destination, outputs: describeOutputs(stage) }), manifestPath = join(stage, "migration-manifest.json");
+  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 }); syncFile(manifestPath); syncDirectory(stage); return { stage, manifest };
+}
+function sourceUnchanged(source) {
+  if (source.status !== "present" || !existsSync(source.path) || hashFile(source.path) !== source.sha256) return false;
+  const expected = new Map((source.companions || []).map((item) => [item.path, item.sha256]));
+  for (const suffix of source.kind === "sqlite" ? ["-wal", "-shm"] : []) { const path = `${source.path}${suffix}`; if (existsSync(path) !== expected.has(path) || (existsSync(path) && hashFile(path) !== expected.get(path))) return false; }
+  return true;
+}
 export function verifyMigration(root) {
   try {
     const manifest = JSON.parse(readFileSync(join(root, "migration-manifest.json"), "utf8"));
-    if (manifest.version !== 1) return { valid: false, reason: "manifest_version" };
-    for (const source of manifest.sources.filter((x) => x.status === "present")) {
-      if (!existsSync(source.path) || hashFile(source.path) !== source.sha256) return { valid: false, reason: "source_changed" };
-    }
-    if (existsSync(join(root, "metrics.db"))) sqliteDetails(join(root, "metrics.db"));
+    if (manifest.version !== 2 || !manifest.migration_id || !manifest.target) return { valid: false, reason: "manifest_identity" };
+    for (const source of manifest.sources.filter((i) => i.status === "present")) if (!sourceUnchanged(source)) return { valid: false, reason: "source_changed" };
+    for (const output of manifest.outputs) { const path = join(root, output.path); if (!existsSync(path)) return { valid: false, reason: "output_missing" }; assertRegularSingleLink(path); if (hashFile(path) !== output.sha256) return { valid: false, reason: "output_changed" }; if (output.kind === "sqlite") { const details = sqliteDetails(path); if (JSON.stringify(details.tables) !== JSON.stringify(output.tables)) return { valid: false, reason: "output_counts_changed" }; } else if (output.kind === "jsonl") readFileSync(path, "utf8").split("\n").filter(Boolean).map(JSON.parse); else if (output.kind === "json") JSON.parse(readFileSync(path, "utf8")); }
     return { valid: true, manifest };
   } catch (error) { return { valid: false, reason: error.message }; }
 }
-
-export function migrateProviderState({ sources, target, crashAt } = {}) {
-  const destination = resolve(target);
+function activateStage(target) {
+  const destination = resolve(target), stage = `${destination}.staging`;
   if (existsSync(destination)) throw new Error(`target already exists: ${destination}`);
-  const { stage, manifest } = stageProviderState({ sources, target: destination });
-  if (crashAt === "before-activate") throw new Error("injected crash before-activate");
-  const verified = verifyMigration(stage);
-  if (!verified.valid) throw new Error(`migration verification failed: ${verified.reason}`);
-  renameSync(stage, destination);
-  const parentFd = openSync(dirname(destination), "r"); try { fsyncSync(parentFd); } finally { closeSync(parentFd); }
-  return { activated: true, target: destination, manifest };
+  const verified = verifyMigration(stage); if (!verified.valid) throw new Error(`migration verification failed: ${verified.reason}`);
+  const manifest = { ...verified.manifest, activated_at: new Date().toISOString() }, manifestPath = join(stage, "migration-manifest.json");
+  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 }); syncFile(manifestPath); syncDirectory(stage); renameSync(stage, destination); syncDirectory(dirname(destination)); return manifest;
 }
-
-function usage() {
-  process.stderr.write("usage: migrate-provider-state.mjs --inventory SOURCE... | --stage TARGET SOURCE... | --verify TARGET | --activate TARGET | --rollback TARGET\n");
+export function migrateProviderState({ sources, target, crashAt } = {}) { const destination = resolve(target); if (existsSync(destination)) throw new Error(`target already exists: ${destination}`); const { manifest } = stageProviderState({ sources, target: destination }); if (crashAt === "before-activate") throw new Error("injected crash before-activate"); activateStage(destination); return { activated: true, target: destination, manifest }; }
+function rollback(target) {
+  const destination = resolve(target), stage = `${destination}.staging`;
+  if (!existsSync(destination)) { if (!existsSync(stage)) throw new Error("no owned migration to roll back"); ownedManifest(stage, destination); rmSync(stage, { recursive: true }); syncDirectory(dirname(destination)); return { staged_removed: true }; }
+  const manifest = ownedManifest(destination, destination), activeAudit = join(destination, "audit.jsonl"), sourceAudit = manifest.sources.find((i) => i.kind === "jsonl" && i.status === "present")?.path; let replayed = 0;
+  if (sourceAudit && existsSync(activeAudit)) { const existing = new Set(readFileSync(sourceAudit, "utf8").split("\n").filter(Boolean).map(hashBytes)), additions = []; for (const line of readFileSync(activeAudit, "utf8").split("\n").filter(Boolean)) { const event = JSON.parse(line); if (!event.migration_provenance && !existing.has(hashBytes(line))) { additions.push(line); existing.add(hashBytes(line)); } } if (additions.length) { const fd = openSync(sourceAudit, constants.O_WRONLY | constants.O_APPEND | constants.O_NOFOLLOW); try { writeFileSync(fd, `${additions.join("\n")}\n`); fsyncSync(fd); } finally { closeSync(fd); } replayed = additions.length; } }
+  return { active_preserved: true, replayed };
 }
-
-if (import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const [command, target, ...sources] = process.argv.slice(2);
-  if (command === "--inventory") console.log(JSON.stringify(buildMigrationManifest([target, ...sources].map((path) => ({ name: basename(path), kind: path.endsWith(".db") ? "sqlite" : "json", path }))), null, 2));
-  else if (command === "--stage") console.log(JSON.stringify(stageProviderState({ sources, target }), null, 2));
-  else if (command === "--verify") { const result = verifyMigration(target); console.log(JSON.stringify(result)); if (!result.valid) process.exitCode = 1; }
-  else if (command === "--activate") {
-    const stage = `${resolve(target)}.staging`; const result = verifyMigration(stage);
-    if (!result.valid || existsSync(target)) throw new Error(result.reason || "target already exists");
-    renameSync(stage, resolve(target));
-  } else if (command === "--rollback") rmSync(`${resolve(target)}.staging`, { recursive: true, force: true });
-  else { usage(); process.exitCode = 2; }
-}
+function usage() { process.stderr.write("usage: migrate-provider-state.mjs --inventory SOURCE... | --stage TARGET SOURCE... | --verify TARGET | --activate TARGET | --rollback TARGET\n"); }
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) { const [command, target, ...sources] = process.argv.slice(2); if (command === "--inventory") console.log(JSON.stringify(buildMigrationManifest(inventoryRoots([target, ...sources].map((p) => resolve(p)))), null, 2)); else if (command === "--stage") console.log(JSON.stringify(stageProviderState({ sources, target }), null, 2)); else if (command === "--verify") { const result = verifyMigration(target); console.log(JSON.stringify(result)); if (!result.valid) process.exitCode = 1; } else if (command === "--activate") console.log(JSON.stringify(activateStage(target))); else if (command === "--rollback") console.log(JSON.stringify(rollback(target))); else { usage(); process.exitCode = 2; } }
