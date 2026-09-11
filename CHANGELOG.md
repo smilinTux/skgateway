@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Continue a provider-neutral bucket chain when one member has all exact
+  backend claims quarantined, while concrete-model requests remain fail closed.
+
 - The OpenRouter free-tier backend is enabled (`backends.openrouter` and
   `discovery.providers.openrouter`), discovery-only with no static model list,
   keyed from `OPENROUTER_API_KEY` in the service EnvironmentFile and never
