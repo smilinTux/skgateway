@@ -60,12 +60,15 @@ test("durable admission fails closed and binds the opaque account reference", as
   assert.equal(result.status, 503);
   assert.equal(target.count, 0);
 
+  const fixedStaleExpiry = 1;
   configureProviderHealthPersistence({ append() {}, snapshot(filter) {
-    return [exactSnapshot(filter, { evidence_expires_at: Date.now() - 1 })];
+    return [exactSnapshot(filter, { evidence_expires_at: fixedStaleExpiry })];
   } });
-  result = await routeAndSend(router, { model: "contract-model" }, "/chat/completions", "POST", {}, body(), false);
-  assert.equal(result.status, 503);
-  assert.equal(target.count, 0);
+  for (let repetition = 0; repetition < 100; repetition++) {
+    result = await routeAndSend(router, { model: "contract-model" }, "/chat/completions", "POST", {}, body(), false);
+    assert.equal(result.status, 503, `stale observation repetition ${repetition}`);
+    assert.equal(target.count, 0, `stale observation dispatched on repetition ${repetition}`);
+  }
 
   configureProviderHealthPersistence({ append() {}, snapshot() { throw new Error("unreadable"); } });
   result = await routeAndSend(router, { model: "contract-model" }, "/chat/completions", "POST", {}, body(), false);
