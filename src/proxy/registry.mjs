@@ -212,6 +212,11 @@ export function resolve({ model, context, service, role } = {}, path = REGISTRY_
     target = model;
     via = "role";
   }
+  // A sk-* model is an explicit logical role request. If it is not declared,
+  // applying defaults.role can silently send it to an unrelated provider.
+  if (target == null && typeof model === "string" && model.startsWith("sk-")) {
+    return null;
+  }
   if (target == null) {
     target = defaults.role;
     via = "default";

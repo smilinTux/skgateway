@@ -105,11 +105,11 @@ test('runtime rejects a foreign primary or fallback before upstream dispatch and
     const router = { route: async () => { routeCalls += 1; return candidates; } };
     const result = await routeAndSend(
       router,
-      { model: 'sk-codex-mid' },
+      { model: 'codex-test' },
       '/v1/chat/completions',
       'POST',
       {},
-      Buffer.from('{"model":"sk-codex-mid","messages":[]}'),
+      Buffer.from('{"model":"codex-test","messages":[]}'),
       false,
       (event) => events.push(event),
     );

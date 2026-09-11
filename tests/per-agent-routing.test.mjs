@@ -235,7 +235,7 @@ describe("per-agent routing via routeAndSend", () => {
     assert.equal(backendB.state.lastModel, "pinned", "fallback still received the pinned model");
   });
 
-  test("an explicit x-sk-role signal wins over the agent pin", async () => {
+  test("an unknown explicit x-sk-role fails closed and does not use the agent pin", async () => {
     const router = createRouter({
       backends: {
         a: { url: backendA.base, auth_type: "none", models: ["model-a"], priority: 1 },
@@ -246,13 +246,18 @@ describe("per-agent routing via routeAndSend", () => {
     });
 
     // With an explicit role signal present, the per-agent pin must NOT rewrite
-    // the model (deliberate per-request routing intent wins). Registry resolution
-    // for the role finds no registry file at the MODULE default path, so it falls
-    // through to normal model-name routing on the ORIGINAL model-b → backend b.
+    // the model. The undeclared logical role must also never fall through to
+    // the concrete model or a mutable registry default.
+    const beforeA = backendA.state.count;
+    const beforeB = backendB.state.count;
     const r = await routeAndSend(
       router, { model: "model-b", agentId: "agenta", role: "sk-code" },
       "/v1/chat/completions", "POST", HEADERS, bodyFor("model-b"), false,
     );
-    assert.equal(r.backendId, "b", "explicit role signal suppressed the agent pin");
+    assert.equal(r.status, 404);
+    assert.equal(JSON.parse(r.body).error.code, "unknown_logical_role");
+    assert.equal(r.backendId, null);
+    assert.equal(backendA.state.count, beforeA);
+    assert.equal(backendB.state.count, beforeB);
   });
 });

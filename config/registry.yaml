@@ -26,6 +26,8 @@ backends:
 roles:
   ## Sovereign default: reasoning + tools + vision, zone 0, never egresses.
   sk-default: qwen38
+  ## Explicit stable Qwen route. Never let this alias inherit a mutable default.
+  sk-qwen: qwen38
   ## Subscription frontier (zone 2, public-classification work only).
   sk-codex: codex-frontier
   sk-codex-mid: codex-mid

@@ -797,31 +797,25 @@ ${extraRoles}defaults:
     assert.equal(r.status, 200, 'a registry-declared role wins over the typo heuristic');
   });
 
-  test('NEGATIVE CONTROL, flag OFF: a bucket id is genuinely NOT a bucket', async () => {
-    // So nobody later reads a green suite and assumes the bucket layer has
-    // been armed all along. With the flag off, sk-l-secret is an ordinary sk-*
-    // id: it falls through to registry routing and is SERVED, with no floor
-    // and no ceiling applied. That is today's real behaviour and it is exactly
-    // why the flag exists.
+  test('flag OFF: an undeclared bucket-shaped logical id still fails closed', async () => {
+    // Disabling bucket semantics must not turn an undeclared sk-* id into a
+    // request for the mutable registry default.
     await applyConfig({ buckets_enabled: false });
     const r = await routeAndSend(
       router, { model: 'sk-l-secret', agentId: 't' }, '/chat/completions', 'POST', HEADERS, bodyFor('sk-l-secret'), false,
     );
-    assert.equal(r.status, 200, 'flag off means the bucket layer is inert, not enforcing');
-    assert.equal(pool.state.count, 1, 'it was routed through the registry default, not gated');
+    assert.equal(r.status, 404);
+    assert.equal(JSON.parse(r.body).error.code, 'unknown_logical_role');
+    assert.equal(pool.state.count, 0, 'no upstream received the undeclared logical id');
   });
 
-  test('NEGATIVE CONTROL, flag OFF: the typo gate is off too, and still returns 200', async () => {
-    // The pre-fix behaviour, pinned. With buckets disabled there is no bucket
-    // contract to violate, so sk-xl-secrets keeps falling through. This is the
-    // control that proves the 400 above comes from the flag and not from some
-    // unrelated id validation.
+  test('flag OFF: a bucket typo fails as an unknown logical role', async () => {
     await applyConfig({ buckets_enabled: false });
     const r = await routeAndSend(
       router, { model: 'sk-xl-secrets', agentId: 't' }, '/chat/completions', 'POST', HEADERS, bodyFor('sk-xl-secrets'), false,
     );
-    assert.equal(r.status, 200);
-    assert.notEqual(r.status, 400, 'the 400 must come from buckets_enabled, or it is testing nothing');
+    assert.equal(r.status, 404);
+    assert.equal(JSON.parse(r.body).error.code, 'unknown_logical_role');
   });
 });
 

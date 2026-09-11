@@ -2250,7 +2250,19 @@ export function createRouter(config = {}) {
     return true;
   }
 
-  return { route, routeExactBackend, getHealth, getProviderUsage: providerUsageSnapshot, addBackend, removeBackend, getBackend, getBackends, registerDiscoveredModels, resolveAgentTarget };
+  return {
+    route,
+    routeExactBackend,
+    getHealth,
+    getProviderUsage: providerUsageSnapshot,
+    addBackend,
+    removeBackend,
+    getBackend,
+    getBackends,
+    registerDiscoveredModels,
+    resolveAgentTarget,
+    getRegistryPath: () => registryPath,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -3326,6 +3338,8 @@ export async function routeAndSend(router, request, upstreamPath, method, client
   // model-name routing (full backward-compat).
   let candidates = null;
   let isBucketChain = false;
+  let resolvedLogicalRoute = null;
+  let resolvedRegistryRole = null;
 
   // Recovery probes must measure the provider named by the capacity domain.
   // Keep this as a function argument rather than a request field so an HTTP
@@ -3385,12 +3399,47 @@ export async function routeAndSend(router, request, upstreamPath, method, client
   // default. Registry routing here previously rewrote Kimi probes to Qwen and
   // produced a successful response without ever observing Kimi.
   if (!candidates && shouldUseRegistryRouting(router, request, bootstrapProbe)) {
+    const registryPath = typeof router.getRegistryPath === "function"
+      ? router.getRegistryPath()
+      : undefined;
     let reg = resolveRegistry({
       model: request.model,
       context: request.context,
       service: request.service,
       role: request.role,
-    });
+    }, registryPath);
+
+    if (!reg) {
+      const unknownRole = typeof request.role === "string" && request.role.startsWith("sk-")
+        ? request.role
+        : typeof request.model === "string" && request.model.startsWith("sk-")
+          ? request.model
+          : null;
+      if (unknownRole) {
+        await emitSiem("error", {
+          status: 404,
+          code: "unknown_logical_role",
+          requested_model: requestedModel,
+          logical_role: unknownRole,
+        }, {});
+        return {
+          status: 404,
+          headers: { "content-type": "application/json" },
+          body: Buffer.from(JSON.stringify({
+            error: {
+              message: `Unknown logical role: ${unknownRole}`,
+              code: "unknown_logical_role",
+              type: "invalid_request_error",
+            },
+            requested_model: requestedModel,
+          }), "utf8"),
+          backendId: null,
+          requestedModel,
+          logicalRoute: unknownRole,
+          role: unknownRole,
+        };
+      }
+    }
 
     // ── sk-auto: pick the concrete role per-request by DIFFICULTY ──
     // resolve() returns an { auto:true } marker for the sk-auto role/context.
@@ -3402,7 +3451,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       // Decision cache: identical prompts under the same config epoch skip
       // re-classification + the empirical lookup. A registry `auto:` edit bumps
       // the epoch → transparent invalidation. (Scaffolds the S2 small-LLM tier.)
-      const _ckey = decisionKey(messages, getConfigEpoch());
+      const _ckey = decisionKey(messages, getConfigEpoch(registryPath));
       let d = _autoDecisionCache.get(_ckey);
       const _cached = !!d;
       if (!d) {
@@ -3416,14 +3465,14 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           // Map a logical role to its concrete model name so empirical stats
           // (keyed by concrete model) can be looked up.
           resolveModel: (role) => {
-            const r = resolveRegistry({ role });
+            const r = resolveRegistry({ role }, registryPath);
             return r && r.model ? r.model : null;
           },
         });
         d = { role: adj.role, reason: adj.reason, signals: adj.signals, promptClass };
         _autoDecisionCache.set(_ckey, d, autoCfg.cache_ttl_ms);
       }
-      const picked = resolveRegistry({ role: d.role });
+      const picked = resolveRegistry({ role: d.role }, registryPath);
       console.log(
         `[router] auto-route difficulty=${d.role} class=${d.promptClass} reason=${d.reason} ` +
         `signals=[${d.signals.join(",")}]${_cached ? " (cached)" : ""} -> backend=${picked ? picked.backend : "(unresolved)"}`
@@ -3460,6 +3509,8 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     }
 
     if (reg) {
+      resolvedLogicalRoute = request.model;
+      resolvedRegistryRole = reg.role;
       // Rewrite the outgoing model so the upstream receives a real name.
       body = rewriteBodyModel(body, reg.model);
       body = applyBodyFloor(body, reg.model, reg.minOutputTokens);
@@ -4649,7 +4700,8 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     const inferredProvider = backend.discovery || inferProviderFromBackend(backendId);
     lastResult.provider = inferredProvider;
     lastResult.rail = inferRailFromBackend(backendId, backendUrl, isLocalUrl, inferredProvider);
-    lastResult.logicalRoute = isBucketChain ? bucketAddr.bucket : (isRegistryRouted(request) ? request.model : null);
+    lastResult.logicalRoute = isBucketChain ? bucketAddr.bucket : resolvedLogicalRoute;
+    if (resolvedRegistryRole) lastResult.role = resolvedRegistryRole;
     // Runtime revision combines readiness and discovery for tracking
     lastResult.runtimeRevision = `${backend.readinessRevision}:${backend.discoveryRevision}`;
     if (attemptEnergy) lastResult.energy = attemptEnergy;

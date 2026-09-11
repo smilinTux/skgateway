@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import http from "node:http";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, test } from "node:test";
 
 import { createRouter, routeAndSend } from "../src/proxy/router.mjs";
@@ -8,6 +11,19 @@ import { enforceResponseContract } from "../src/proxy/response-contract.mjs";
 const MODEL = "Qwen/Qwen3-30B-A3B";
 const REQUESTED = "sk-qwen";
 const LIVE_QWEN_MODEL = "qwen3.8-27b-huihui-abliterated-q4_k_m";
+const QWEN_REGISTRY = join(mkdtempSync(join(tmpdir(), "skgw-sse-qwen-")), "registry.yaml");
+
+function pinQwenRole(url) {
+  writeFileSync(QWEN_REGISTRY, [
+    "backends:",
+    "  qwen38:",
+    `    url: ${url}`,
+    `    model: ${LIVE_QWEN_MODEL}`,
+    "roles:",
+    "  sk-qwen: qwen38",
+    "",
+  ].join("\n"));
+}
 
 function sseBody(deltas) {
   const frames = deltas.map((entry) => `data: ${JSON.stringify({
@@ -591,7 +607,8 @@ describe("completed SSE tool-call structure", () => {
     await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
     try {
       const url = `http://127.0.0.1:${upstream.address().port}/v1`;
-      const router = createRouter({ backends: { qwen: { url, auth_type: "none", models: [REQUESTED] } } });
+      pinQwenRole(url);
+      const router = createRouter({ registry_path: QWEN_REGISTRY, backends: { qwen: { url, auth_type: "none", models: [LIVE_QWEN_MODEL] } } });
       const events = [];
       const result = await routeAndSend(router, { model: REQUESTED, agentId: "repair" },
         "/chat/completions", "POST", { "content-type": "application/json" },

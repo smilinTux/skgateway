@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import http from "node:http";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, test } from "node:test";
 
 import {
@@ -13,6 +16,20 @@ import { createRouter, routeAndSend } from "../src/proxy/router.mjs";
 import { enforceResponseContract } from "../src/proxy/response-contract.mjs";
 
 const HEADERS = { "content-type": "application/json" };
+const QWEN_MODEL = "qwen3.8-27b-huihui-abliterated-q4_k_m";
+const QWEN_REGISTRY = join(mkdtempSync(join(tmpdir(), "skgw-shared-qwen-")), "registry.yaml");
+
+function pinQwenRole(url) {
+  writeFileSync(QWEN_REGISTRY, [
+    "backends:",
+    "  qwen38:",
+    `    url: ${url}`,
+    `    model: ${QWEN_MODEL}`,
+    "roles:",
+    "  sk-qwen: qwen38",
+    "",
+  ].join("\n"));
+}
 
 function body(model, stream = false) {
   return Buffer.from(JSON.stringify({ model, stream, messages: [{ role: "user", content: "public synthetic" }] }));
@@ -132,7 +149,8 @@ describe("router qualification repairs", () => {
       res.end(upstreamBody);
     });
     try {
-      const router = createRouter({ backends: { qwen: { url: upstream.url, auth_type: "none", models: ["sk-qwen"] } } });
+      pinQwenRole(upstream.url);
+      const router = createRouter({ registry_path: QWEN_REGISTRY, backends: { qwen: { url: upstream.url, auth_type: "none", models: [QWEN_MODEL] } } });
       const events = [];
       const visible = await routeAndSend(router, { model: "sk-qwen", agentId: "canary" },
         "/chat/completions", "POST", HEADERS, body("sk-qwen", true), false, (event) => events.push(event));
@@ -163,7 +181,8 @@ describe("router qualification repairs", () => {
       res.end(JSON.stringify({ model: "Qwen/Qwen3-30B-A3B", choices: [{ message: { content: "ok" } }] }));
     });
     try {
-      const router = createRouter({ backends: { qwen: { url: upstream.url, auth_type: "none", models: ["sk-qwen"] } } });
+      pinQwenRole(upstream.url);
+      const router = createRouter({ registry_path: QWEN_REGISTRY, backends: { qwen: { url: upstream.url, auth_type: "none", models: [QWEN_MODEL] } } });
       const events = [];
       const result = await routeAndSend(router, { model: "sk-qwen", agentId: "canary" },
         "/chat/completions", "POST", HEADERS, body("sk-qwen"), false, (event) => events.push(event));
@@ -195,7 +214,9 @@ describe("router qualification repairs", () => {
   test("every pool admission 503 emits a response audit event", async () => {
     getPool({ defaultMaxConcurrent: 1, defaultMaxQueue: 0 });
     const held = await getPool().acquire("qwen");
-    const router = createRouter({ backends: { qwen: { url: "http://127.0.0.1:9/v1", auth_type: "none", models: ["sk-qwen"] } } });
+    const url = "http://127.0.0.1:9/v1";
+    pinQwenRole(url);
+    const router = createRouter({ registry_path: QWEN_REGISTRY, backends: { qwen: { url, auth_type: "none", models: [QWEN_MODEL] } } });
     const events = [];
     try {
       const result = await routeAndSend(router, { model: "sk-qwen", agentId: "canary" },
