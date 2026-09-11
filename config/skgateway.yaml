@@ -282,6 +282,13 @@ sanitizer:
   keep_end: 12
   strip_thinking: true
 
+# Compatibility names advertised to clients. Routing rewrites these to the
+# exact upstream model id before backend selection and forwarding.
+model_aliases:
+  qwen3.8-27b: qwen3.8-27b-huihui-abliterated-q4_k_m
+  qwen3.8-27b-ud-q5_k_xl: qwen3.8-27b-huihui-abliterated-q4_k_m
+  qwen38-abliterated: qwen3.8-27b-huihui-abliterated-q4_k_m
+
 # Per-model context limits.  Formula: max_body_bytes = context_tokens * 4 bytes * 0.80
 # max_system_bytes = max_body_bytes * 0.40.  Values from NVIDIA NIM model cards (2026-05-12).
 model_limits:

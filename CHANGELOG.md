@@ -51,6 +51,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Translate configured compatibility model aliases to their exact upstream
+  model id before backend selection and forwarding, keeping advertised aliases
+  callable without changing exact model routes.
+
 - Preserve the scheduled provider probe owner across every exact recovery
   model so a later successful target cannot re-arm provider throttling.
 
