@@ -37,6 +37,7 @@ import Database from 'better-sqlite3';
 import { mkdirSync, existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { getPricing } from '../config.mjs';
+import { createProviderHealthStore, migrateProviderHealthTables } from '../health/store.mjs';
 
 // ─── constants ────────────────────────────────────────────────────────────────
 
@@ -369,6 +370,7 @@ function migrate(db) {
   ensureColumn(db, 'request_log', 'requested_model', 'TEXT');
   ensureColumn(db, 'request_log', 'served_model', 'TEXT');
   ensureColumn(db, 'request_log', 'runtime_revision', 'TEXT');
+  migrateProviderHealthTables(db);
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -500,6 +502,9 @@ export function createMetricsCollector(config) {
     // has to reach the live 8,199-row database goes through migrate().
     migrate(db);
   }
+
+  const healthProjectionPath = config?.state_paths?.providerHealth || (cfg.db_path ? resolve(dirname(cfg.db_path), 'provider-health.json') : null);
+  const healthStore = db ? createProviderHealthStore({ db, projectionPath: healthProjectionPath }) : null;
 
   // ── prepared statements ──────────────────────────────────────────────────
   let stmts = null;
@@ -1341,6 +1346,7 @@ export function createMetricsCollector(config) {
     getTokenUsage,
     getTerminalRequests,
     getCosts,
+    healthStore,
     close,
     /** Force a synchronous flush of the write buffer. Mainly for tests. */
     flush: () => maybeFlush(true),

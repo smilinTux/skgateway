@@ -1,5 +1,14 @@
+import { randomUUID } from "node:crypto";
+
 const DEFAULT_MAX_AGE_MS = 15 * 60 * 1000;
 const records = new Map();
+let healthSink = null;
+let healthDefaults = null;
+
+export function configureProviderHealthPersistence(store, defaults = null) {
+  healthSink = store?.append instanceof Function ? store : null;
+  healthDefaults = defaults && typeof defaults === "object" ? { ...defaults } : null;
+}
 
 const HEADER_SCHEMAS = {
   codex: [
@@ -72,7 +81,7 @@ function retryAt(headers, now) {
   return Number.isFinite(date) ? new Date(date).toISOString() : null;
 }
 
-export function observeProviderUsage(provider, response, { now = Date.now() } = {}) {
+export function observeProviderUsage(provider, response, { now = Date.now(), health = null } = {}) {
   if (!Object.hasOwn(HEADER_SCHEMAS, provider)) return;
   const prior = records.get(provider);
   const windows = parseProviderQuota(provider, response?.headers, { now });
@@ -93,6 +102,38 @@ export function observeProviderUsage(provider, response, { now = Date.now() } = 
       cooldown_until: throttled ? retryAt(response?.headers, now) : null,
     },
   });
+  const context = health ? { ...(healthDefaults || {}), ...health } : healthDefaults;
+  if (healthSink && context) {
+    const resetTimes = windows.map((window) => Date.parse(window.reset_at)).filter(Number.isFinite);
+    const retry = retryAt(response?.headers, now);
+    const reset = retry ? Date.parse(retry) : resetTimes.length ? Math.min(...resetTimes) : null;
+    const remainingRatio = windows.length ? Math.min(...windows.map((window) => window.limit > 0 ? window.remaining / window.limit : 0)) : null;
+    try {
+      healthSink.append({
+        ...context,
+        schema_version: 1,
+        observation_id: context.observation_id || randomUUID(),
+        observed_at: now,
+        expires_at: context.expires_at || now + DEFAULT_MAX_AGE_MS,
+        provider,
+        source: "real_request",
+        probe_cost: context.probe_cost || "unknown",
+        dimensions: {
+          ...(context.dimensions || {}),
+          transport: status >= 200 && status < 500 ? "available" : "degraded",
+          quota: status === 402 ? "exhausted" : status === 429 ? "throttled" : remainingRatio == null ? "unknown" : remainingRatio <= 0.1 ? "low" : "available",
+        },
+        success: status >= 200 && status < 400,
+        status_class: status ? `${Math.floor(status / 100)}xx` : "none",
+        provider_error_code: throttled ? (status === 402 ? "quota_exhausted" : "rate_limited") : null,
+        reset_at: reset,
+        quota_windows: windows.map((window) => ({ ...window, reset_at: window.reset_at ? Date.parse(window.reset_at) : null })),
+      });
+      records.get(provider).persistence = { state: "ready", observed_at: new Date(now).toISOString() };
+    } catch {
+      records.get(provider).persistence = { state: "error", observed_at: new Date(now).toISOString() };
+    }
+  }
 }
 
 export function providerUsageSnapshot({ now = Date.now(), maxAgeMs = DEFAULT_MAX_AGE_MS } = {}) {
@@ -118,4 +159,4 @@ export function providerUsageSnapshot({ now = Date.now(), maxAgeMs = DEFAULT_MAX
   return out;
 }
 
-export function _resetProviderUsageForTests() { records.clear(); }
+export function _resetProviderUsageForTests() { records.clear(); healthSink = null; healthDefaults = null; }

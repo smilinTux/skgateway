@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Persist strictly normalized provider health observations and deterministic
+  current snapshots in the shared metrics database, with a private
+  `provider-health.json` projection, restart-safe rebuilds, and passive
+  allowlisted quota evidence that never stores raw headers or response bodies.
+
 - Move mutable gateway metrics, audit, capacity, health, and cache state to
   provider-neutral XDG paths with private file handling and a crash-safe,
   provenance-preserving staged migration and rollback-forward tool. Migration

@@ -901,7 +901,11 @@ if (config.metrics?.enabled === true) {
   try {
     ensurePrivateFile(config.metrics.db_path);
     const { createMetricsCollector } = await import("./metrics/collector.mjs");
-    metrics = createMetricsCollector(config.metrics);
+    metrics = createMetricsCollector(config);
+    if (metrics.healthStore) {
+      const { configureProviderHealthPersistence } = await import("./metrics/provider-usage.mjs");
+      configureProviderHealthPersistence(metrics.healthStore, config.provider_health?.observation_identity || null);
+    }
     console.log("[skgateway] metrics collector initialized");
   } catch (e) {
     // Metrics was explicitly ENABLED in config and still failed to load. That is a

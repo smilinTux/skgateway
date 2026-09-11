@@ -4,6 +4,7 @@ import test from "node:test";
 import { createRouter, routeAndSend } from "../src/proxy/router.mjs";
 import {
   _resetProviderUsageForTests,
+  configureProviderHealthPersistence,
   observeProviderUsage,
   parseProviderQuota,
   providerUsageSnapshot,
@@ -58,6 +59,23 @@ test("429 exhaustion and later success recover gateway observation without inven
   assert.equal(usage.gateway_observed.state, "available");
   assert.equal(usage.gateway_observed.cooldown_until, null);
   assert.equal(usage.gateway_observed.error_count, 1);
+});
+
+test("passive allowlisted quota evidence can be persisted without raw headers", () => {
+  const appended = [];
+  configureProviderHealthPersistence({ append: (value) => appended.push(value) }, {
+    gateway_instance: "gateway-a", boot_id: "boot-a", runtime_revision: "runtime-a", config_revision: "config-a",
+    backend_id: "codex-a", account_ref: "opaque-a", model_id: "gpt-5", bucket_id: "sk-l",
+    logical_route: "coding", scope: "model", configured_mode: "active", circuit_state: "closed",
+  });
+  observeProviderUsage("codex", { status: 200, headers: {
+    authorization: "Bearer must-not-persist",
+    "x-ratelimit-limit-tokens": "100", "x-ratelimit-remaining-tokens": "9", "x-ratelimit-reset-tokens": "60s",
+  } }, { now: 1_800_000_000_000 });
+  assert.equal(appended.length, 1);
+  assert.equal(appended[0].dimensions.quota, "low");
+  assert.equal(appended[0].bucket_id, "sk-l");
+  assert.equal(JSON.stringify(appended[0]).includes("must-not-persist"), false);
 });
 
 test("production Kimi backend id routes authoritative response quota into snapshot", async () => {
