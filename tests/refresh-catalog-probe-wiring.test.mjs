@@ -47,9 +47,12 @@ const PORT = 18991, DASH = 18992;
 describe("card C3: refreshCatalog wires discovery.probe_* into discoverCatalog", () => {
   let mod;
   let tmpDir;
+  let priorStandalone;
 
   before(async () => {
     tmpDir = mkdtempSync(join(tmpdir(), "skgw-c3-probe-wiring-"));
+    priorStandalone = process.env.SK_STANDALONE;
+    process.env.SK_STANDALONE = "1";
     const cfgPath = join(tmpDir, "gw.yaml");
     const storePath = join(tmpDir, "model_catalog_store.json");
 
@@ -86,6 +89,8 @@ describe("card C3: refreshCatalog wires discovery.probe_* into discoverCatalog",
   });
 
   after(() => {
+    if (priorStandalone === undefined) delete process.env.SK_STANDALONE;
+    else process.env.SK_STANDALONE = priorStandalone;
     delete process.env.SKGATEWAY_CONFIG;
     delete process.env.SKGATEWAY_MODEL_CATALOG_STORE_PATH;
     try { mod.server.close(); } catch { /* best effort */ }

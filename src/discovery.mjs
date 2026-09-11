@@ -1091,7 +1091,7 @@ export async function discoverCatalog(opts) {
       const dueAt = (typeof cache.lastProbedAt === 'number' ? cache.lastProbedAt : -Infinity) + probeSeconds * 1000;
       if (at >= dueAt) {
         let probed = loadLifecycleStoreFresh(lifecycleStorePath);
-        const providers = Array.isArray(probeProviders) && probeProviders.length ? probeProviders : [probeProvider];
+        const providers = Array.isArray(probeProviders) ? probeProviders : [probeProvider];
         // Resolved lazily and only when a real network runner is needed, so a
         // fully-injected (test) sweep never reads the live config or env.
         const backends = (probeRunProbe && (chatComplete || !capabilityProviders.length))

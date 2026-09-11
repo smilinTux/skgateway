@@ -53,7 +53,7 @@ import { isRoutable, isEffectivelyRoutable, LIFECYCLE_STATES } from "./discovery
 import { rankModels } from "./ranking/rank.mjs";
 import { deriveCapabilities } from "./ranking/capabilities.mjs";
 import { buildCapabilityCatalog } from "./ranking/catalog.mjs";
-import { REGISTRY_PATH } from "./proxy/registry.mjs";
+import { REGISTRY_PATH, isRegistryRouted, resolve as resolveRegistry } from "./proxy/registry.mjs";
 import { energyRowsFrom, energyHeaders } from "./metrics/energy.mjs";
 import { attributionHeaders } from "./metrics/attribution.mjs";
 import { sampleTokenRatio } from "./metrics/token-ratio.mjs";
@@ -108,6 +108,31 @@ function routerBackendsForConfig(cfg) {
   }
   return backends;
 }
+
+function registryProviderAllowsInference(cfg, request) {
+  if (!isRegistryRouted(request)) return true;
+  const target = resolveRegistry({
+    model: request.model,
+    context: request.context,
+    service: request.service,
+    role: request.role,
+  });
+  return !target?.backend || providerNetworkPermission(
+    providerConfiguredMode(cfg, target.backend),
+    "inference",
+  );
+}
+
+function disabledRegistryProviderResponse() {
+  return {
+    status: 503,
+    headers: { "content-type": "application/json" },
+    body: Buffer.from(JSON.stringify({
+      error: { message: "Registry target provider is disabled", code: "provider_disabled" },
+    })),
+  };
+}
+
 const _routerBackends = routerBackendsForConfig(config);
 let routerConfiguredBackendIds = new Set(Object.keys(config.backends || {}));
 const router = createRouter({ backends: _routerBackends, quarantine: config.quarantine, routing: config.routing });
@@ -2422,10 +2447,11 @@ export const server = http.createServer(async (req, res) => {
     res.once("close", onClientClose);
     if (res.destroyed) onClientClose();
     try {
+      const _registryProviderAllowed = registryProviderAllowsInference(config, routeRequest);
       // Semantic cache, SHADOW ONLY. Records whether a cached answer would have
       // matched and throws that answer away. It cannot change what is served.
       // Guarded on eligible() first so ineligible traffic never spends an embed.
-      const _sc = shadowCache(config);
+      const _sc = _registryProviderAllowed ? shadowCache(config) : null;
       // KNOWN BIASES — all three inflate the measured shadow hit rate above
       // what serving would ever achieve, because they make distinct requests
       // hash/embed identically. Deliberately left as-is here (fixing them is
@@ -2454,10 +2480,12 @@ export const server = http.createServer(async (req, res) => {
         } catch { /* the cache is an observer; a failure here must never fail the request */ }
       }
 
-      result = await routeAndSend(
-        router, routeRequest, routePath, req.method, req.headers, transformedBody, true, siemHook,
-        upstreamAbort.signal,
-      );
+      result = _registryProviderAllowed
+        ? await routeAndSend(
+          router, routeRequest, routePath, req.method, req.headers, transformedBody, true, siemHook,
+          upstreamAbort.signal,
+        )
+        : disabledRegistryProviderResponse();
 
       // ── Response sanitization (card 080e032e) ──
       // Apply sanitizer.mjs response sanitization before the client receives bytes.

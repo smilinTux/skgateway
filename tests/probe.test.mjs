@@ -102,6 +102,7 @@ describe('selectProbeCandidates (pure)', () => {
   });
 });
 
+
 describe('probeModels (fake completion runner + fake pool + fake clock)', () => {
   test('a 410 probe flips the model to eol with reason probe_failed', async () => {
     const store = { dying: lc({ last_verified_at: null }) };
@@ -427,6 +428,26 @@ describe('discoverCatalog wires the probe sweep into the existing refresh cadenc
     assert.equal(calls, 0);
   });
 
+  test('an explicit empty probe provider list is a hard no-probe decision', async () => {
+    const path = freshPath();
+    let calls = 0;
+    await discoverCatalog({
+      localModels: [],
+      nvidiaFetch: async () => ({ data: [{ id: 'nvidia/denied' }] }),
+      openrouterFetch: noopFetch(),
+      cache: {},
+      now: () => NOW,
+      lifecycleStorePath: path,
+      probeSeconds: 1,
+      probeProviders: [],
+      probeRunProbe: async () => {
+        calls++;
+        return { ok: true, status: 200 };
+      },
+    });
+    assert.equal(calls, 0);
+  });
+
   test('a due probe sweep probes a long-tail model and persists the outcome', async () => {
     const path = freshPath();
     const cache = {};
@@ -727,4 +748,3 @@ describe('discoverCatalog: per-provider sweeps and battery gating (card 0e010400
     assert.equal(fetches, 0);
   });
 });
-

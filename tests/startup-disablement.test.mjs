@@ -384,7 +384,73 @@ test("disabled OpenRouter performs no discovery, probe, capability, or inference
   }
 });
 
-test("reload removes a newly disabled OpenRouter backend before another inference call", async () => {
+test("disabled OpenRouter rejects a registry-routed inference request before it reaches the registry backend", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "skgw-openrouter-registry-disabled-"));
+  let gateway;
+  let openrouter;
+  let openrouterRequests = 0;
+  try {
+    openrouter = await startJsonServer(async (req, res) => {
+      openrouterRequests++;
+      for await (const _chunk of req) { /* drain request */ }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ choices: [{ message: { content: "unexpected" } }] }));
+    });
+    const port = await freePort();
+    const dashboardPort = await freePort();
+    const registryPath = join(dir, "registry.json");
+    writeFileSync(registryPath, JSON.stringify({
+      backends: {
+        openrouter: { url: `http://127.0.0.1:${openrouter.port}/v1`, model: "fixture-model" },
+      },
+      roles: { "sk-review": "openrouter" },
+    }));
+    const configPath = writeConfig(dir, [
+      "server:",
+      "  bind: 127.0.0.1",
+      `  port: ${port}`,
+      `  dashboard_port: ${dashboardPort}`,
+      "dashboard:",
+      "  enabled: false",
+      "metrics:",
+      "  enabled: false",
+      "identity:",
+      "  enabled: false",
+      "siem:",
+      "  enabled: false",
+      "  outputs: []",
+      "providers:",
+      "  openrouter:",
+      "    configured_mode: disabled",
+      "discovery:",
+      "  enabled: false",
+      "backends:",
+      "  openrouter:",
+      `    url: http://127.0.0.1:${openrouter.port}/v1`,
+      "    auth_type: none",
+      "    priority: 1",
+    ]);
+
+    gateway = await bootGateway({
+      configPath,
+      env: { SKMODELS_REGISTRY: registryPath, SK_STANDALONE: "1" },
+    });
+    const response = await request(port, "/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "sk-review", messages: [{ role: "user", content: "fixture" }] }),
+    });
+    assert.equal(response.status, 503);
+    await response.arrayBuffer();
+    assert.equal(openrouterRequests, 0);
+  } finally {
+    await stopGateway(gateway);
+    await closeServer(openrouter?.server);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("reload blocks a newly disabled OpenRouter registry backend before another inference call", async () => {
   const dir = mkdtempSync(join(tmpdir(), "skgw-openrouter-reload-"));
   let gateway;
   let openrouter;
@@ -398,6 +464,13 @@ test("reload removes a newly disabled OpenRouter backend before another inferenc
     });
     const port = await freePort();
     const dashboardPort = await freePort();
+    const registryPath = join(dir, "registry.json");
+    writeFileSync(registryPath, JSON.stringify({
+      backends: {
+        openrouter: { url: `http://127.0.0.1:${openrouter.port}/v1`, model: "fixture-model" },
+      },
+      roles: { "sk-review": "openrouter" },
+    }));
     const configLines = (mode) => [
       "server:",
       "  bind: 127.0.0.1",
@@ -426,8 +499,18 @@ test("reload removes a newly disabled OpenRouter backend before another inferenc
       "    priority: 1",
     ];
     const configPath = writeConfig(dir, configLines("active"));
-    gateway = await bootGateway({ configPath });
-    openrouterRequests = 0;
+    gateway = await bootGateway({
+      configPath,
+      env: { SKMODELS_REGISTRY: registryPath, SK_STANDALONE: "1" },
+    });
+    const activeResponse = await request(port, "/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "sk-review", messages: [] }),
+    });
+    assert.equal(activeResponse.status, 200);
+    await activeResponse.arrayBuffer();
+    assert.equal(openrouterRequests, 1);
 
     writeFileSync(configPath, `${configLines("disabled").join("\n")}\n`, "utf8");
     gateway.child.kill("SIGHUP");
@@ -436,11 +519,11 @@ test("reload removes a newly disabled OpenRouter backend before another inferenc
     const response = await request(port, "/v1/chat/completions", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ model: "openrouter-reload-model", messages: [] }),
+      body: JSON.stringify({ model: "sk-review", messages: [] }),
     });
-    assert.notEqual(response.status, 200);
+    assert.equal(response.status, 503);
     await response.arrayBuffer();
-    assert.equal(openrouterRequests, 0);
+    assert.equal(openrouterRequests, 1);
   } finally {
     await stopGateway(gateway);
     await closeServer(openrouter?.server);

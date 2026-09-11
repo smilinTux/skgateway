@@ -36,6 +36,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const INDEX = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'src', 'index.mjs');
 const PORT = 18993, DASH = 18994;
 let mod, tmpDir, registerDiscoveredRoutes;
+let priorStandalone;
 
 /** A minimal stand-in for a router Backend. */
 function fakeBackend() {
@@ -48,6 +49,8 @@ const allActive = () => ({ state: 'active' });
 describe('a discovery provider routes to the configured backend of the same name', () => {
   before(async () => {
     tmpDir = mkdtempSync(join(tmpdir(), 'skgw-provider-routing-'));
+    priorStandalone = process.env.SK_STANDALONE;
+    process.env.SK_STANDALONE = '1';
     const cfgPath = join(tmpDir, 'gw.yaml');
     const storePath = join(tmpDir, 'model_catalog_store.json');
     writeFileSync(storePath, '{}');
@@ -66,6 +69,8 @@ describe('a discovery provider routes to the configured backend of the same name
   });
 
   after(() => {
+    if (priorStandalone === undefined) delete process.env.SK_STANDALONE;
+    else process.env.SK_STANDALONE = priorStandalone;
     delete process.env.SKGATEWAY_CONFIG;
     delete process.env.SKGATEWAY_MODEL_CATALOG_STORE_PATH;
     try { mod.server.close(); } catch { /* best effort */ }
@@ -96,7 +101,10 @@ describe('a discovery provider routes to the configured backend of the same name
 
   test('the two original providers are unchanged', () => {
     const backends = { nvidia: fakeBackend(), openrouter: fakeBackend() };
-    const cfg = { backends: { nvidia: { models: ['openai/gpt-oss-20b'] }, openrouter: {} } };
+    const cfg = {
+      providers: { openrouter: { configured_mode: 'active' } },
+      backends: { nvidia: { models: ['openai/gpt-oss-20b'] }, openrouter: {} },
+    };
     registerDiscoveredRoutes(
       cfg,
       [
