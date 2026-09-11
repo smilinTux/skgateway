@@ -21,6 +21,7 @@ import path from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
+import { getConfig } from "../config.mjs";
 import { sendUpstream } from "./upstream.mjs";
 import { createEvent, EventType } from "../siem/events.mjs";
 import { isAnthropicBackend, toAnthropicRequest, toOpenAIResponse } from "./anthropic-adapter.mjs";

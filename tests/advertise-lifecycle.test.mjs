@@ -349,6 +349,7 @@ describe("registerDiscoveredRoutes - only active|suspect ids written to Backend.
     };
     const getLifecycleFn = (id) => lifecycle[id] || { state: "active" };
     const cfg = {
+      providers: { openrouter: { configured_mode: "active" } },
       backends: {
         nvidia: { models: ["nvidia/static-active"] },
         openrouter: { models: [] },
@@ -392,7 +393,10 @@ describe("registerDiscoveredRoutes - only active|suspect ids written to Backend.
     const backends = { openrouter: { models: [], discovery: null } };
     const getBackend = (name) => backends[name] || null;
     mod.registerDiscoveredRoutes(
-      { backends: { openrouter: { models: [] } } },
+      {
+        providers: { openrouter: { configured_mode: "active" } },
+        backends: { openrouter: { models: [] } },
+      },
       [{ id: "openrouter/only-eol", provider: "openrouter" }],
       { getBackend, getLifecycleFn: () => ({ state: "eol" }) },
     );

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Restore router access to the loaded configuration and keep OpenRouter lifecycle fixtures explicit while its production default remains disabled.
+
 - Continue a provider-neutral bucket chain when one member has all exact
   backend claims quarantined, while concrete-model requests remain fail closed.
 
