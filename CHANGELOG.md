@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Align durable provider health observations with the canonical `disabled`
+  configured mode and reject the obsolete `off` value.
+
 - Persist strictly normalized provider health observations and deterministic
   current snapshots in the shared metrics database, with a private
   `provider-health.json` projection, restart-safe rebuilds, and passive

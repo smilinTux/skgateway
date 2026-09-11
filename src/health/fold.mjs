@@ -7,7 +7,7 @@ function snapshotKey(o) { return [o.gateway_instance, o.provider, o.backend_id |
 
 function overall(s) {
   const d = s.dimensions;
-  if (s.configured_mode === "off") return "disabled";
+  if (s.configured_mode === "disabled") return "disabled";
   if (["missing", "expired", "rejected"].includes(d.auth) || d.entitlement === "denied" || d.transport === "unavailable") return "unavailable";
   if (["throttled", "exhausted"].includes(d.quota) || ["saturated", "quarantined"].includes(d.capacity) || s.quarantine_scope) return "throttled";
   if (d.entitlement === "stale" || d.auth === "near_expiry" || d.transport === "degraded" || d.inference === "degraded" || s.elevated_errors) return "degraded";

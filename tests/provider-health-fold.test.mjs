@@ -23,8 +23,8 @@ describe("provider health snapshot fold", () => {
     assert.equal(snapshot.dimensions.quota, "unknown");
   });
 
-  test("configured off takes precedence", () => {
-    const snapshot = foldProviderSnapshot(null, observation({ configured_mode: "off" }), DEFAULT_THRESHOLDS);
+  test("configured disabled takes precedence", () => {
+    const snapshot = foldProviderSnapshot(null, observation({ configured_mode: "disabled" }), DEFAULT_THRESHOLDS);
     assert.equal(snapshot.overall, "disabled");
   });
 

@@ -2,7 +2,7 @@ const PROVIDERS = new Set(["local", "codex", "kimi", "zai", "cursor", "openroute
 const SCOPES = new Set(["provider", "account", "backend", "model"]);
 const SOURCES = new Set(["real_request", "catalog_poll", "account_poll", "credential_metadata", "local_control"]);
 const PROBE_COSTS = new Set(["zero", "token", "unknown"]);
-const MODES = new Set(["off", "monitor_only", "canary", "active"]);
+const MODES = new Set(["disabled", "monitor_only", "canary", "active"]);
 const CIRCUITS = new Set(["closed", "open", "half_open"]);
 const ERROR_CODES = new Set([
   "rate_limited", "quota_exhausted", "auth_rejected", "credential_missing",
