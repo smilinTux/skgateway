@@ -207,7 +207,7 @@ function hasValidUsage(usage) {
   if (!usage || typeof usage !== "object" || Array.isArray(usage)) return false;
   const keys = Object.keys(usage);
   if (!keys.includes("prompt_tokens") || !keys.includes("completion_tokens")
-      || keys.some((key) => !["prompt_tokens", "completion_tokens", "total_tokens", "prompt_tokens_details"].includes(key))) return false;
+      || keys.some((key) => !["prompt_tokens", "completion_tokens", "total_tokens", "prompt_tokens_details", "completion_tokens_details"].includes(key))) return false;
   const values = [usage.prompt_tokens, usage.completion_tokens, usage.total_tokens]
     .filter((value) => value !== undefined);
   if (values.some((value) => !Number.isSafeInteger(value) || value < 0 || value > MAX_USAGE_TOKENS)) return false;
@@ -220,6 +220,13 @@ function hasValidUsage(usage) {
         || Object.keys(details).length !== 1 || !Object.hasOwn(details, "cached_tokens")
         || !Number.isSafeInteger(details.cached_tokens) || details.cached_tokens < 0
         || details.cached_tokens > usage.prompt_tokens) return false;
+  }
+  if (Object.hasOwn(usage, "completion_tokens_details")) {
+    const details = usage.completion_tokens_details;
+    if (!details || typeof details !== "object" || Array.isArray(details)
+        || Object.keys(details).length !== 1 || !Object.hasOwn(details, "reasoning_tokens")
+        || !Number.isSafeInteger(details.reasoning_tokens) || details.reasoning_tokens < 0
+        || details.reasoning_tokens > usage.completion_tokens) return false;
   }
   return true;
 }
@@ -322,10 +329,16 @@ export function enforceResponseContract(response, requestedModel) {
         const parsed = JSON.parse(payload);
         if (!servedModel && typeof parsed.model === "string" && parsed.model) servedModel = parsed.model;
         if (Object.hasOwn(parsed, "usage")) {
+          const choices = Array.isArray(parsed.choices) ? parsed.choices : null;
+          const attachedTerminalUsage = choices?.length > 0 && choices.every((choice) => {
+            const output = choice?.delta || {};
+            return choice?.finish_reason != null && !hasVisibleContent(output)
+              && (!Array.isArray(output.tool_calls) || output.tool_calls.length === 0);
+          });
           if (stream.usageSeen || !hasValidUsage(parsed.usage)
-              || !Array.isArray(parsed.choices) || parsed.choices.length !== 0
-              || choiceStates.size === 0
-              || [...choiceStates.values()].some((state) => !hasValidCompletion(state))) stream.invalidCompletion = true;
+              || !choices || (choices.length !== 0 && !attachedTerminalUsage)
+              || (choices.length === 0 && (choiceStates.size === 0
+                || [...choiceStates.values()].some((state) => !hasValidCompletion(state))))) stream.invalidCompletion = true;
           stream.usageSeen = true;
         }
         const clean = stripReasoning(parsed);

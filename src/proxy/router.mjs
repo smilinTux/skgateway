@@ -40,7 +40,7 @@ import { observeProviderUsage, providerUsageSnapshot } from "../metrics/provider
 import { recordModelOutcome, getLifecycle } from "../discovery/model_catalog_store.mjs";
 import {
   admitCapacity, capacityStatus, clearCapacity, finishCapacityProbe,
-  isSubscriptionExhaustion, recordModelThrottled, recordProviderUnavailable,
+  isSubscriptionExhaustion, recordModelThrottled, recordModelUnavailable, recordProviderUnavailable,
   recordSubscriptionExhausted,
   releaseCapacityProbe,
 } from "../discovery/capacity_store.mjs";
@@ -649,6 +649,11 @@ function applyBodyFloor(body, model, floor) {
   try {
     const obj = JSON.parse(body.toString("utf-8"));
     const cfg = { reasoningFloorMaxTokens: floor, reasoningModels: [model] };
+    if (obj && typeof obj === "object" && obj.max_tokens == null && obj.max_completion_tokens == null) {
+      obj.max_completion_tokens = floor;
+      console.log(`[router] reasoning floor: model=${model} max_completion_tokens omitted -> ${floor}`);
+      return Buffer.from(JSON.stringify(obj), "utf-8");
+    }
     if (obj && typeof obj === "object" &&
         applyReasoningFloor(obj, cfg, model, (m) => console.log(`[router] ${m}`))) {
       return Buffer.from(JSON.stringify(obj), "utf-8");
@@ -949,6 +954,10 @@ export class Backend {
     this.context_limit = Number.isFinite(config.context_limit) && config.context_limit > 0
       ? config.context_limit
       : null;
+    /** @type {number} minimum explicit output budget for reasoning models */
+    this.min_output_tokens = Number.isFinite(config.min_output_tokens) && config.min_output_tokens > 0
+      ? config.min_output_tokens
+      : 0;
 
     this._totalRequests = 0;
     this._totalErrors = 0;
@@ -3824,7 +3833,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // A candidate may carry a per-attempt body (e.g. the cloud-fallback
     // candidate rewrites the model to a cloud-served id). Default to the shared
     // body when no override is present.
-    const attemptBody = candidates[i].bodyOverride || attemptBodyBase;
+    let attemptBody = candidates[i].bodyOverride || attemptBodyBase;
 
     // Context preflight (card 9ed4a9f7): a backend may declare context_limit,
     // the true serving-engine token ceiling (e.g. llama.cpp --ctx-size 32768
@@ -3865,6 +3874,11 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // in the list (candidatesFor() only ever matches on model id), so
     // request.model is the correct default.
     const candidateModel = candidates[i].model || request.model;
+    attemptBody = applyBodyFloor(
+      attemptBody,
+      candidateModel,
+      Number.isFinite(backend?.min_output_tokens) ? backend.min_output_tokens : 0,
+    );
     let attemptTimeoutMs = isBucketChain
       ? bucketLivenessTimeoutMs(backend.timeout_ms)
       : backend.timeout_ms;
@@ -4261,6 +4275,42 @@ export async function routeAndSend(router, request, upstreamPath, method, client
 
     const upstreamStatus = res?.status;
 
+    if (providerName === "zai" && upstreamStatus >= 200 && upstreamStatus < 300 &&
+        String(res?.headers?.["content-type"] || "").includes("text/event-stream")) {
+      const shape = { frames: 0, done: 0, content_chars: 0, reasoning_chars: 0, tool_fragments: 0, finish_reasons: [], usage_keys: [], usage_detail_keys: [], sequence: [] };
+      for (const line of res.body.toString("utf8").split("\n")) {
+        if (!line.startsWith("data:")) continue;
+        const payload = line.slice(5).trim();
+        if (payload === "[DONE]") { shape.done++; continue; }
+        try {
+          const frame = JSON.parse(payload);
+          shape.frames++;
+          if (shape.sequence.length < 64) shape.sequence.push({
+            choices: (frame.choices || []).map((choice) => ({
+              index: choice?.index ?? null,
+              delta_keys: Object.keys(choice?.delta || {}).sort(),
+              finish_reason: choice?.finish_reason ?? null,
+            })),
+            usage: Object.hasOwn(frame, "usage"),
+          });
+          if (frame?.usage && typeof frame.usage === "object") {
+            shape.usage_keys = Object.keys(frame.usage).sort();
+            shape.usage_detail_keys = Object.entries(frame.usage)
+              .filter(([, value]) => value && typeof value === "object" && !Array.isArray(value))
+              .flatMap(([key, value]) => Object.keys(value).map((child) => `${key}.${child}`)).sort();
+          }
+          for (const choice of frame.choices || []) {
+            const delta = choice?.delta || {};
+            if (typeof delta.content === "string") shape.content_chars += delta.content.length;
+            if (typeof delta.reasoning_content === "string") shape.reasoning_chars += delta.reasoning_content.length;
+            if (Array.isArray(delta.tool_calls)) shape.tool_fragments += delta.tool_calls.length;
+            if (choice?.finish_reason != null) shape.finish_reasons.push(choice.finish_reason);
+          }
+        } catch {}
+      }
+      console.log(`[router] GLM SSE shape ${JSON.stringify(shape)}`);
+    }
+
     // Validate the buffered JSON form first, then re-emit and validate the
     // canonical OpenAI SSE form when the original client asked to stream.
     if (flippedToNonStream) {
@@ -4270,6 +4320,13 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       try {
         const completion = JSON.parse(res.body.toString("utf-8"));
         if (completion && Array.isArray(completion.choices) && completion.choices.length) {
+          if (providerName === "zai") {
+            console.log(`[router] GLM flip shape ${JSON.stringify(completion.choices.map((choice) => ({
+              finish_reason: choice?.finish_reason ?? null,
+              content_chars: typeof choice?.message?.content === "string" ? choice.message.content.length : 0,
+              tool_calls: Array.isArray(choice?.message?.tool_calls) ? choice.message.tool_calls.length : 0,
+            })))}`);
+          }
           completion.id ||= ("chatcmpl-flip-" + Date.now());
           completion.created = typeof completion.created === "number"
             ? completion.created : Math.floor(Date.now() / 1000);
@@ -4300,7 +4357,8 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     })();
     const requestedMaxTokens = (() => {
       try {
-        const value = JSON.parse(attemptBody?.toString("utf8") || "{}").max_tokens;
+        const parsed = JSON.parse(attemptBody?.toString("utf8") || "{}");
+        const value = parsed.max_tokens ?? parsed.max_completion_tokens;
         return Number.isFinite(value) ? value : null;
       } catch { return null; }
     })();
@@ -4311,6 +4369,9 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           ? "response_budget"
           : "malformed_response"
         : res.status >= 500 ? "backend_cooldown" : null;
+    if (providerName === "zai" && recoveryFailureClass === "malformed_response") {
+      console.warn(`[router] malformed GLM response model=${candidateModel} code=${responseErrorCode || "unknown"}`);
+    }
     // The response contract rewrites malformed upstream 2xx responses to a
     // non-2xx status, so this is also the schema-valid recovery boundary.
     const recoveryProbeSucceeded = capacityAdmission.probe &&
@@ -4355,8 +4416,13 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         recordModelThrottled(providerName, candidateModel, { retryAt });
       } else if (res.status >= 200 && res.status < 300) {
         clearCapacity(providerName, candidateModel);
-      } else if (providerName === "zai" && recoveryFailureClass) {
+      } else if (providerName === "zai" && recoveryFailureClass === "authentication_failure") {
         recordProviderUnavailable(providerName, { reason: recoveryFailureClass });
+      } else if (providerName === "zai" && recoveryFailureClass) {
+        recordModelUnavailable(providerName, candidateModel, {
+          reason: recoveryFailureClass,
+          retryAt: Date.now() + DEFAULT_402_COOLDOWN_MS,
+        });
       }
     }
 
@@ -4436,21 +4502,22 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       energyAttempts.push(attemptEnergy);
     }
 
-    // `healthy` drives every BACKEND-health side effect below (quarantine,
-    // local-health, the error-rate window inside recordOutcome itself) and
-    // is deliberately unchanged from the original `success = res.status <
-    // 500`: a 429/402 is not evidence the backend is broken (card 9e28de88
-    // fix #4). `retryElsewhere`/`throttled` (below, after these health
-    // writes) is the SEPARATE routing decision of whether to keep this
-    // response or try the next door; splitting the two is the whole point
-    // of this card, so a throttled model can fail over WITHOUT damaging
-    // backend health or lifecycle state.
-    const healthy = res.status < 500;
+    // `healthy` drives shared backend health and lifecycle state. A contract
+    // failure after an upstream 2xx belongs to the exact model's capacity
+    // record, not the shared provider transport. The invalid response still
+    // fails closed and can fail over without hiding every sibling model.
+    const modelContractFailure = upstreamStatus >= 200 && upstreamStatus < 300 &&
+      res.status === 502 &&
+      (recoveryFailureClass === "malformed_response" || recoveryFailureClass === "response_budget");
+    const healthy = res.status < 500 || modelContractFailure;
     const qTransition = backend.recordOutcome(healthy, latencyMs, {
       failureClass: recoveryFailureClass,
       authoritativeRecovery: recoveryProbeSucceeded,
     });
-    const claimTransition = backend.recordModelClaimOutcome(candidateModel, res.status);
+    const claimTransition = backend.recordModelClaimOutcome(
+      candidateModel,
+      modelContractFailure ? upstreamStatus : res.status,
+    );
     if (claimTransition) {
       const quarantined = claimTransition.transition === "quarantined";
       process.stdout.write(JSON.stringify({

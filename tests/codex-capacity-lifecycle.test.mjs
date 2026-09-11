@@ -252,6 +252,39 @@ test("model cooldown is visible without suppressing sibling Codex models", () =>
   ], lookup).map((entry) => entry.id), ["gpt-5.1"]);
 });
 
+test("a malformed model response does not suppress sibling GLM models", () => {
+  capacity.clearCapacity("zai", null, { now: 9100, path: store });
+  capacity.recordModelUnavailable("zai", "glm-5.3", {
+    reason: "malformed_response", now: 9101, retryAt: 10101, path: store,
+  });
+  const failed = capacity.capacityStatus("zai", "glm-5.3", { now: 9102, path: store });
+  const sibling = capacity.capacityStatus("zai", "glm-4.7", { now: 9102, path: store });
+  assert.equal(failed.state, "throttled");
+  assert.equal(failed.scope, "model");
+  assert.equal(failed.reason, "malformed_response");
+  assert.equal(sibling.state, "available");
+});
+
+test("a malformed GLM recovery probe re-arms only the exact model", () => {
+  capacity._resetCapacityProbesForTests();
+  capacity.recordProviderUnavailable("zai", {
+    reason: "backend_cooldown", now: 9200, retryAt: 9300, path: store,
+  });
+  const owner = {};
+  assert.equal(capacity.admitCapacity("zai", "glm-4.7", {
+    now: 309200, publicSynthetic: true, probeOwner: owner, path: store,
+  }).probe, true);
+  capacity.finishCapacityProbe("zai", false, {
+    probeOwner: owner, model: "glm-4.7", reason: "malformed_response",
+    now: 309201, retryAt: 310201, path: store,
+  });
+  const failed = capacity.capacityStatus("zai", "glm-4.7", { now: 309202, path: store });
+  const sibling = capacity.capacityStatus("zai", "glm-4.6", { now: 309202, path: store });
+  assert.equal(failed.scope, "model");
+  assert.equal(failed.reason, "malformed_response");
+  assert.equal(sibling.state, "available");
+});
+
 test("provider exhaustion dominates an earlier model retry deadline", () => {
   capacity._resetCapacityProbesForTests();
   capacity.clearCapacity("codex", "gpt-5", { now: 9500, path: store });
