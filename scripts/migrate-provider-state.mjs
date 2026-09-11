@@ -33,10 +33,21 @@ function sqliteDetails(path) {
     return { integrity, schema_version: db.pragma("schema_version", { simple: true }), user_version: db.pragma("user_version", { simple: true }), tables };
   } finally { db.close(); }
 }
+function cacheRootDetails(path) {
+  const root = lstatSync(path);
+  if (!root.isDirectory() || root.isSymbolicLink() || root.nlink < 1) throw new Error(`cache root must be a real directory: ${path}`);
+  const entries = [];
+  for (const entry of readdirSync(path, { recursive: true, withFileTypes: true })) {
+    const itemPath = join(entry.parentPath || entry.path, entry.name), stat = lstatSync(itemPath), type = stat.isFile() ? "file" : stat.isDirectory() ? "directory" : "unsupported";
+    entries.push({ path: relative(path, itemPath), type, device: stat.dev, inode: stat.ino, uid: stat.uid, mode: stat.mode & 0o777, links: stat.nlink, ...(type === "file" ? { bytes: stat.size, sha256: hashFile(itemPath) } : {}) });
+  }
+  return { device: root.dev, inode: root.ino, uid: root.uid, mode: root.mode & 0o777, links: root.nlink, entries: entries.sort((a, b) => a.path.localeCompare(b.path)) };
+}
 function describeSource(source) {
   if (!source.path || source.kind === "memory") return { name: source.name, kind: source.kind, status: "no_source" };
   const path = resolve(source.path);
   if (!existsSync(path)) return { name: source.name, kind: source.kind, path, status: "missing" };
+  if (source.kind === "cache-root") return { name: source.name, kind: source.kind, path, status: "present", ...cacheRootDetails(path) };
   const stat = assertRegularSingleLink(path);
   const item = { name: source.name, kind: source.kind, path, status: "present", bytes: stat.size, sha256: hashFile(path), device: stat.dev, inode: stat.ino, uid: stat.uid, mode: stat.mode & 0o777, links: stat.nlink };
   const companions = [];
@@ -111,6 +122,7 @@ function inventoryRoots(roots) {
   for (const root of roots) {
     for (const [file, kind] of ROOT_FILES) { const path = join(root, file); inventory.push({ name: `${basename(root)}:${file}`, kind, path }); }
     const cacheRoot = join(root, "semantic-cache");
+    inventory.push({ name: `${basename(root)}:semantic-cache`, kind: "cache-root", path: cacheRoot });
     if (existsSync(cacheRoot)) for (const entry of readdirSync(cacheRoot, { recursive: true, withFileTypes: true })) { if (entry.isFile()) { const path = join(entry.parentPath || entry.path, entry.name); inventory.push({ name: `${basename(root)}:semantic-cache/${relative(cacheRoot, path)}`, kind: "cache", path }); } }
   }
   if (!inventory.some((entry) => entry.kind === "cache")) inventory.push({ name: "semantic-cache-memory", kind: "memory", path: null });
@@ -145,6 +157,9 @@ function stageProviderState({ sources, target }) {
 function sourceUnchanged(source) {
   if (source.status === "missing") return !existsSync(source.path);
   if (source.status !== "present" || !existsSync(source.path)) return false;
+  if (source.kind === "cache-root") {
+    try { const current = cacheRootDetails(source.path); return JSON.stringify(current) === JSON.stringify({ device: source.device, inode: source.inode, uid: source.uid, mode: source.mode, links: source.links, entries: source.entries }); } catch { return false; }
+  }
   const current = lstatSync(source.path);
   if (!current.isFile() || current.nlink !== source.links || current.dev !== source.device || current.ino !== source.inode || current.uid !== source.uid || (current.mode & 0o777) !== source.mode || hashFile(source.path) !== source.sha256) return false;
   const expected = new Map((source.companions || []).map((item) => [item.path, item.sha256]));

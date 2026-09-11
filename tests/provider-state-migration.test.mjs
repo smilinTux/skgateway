@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import fs, { appendFileSync, chmodSync, existsSync, linkSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import fs, { appendFileSync, chmodSync, existsSync, linkSync, mkdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
@@ -124,4 +124,23 @@ test("activation rejects a known input that appeared after staging", () => {
   assert.equal(verifyMigration(`${target}.staging`).valid, false);
   assert.notEqual(cli("--activate", target).status, 0);
   assert.equal(existsSync(target), false);
+});
+
+test("cache inventory binds directory absence and every durable entry", () => {
+  const mutations = {
+    appear(source) { mkdirSync(join(source, "semantic-cache")); writeFileSync(join(source, "semantic-cache", "late.json"), '{}\n', { mode: 0o600 }); },
+    disappear(source) { rmSync(join(source, "semantic-cache"), { recursive: true }); },
+    change(source) { writeFileSync(join(source, "semantic-cache", "entry.json"), '{"changed":true}\n', { mode: 0o600 }); },
+    type(source) { unlinkSync(join(source, "semantic-cache", "entry.json")); mkdirSync(join(source, "semantic-cache", "entry.json")); },
+    link(source, root) { const entry = join(source, "semantic-cache", "entry.json"), victim = join(root, "victim"); writeFileSync(victim, '{}\n', { mode: 0o600 }); unlinkSync(entry); linkSync(victim, entry); },
+  };
+  for (const [name, mutate] of Object.entries(mutations)) {
+    const root = mkdtempSync(join(tmpdir(), `skgw-cache-${name}-`)), source = join(root, "source"), target = join(root, "target"); mkdirSync(source);
+    writeFileSync(join(source, "audit.jsonl"), '{"event_id":"before"}\n', { mode: 0o600 });
+    if (name !== "appear") { mkdirSync(join(source, "semantic-cache")); writeFileSync(join(source, "semantic-cache", "entry.json"), '{}\n', { mode: 0o600 }); }
+    assert.throws(() => migrateProviderState({ sources: [source], target, crashAt: "before-activate" }), /injected crash/);
+    mutate(source, root);
+    assert.equal(verifyMigration(`${target}.staging`).valid, false, name);
+    assert.notEqual(cli("--activate", target).status, 0, name);
+  }
 });
