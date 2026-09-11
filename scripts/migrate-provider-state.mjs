@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, closeSync, constants, copyFileSync, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, constants, copyFileSync, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import Database from "better-sqlite3";
@@ -185,11 +185,52 @@ function activateStage(target) {
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 }); syncFile(manifestPath); syncDirectory(stage); renameSync(stage, destination); syncDirectory(dirname(destination)); return manifest;
 }
 export function migrateProviderState({ sources, target, crashAt } = {}) { const destination = resolve(target); if (existsSync(destination)) throw new Error(`target already exists: ${destination}`); const { manifest } = stageProviderState({ sources, target: destination }); if (crashAt === "before-activate") throw new Error("injected crash before-activate"); activateStage(destination); return { activated: true, target: destination, manifest }; }
+function persistPrivateJson(path, value) {
+  writePrivateFileAtomic(path, `${JSON.stringify(value)}\n`);
+  syncFile(path);
+  syncDirectory(dirname(path));
+}
+function validateReplaySource(sourceAudit, sourceRecord) {
+  const stat = lstatSync(sourceAudit);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.dev !== sourceRecord.device || stat.ino !== sourceRecord.inode || stat.uid !== sourceRecord.uid || (stat.mode & 0o777) !== sourceRecord.mode) throw new Error("rollback source identity changed");
+  return stat;
+}
+function reconcileReplayJournal(journal, sourceAudit, sourceRecord) {
+  const stat = validateReplaySource(sourceAudit, sourceRecord), payload = Buffer.from(journal.payload_base64, "base64");
+  if (journal.source_device !== stat.dev || journal.source_inode !== stat.ino || journal.source_offset > stat.size) throw new Error("rollback journal source mismatch");
+  const tail = readFileSync(sourceAudit).subarray(journal.source_offset);
+  if (tail.length > payload.length || !payload.subarray(0, tail.length).equals(tail)) throw new Error("rollback source diverged from replay journal");
+  if (tail.length < payload.length) {
+    const fd = openSync(sourceAudit, constants.O_WRONLY | constants.O_APPEND | constants.O_NOFOLLOW);
+    try { const opened = fstatSync(fd); if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== sourceRecord.device || opened.ino !== sourceRecord.inode || opened.uid !== sourceRecord.uid || (opened.mode & 0o777) !== sourceRecord.mode) throw new Error("rollback source identity changed"); writeFileSync(fd, payload.subarray(tail.length)); fsyncSync(fd); } finally { closeSync(fd); }
+    return true;
+  }
+  return false;
+}
 function rollback(target) {
   const destination = resolve(target), stage = `${destination}.staging`;
   if (!existsSync(destination)) { if (!existsSync(stage)) throw new Error("no owned migration to roll back"); ownedManifest(stage, destination); rmSync(stage, { recursive: true }); syncDirectory(dirname(destination)); return { staged_removed: true }; }
   const manifest = ownedManifest(destination, destination), activeAudit = join(destination, "audit.jsonl"), sourceAudit = manifest.sources.find((i) => i.kind === "jsonl" && i.status === "present")?.path; let replayed = 0;
-  if (sourceAudit && existsSync(activeAudit)) { const sourceRecord = manifest.sources.find((item) => item.path === sourceAudit), activeLines = readFileSync(activeAudit, "utf8").split("\n").filter(Boolean), cursorPath = join(dirname(sourceAudit), `.skgateway-rollback-${manifest.migration_id}.json`); let cursor = manifest.outputs.find((item) => item.path === "audit.jsonl")?.records ?? 0; if (existsSync(cursorPath)) { const saved = JSON.parse(readFileSync(cursorPath, "utf8")); if (saved.migration_id !== manifest.migration_id || !Number.isSafeInteger(saved.active_records)) throw new Error("invalid rollback cursor"); cursor = saved.active_records; } if (cursor > activeLines.length) throw new Error("active audit truncated after rollback"); const additions = activeLines.slice(cursor).filter((line) => !JSON.parse(line).migration_provenance); if (additions.length) { const fd = openSync(sourceAudit, constants.O_WRONLY | constants.O_APPEND | constants.O_NOFOLLOW); try { const opened = fstatSync(fd); if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== sourceRecord.device || opened.ino !== sourceRecord.inode || opened.uid !== sourceRecord.uid || (opened.mode & 0o777) !== sourceRecord.mode) throw new Error("rollback source identity changed"); writeFileSync(fd, `${additions.join("\n")}\n`); fsyncSync(fd); } finally { closeSync(fd); } replayed = additions.length; } writePrivateFileAtomic(cursorPath, `${JSON.stringify({ migration_id: manifest.migration_id, active_records: activeLines.length })}\n`); }
+  if (sourceAudit && existsSync(activeAudit)) {
+    const sourceRecord = manifest.sources.find((item) => item.path === sourceAudit), activeLines = readFileSync(activeAudit, "utf8").split("\n").filter(Boolean), parent = dirname(sourceAudit), cursorPath = join(parent, `.skgateway-rollback-${manifest.migration_id}.json`), journalPath = join(parent, `.skgateway-rollback-${manifest.migration_id}.journal`);
+    let cursor = manifest.outputs.find((item) => item.path === "audit.jsonl")?.records ?? 0;
+    if (existsSync(cursorPath)) { const saved = JSON.parse(readFileSync(cursorPath, "utf8")); if (saved.migration_id !== manifest.migration_id || !Number.isSafeInteger(saved.active_records)) throw new Error("invalid rollback cursor"); cursor = saved.active_records; }
+    if (pathEntryExists(journalPath)) {
+      const journal = JSON.parse(readFileSync(journalPath, "utf8"));
+      if (journal.migration_id !== manifest.migration_id || !Number.isSafeInteger(journal.active_records) || journal.active_records > activeLines.length) throw new Error("invalid rollback journal");
+      if (cursor < journal.active_records) { const appended = reconcileReplayJournal(journal, sourceAudit, sourceRecord); replayed += appended ? journal.replayed_records : 0; persistPrivateJson(cursorPath, { migration_id: manifest.migration_id, active_records: journal.active_records }); cursor = journal.active_records; }
+      unlinkSync(journalPath); syncDirectory(parent);
+    }
+    if (cursor > activeLines.length) throw new Error("active audit truncated after rollback");
+    const additions = activeLines.slice(cursor).filter((line) => !JSON.parse(line).migration_provenance);
+    if (additions.length) {
+      const payload = Buffer.from(`${additions.join("\n")}\n`), sourceStat = validateReplaySource(sourceAudit, sourceRecord), journal = { migration_id: manifest.migration_id, active_records: activeLines.length, replayed_records: additions.length, source_device: sourceStat.dev, source_inode: sourceStat.ino, source_offset: sourceStat.size, payload_base64: payload.toString("base64") };
+      persistPrivateJson(journalPath, journal);
+      if (reconcileReplayJournal(journal, sourceAudit, sourceRecord)) replayed += additions.length;
+      persistPrivateJson(cursorPath, { migration_id: manifest.migration_id, active_records: activeLines.length });
+      unlinkSync(journalPath); syncDirectory(parent);
+    } else if (!existsSync(cursorPath)) persistPrivateJson(cursorPath, { migration_id: manifest.migration_id, active_records: activeLines.length });
+  }
   return { active_preserved: true, replayed };
 }
 function usage() { process.stderr.write("usage: migrate-provider-state.mjs --inventory SOURCE... | --stage TARGET SOURCE... | --verify TARGET | --activate TARGET | --rollback TARGET\n"); }

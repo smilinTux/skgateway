@@ -13,7 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   activation now binds absent known inputs, rollback tracks duplicate audit
   occurrences by position, durable cache directory inventories reject any
   post-stage change including dangling symlink creation, and production writes
-  reject unsafe XDG roots.
+  reject unsafe XDG roots. Rollback-forward audit replay uses a durable
+  write-ahead journal to recover exactly once after process interruption.
 
 - Restore router access to the loaded configuration and keep OpenRouter lifecycle fixtures explicit while its production default remains disabled.
 

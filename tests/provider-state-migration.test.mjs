@@ -154,3 +154,17 @@ test("dangling cache-root symlink does not satisfy an absence declaration", () =
   assert.notEqual(cli("--activate", target).status, 0);
   assert.equal(existsSync(target), false);
 });
+
+test("rollback journal recovers exactly once across SIGKILL windows", () => {
+  for (const phase of ["preappend", "postappend", "postfsync", "precommit"]) {
+    const root = mkdtempSync(join(tmpdir(), `skgw-replay-${phase}-`)), source = join(root, "source"), target = join(root, "target"); mkdirSync(source);
+    const input = join(source, "audit.jsonl"), line = '{"message":"one-occurrence"}'; writeFileSync(input, '{"event_id":"before"}\n', { mode: 0o600 });
+    migrateProviderState({ sources: [source], target }); appendFileSync(join(target, "audit.jsonl"), `${line}\n`);
+    const preload = new URL("./fixtures/rollback-crash-after-fsync.mjs", import.meta.url).pathname;
+    const crashed = spawnSync(process.execPath, ["--import", preload, migrationScript, "--rollback", target], { encoding: "utf8", env: { ...process.env, SKGW_TEST_CRASH_SOURCE: input, SKGW_TEST_CRASH_PHASE: phase } });
+    assert.equal(crashed.signal, "SIGKILL", phase);
+    assert.equal(cli("--rollback", target).status, 0, phase);
+    assert.equal(cli("--rollback", target).status, 0, phase);
+    assert.equal(readFileSync(input, "utf8").split("\n").filter((row) => row === line).length, 1, phase);
+  }
+});
