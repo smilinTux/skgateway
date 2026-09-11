@@ -51,12 +51,17 @@ test("only an observed upstream 429 is returned as 429", () => {
 });
 
 test("quota, provider auth, caller auth, and malformed success remain distinct", () => {
-  assert.equal(normalizeFailure({ origin: "upstream", upstreamStatus: 429, upstreamAttempted: true, quotaProven: true }).reason, "quota_exhausted");
+  for (const upstreamStatus of [402, 403, 429]) {
+    const quota = normalizeFailure({ origin: "upstream", upstreamStatus, upstreamAttempted: true, quotaProven: true });
+    assert.equal(quota.clientStatus, 429);
+    assert.equal(quota.reason, "quota_exhausted");
+  }
   assert.deepEqual(
     normalizeFailure({ origin: "upstream", upstreamStatus: 401, upstreamAttempted: true }).clientStatus,
     503,
   );
   assert.equal(normalizeFailure({ origin: "caller", upstreamStatus: 401, upstreamAttempted: false }).clientStatus, 401);
+  assert.equal(normalizeFailure({ origin: "caller", upstreamStatus: 403, upstreamAttempted: false }).clientStatus, 403);
   const malformed = normalizeFailure({ origin: "upstream", upstreamStatus: 200, reason: "malformed_response", upstreamAttempted: true, retryAt: 99 });
   assert.equal(malformed.clientStatus, 502);
   assert.equal(malformed.retryAt, null);

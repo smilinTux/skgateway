@@ -10,6 +10,7 @@ import {
   Backend, createRouter, routeAndSend, ModelOwnerDownError, shouldUseRegistryRouting,
 } from "../src/proxy/router.mjs";
 import { ConnectionPool } from "../src/proxy/connection-pool.mjs";
+import { configureProviderHealthPersistence, _resetProviderUsageForTests } from "../src/metrics/provider-usage.mjs";
 
 const config = loadYaml(readFileSync(new URL("../config/skgateway-codex.yaml", import.meta.url), "utf8"));
 
@@ -66,6 +67,7 @@ describe("Kimi admission contract", () => {
 });
 
 describe("Kimi synthetic request probes", () => {
+  test.beforeEach(() => _resetProviderUsageForTests());
   test("only an exact admission-owner bootstrap bypasses public registry routing", () => {
     const router = createRouter({ backends: {
       kimi: {
@@ -102,7 +104,7 @@ describe("Kimi synthetic request probes", () => {
     const router = createRouter({ backends: {
       kimi: {
         url: `http://127.0.0.1:${port}/v1`, auth_type: "none", models: ["kimi-for-coding"], timeout_ms: 20,
-        require_observed_health: true,
+        require_observed_health: true, account_ref: "kimi-test-account",
       },
       foreign: {
         url: "http://127.0.0.1:9/v1", auth_type: "none", models: ["*"], priority: 1,
@@ -110,14 +112,21 @@ describe("Kimi synthetic request probes", () => {
     }, failover: true, siem_log: false });
     await assert.rejects(() => router.route({ model: "kimi-for-coding", agentId: "ordinary" }),
       (error) => error instanceof ModelOwnerDownError);
+    const probeOwner = "kimi-test-probe";
+    let circuitState = "half_open";
+    configureProviderHealthPersistence({ append() {}, snapshot(filter) { return [{
+      ...filter, circuit_state: circuitState, evidence_expires_at: Date.now() + 60_000,
+      evidence_stale: false, half_open_lease: { owner: probeOwner, expires_at: Date.now() + 60_000 },
+    }]; } });
     const ok = await routeAndSend(router, {
-      model: "kimi-for-coding", agentId: "probe", context: "public",
+      model: "kimi-for-coding", agentId: "probe", context: "public", capacityProbeOwner: probeOwner,
     }, "/chat/completions", "POST",
       { "content-type": "application/json", "x-sk-context": "public", "x-sk-probe": "synthetic" },
       body("kimi-for-coding"), false);
     assert.equal(ok.status, 200);
     assert.equal(ok.backendId, "kimi");
     assert.equal(state.body.tools[0].function.name, "probe");
+    circuitState = "closed";
     state.delay = 80;
     const timeout = await routeAndSend(router, { model: "kimi-for-coding", agentId: "probe" }, "/chat/completions", "POST",
       { "content-type": "application/json" }, body("kimi-for-coding"), false);

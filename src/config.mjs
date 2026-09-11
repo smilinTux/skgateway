@@ -851,6 +851,10 @@ export function assertProviderRoutes(
     if ('require_observed_health' in backend && typeof backend.require_observed_health !== 'boolean') {
       errs.push(`backends.${name}.require_observed_health must be a boolean`);
     }
+    if (backend.require_observed_health === true &&
+        (typeof backend.account_ref !== 'string' || !backend.account_ref.trim())) {
+      errs.push(`backends.${name}.account_ref must be a non-empty opaque reference when require_observed_health is true`);
+    }
     if (auth === 'codex_oauth' && !backend.credentials_path && !backend.credentials_file) {
       errs.push(`backends.${name}.auth_type is "codex_oauth" but no credentials_path/credentials_file is set`);
     }

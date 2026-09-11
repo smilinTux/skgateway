@@ -2768,6 +2768,7 @@ export const server = http.createServer(async (req, res) => {
           responseHeaders: result?.headers ?? {},
           responseBody: parsedBody,
           backend: result?.backendId,
+          errorMsg: result?.terminalFailureReason || undefined,
           // Card 316dd167 / A8: the one fact that distinguishes a silent
           // substitution from an ordinary call, and it was already sitting in
           // memory here. The gateway relays the upstream body verbatim

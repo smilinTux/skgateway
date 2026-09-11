@@ -8,6 +8,7 @@ import {
   observeProviderUsage,
   parseProviderQuota,
   providerUsageSnapshot,
+  providerHealthAdmissionSnapshot,
 } from "../src/metrics/provider-usage.mjs";
 
 test.beforeEach(() => _resetProviderUsageForTests());
@@ -76,6 +77,20 @@ test("passive allowlisted quota evidence can be persisted without raw headers", 
   assert.equal(appended[0].dimensions.quota, "low");
   assert.equal(appended[0].bucket_id, "sk-l");
   assert.equal(JSON.stringify(appended[0]).includes("must-not-persist"), false);
+});
+
+test("admission distinguishes unavailable, unreadable, stale, and exact account state", () => {
+  assert.equal(providerHealthAdmissionSnapshot({}).state, "unavailable");
+  configureProviderHealthPersistence({ append() {}, snapshot() { throw new Error("broken"); } });
+  assert.equal(providerHealthAdmissionSnapshot({}).state, "unreadable");
+  const base = { provider: "zai", backend_id: "glm", account_ref: "opaque-a", model_id: "glm-4.7",
+    circuit_state: "closed", evidence_expires_at: 2000, evidence_stale: false };
+  configureProviderHealthPersistence({ append() {}, snapshot() { return [{ ...base, account_ref: "opaque-b" }]; } });
+  assert.equal(providerHealthAdmissionSnapshot(base, { now: 1000 }).state, "missing");
+  configureProviderHealthPersistence({ append() {}, snapshot() { return [{ ...base, evidence_expires_at: 999 }]; } });
+  assert.equal(providerHealthAdmissionSnapshot(base, { now: 1000 }).state, "stale");
+  configureProviderHealthPersistence({ append() {}, snapshot() { return [base]; } });
+  assert.equal(providerHealthAdmissionSnapshot(base, { now: 1000 }).state, "ready");
 });
 
 test("production Kimi backend id routes authoritative response quota into snapshot", async () => {

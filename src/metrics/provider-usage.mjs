@@ -16,6 +16,29 @@ export function providerHealthSnapshots(filter = {}) {
   try { return healthSink.snapshot(filter); } catch { return []; }
 }
 
+/** Return one exact, current durable scope without collapsing store failures
+ * into a healthy cold start. Admission callers must treat every non-ready
+ * state as ineligible. */
+export function providerHealthAdmissionSnapshot(filter = {}, { now = Date.now() } = {}) {
+  if (!healthSink?.snapshot) return Object.freeze({ state: "unavailable", snapshot: null });
+  let snapshots;
+  try { snapshots = healthSink.snapshot(filter); }
+  catch { return Object.freeze({ state: "unreadable", snapshot: null }); }
+  if (!Array.isArray(snapshots)) return Object.freeze({ state: "malformed", snapshot: null });
+  const exact = snapshots.filter((snapshot) => snapshot &&
+    snapshot.provider === filter.provider &&
+    snapshot.backend_id === filter.backend_id &&
+    snapshot.account_ref === filter.account_ref &&
+    snapshot.model_id === filter.model_id);
+  if (exact.length !== 1) return Object.freeze({ state: exact.length ? "ambiguous" : "missing", snapshot: null });
+  const snapshot = exact[0];
+  if (!Number.isSafeInteger(snapshot.evidence_expires_at) || snapshot.evidence_expires_at < now || snapshot.evidence_stale === true) {
+    return Object.freeze({ state: "stale", snapshot: null });
+  }
+  if (typeof snapshot.circuit_state !== "string") return Object.freeze({ state: "malformed", snapshot: null });
+  return Object.freeze({ state: "ready", snapshot });
+}
+
 const HEADER_SCHEMAS = {
   codex: [
     ["tokens", "x-ratelimit-limit-tokens", "x-ratelimit-remaining-tokens", "x-ratelimit-reset-tokens"],

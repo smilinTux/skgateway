@@ -37,7 +37,7 @@ import { isRegistryRouted, resolve as resolveRegistry, getAutoConfig, getConfigE
 import { getFailoverConfig, isLocalUrl, probeLocalHealth, recordLocalOutcome } from "./local-failover.mjs";
 import { readMeter } from "./meter-client.mjs";
 import { marginalJoules, imputeJoules, resolveBasis, coeffsForModel, backendIsLocal, usageFromSSE, resolveMeterUrl } from "../metrics/energy.mjs";
-import { observeProviderUsage, providerUsageSnapshot, providerHealthSnapshots } from "../metrics/provider-usage.mjs";
+import { observeProviderUsage, providerUsageSnapshot, providerHealthAdmissionSnapshot } from "../metrics/provider-usage.mjs";
 import {
   effectiveInferenceEligibility,
   independentAttemptCandidates,
@@ -45,15 +45,10 @@ import {
   selectTerminalFailure,
 } from "../health/failure.mjs";
 import { recordModelOutcome, getLifecycle } from "../discovery/model_catalog_store.mjs";
-import {
-  admitCapacity, capacityStatus, clearCapacity, finishCapacityProbe,
-  isSubscriptionExhaustion, recordModelThrottled, recordModelUnavailable, recordProviderUnavailable,
-  recordSubscriptionExhausted,
-  releaseCapacityProbe,
-} from "../discovery/capacity_store.mjs";
+import { capacityStatus } from "../discovery/capacity_store.mjs";
 import { isRoutable, isEffectivelyRoutable } from "../discovery/lifecycle.mjs";
 import { applyReasoningFloor } from "./core.mjs";
-import { enforceResponseContract } from "./response-contract.mjs";
+import { enforceResponseContract, terminalSseFailure } from "./response-contract.mjs";
 import { shouldForceNonStream } from "../classifiers/classifier.mjs";
 import { openAIJsonToSSEBuffer } from "./stream.mjs";
 import { createDecisionCache, decisionKey } from "./decision-cache.mjs";
@@ -195,9 +190,6 @@ const DOWN_ERROR_RATE = 0.50;
  * Default: 60 seconds.
  */
 const DEFAULT_COOLDOWN_MS = 60_000;
-
-/** Timeout (ms) used for liveness probe requests during recovery. */
-const PROBE_TIMEOUT_MS = 8_000;
 
 /**
  * Max ranked candidates mapped into the router's candidate array for an
@@ -870,6 +862,12 @@ export class Backend {
     // observed. Legacy providers retain warm-start behaviour; newly admitted
     // external lanes must prove a bounded probe before receiving work.
     this.require_observed_health = config.require_observed_health === true;
+    this.account_ref = typeof config.account_ref === "string" && config.account_ref
+      ? config.account_ref
+      : null;
+    this.capacity_domain = typeof config.capacity_domain === "string" && config.capacity_domain
+      ? config.capacity_domain
+      : this.id;
 
     // Dead-alias auto-quarantine tunables (card 2d1f3a2c). Per-backend config
     // overrides the router-level default which overrides the module default.
@@ -3862,7 +3860,10 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     ? AbortSignal.any([abortSignal, deadlineSignal])
     : deadlineSignal;
   const failureAttempts = [];
-  candidates = independentAttemptCandidates(candidates, { maxAttempts: 3 });
+  candidates = independentAttemptCandidates(candidates, { maxAttempts: Number.MAX_SAFE_INTEGER });
+  let upstreamAttemptCount = 0;
+  const attemptedCapacityDomains = new Set();
+  let previousAttemptedBackend = null;
   // Doors that refused the context preflight (card 9ed4a9f7), bounded one
   // entry per candidate, used to synthesize the explicit 400 when EVERY
   // door is too small for the request.
@@ -3938,30 +3939,6 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       ? bucketLivenessTimeoutMs(backend.timeout_ms)
       : backend.timeout_ms;
 
-    if (i > 0) {
-      didFailover = true;
-      // SIEM failover event written to stdout as a JSON line
-      process.stdout.write(JSON.stringify({
-        ts: new Date().toISOString(),
-        event: "failover",
-        source: "router",
-        from: candidates[i - 1].backendId,
-        to: backendId,
-        model: request.model,
-        agentId: request.agentId,
-        previousStatus: lastResult?.status,
-      }) + "\n");
-      console.warn(
-        `[router] FAILOVER: ${candidates[i - 1].backendId} → ${backendId}` +
-        ` (prev_status=${lastResult?.status})`
-      );
-      await emitSiem("failover", {
-        from_backend: candidates[i - 1].backendId,
-        to_backend: backendId,
-        reason: `previous_status_${lastResult?.status ?? "error"}`,
-      }, { backend: backendId });
-    }
-
     // Model-granular throttle cooldown (card 9e28de88 fix #2): this exact
     // door threw a 429/402 for this exact model recently enough that it is
     // still cooling down. Skip it with NO network call rather than paying
@@ -3975,13 +3952,29 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       : null;
     let configuredMode = "active";
     try { configuredMode = providerConfiguredMode(getConfig(), providerName); } catch {}
-    const durableSnapshot = providerHealthSnapshots({
-      provider: providerName,
-      backend_id: backendId,
-      model_id: candidateModel,
-    })[0] || null;
     const purpose = publicSynthetic ? "recovery" : "inference";
-    const eligible = durableSnapshot
+    const healthAdmission = backend.require_observed_health
+      ? providerHealthAdmissionSnapshot({
+          provider: providerName,
+          backend_id: backendId,
+          account_ref: backend.account_ref,
+          model_id: candidateModel,
+        })
+      : { state: "legacy", snapshot: null };
+    const durableSnapshot = healthAdmission.snapshot;
+    const eligible = backend.require_observed_health
+      ? healthAdmission.state === "ready" && effectiveInferenceEligibility({
+          mode: configuredMode,
+          circuit: durableSnapshot.circuit_state,
+          purpose,
+          lease: durableSnapshot.half_open_lease,
+          leaseOwner: capacityProbeOwner,
+          now: Date.now(),
+          scopeMatches: durableSnapshot.provider === providerName &&
+            durableSnapshot.backend_id === backendId && durableSnapshot.account_ref === backend.account_ref &&
+            durableSnapshot.model_id === candidateModel,
+        })
+      : durableSnapshot
       ? effectiveInferenceEligibility({
           mode: configuredMode,
           circuit: durableSnapshot.circuit_state,
@@ -4006,37 +3999,12 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       }));
       continue;
     }
-    const capacityAdmission = providerName === "codex" || providerName === "zai"
-      ? admitCapacity(providerName, candidateModel, { publicSynthetic, probeOwner: capacityProbeOwner })
-      : { admitted: true, probe: false };
-    if (capacityAdmission.probe) {
-      attemptTimeoutMs = Math.min(attemptTimeoutMs || PROBE_TIMEOUT_MS, PROBE_TIMEOUT_MS);
-      try {
-        await emitSiem(EventType.CAPACITY, {
-          action: "probe_attempt",
-          state: "throttled",
-          scope: capacityAdmission.status.scope,
-          reason: capacityAdmission.status.reason,
-          retry_at: capacityAdmission.status.retry_at,
-          probe_state: "in_progress",
-          deadline_ms: PROBE_TIMEOUT_MS,
-        }, { backend: backendId, correlation_id: _siemRequestId });
-      } catch (error) {
-        releaseCapacityProbe(providerName, capacityProbeOwner);
-        throw error;
-      }
-    }
-    const probeResponseLimit = capacityAdmission.probe ? 1024 * 1024 : 0;
-    if (!capacityAdmission.admitted) {
-      const remainingMs = Math.max(1000, (capacityAdmission.status.retry_at || Date.now() + 1000) - Date.now());
-      throttledAttempts.push({ backendId, model: candidateModel, status: 429,
-        cooldownMs: remainingMs, skipped: true, reason: capacityAdmission.status.reason });
-      failureAttempts.push(normalizeFailure({ origin: "gateway", reason: "cooldown_active",
-        upstreamAttempted: false, retryAt: capacityAdmission.status.retry_at, requestId: _siemRequestId }));
-      continue;
-    }
+    // Durable health is the sole admission authority. The legacy capacity
+    // file remains available to compatibility readers but cannot admit,
+    // reject, or lease a request here.
+    const probeResponseLimit = 0;
 
-    if (isThrottled(backendId, candidateModel) && !capacityAdmission.probe) {
+    if (isThrottled(backendId, candidateModel)) {
       const state = _throttleCooldowns.get(throttleKey(backendId, candidateModel));
       const remainingMs = Math.max(0, (state?.untilMs ?? 0) - Date.now());
       console.warn(
@@ -4052,9 +4020,12 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       continue;
     }
 
+    const capacityDomain = backend.capacity_domain || backendId;
+    if (attemptedCapacityDomains.has(capacityDomain)) continue;
+    if (upstreamAttemptCount >= 3) break;
+
     const remainingOperationMs = operationDeadline - Date.now();
     if (remainingOperationMs <= 0) {
-      if (capacityAdmission.probe) releaseCapacityProbe(providerName, capacityProbeOwner);
       failureAttempts.push(normalizeFailure({ origin: "gateway", reason: "operation_timeout",
         upstreamAttempted: false, requestId: _siemRequestId }));
       break;
@@ -4117,12 +4088,8 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       try {
         slot = await pool.acquire(backendId, { signal: operationSignal });
       } catch (err) {
-        // Capacity admission owns a provider-wide half-open lock. Pool
-        // rejection happens before the upstream try/finally below, so it must
-        // explicitly re-arm and release the probe here on every early return.
-        if (capacityAdmission.probe) finishCapacityProbe(providerName, false, {
-          probeOwner: capacityProbeOwner, model: candidateModel,
-        });
+        // Pool rejection occurs before any upstream request and does not
+        // consume the upstream attempt budget.
         // A client which leaves while queued is the same neutral 499 as one
         // which leaves after dispatch: no failover and no backend-health write.
         if (err instanceof PoolAdmissionError && err.code === "client_closed" && !abortSignal?.aborted && deadlineSignal.aborted) {
@@ -4167,7 +4134,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         const code = err instanceof PoolAdmissionError
           ? err.code
           : "capacity_exceeded";
-        const capacityDomain = err instanceof PoolAdmissionError
+        const rejectedCapacityDomain = err instanceof PoolAdmissionError
           ? err.capacityDomain
           : backendId;
         const retryAfterSeconds = err instanceof PoolAdmissionError
@@ -4178,7 +4145,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           type: code === "queue_timeout" ? "pool_queue_timeout" : "pool_capacity_exceeded",
           status_code: 503,
           backend: backendId,
-          capacity_domain: capacityDomain,
+          capacity_domain: rejectedCapacityDomain,
           retry_after_seconds: retryAfterSeconds,
           message: err.message,
         }, { backend: backendId });
@@ -4205,7 +4172,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           failover: false,
           admission_rejected: true,
           code,
-          capacity_domain: capacityDomain,
+          capacity_domain: rejectedCapacityDomain,
         }, { backend: backendId });
         return {
           status: 503,
@@ -4216,17 +4183,17 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           body: Buffer.from(JSON.stringify({
             error: {
               message: code === "queue_timeout"
-                ? `Capacity domain ${capacityDomain} queue wait timed out.`
-                : `Capacity domain ${capacityDomain} queue is full.`,
+                ? `Capacity domain ${rejectedCapacityDomain} queue wait timed out.`
+                : `Capacity domain ${rejectedCapacityDomain} queue is full.`,
               code,
               backend: backendId,
-              capacity_domain: capacityDomain,
+              capacity_domain: rejectedCapacityDomain,
               retryable: true,
               retry_after_seconds: retryAfterSeconds,
             }
           })),
           backendId,
-          capacityDomain,
+          capacityDomain: rejectedCapacityDomain,
           queueWaitMs,
           inflightConcurrency,
           admissionOutcome,
@@ -4243,6 +4210,27 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     const queueWaitMs = slot?.queueWaitMs ?? 0;
     const inflightConcurrency = slot?.inflightConcurrency ?? 1;
     const admissionOutcome = slot?.admissionOutcome ?? "admitted";
+    const actualCapacityDomain = slot?.capacityDomain || capacityDomain;
+    if (attemptedCapacityDomains.has(actualCapacityDomain)) {
+      if (slot && pool) pool.release(slot);
+      continue;
+    }
+    attemptedCapacityDomains.add(actualCapacityDomain);
+    upstreamAttemptCount++;
+    if (previousAttemptedBackend) {
+      didFailover = true;
+      process.stdout.write(JSON.stringify({
+        ts: new Date().toISOString(), event: "failover", source: "router",
+        from: previousAttemptedBackend, to: backendId, model: request.model,
+        agentId: request.agentId, previousStatus: lastResult?.status,
+      }) + "\n");
+      console.warn(`[router] FAILOVER: ${previousAttemptedBackend} -> ${backendId} (prev_status=${lastResult?.status})`);
+      await emitSiem("failover", {
+        from_backend: previousAttemptedBackend, to_backend: backendId,
+        reason: `previous_status_${lastResult?.status ?? "error"}`,
+      }, { backend: backendId });
+    }
+    previousAttemptedBackend = backendId;
 
     // Meter read is per attempt, not per request: a failover attempt must be
     // attributed to the backend that actually served it. Fail-open, so a slow
@@ -4417,6 +4405,10 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       console.log(`[router] GLM SSE shape ${JSON.stringify(shape)}`);
     }
 
+    const upstreamWasSse = upstreamStatus >= 200 && upstreamStatus < 300 &&
+      String(res?.headers?.["content-type"] || res?.headers?.["Content-Type"] || "").includes("text/event-stream");
+    const upstreamSseBody = upstreamWasSse ? Buffer.from(res.body) : null;
+
     // Validate the buffered JSON form first, then re-emit and validate the
     // canonical OpenAI SSE form when the original client asked to stream.
     if (flippedToNonStream) {
@@ -4454,6 +4446,29 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     if (!flippedToNonStream) {
       res = enforceResponseContract(res, requestedModel);
     }
+    const partialStreamFailed = clientStreamWanted && upstreamWasSse && res.status === 502 &&
+      upstreamSseBody.includes(Buffer.from("data:")) && !upstreamSseBody.includes(Buffer.from("data: [DONE]"));
+    if (partialStreamFailed) {
+      const prefix = upstreamSseBody.toString("utf8").replace(/\s*$/, "\n\n");
+      res = {
+        ...res,
+        status: 200,
+        headers: { ...res.headers, "content-type": "text/event-stream", "cache-control": "no-store" },
+        body: Buffer.concat([
+          Buffer.from(prefix, "utf8"),
+          terminalSseFailure({
+            requestId: _siemRequestId,
+            reason: "partial_stream_failed",
+            origin: "upstream",
+            retryable: false,
+            attemptCount: upstreamAttemptCount,
+          }),
+        ]),
+        terminalFailureReason: "partial_stream_failed",
+      };
+      delete res.headers["content-length"];
+      delete res.headers["Content-Length"];
+    }
     observeProviderUsage(providerName, res);
     const latencyMs = (Date.now() - queueStart) - meterBeforeMs;
 
@@ -4461,6 +4476,9 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       try { return JSON.parse(res.body?.toString("utf8") || "{}").error?.code || null; }
       catch { return null; }
     })();
+    const quotaProven = upstreamStatus === 402 || [
+      "quota_exhausted", "subscription_exhausted", "usage_limit_exceeded",
+    ].includes(responseErrorCode);
     const requestedMaxTokens = (() => {
       try {
         const parsed = JSON.parse(attemptBody?.toString("utf8") || "{}");
@@ -4475,7 +4493,19 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           ? "response_budget"
           : "malformed_response"
         : res.status >= 500 ? "backend_cooldown" : null;
-    if (upstreamStatus === 401 || upstreamStatus === 403) {
+    if (upstreamStatus === 403 && quotaProven) {
+      res = {
+        ...res,
+        status: 429,
+        headers: { ...res.headers, "content-type": "application/json", "cache-control": "no-store" },
+        body: Buffer.from(JSON.stringify({ error: {
+          message: "The selected provider quota is exhausted",
+          code: "quota_exhausted",
+          type: "rate_limit_error",
+          retryable: true,
+        } }), "utf8"),
+      };
+    } else if (upstreamStatus === 401 || upstreamStatus === 403) {
       const reason = upstreamStatus === 401
         ? "provider_auth_unavailable"
         : "provider_entitlement_unavailable";
@@ -4504,9 +4534,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         reason: upstreamStatus >= 200 && upstreamStatus < 300 && res.status === 502
           ? "malformed_response"
           : undefined,
-        quotaProven: upstreamStatus === 402 || [
-          "quota_exhausted", "subscription_exhausted", "usage_limit_exceeded",
-        ].includes(responseErrorCode),
+        quotaProven,
         retryAt: parsedRetryMs == null ? null : Date.now() + parsedRetryMs,
         upstreamAttempted: true,
         requestId: _siemRequestId,
@@ -4515,60 +4543,6 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     if (providerName === "zai" && recoveryFailureClass === "malformed_response") {
       console.warn(`[router] malformed GLM response model=${candidateModel} code=${responseErrorCode || "unknown"}`);
     }
-    // The response contract rewrites malformed upstream 2xx responses to a
-    // non-2xx status, so this is also the schema-valid recovery boundary.
-    const recoveryProbeSucceeded = capacityAdmission.probe &&
-      res.status >= 200 && res.status < 300;
-
-    if (providerName === "codex" || providerName === "zai") {
-      const retryAfter = res.headers?.["retry-after"] ?? res.headers?.["Retry-After"];
-      const retryAt = Date.now() + Math.min(parseRetryAfterMs(retryAfter) ?? DEFAULT_402_COOLDOWN_MS, MAX_THROTTLE_COOLDOWN_MS);
-      if (isSubscriptionExhaustion(res.status, res.body)) {
-        await emitSiem(EventType.CAPACITY, {
-          action: "subscription_exhausted",
-          state: "throttled",
-          scope: "provider",
-          reason: "subscription_exhausted",
-          retry_at: retryAt,
-          probe_state: "pending",
-        }, { backend: backendId, correlation_id: _siemRequestId });
-        if (capacityAdmission.probe) {
-          finishCapacityProbe(providerName, false, {
-            probeOwner: capacityProbeOwner, model: candidateModel, retryAt, providerWide: true,
-          });
-        } else {
-          recordSubscriptionExhausted(providerName, { retryAt });
-        }
-      } else if (capacityAdmission.probe) {
-        const probeSucceeded = recoveryProbeSucceeded;
-        if (probeSucceeded) {
-          await emitSiem(EventType.CAPACITY, {
-            action: "probe_recovered",
-            state: "available",
-            scope: "provider",
-            reason: null,
-            retry_at: null,
-            probe_state: "succeeded",
-          }, { backend: backendId, correlation_id: _siemRequestId });
-        }
-        finishCapacityProbe(providerName, probeSucceeded, {
-          probeOwner: capacityProbeOwner, model: candidateModel,
-          retryAt: recoveryFailureClass === "authentication_failure" ? retryAt : undefined,
-          reason: probeSucceeded ? null : recoveryFailureClass,
-        });
-      } else if (res.status === 429 || res.status === 402) {
-        recordModelThrottled(providerName, candidateModel, { retryAt });
-      } else if (res.status >= 200 && res.status < 300) {
-        clearCapacity(providerName, candidateModel);
-      } else if (providerName === "zai" && recoveryFailureClass === "authentication_failure") {
-        recordProviderUnavailable(providerName, { reason: recoveryFailureClass });
-      } else if (providerName === "zai" && recoveryFailureClass) {
-        recordModelUnavailable(providerName, candidateModel, {
-          reason: recoveryFailureClass,
-        });
-      }
-    }
-
     // A downstream disconnect is not evidence about the backend or model.
     // Return immediately after releasing the pool/meter slot in `finally`,
     // before energy reads, health/lifecycle writes, or failover can run.
@@ -4660,7 +4634,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     const healthy = res.status < 500 || modelContractFailure;
     const qTransition = backend.recordOutcome(healthy, latencyMs, {
       failureClass: recoveryFailureClass,
-      authoritativeRecovery: recoveryProbeSucceeded,
+      authoritativeRecovery: false,
     });
     const claimTransition = backend.recordModelClaimOutcome(
       candidateModel,
@@ -4838,6 +4812,18 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       }
     }
 
+    if (partialStreamFailed) {
+      await emitSiem("response", {
+        status: 200,
+        terminal_state: "partial_stream_failed",
+        failure_reason: "partial_stream_failed",
+        upstream_attempted: true,
+        attempt_count: upstreamAttemptCount,
+        failover: didFailover,
+      }, { backend: backendId });
+      return lastResult;
+    }
+
     if (!retryElsewhere) {
       console.log(
         `[router] ${res.status} OK backend=${backendId} latency=${latencyMs}ms` +
@@ -5006,6 +4992,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       all_backends_failed: true,
       all_throttled: true,
     }, { backend: backendId });
+    const terminal = selectTerminalFailure(failureAttempts, operationDeadline);
     return {
       status: 429,
       headers: {
@@ -5020,6 +5007,12 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       backoffClassification,
       retryAfterSeconds: retryAfterSec,
       failover: didFailover,
+      clientStatus: terminal.clientStatus,
+      upstreamStatus: terminal.upstreamStatus,
+      failureOrigin: terminal.origin,
+      failureReason: terminal.reason,
+      upstreamAttempted: terminal.upstreamAttempted,
+      attemptCount: terminal.attemptCount,
     };
   }
 

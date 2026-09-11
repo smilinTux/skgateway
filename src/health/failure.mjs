@@ -16,6 +16,9 @@ function classify({ origin, upstreamStatus, reason, quotaProven }) {
   if (reason === "malformed_response" || (upstreamStatus >= 200 && upstreamStatus < 300 && reason)) {
     return { clientStatus: 502, reason: "malformed_response", retryable: true };
   }
+  if (quotaProven && [402, 403, 429].includes(upstreamStatus)) {
+    return { clientStatus: 429, reason: "quota_exhausted", retryable: true };
+  }
   if (upstreamStatus === 401 || upstreamStatus === 403) {
     return {
       clientStatus: 503,
@@ -25,10 +28,9 @@ function classify({ origin, upstreamStatus, reason, quotaProven }) {
   }
   if (upstreamStatus === 429) return {
     clientStatus: 429,
-    reason: quotaProven ? "quota_exhausted" : "rate_limited",
+    reason: "rate_limited",
     retryable: true,
   };
-  if (upstreamStatus === 402 && quotaProven) return { clientStatus: 503, reason: "quota_exhausted", retryable: true };
   if ([502, 503, 504, 529].includes(upstreamStatus)) return {
     clientStatus: upstreamStatus === 504 ? 504 : 502,
     reason: upstreamStatus === 504 ? "upstream_timeout" : "upstream_unavailable",

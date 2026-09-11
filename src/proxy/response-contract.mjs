@@ -298,8 +298,18 @@ function hasValidCompletion(state) {
 }
 
 /** Build one terminal SSE error event. Callers must close immediately after it. */
-export function terminalSseFailure({ requestId = null, reason = "partial_stream_failed" } = {}) {
-  const payload = { error: { type: "upstream_error", code: reason, message: "Upstream stream ended before a valid terminal event" } };
+export function terminalSseFailure({
+  requestId = null,
+  reason = "partial_stream_failed",
+  origin = "upstream",
+  retryable = false,
+  attemptCount = 1,
+} = {}) {
+  const payload = { error: {
+    type: "upstream_error", code: reason,
+    message: "Upstream stream ended before a valid terminal event",
+    origin, retryable, attempt_count: attemptCount,
+  } };
   if (requestId) payload.request_id = requestId;
   return Buffer.from(`event: error\ndata: ${JSON.stringify(payload)}\n\n`, "utf8");
 }

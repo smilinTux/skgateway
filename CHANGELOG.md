@@ -8,7 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 - Normalize provider failure attribution, enforce durable circuit admission,
-  and bound failover to three independent capacity domains under one deadline.
+  and bound failover to three actual upstream attempts in independent capacity
+  domains under one deadline. Exact opaque account references now fail closed
+  on missing, stale, malformed, or unreadable health state. Partial SSE output
+  terminates with one typed error and no cross-provider splice. The legacy
+  capacity file remains compatibility state and no longer controls admission.
 
 - Align durable provider health observations with the canonical `disabled`
   configured mode and reject the obsolete `off` value.

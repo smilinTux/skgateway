@@ -229,6 +229,7 @@ backends:
     timeout_ms: 30000
     context_limit: 262144
     require_observed_health: true
+    account_ref: kimi-code-primary
 
   kimi-k3:
     url: https://api.kimi.ai/coding/v1
@@ -240,6 +241,7 @@ backends:
     timeout_ms: 60000
     context_limit: 1048576
     require_observed_health: true
+    account_ref: kimi-code-primary
 
   ## REMOVED 2026-08-25 by Chef. Same box as above, his personal 5060, not part
   ## of the chi cluster. This pool had never been instantiated, meaning it had
