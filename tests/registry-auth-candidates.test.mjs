@@ -132,6 +132,13 @@ test("registry role -> UNCONFIGURED url keeps the synthetic reg: pool (no auth, 
   }
 });
 
+test("provider admission callback denies and callback failures fail closed", async () => {
+  for (const providerAdmission of [() => false, () => { throw new Error("fixture"); }]) {
+    const router = createRouter({ backends: {}, failover: false, siem_log: false, providerAdmission });
+    assert.equal(router.providerAdmissionAllowed({ backend: "fixture" }, "inference"), false);
+  }
+});
+
 test("configured codex_oauth backend bound by a registry role builds codex headers", async () => {
   const credsPath = join(dir, "auth.json");
   writeFileSync(credsPath, JSON.stringify({
