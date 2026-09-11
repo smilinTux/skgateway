@@ -632,6 +632,9 @@ export function buildAdminModelsView(full, allow, getLifecycleFn = getLifecycle,
  */
 export async function refreshCatalog(cfg, discoverCatalogFn = discoverCatalog) {
   const d = cfg.discovery || {};
+  const requestedProbeProviders = Array.isArray(d.probe_providers)
+    ? d.probe_providers.map(String)
+    : ["nvidia"];
   const providerCanMonitor = (provider) => providerNetworkPermission(
     providerConfiguredMode(cfg, provider),
     "monitor",
@@ -698,12 +701,10 @@ export async function refreshCatalog(cfg, discoverCatalogFn = discoverCatalog) {
     //   capability_timeout_ms / capability_scope ('sweep' | 'provider')
     // Undefined knobs fall through to probe.mjs / capability-assessment.mjs
     // defaults, exactly like probe_budget above.
-    probeProviders: Array.isArray(d.probe_providers) && d.probe_providers.length
-      ? d.probe_providers.map(String).filter((provider) => providerNetworkPermission(
-          providerConfiguredMode(cfg, provider),
-          "qualification",
-        ))
-      : undefined,
+    probeProviders: requestedProbeProviders.filter((provider) => providerNetworkPermission(
+      providerConfiguredMode(cfg, provider),
+      "qualification",
+    )),
     capabilityProviders: Object.entries(d.providers || {})
       .filter(([provider, p]) => p && p.capability_battery === true && providerNetworkPermission(
         providerConfiguredMode(cfg, provider),

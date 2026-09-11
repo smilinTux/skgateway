@@ -55,7 +55,7 @@ import { createDecisionCache, decisionKey } from "./decision-cache.mjs";
 // reimplementation. getConfig() gates the whole branch behind
 // routing.match_enabled (config.mjs, unmodified: the DEFAULTS already carry
 // a `routing:` block, card P4.4 adds match_enabled to it later).
-import { getConfig } from "../config.mjs";
+import { getConfig, providerConfiguredMode, providerNetworkPermission } from "../config.mjs";
 import { buildServingCatalog } from "../discovery.mjs";
 import { rankModels } from "../ranking/rank.mjs";
 import { buildCapabilityCatalog } from "../ranking/catalog.mjs";
@@ -3460,6 +3460,15 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     }
 
     if (reg) {
+      if (!providerNetworkPermission(providerConfiguredMode(getConfig(), reg.backend), "inference")) {
+        return {
+          status: 503,
+          headers: { "content-type": "application/json" },
+          body: Buffer.from(JSON.stringify({
+            error: { message: "Registry target provider is disabled", code: "provider_disabled" },
+          })),
+        };
+      }
       // Rewrite the outgoing model so the upstream receives a real name.
       body = rewriteBodyModel(body, reg.model);
       body = applyBodyFloor(body, reg.model, reg.minOutputTokens);

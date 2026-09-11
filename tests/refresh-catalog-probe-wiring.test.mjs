@@ -305,7 +305,7 @@ describe("card C3: refreshCatalog wires discovery.probe_* into discoverCatalog",
     let captured = null;
     const spy = async (opts) => { captured = opts; return { models: [] }; };
     await mod.refreshCatalog({ backends: {}, discovery: { enabled: true, providers: {}, probe_seconds: 86400 } }, spy);
-    assert.equal(captured.probeProviders, undefined);
+    assert.deepEqual(captured.probeProviders, ["nvidia"]);
     assert.deepEqual(captured.capabilityProviders, []);
     assert.equal(captured.capabilityScope, undefined);
   });
