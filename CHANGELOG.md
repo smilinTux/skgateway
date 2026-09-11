@@ -51,6 +51,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Normalize only legacy model-local Z.ai malformed-response and transport
+  recovery deadlines at read time without rewriting persisted capacity state.
+
 - Keep Z.ai malformed-response and transport cooldowns on the bounded
   model-recovery deadline instead of the six-hour subscription deadline.
 

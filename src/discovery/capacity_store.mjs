@@ -9,6 +9,7 @@ const probes = new Map();
 const scheduledProbes = new Map();
 const TRANSIENT_RETRY_MS = 5 * 60 * 1000;
 const TERMINAL_RETRY_MS = 30 * 60 * 1000;
+const MODEL_RECOVERY_RETRY_MS = 60 * 1000;
 const ZAI_RECOVERY_MODELS = Object.freeze(["glm-4.6", "glm-4.7", "glm-5.3"]);
 
 /** Keep shared provider recovery on the exact claims qualified for fleet use. */
@@ -40,8 +41,13 @@ export function capacityStatus(provider, model, { now = Date.now(), path = CAPAC
   const store = load(path);
   const providerRecord = store[`provider:${provider}`];
   const modelRecord = store[`model:${provider}:${model}`];
-  const record = providerRecord?.state === "throttled" ? providerRecord : (modelRecord || providerRecord);
+  let record = providerRecord?.state === "throttled" ? providerRecord : (modelRecord || providerRecord);
   if (!record) return { state: "unknown", reason: null, retry_at: null, probe_state: "none", current: false };
+  if (record === modelRecord && provider === "zai" && record.scope === "model" &&
+      (record.reason === "malformed_response" || record.reason === "backend_cooldown") &&
+      Number.isFinite(record.observed_at) && Number.isFinite(record.retry_at)) {
+    record = { ...record, retry_at: Math.min(record.retry_at, record.observed_at + MODEL_RECOVERY_RETRY_MS) };
+  }
   const current = Number.isFinite(record.observed_at) && now - record.observed_at <= 48 * 60 * 60 * 1000;
   if (record.state === "available") return { ...record, current };
   return { ...record, state: "throttled", current };
@@ -89,7 +95,7 @@ export function recordModelUnavailable(provider, model, {
   const store = load(path);
   const record = {
     state: "throttled", scope: "model", reason,
-    retry_at: Math.max(now + 1000, Number(retryAt) || now + 60_000),
+    retry_at: Math.max(now + 1000, Number(retryAt) || now + MODEL_RECOVERY_RETRY_MS),
     probe_state: "none", observed_at: now,
   };
   save({ ...store, [`model:${provider}:${model}`]: record }, path);
