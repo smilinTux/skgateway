@@ -329,6 +329,125 @@ describe("disabled qualification startup", () => {
   });
 });
 
+test("disabled OpenRouter performs no discovery, probe, capability, or inference network calls at startup", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "skgw-openrouter-disabled-startup-"));
+  let gateway;
+  let openrouter;
+  let openrouterRequests = 0;
+  try {
+    openrouter = await startJsonServer((_req, res) => {
+      openrouterRequests++;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ data: [] }));
+    });
+    const port = await freePort();
+    const dashboardPort = await freePort();
+    const configPath = writeConfig(dir, [
+      "server:",
+      "  bind: 127.0.0.1",
+      `  port: ${port}`,
+      `  dashboard_port: ${dashboardPort}`,
+      "dashboard:",
+      "  enabled: false",
+      "metrics:",
+      "  enabled: false",
+      "identity:",
+      "  enabled: false",
+      "siem:",
+      "  enabled: false",
+      "  outputs: []",
+      "providers:",
+      "  openrouter:",
+      "    configured_mode: disabled",
+      "discovery:",
+      "  enabled: true",
+      "  refresh_seconds: 3600",
+      "  probe_seconds: 1",
+      "  probe_providers: [openrouter]",
+      "  providers:",
+      "    openrouter: { enabled: true, free_only: true, chat_only: true, capability_battery: true }",
+      "backends:",
+      "  openrouter:",
+      `    url: http://127.0.0.1:${openrouter.port}/v1`,
+      "    auth_type: none",
+      "    discovery: free",
+      "    priority: 1",
+    ]);
+
+    gateway = await bootGateway({ configPath });
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
+    assert.equal(openrouterRequests, 0);
+  } finally {
+    await stopGateway(gateway);
+    await closeServer(openrouter?.server);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("reload removes a newly disabled OpenRouter backend before another inference call", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "skgw-openrouter-reload-"));
+  let gateway;
+  let openrouter;
+  let openrouterRequests = 0;
+  try {
+    openrouter = await startJsonServer(async (req, res) => {
+      openrouterRequests++;
+      for await (const _chunk of req) { /* drain request */ }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ choices: [{ message: { content: "unexpected" } }] }));
+    });
+    const port = await freePort();
+    const dashboardPort = await freePort();
+    const configLines = (mode) => [
+      "server:",
+      "  bind: 127.0.0.1",
+      `  port: ${port}`,
+      `  dashboard_port: ${dashboardPort}`,
+      "dashboard:",
+      "  enabled: false",
+      "metrics:",
+      "  enabled: false",
+      "identity:",
+      "  enabled: false",
+      "siem:",
+      "  enabled: false",
+      "  outputs: []",
+      "providers:",
+      "  openrouter:",
+      `    configured_mode: ${mode}`,
+      "discovery:",
+      "  enabled: false",
+      "backends:",
+      "  openrouter:",
+      `    url: http://127.0.0.1:${openrouter.port}/v1`,
+      "    auth_type: none",
+      "    discovery: free",
+      "    models: [openrouter-reload-model]",
+      "    priority: 1",
+    ];
+    const configPath = writeConfig(dir, configLines("active"));
+    gateway = await bootGateway({ configPath });
+    openrouterRequests = 0;
+
+    writeFileSync(configPath, `${configLines("disabled").join("\n")}\n`, "utf8");
+    gateway.child.kill("SIGHUP");
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
+
+    const response = await request(port, "/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "openrouter-reload-model", messages: [] }),
+    });
+    assert.notEqual(response.status, 200);
+    await response.arrayBuffer();
+    assert.equal(openrouterRequests, 0);
+  } finally {
+    await stopGateway(gateway);
+    await closeServer(openrouter?.server);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 describe("enabled startup compatibility", () => {
   let dir;
   let gateway;

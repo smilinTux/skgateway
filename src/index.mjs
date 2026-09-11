@@ -10,7 +10,7 @@
  */
 
 import http from "node:http";
-import { loadConfig, getConfig } from "./config.mjs";
+import { loadConfig, getConfig, providerConfiguredMode, providerNetworkPermission } from "./config.mjs";
 import { createProxyServer, handleRequest, buildConfig, trimSystemMessages, trimConversationHistory } from "./proxy/core.mjs";
 import { createRouter, routeAndSend } from "./proxy/router.mjs";
 import { sanitizeResponse } from "./proxy/sanitizer.mjs";
@@ -97,13 +97,19 @@ export const matchRoutingEnabled = !!(config.routing && config.routing.match_ena
 
 // ─── Initialize subsystems ───
 // Map YAML credentials_path → credentials_file (Backend reads credentials_file)
-const _routerBackends = {};
-for (const [id, b] of Object.entries(config.backends || {})) {
-  _routerBackends[id] = { ...b };
-  if (b.credentials_path && !b.credentials_file) {
-    _routerBackends[id].credentials_file = b.credentials_path;
+function routerBackendsForConfig(cfg) {
+  const backends = {};
+  for (const [id, backend] of Object.entries(cfg.backends || {})) {
+    if (!providerNetworkPermission(providerConfiguredMode(cfg, id), "inference")) continue;
+    backends[id] = { ...backend };
+    if (backend.credentials_path && !backend.credentials_file) {
+      backends[id].credentials_file = backend.credentials_path;
+    }
   }
+  return backends;
 }
+const _routerBackends = routerBackendsForConfig(config);
+let routerConfiguredBackendIds = new Set(Object.keys(config.backends || {}));
 const router = createRouter({ backends: _routerBackends, quarantine: config.quarantine, routing: config.routing });
 
 // Advertised-vs-working reconciliation mode (card 5c680ee9). The /v1/models
@@ -252,6 +258,7 @@ export function registerDiscoveredRoutes(cfg, catalog, opts = {}) {
   const getLifecycleFn = opts.getLifecycleFn || getLifecycle;
   const byProvider = new Map();
   for (const m of catalog) {
+    if (!providerNetworkPermission(providerConfiguredMode(cfg, m.provider), "inference")) continue;
     const be = providerBackend(m.provider, cfg);
     if (!be) continue;
     if (!byProvider.has(be)) byProvider.set(be, new Set());
@@ -600,8 +607,12 @@ export function buildAdminModelsView(full, allow, getLifecycleFn = getLifecycle,
  */
 export async function refreshCatalog(cfg, discoverCatalogFn = discoverCatalog) {
   const d = cfg.discovery || {};
-  const nvEnabled = d.providers?.nvidia?.enabled !== false;
-  const orEnabled = d.providers?.openrouter?.enabled !== false;
+  const providerCanMonitor = (provider) => providerNetworkPermission(
+    providerConfiguredMode(cfg, provider),
+    "monitor",
+  );
+  const nvEnabled = d.providers?.nvidia?.enabled !== false && providerCanMonitor("nvidia");
+  const orEnabled = d.providers?.openrouter?.enabled !== false && providerCanMonitor("openrouter");
   // OpenCode Zen (card C8) is the one provider that defaults OFF rather than
   // ON: nvidia and openrouter use `!== false` because they are long-standing
   // and an operator who never mentions them still expects them. A brand-new
@@ -617,15 +628,15 @@ export async function refreshCatalog(cfg, discoverCatalogFn = discoverCatalog) {
   // and an operator reading the file would reasonably believe otherwise.
   // Built-but-unreachable is the failure mode this fleet keeps rediscovering,
   // so the wiring lands with the feature even when the feature ships off.
-  const ocEnabled = d.providers?.opencode?.enabled === true;
-  const anthropicEnabled = d.providers?.anthropic?.enabled === true;
+  const ocEnabled = d.providers?.opencode?.enabled === true && providerCanMonitor("opencode");
+  const anthropicEnabled = d.providers?.anthropic?.enabled === true && providerCanMonitor("anthropic");
   // Codex (OpenAI subscription backend): same opt-in rule as opencode above
   // (=== true, not !== false). The fetch needs the codex backend's Codex CLI
   // credentials (bearer + chatgpt-account-id), built from its credentials_path
   // via readCodexAuthHeaders() (read-only, never refreshed).
-  const cxEnabled = d.providers?.codex?.enabled === true;
+  const cxEnabled = d.providers?.codex?.enabled === true && providerCanMonitor("codex");
   const codexCreds = cfg.backends?.codex?.credentials_path || cfg.backends?.codex?.credentials_file;
-  const zaiEnabled = d.providers?.zai?.enabled === true && Boolean(cfg.backends?.zai);
+  const zaiEnabled = d.providers?.zai?.enabled === true && Boolean(cfg.backends?.zai) && providerCanMonitor("zai");
   const zaiCreds = cfg.backends?.zai?.credentials_path || cfg.backends?.zai?.credentials_file || ZAI_CREDENTIALS_PATH;
   const nvidiaKey = process.env[cfg.backends?.nvidia?.api_key_env || "NVIDIA_API_KEY"];
   const openrouterKey = process.env[cfg.backends?.openrouter?.api_key_env || "OPENROUTER_API_KEY"];
@@ -663,23 +674,33 @@ export async function refreshCatalog(cfg, discoverCatalogFn = discoverCatalog) {
     // Undefined knobs fall through to probe.mjs / capability-assessment.mjs
     // defaults, exactly like probe_budget above.
     probeProviders: Array.isArray(d.probe_providers) && d.probe_providers.length
-      ? d.probe_providers.map(String)
+      ? d.probe_providers.map(String).filter((provider) => providerNetworkPermission(
+          providerConfiguredMode(cfg, provider),
+          "qualification",
+        ))
       : undefined,
     capabilityProviders: Object.entries(d.providers || {})
-      .filter(([, p]) => p && p.capability_battery === true)
+      .filter(([provider, p]) => p && p.capability_battery === true && providerNetworkPermission(
+        providerConfiguredMode(cfg, provider),
+        "qualification",
+      ))
       .map(([name]) => name),
     capabilityBudget: d.capability_budget,
     capabilityIntervalMs: d.capability_interval_seconds ? d.capability_interval_seconds * 1000 : undefined,
     capabilityTimeoutMs: d.capability_timeout_ms,
     capabilityScope: d.capability_scope,
   });
-  _catalog = models;
-  registerDiscoveredRoutes(cfg, models);
+  const routableModels = models.filter((model) => providerNetworkPermission(
+    providerConfiguredMode(cfg, model.provider),
+    "inference",
+  ));
+  _catalog = routableModels;
+  registerDiscoveredRoutes(cfg, routableModels);
   // Providers absent from the returned catalog still completed a discovery
   // attempt. Record that outcome so pending becomes attributable failed/stale
   // instead of remaining ambiguous forever.
   const zaiProvider = _discoveryCache.providers?.zai;
-  if (cfg.backends?.zai && !models.some((m) => m.provider === "zai")) {
+  if (cfg.backends?.zai && providerNetworkPermission(providerConfiguredMode(cfg, "zai"), "inference") && !routableModels.some((m) => m.provider === "zai")) {
     router.registerDiscoveredModels?.("zai", [], {
       ok: zaiProvider?.ok !== false,
       stale: zaiProvider?.ok === false,
@@ -687,7 +708,7 @@ export async function refreshCatalog(cfg, discoverCatalogFn = discoverCatalog) {
     });
   }
   saveCache(_discoveryCache);
-  return models;
+  return routableModels;
 }
 
 /**
@@ -2742,6 +2763,14 @@ process.on("SIGINT", () => shutdown("SIGINT"));
 _cfgEmitter.on("config-changed", () => {
   try {
     Object.assign(config, _cfgEmitter.current());
+    const activeBackends = routerBackendsForConfig(config);
+    for (const id of routerConfiguredBackendIds) {
+      if (!activeBackends[id]) router.removeBackend(id);
+    }
+    for (const [id, backend] of Object.entries(activeBackends)) {
+      if (!router.getBackend(id)) router.addBackend({ id, ...backend });
+    }
+    routerConfiguredBackendIds = new Set(Object.keys(config.backends || {}));
     clientAuthenticator = config.client_auth?.enabled ? new ClientAuthenticator(config.client_auth) : null;
     operatorAuthenticator = config.operator_auth?.enabled ? new ClientAuthenticator(config.operator_auth) : null;
     console.log("[skgateway] config reloaded");

@@ -288,8 +288,8 @@ describe("card C3: refreshCatalog wires discovery.probe_* into discoverCatalog",
       },
     };
     await mod.refreshCatalog(cfg, spy);
-    assert.deepEqual(captured.probeProviders, ["nvidia", "openrouter"]);
-    assert.deepEqual(captured.capabilityProviders.sort(), ["nvidia", "openrouter"]);
+    assert.deepEqual(captured.probeProviders, ["nvidia"]);
+    assert.deepEqual(captured.capabilityProviders.sort(), ["nvidia"]);
     assert.equal(captured.capabilityBudget, 4);
     assert.equal(captured.capabilityIntervalMs, 604800 * 1000);
     assert.equal(captured.capabilityTimeoutMs, 20000);
@@ -303,6 +303,45 @@ describe("card C3: refreshCatalog wires discovery.probe_* into discoverCatalog",
     assert.equal(captured.probeProviders, undefined);
     assert.deepEqual(captured.capabilityProviders, []);
     assert.equal(captured.capabilityScope, undefined);
+  });
+
+  test("disabled OpenRouter cannot enter discovery routing, probes, or the capability battery", async () => {
+    let captured = null;
+    const spy = async (opts) => {
+      captured = opts;
+      return {
+        models: [{ id: "openrouter/fixture:free", provider: "openrouter" }],
+      };
+    };
+    const cfg = {
+      providers: { openrouter: { configured_mode: "disabled" } },
+      backends: { openrouter: { discovery: "free" } },
+      discovery: {
+        enabled: true,
+        probe_seconds: 60,
+        probe_providers: ["nvidia", "openrouter"],
+        providers: {
+          nvidia: { enabled: true, capability_battery: true },
+          openrouter: { enabled: true, capability_battery: true },
+        },
+      },
+    };
+
+    const catalog = await mod.refreshCatalog(cfg, spy);
+    assert.deepEqual(catalog, [], "disabled provider models must not become routable");
+    assert.deepEqual(captured.probeProviders, ["nvidia"]);
+    assert.deepEqual(captured.capabilityProviders, ["nvidia"]);
+
+    const backend = {
+      discovery: "free",
+      models: [],
+      replaceDiscoveredModels(models) { this.models = models; },
+    };
+    mod.registerDiscoveredRoutes(cfg, [{ id: "openrouter/cached:free", provider: "openrouter" }], {
+      getBackend: (name) => name === "openrouter" ? backend : null,
+      getLifecycleFn: () => ({ state: "active" }),
+    });
+    assert.deepEqual(backend.models, [], "cached disabled models must not register with the router");
   });
 
   // ── Prove refreshCatalog is reachable off the real, fully-booted module ──

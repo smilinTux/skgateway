@@ -438,6 +438,10 @@ dashboard:
   enabled: true
   refresh_ms: 5000
 
+providers:
+  openrouter:
+    configured_mode: disabled
+
 ## Dynamic provider model discovery (SKGateway dynamic-provider-model-discovery,
 ## design doc 2026-07-25). Periodically queries each declared backend's
 ## model-list endpoint and folds newly seen models into the effective model
@@ -447,7 +451,7 @@ discovery:
   refresh_seconds: 3600            # how often to re-poll each provider (1h)
   providers:
     nvidia:     { enabled: true, free_only: true, chat_only: true }
-    openrouter: { enabled: true, free_only: true, chat_only: true }
+    openrouter: { enabled: false, free_only: true, chat_only: true }
     ## opencode: { enabled: true, free_only: true, chat_only: true }
     ## Commented out on purpose (card C8 / 6cc8aac3). NOT wired into
     ## production discovery yet in this change (refreshCatalog in
@@ -505,7 +509,7 @@ discovery:
   #
   # providers:
   #   nvidia:     { enabled: true, capability_battery: true }
-  #   openrouter: { enabled: true, capability_battery: true }
+  #   openrouter: { enabled: false, capability_battery: false }
   # capability_budget:            3    # models battered per provider per
   #                                    # sweep (never-assessed first, then
   #                                    # oldest-assessed). Real completions.

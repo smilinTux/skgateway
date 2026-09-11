@@ -104,12 +104,20 @@ const DEFAULTS = {
       priority: 3,
     },
     openrouter: {
+      enabled: false,
       url: 'https://openrouter.ai/api/v1',
       auth_type: 'api_key',
       api_key_env: 'OPENROUTER_API_KEY',
       discovery: 'free', // free | all
       max_concurrent: 10,
     },
+  },
+
+  // Provider lifecycle configuration is intentionally independent from legacy
+  // discovery flags. New providers must opt into a network mode explicitly;
+  // established providers retain their current mode until their own migration.
+  providers: {
+    openrouter: { configured_mode: 'disabled' },
   },
 
   tools: {
@@ -329,7 +337,7 @@ const DEFAULTS = {
     refresh_seconds: 3600,
     providers: {
       nvidia: { enabled: true, free_only: true, chat_only: true },
-      openrouter: { enabled: true, free_only: true, chat_only: true },
+      openrouter: { enabled: false, free_only: true, chat_only: true },
       anthropic: { enabled: false, free_only: false, chat_only: true },
     },
   },
@@ -489,6 +497,75 @@ function disableOrphanDiscoveryProviders(cfg) {
     if (!Object.prototype.hasOwnProperty.call(cfg.backends || {}, id) && isMapping(provider)) {
       provider.enabled = false;
     }
+  }
+}
+
+const PROVIDER_MODES = new Set(['disabled', 'monitor_only', 'canary', 'active']);
+const PROVIDER_NETWORK_PURPOSES = new Set(['monitor', 'qualification', 'recovery', 'inference']);
+
+/**
+ * Normalize one provider configured mode.
+ *
+ * @param {unknown} value
+ * @returns {'disabled'|'monitor_only'|'canary'|'active'}
+ */
+export function normalizeProviderMode(value = 'disabled') {
+  const mode = String(value).toLowerCase();
+  if (!PROVIDER_MODES.has(mode)) {
+    throw new Error(`invalid provider configured_mode: ${value}`);
+  }
+  return mode;
+}
+
+/**
+ * Determine whether a provider mode may make a network call for one purpose.
+ *
+ * @param {string} mode
+ * @param {string} purpose
+ * @returns {boolean}
+ */
+export function providerNetworkPermission(mode, purpose) {
+  const normalizedMode = normalizeProviderMode(mode);
+  if (!PROVIDER_NETWORK_PURPOSES.has(purpose)) return false;
+  if (normalizedMode === 'disabled') return false;
+  if (normalizedMode === 'monitor_only') return purpose === 'monitor';
+  if (normalizedMode === 'canary') return purpose !== 'inference';
+  return true;
+}
+
+/**
+ * Read one normalized provider mode from a complete or hand-built config.
+ * Existing providers other than OpenRouter retain their active legacy posture;
+ * OpenRouter is fail-closed until a future authorized activation changes it.
+ *
+ * @param {object} cfg
+ * @param {string} provider
+ * @returns {'disabled'|'monitor_only'|'canary'|'active'}
+ */
+export function providerConfiguredMode(cfg, provider) {
+  const configured = cfg?.providers?.[provider]?.configured_mode;
+  return normalizeProviderMode(configured ?? (provider === 'openrouter' ? 'disabled' : 'active'));
+}
+
+/** Normalize all configured, backend, and discovery providers into one namespace. */
+function normalizeProviderModes(cfg) {
+  if (cfg.providers == null) cfg.providers = {};
+  if (!isMapping(cfg.providers)) throw new ConfigError(['providers must be a mapping']);
+
+  const ids = new Set([
+    ...Object.keys(cfg.providers),
+    ...Object.keys(cfg.backends || {}),
+    ...Object.keys(cfg.discovery?.providers || {}),
+  ]);
+  for (const id of ids) {
+    const provider = cfg.providers[id];
+    if (provider != null && !isMapping(provider)) {
+      throw new ConfigError([`providers.${id} must be a mapping`]);
+    }
+    cfg.providers[id] = {
+      ...(provider || {}),
+      configured_mode: providerConfiguredMode(cfg, id),
+    };
   }
 }
 
@@ -1191,6 +1268,7 @@ function _readAndBuild(filePath, silent) {
   }
 
   disableOrphanDiscoveryProviders(base);
+  normalizeProviderModes(base);
   base.semantic_cache = normalizeSemanticCache(base.semantic_cache);
   applyEnvOverrides(base);
   resolvePaths(base);
