@@ -214,14 +214,22 @@ function hasValidUsage(usage) {
   if (usage.prompt_tokens + usage.completion_tokens > MAX_USAGE_TOKENS) return false;
   if (Object.hasOwn(usage, "total_tokens")
       && usage.total_tokens !== usage.prompt_tokens + usage.completion_tokens) return false;
-  if (Object.hasOwn(usage, "prompt_tokens_details")) {
+  // An explicit `null` means "no details", exactly like omitting the key, and is
+  // what OpenAI-compatible servers (the qwen3.8 llama-server on chiap08 among
+  // them) actually send. Gating on hasOwn alone and then failing `!details`
+  // rejected that, which on 2026-09-11 rewrote good 200s into
+  // 502 invalid_upstream_completion for every STREAMING caller -- the non-stream
+  // path never runs this check, so the same completion passed as buffered JSON
+  // and failed once re-emitted as SSE. A non-null but malformed block below is
+  // still rejected; this only equates null with absent.
+  if (Object.hasOwn(usage, "prompt_tokens_details") && usage.prompt_tokens_details != null) {
     const details = usage.prompt_tokens_details;
     if (!details || typeof details !== "object" || Array.isArray(details)
         || Object.keys(details).length !== 1 || !Object.hasOwn(details, "cached_tokens")
         || !Number.isSafeInteger(details.cached_tokens) || details.cached_tokens < 0
         || details.cached_tokens > usage.prompt_tokens) return false;
   }
-  if (Object.hasOwn(usage, "completion_tokens_details")) {
+  if (Object.hasOwn(usage, "completion_tokens_details") && usage.completion_tokens_details != null) {
     const details = usage.completion_tokens_details;
     if (!details || typeof details !== "object" || Array.isArray(details)
         || Object.keys(details).length !== 1 || !Object.hasOwn(details, "reasoning_tokens")

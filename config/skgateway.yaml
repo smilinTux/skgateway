@@ -53,9 +53,21 @@ pooling:
   capacity_domains:
     chiap08-qwen38:
       members: [chiap08-qwen38, "reg:qwen38"]
+      # Chef, 2026-09-11: this box handles 2 concurrent, not 4. The live config
+      # had drifted up to max 4 / maxQueue 4 while the in-repo config still said
+      # 2 -- and with sk-default repointed here, a burst of agent cron jobs drove
+      # peakActive=4 peakQueue=4 (both at ceiling) and llama-server started
+      # returning completions the response contract rejected as
+      # "invalid_upstream_completion" (HTTP 502). Same failure shape as the
+      # claude-code-api outage earlier the same day: an admission cap set above
+      # what the backend can actually serve turns load into corrupt responses.
+      #
+      # max is the REAL concurrency ceiling. maxQueue is deliberately deep and
+      # the timeout generous so a burst WAITS instead of erroring -- queueing is
+      # free, a 502 costs the whole job its retries.
       max: 2
-      maxQueue: 2
-      queueTimeoutMs: 10000
+      maxQueue: 24
+      queueTimeoutMs: 120000
     chiap01-qwen38:
       members: [chiap01-qwen38]
       max: 1
