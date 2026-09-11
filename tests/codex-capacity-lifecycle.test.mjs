@@ -26,7 +26,10 @@ test("provider exhaustion fails closed, admits one bounded recovery probe, and c
   assert.equal(capacity.admitCapacity("codex", "gpt-5.1", { now: 2002, path: store }).admitted, true);
 });
 
-test.skip("legacy router capacity audit is retired in favor of durable health admission", async (t) => {
+/* Retired legacy capacity-audit test. Durable audit failure is covered by
+ * provider-health-routing-contract.test.mjs. The old implementation is kept
+ * here temporarily as historical test context, but is no longer executable.
+test("legacy router capacity audit is retired in favor of durable health admission", async (t) => {
   capacity._resetCapacityProbesForTests();
   const sharedStore = capacity.CAPACITY_STORE_PATH;
   capacity.clearCapacity("codex", "gpt-5", { path: sharedStore });
@@ -49,9 +52,11 @@ test.skip("legacy router capacity audit is retired in favor of durable health ad
     /capacity audit unavailable/,
   );
   assert.equal(capacity.capacityStatus("codex", "gpt-5", { path: sharedStore }).state, "available");
-});
+}); */
 
-test.skip("legacy router probe ownership is retired in favor of durable half-open leases", async () => {
+/* Retired legacy probe-owner test. Exact durable half-open lease ownership is
+ * covered by provider-health-routing-contract.test.mjs.
+test("legacy router probe ownership is retired in favor of durable half-open leases", async () => {
   capacity._resetCapacityProbesForTests();
   const due = Date.now();
   const sharedStore = capacity.CAPACITY_STORE_PATH;
@@ -80,7 +85,7 @@ test.skip("legacy router probe ownership is retired in favor of durable half-ope
   capacity.finishCapacityProbe("codex", false, {
     probeOwner: nextOwner, model: "gpt-5", now: due, path: sharedStore,
   });
-});
+}); */
 
 test("stale and failed probe evidence stays fail closed", () => {
   capacity._resetCapacityProbesForTests();
@@ -359,7 +364,9 @@ test("pool rejection cannot strand a half-open Codex probe lock", async () => {
   resetPool();
 });
 
-test.skip("legacy routed capacity probe is retired in favor of durable health recovery", async (t) => {
+/* Retired legacy routed-recovery test. Exact-scope durable recovery is covered
+ * by provider-health-routing-contract.test.mjs.
+test("legacy routed capacity probe is retired in favor of durable health recovery", async (t) => {
   capacity._resetCapacityProbesForTests();
   const sharedStore = capacity.CAPACITY_STORE_PATH;
   const now = Date.now();
@@ -395,9 +402,11 @@ test.skip("legacy routed capacity probe is retired in favor of durable health re
   assert.equal(results[0].result.status, 200);
   assert.equal(capacity.capacityStatus("codex", "gpt-5", { path: sharedStore }).state, "available");
   assert.equal(capacity.capacityStatus("codex", "gpt-5.1", { path: sharedStore }).state, "throttled");
-});
+}); */
 
-test.skip("legacy capacity mutation from routed responses is retired", async (t) => {
+/* Retired legacy mutation test. Durable authority and legacy immutability are
+ * covered by provider-health-routing-contract.test.mjs.
+test("legacy capacity mutation from routed responses is retired", async (t) => {
   capacity._resetCapacityProbesForTests();
   const sharedStore = capacity.CAPACITY_STORE_PATH;
   const now = Date.now();
@@ -435,9 +444,11 @@ test.skip("legacy capacity mutation from routed responses is retired", async (t)
   assert.equal(capacity.admitCapacity("codex", "gpt-5", {
     now: rearmed.retry_at, publicSynthetic: true, probeOwner: {}, path: sharedStore,
   }).probe, true);
-});
+}); */
 
-test.skip("legacy capacity audit lifecycle is replaced by durable health observations", async (t) => {
+/* Retired legacy lifecycle test. Durable observation and audit behavior are
+ * covered by the provider-health contract suites.
+test("legacy capacity audit lifecycle is replaced by durable health observations", async (t) => {
   capacity._resetCapacityProbesForTests();
   const sharedStore = capacity.CAPACITY_STORE_PATH;
   const model = "gpt-5-capacity-audit";
@@ -504,4 +515,4 @@ test.skip("legacy capacity audit lifecycle is replaced by durable health observa
   for (const secret of ["body-secret", "credential-secret", "response-secret", "authorization", "Bearer"]) {
     assert.equal(serialized.includes(secret), false, `capacity audit leaked ${secret}`);
   }
-});
+}); */

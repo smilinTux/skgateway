@@ -67,6 +67,7 @@ const { _resetCacheForTests } = await import('../src/discovery/model_catalog_sto
 const { resetLocalHealth } = await import('../src/proxy/local-failover.mjs');
 const { looksLikeBucketAttempt, parseBucketId, allBuckets } = await import('../src/policy/buckets.mjs');
 const { EventType } = await import('../src/siem/events.mjs');
+const { recordModelThrottled } = await import('../src/discovery/capacity_store.mjs');
 
 const HEADERS = { 'content-type': 'application/json' };
 const bodyFor = (model) => Buffer.from(JSON.stringify({ model, messages: [{ role: 'user', content: 'hi' }] }));
@@ -283,6 +284,21 @@ ${extraRoles}defaults:
       assert.ok(event.request_id);
     }
     assert.equal(new Set(decisions.map((e) => e.request_id)).size, 1);
+  });
+
+  test('legacy capacity cannot remove an otherwise eligible bucket member', async () => {
+    await applyConfig({ buckets_enabled: true });
+    recordModelThrottled('local', 'pool-l-local', {
+      now: Date.now(), retryAt: Date.now() + 60_000, path: CAPACITY_PATH,
+    });
+    const result = await routeAndSend(
+      router,
+      { model: 'sk-l-secret', agentId: 'durable-bucket-authority' },
+      '/chat/completions', 'POST', HEADERS, bodyFor('sk-l-secret'), false,
+    );
+    assert.equal(result.status, 200);
+    assert.equal(result.bucketMember, 'pool-l-local');
+    assert.equal(pool.state.count, 1);
   });
 
   test('a bucket skips a member whose exact model claims are quarantined', async () => {

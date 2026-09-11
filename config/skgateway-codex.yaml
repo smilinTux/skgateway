@@ -135,6 +135,8 @@ backends:
       - qwen3.8-27b
       - qwen38-abliterated
     priority: 3
+    require_observed_health: true
+    account_ref: chiap01-qwen38-runtime
 
   chiap08-qwen38:
     url: http://100.81.238.58:11439/v1
@@ -145,6 +147,8 @@ backends:
       - qwen3.8-27b
       - qwen38-abliterated
     priority: 3
+    require_observed_health: true
+    account_ref: chiap08-qwen38-runtime
 
   ## DISABLED 2026-08-26 by Chef: the chi cluster has no Anthropic
   ## subscription. Tested Claude ids hung for 45 seconds rather than failing
@@ -215,6 +219,8 @@ backends:
       - gpt-5.4-mini
     priority: 2
     timeout_ms: 300000
+    require_observed_health: true
+    account_ref: codex-primary
 
   ## Kimi Code subscription. The gateway reads the CLI-owned OAuth file only;
   ## it never refreshes or writes credentials. These routes remain fail-closed
@@ -264,6 +270,8 @@ backends:
     priority: 2
     timeout_ms: 300000
     min_output_tokens: 256
+    require_observed_health: true
+    account_ref: zai-primary
 
   ## DISABLED 2026-08-26 by Chef: NVIDIA NIM is reserved for future use.
   ## The config loader deep-merges built-in defaults when this key is absent,

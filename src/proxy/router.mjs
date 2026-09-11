@@ -2934,8 +2934,7 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
           .filter((backend) => backend.supportsModel(e.id))
           .map((backend) => backend.id)
         : [];
-      const capacity = capacityStatus(e.provider, e.id);
-      return isEffectivelyRoutable(getLifecycle(e.id), claimers) && capacity.state !== "throttled";
+      return isEffectivelyRoutable(getLifecycle(e.id), claimers);
     },
   });
 
@@ -4493,7 +4492,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           ? "response_budget"
           : "malformed_response"
         : res.status >= 500 ? "backend_cooldown" : null;
-    if (upstreamStatus === 403 && quotaProven) {
+    if ([402, 403, 429].includes(upstreamStatus) && quotaProven) {
       res = {
         ...res,
         status: 429,
@@ -4869,14 +4868,15 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       // record the observation for attribution/future ranking use, on the
       // SAME map, not a parallel scoreboard.
       const retryAfterHeader = res.headers?.["retry-after"] ?? res.headers?.["Retry-After"];
-      const { cooldownMs } = recordThrottle(backendId, candidateModel, res.status, retryAfterHeader);
-      throttledAttempts.push({ backendId, model: candidateModel, status: res.status, cooldownMs });
+      const throttleStatus = upstreamStatus === 402 ? 402 : res.status;
+      const { cooldownMs } = recordThrottle(backendId, candidateModel, throttleStatus, retryAfterHeader);
+      throttledAttempts.push({ backendId, model: candidateModel, status: throttleStatus, cooldownMs });
       console.warn(
-        `[router] ${res.status} THROTTLED backend=${backendId} model=${candidateModel} ` +
+        `[router] ${throttleStatus} THROTTLED backend=${backendId} model=${candidateModel} ` +
         `cooldown=${cooldownMs}ms` +
         (i < candidates.length - 1 ? " (trying next door)" : " (no more candidates)")
       );
-      lastResult.backoffClassification = res.status === 429
+      lastResult.backoffClassification = throttleStatus === 429
         ? "provider_429"
         : "provider_backoff";
       lastResult.retryAfterMs = cooldownMs;

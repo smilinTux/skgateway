@@ -173,7 +173,9 @@ test("routed 401 recovery attempt remains fail closed", async (t) => {
     "authentication_failure");
 });
 
-test.skip("legacy model capacity mutation is retired in favor of durable health observations", async (t) => {
+/* Retired legacy model-mutation test. Malformed durable observations are
+ * covered by the provider-health routing and store contract suites.
+test("legacy model capacity mutation is retired in favor of durable health observations", async (t) => {
   _resetCapacityProbesForTests();
   clearCapacity("zai", null, { path: CAPACITY_STORE_PATH });
   t.after(() => clearCapacity("zai", null, { path: CAPACITY_STORE_PATH }));
@@ -201,9 +203,11 @@ test.skip("legacy model capacity mutation is retired in favor of durable health 
   assert.equal(status.reason, "malformed_response");
   assert.ok(status.retry_at - status.observed_at <= 60_000);
   assert.equal(capacityStatus("zai", "glm-5.3", { path: CAPACITY_STORE_PATH }).state, "available");
-});
+}); */
 
-test.skip("legacy transport capacity mutation is retired in favor of durable health observations", async (t) => {
+/* Retired legacy transport-mutation test. Transport durable observations are
+ * covered by the provider-health routing and store contract suites.
+test("legacy transport capacity mutation is retired in favor of durable health observations", async (t) => {
   _resetCapacityProbesForTests();
   clearCapacity("zai", null, { path: CAPACITY_STORE_PATH });
   t.after(() => clearCapacity("zai", null, { path: CAPACITY_STORE_PATH }));
@@ -232,7 +236,7 @@ test.skip("legacy transport capacity mutation is retired in favor of durable hea
     assert.equal(status.reason, "backend_cooldown");
     assert.ok(status.retry_at - status.observed_at <= 60_000);
   }
-});
+}); */
 
 test("only the owned schema-valid success clears recovery state", () => {
   _resetCapacityProbesForTests();
