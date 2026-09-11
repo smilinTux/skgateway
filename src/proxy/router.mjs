@@ -3076,13 +3076,17 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
     try {
       results = await router.route({ ...request, model: member.id, agentId: request.agentId });
     } catch (err) {
-      if (err instanceof ModelEolError) {
+      if (err instanceof ModelEolError || err instanceof ModelClaimQuarantinedError) {
         skipped.push(member.id);
         await emitSiem(EventType.ANOMALY, {
           type: "bucket_member_skipped",
           outcome: "skipped",
           bucket: addr.bucket,
           member: member.id,
+          reason: err instanceof ModelClaimQuarantinedError
+            ? "all_model_claims_quarantined"
+            : "eol_gated",
+          detail: err.eolReason || err.message,
           eol_reason: err.eolReason || err.message,
         }, {});
         continue;
@@ -3163,7 +3167,7 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
             model_class: addr.model_class,
             sensitivity: addr.sensitivity,
             ceiling,
-            excluded: skipped.map((id) => ({ id, reason: "eol-gated" })),
+            excluded: skipped.map((id) => ({ id, reason: "unroutable" })),
           },
         }), "utf-8"),
       },

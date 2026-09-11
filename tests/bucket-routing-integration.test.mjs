@@ -59,6 +59,7 @@ const {
   bucketLivenessTimeoutMs,
   DEFAULT_BUCKET_LIVENESS_TIMEOUT_MS,
   ModelEolError,
+  ModelClaimQuarantinedError,
   ModelOwnerDownError,
 } = await import('../src/proxy/router.mjs');
 const { loadConfig } = await import('../src/config.mjs');
@@ -90,7 +91,7 @@ const applyConfig = (flags) => loadConfig({ configPath: writeConfig(flags), sile
 
 /** A fake upstream that answers 200 and records what model it was asked for. */
 function startUpstream(name) {
-  const state = { count: 0, lastModel: null, lastMaxTokens: null, lastMaxCompletionTokens: null, modelsStatus: 200, hangCompletions: false };
+  const state = { count: 0, status: 200, lastModel: null, lastMaxTokens: null, lastMaxCompletionTokens: null, modelsStatus: 200, hangCompletions: false };
   return new Promise((resolve) => {
     const server = http.createServer((req, res) => {
       if (req.url.endsWith('/models') && req.method === 'GET') {
@@ -113,7 +114,7 @@ function startUpstream(name) {
           state.lastMaxCompletionTokens = null;
         }
         if (state.hangCompletions) return;
-        res.writeHead(200, { 'content-type': 'application/json' });
+        res.writeHead(state.status, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ served: name, model: state.lastModel }));
       });
     });
@@ -282,6 +283,49 @@ ${extraRoles}defaults:
       assert.ok(event.request_id);
     }
     assert.equal(new Set(decisions.map((e) => e.request_id)).size, 1);
+  });
+
+  test('a bucket skips a member whose exact model claims are quarantined', async () => {
+    const dead = await startUpstream('dead');
+    const live = await startUpstream('live');
+    dead.state.status = 404;
+    try {
+      await applyConfig({ buckets_enabled: true });
+      writeFileSync(CATALOG_CACHE_PATH, JSON.stringify({ models: [
+        { id: 'dead-l-local', provider: 'local', free: true, card: { tier: 'local', size_class: 'L' } },
+        { id: 'live-l-local', provider: 'local', free: true, card: { tier: 'local', size_class: 'L' } },
+      ] }), 'utf8');
+      const failoverRouter = createRouter({ backends: {
+        dead: { url: dead.base, auth_type: 'none', models: ['dead-l-local'], priority: 1 },
+        live: { url: live.base, auth_type: 'none', models: ['live-l-local'], priority: 2 },
+      }});
+
+      for (let i = 0; i < 3; i++) {
+        const failed = await routeAndSend(
+          failoverRouter,
+          { model: 'dead-l-local', agentId: 'quarantine-fixture' },
+          '/chat/completions', 'POST', HEADERS, bodyFor('dead-l-local'), false,
+        );
+        assert.equal(failed.status, 404);
+      }
+      await assert.rejects(
+        failoverRouter.route({ model: 'dead-l-local', agentId: 'direct-request' }),
+        ModelClaimQuarantinedError,
+        'a direct concrete request remains fail closed',
+      );
+
+      const result = await routeAndSend(
+        failoverRouter,
+        { model: 'sk-l-secret', agentId: 'bucket-request' },
+        '/chat/completions', 'POST', HEADERS, bodyFor('sk-l-secret'), false,
+      );
+      assert.equal(result.status, 200);
+      assert.equal(result.bucketMember, 'live-l-local');
+      assert.equal(live.state.lastModel, 'live-l-local');
+    } finally {
+      await dead.close();
+      await live.close();
+    }
   });
 
   test('a backend output floor protects bucket-routed reasoning responses', async () => {
