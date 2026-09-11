@@ -51,6 +51,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Keep Z.ai malformed-response and transport cooldowns on the bounded
+  model-recovery deadline instead of the six-hour subscription deadline.
+
 - Translate configured compatibility model aliases to their exact upstream
   model id before backend selection and forwarding, keeping advertised aliases
   callable without changing exact model routes.

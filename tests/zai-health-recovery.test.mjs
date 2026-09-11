@@ -4,6 +4,7 @@ import http from "node:http";
 import { readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { load as yamlLoad } from "js-yaml";
 
 import { Backend, createRouter, routeAndSend } from "../src/proxy/router.mjs";
 import {
@@ -167,8 +168,42 @@ test("malformed GLM output does not poison shared backend lifecycle", async (t) 
   assert.equal(result.status, 502);
   assert.equal(router.getBackend("zai").getHealth().status, "up");
   assert.equal(router.getBackend("zai").getModelClaimHealth("glm-4.7").quarantined, false);
-  assert.equal(capacityStatus("zai", "glm-4.7", { path: CAPACITY_STORE_PATH }).scope, "model");
+  const status = capacityStatus("zai", "glm-4.7", { path: CAPACITY_STORE_PATH });
+  assert.equal(status.scope, "model");
+  assert.equal(status.reason, "malformed_response");
+  assert.ok(status.retry_at - status.observed_at <= 60_000);
   assert.equal(capacityStatus("zai", "glm-5.3", { path: CAPACITY_STORE_PATH }).state, "available");
+});
+
+test("transport 502 and 504 stay model-local with bounded recovery", async (t) => {
+  _resetCapacityProbesForTests();
+  clearCapacity("zai", null, { path: CAPACITY_STORE_PATH });
+  t.after(() => clearCapacity("zai", null, { path: CAPACITY_STORE_PATH }));
+  const upstream = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      const model = JSON.parse(Buffer.concat(chunks).toString("utf8")).model;
+      res.writeHead(model === "glm-4.6" ? 504 : 502, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { code: "upstream_transport" } }));
+    });
+  });
+  await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => upstream.close(resolve)));
+  for (const model of ["glm-4.6", "glm-4.7"]) {
+    clearCapacity("zai", model, { path: CAPACITY_STORE_PATH });
+    const router = createRouter({ backends: { zai: {
+      url: `http://127.0.0.1:${upstream.address().port}/v1`, auth_type: "none",
+      discovery: "zai", models: [model], quarantine_threshold: 0,
+    } } });
+    const result = await routeAndSend(router, { model }, "/v1/chat/completions", "POST", {},
+      Buffer.from(JSON.stringify({ model, messages: [], max_tokens: 512 })), false);
+    assert.equal(result.status, model === "glm-4.6" ? 504 : 502);
+    const status = capacityStatus("zai", model, { path: CAPACITY_STORE_PATH });
+    assert.equal(status.scope, "model");
+    assert.equal(status.reason, "backend_cooldown");
+    assert.ok(status.retry_at - status.observed_at <= 60_000);
+  }
 });
 
 test("only the owned schema-valid success clears recovery state", () => {
@@ -197,6 +232,16 @@ test("Z.ai recovery selects only canonical fleet claims from discovery", () => {
     "glm-5.1", "glm-5.2", "glm-5.3", "glm-5.3-flash",
   ]), ["glm-4.6", "glm-4.7", "glm-5.3"]);
   assert.deepEqual(selectProviderRecoveryModels("zai", ["glm-4.5", "glm-5.3-flash"]), []);
+});
+
+test("canonical GLM recovery claims keep their authoritative class floors", () => {
+  const cards = yamlLoad(readFileSync(
+    new URL("../config/model-cards.overrides.yaml", import.meta.url), "utf8",
+  )).overrides;
+  assert.deepEqual(
+    ["glm-4.6", "glm-4.7", "glm-5.3"].map((model) => cards[model].size_class),
+    ["M", "L", "XL"],
+  );
 });
 
 test("other provider recovery keeps its configured exact models", () => {

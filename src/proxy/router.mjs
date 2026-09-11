@@ -4428,7 +4428,8 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           }, { backend: backendId, correlation_id: _siemRequestId });
         }
         finishCapacityProbe(providerName, probeSucceeded, {
-          probeOwner: capacityProbeOwner, model: candidateModel, retryAt,
+          probeOwner: capacityProbeOwner, model: candidateModel,
+          retryAt: recoveryFailureClass === "authentication_failure" ? retryAt : undefined,
           reason: probeSucceeded ? null : recoveryFailureClass,
         });
       } else if (res.status === 429 || res.status === 402) {
@@ -4440,7 +4441,6 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       } else if (providerName === "zai" && recoveryFailureClass) {
         recordModelUnavailable(providerName, candidateModel, {
           reason: recoveryFailureClass,
-          retryAt: Date.now() + DEFAULT_402_COOLDOWN_MS,
         });
       }
     }
