@@ -47,12 +47,12 @@ pooling:
       maxQueue: 4
       queueTimeoutMs: 30000
     kimi-for-coding:
-      members: [kimi-for-coding, "reg:kimi-for-coding"]
+      members: [kimi-for-coding, "reg:kimi-for-coding", "reg:kimi-for-coding-highspeed"]
       max: 1
       maxQueue: 1
       queueTimeoutMs: 30000
     kimi-k3:
-      members: [kimi-k3, "reg:k3"]
+      members: [kimi-k3, "reg:k3", "reg:k3-256k"]
       max: 1
       maxQueue: 1
       queueTimeoutMs: 30000
@@ -224,6 +224,7 @@ backends:
     auth_type: kimi_oauth
     credentials_path: ~/.kimi-code/credentials/kimi-code.json
     models:
+      - kimi-for-coding-highspeed
       - kimi-for-coding
     priority: 2
     timeout_ms: 30000
@@ -235,6 +236,7 @@ backends:
     auth_type: kimi_oauth
     credentials_path: ~/.kimi-code/credentials/kimi-code.json
     models:
+      - k3-256k
       - k3
     priority: 2
     timeout_ms: 60000
@@ -327,7 +329,9 @@ model_aliases:
 model_limits:
   ## Kimi Code subscription routes. These stay admission-gated until observed
   ## health is established by the bounded compatibility probes.
+  kimi-for-coding-highspeed:               { max_body_bytes: 838000,   max_system_bytes: 335000  }
   kimi-for-coding:                         { max_body_bytes: 838000,   max_system_bytes: 335000  }
+  k3-256k:                                  { max_body_bytes: 838000,   max_system_bytes: 335000  }
   k3:                                      { max_body_bytes: 2000000,  max_system_bytes: 800000  }
   ornith-1.5-9b:                              { max_body_bytes: 209715,   max_system_bytes: 83886   }
   ornith-1.0-35b:                             { max_body_bytes: 800000,   max_system_bytes: 320000  }

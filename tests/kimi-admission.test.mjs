@@ -10,21 +10,103 @@ import {
   Backend, createRouter, routeAndSend, ModelOwnerDownError, shouldUseRegistryRouting,
 } from "../src/proxy/router.mjs";
 import { ConnectionPool } from "../src/proxy/connection-pool.mjs";
+import { buildCapabilityCatalog } from "../src/ranking/catalog.mjs";
+import { loadCardOverrides, applyCardOverlays, CARD_OVERRIDES_PATH } from "../src/discovery.mjs";
+import { loadProviderPostures } from "../src/discovery/provider-posture.mjs";
+import { attributionHeaders } from "../src/metrics/attribution.mjs";
+import {
+  parseBucketId, resolveBucket, requiresToolUse, selectProviderBucketMember,
+} from "../src/policy/buckets.mjs";
 
 const config = loadYaml(readFileSync(new URL("../config/skgateway-codex.yaml", import.meta.url), "utf8"));
 
 describe("Kimi admission contract", () => {
   test("declares exact one-active/one-queued family domains and mappings", () => {
     assert.deepEqual(config.pooling.capacity_domains["kimi-for-coding"], {
-      members: ["kimi-for-coding", "reg:kimi-for-coding"], max: 1, maxQueue: 1, queueTimeoutMs: 30000,
+      members: ["kimi-for-coding", "reg:kimi-for-coding", "reg:kimi-for-coding-highspeed"], max: 1, maxQueue: 1, queueTimeoutMs: 30000,
     });
     assert.deepEqual(config.pooling.capacity_domains["kimi-k3"], {
-      members: ["kimi-k3", "reg:k3"], max: 1, maxQueue: 1, queueTimeoutMs: 30000,
+      members: ["kimi-k3", "reg:k3", "reg:k3-256k"], max: 1, maxQueue: 1, queueTimeoutMs: 30000,
     });
-    assert.equal(config.backends["kimi-for-coding"].models[0], "kimi-for-coding");
-    assert.equal(config.backends["kimi-k3"].models[0], "k3");
+    assert.deepEqual(config.backends["kimi-for-coding"].models, ["kimi-for-coding-highspeed", "kimi-for-coding"]);
+    assert.deepEqual(config.backends["kimi-k3"].models, ["k3-256k", "k3"]);
+    for (const id of ["kimi-for-coding-highspeed", "kimi-for-coding", "k3-256k", "k3"]) {
+      assert.ok(config.model_limits[id], `${id} has an exact context-derived request limit`);
+    }
     assert.equal(config.backends["kimi-for-coding"].require_observed_health, true);
     assert.equal(config.backends["kimi-k3"].require_observed_health, true);
+  });
+
+  test("four real ids map to exact S, M, L, XL Kimi buckets with paid attribution", () => {
+    const ids = ["kimi-for-coding-highspeed", "kimi-for-coding", "k3-256k", "k3"];
+    const models = applyCardOverlays(
+      ids.map((id) => ({ id, provider: id.startsWith("k3") ? "kimi-k3" : "kimi-for-coding", free: false })),
+      loadCardOverrides(CARD_OVERRIDES_PATH),
+    );
+    const catalog = buildCapabilityCatalog(models, {
+      providers: loadProviderPostures(),
+      getLifecycleFn: () => ({ state: "active" }),
+    });
+    for (const [index, cls] of ["S", "M", "L", "XL"].entries()) {
+      const { members } = resolveBucket({ bucket: parseBucketId(`sk-kimi-${cls.toLowerCase()}`), catalog });
+      assert.equal(members[0].id, ids[index]);
+      assert.equal(members[0].model_class, cls);
+      assert.equal(members[0].cost_tier, "paid-cloud");
+      assert.ok(members.every((member) => member.id === ids[index] || ["S", "M", "L", "XL"].indexOf(member.model_class) > index));
+    }
+  });
+
+  test("tool-bearing Kimi S excludes highspeed and escalates within Kimi", () => {
+    const ids = ["kimi-for-coding-highspeed", "kimi-for-coding", "k3-256k", "k3"];
+    const catalog = buildCapabilityCatalog(applyCardOverlays(
+      ids.map((id) => ({ id, provider: id.startsWith("k3") ? "kimi-k3" : "kimi-for-coding", free: false })),
+      loadCardOverrides(CARD_OVERRIDES_PATH),
+    ), { providers: loadProviderPostures(), getLifecycleFn: () => ({ state: "active" }) });
+    const resolved = resolveBucket({
+      bucket: parseBucketId("sk-kimi-s"), catalog,
+      requireToolUse: requiresToolUse({ tools: [{ type: "function" }] }),
+    });
+    assert.equal(resolved.members.some(({ id }) => id === "kimi-for-coding-highspeed"), false);
+    assert.equal(resolved.members[0].id, "kimi-for-coding");
+    assert.match(resolved.rejected.find(({ id }) => id === "kimi-for-coding-highspeed").reason, /sent tools/);
+    assert.ok(resolved.members.every(({ id }) => ids.includes(id)));
+  });
+
+  test("exact Kimi tier wins rotation and a larger healthy tier is fallback", () => {
+    const bucket = parseBucketId("sk-kimi-m");
+    const members = [
+      { id: "k3", model_class: "XL", cost_tier: "paid-cloud" },
+      { id: "kimi-for-coding", model_class: "M", cost_tier: "paid-cloud" },
+      { id: "k3-256k", model_class: "L", cost_tier: "paid-cloud" },
+    ];
+    for (const counter of [0, 1, 99]) {
+      assert.equal(selectProviderBucketMember(bucket, members, counter).id, "kimi-for-coding");
+    }
+    assert.ok(["k3", "k3-256k"].includes(
+      selectProviderBucketMember(bucket, members.filter(({ model_class }) => model_class !== "M"), 0).id,
+    ));
+    assert.equal(selectProviderBucketMember(bucket, [], 0), null);
+  });
+
+  test("Kimi bucket attribution preserves requested route, exact member, provider, and backend", () => {
+    assert.deepEqual(attributionHeaders("req-kimi", {
+      backendId: "kimi-k3",
+      servedModel: "k3-256k",
+      requestedModel: "sk-kimi-l",
+      bucket: "sk-kimi-l",
+      bucketMember: "k3-256k",
+      provider: "kimi-k3",
+      rail: "cloud",
+    }), {
+      "x-sk-req-id": "req-kimi",
+      "x-sk-backend": "kimi-k3",
+      "x-sk-model-served": "k3-256k",
+      "x-sk-model-requested": "sk-kimi-l",
+      "x-sk-bucket": "sk-kimi-l",
+      "x-sk-bucket-member": "k3-256k",
+      "x-sk-provider": "kimi-k3",
+      "x-sk-rail": "cloud",
+    });
   });
 
   test("unknown Kimi health fails closed and auth is read-only", async () => {

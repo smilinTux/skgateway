@@ -381,7 +381,8 @@ overrides:
     summary: "Fast lane of the Kimi coding subscription."
     good_at: [quick edits, boilerplate, high-volume small tasks]
     context_length: 262144
-    supported_parameters: [tools, tool_choice, reasoning]
+    supported_parameters: [reasoning]
+    dynamic_tools: false
     modality: "text+image->text"
     tier: paid-cloud
     speed: "fastest in-plan; same 30-concurrent family ceiling"
@@ -389,6 +390,7 @@ overrides:
     size_class: S
     latency_class: interactive
     reasoning: true
+    notes: "Direct tool probe returned HTTP 400 on 2026-09-11; excluded from tool-bearing routes."
 
   k3-256k:
     display_name: "Kimi K3 256K"
@@ -992,3 +994,15 @@ providers:
     cost_tier: paid-cloud
     verified: "2026-08-22"
     ref: "ZCode subscription entitlement observed locally; provider retention terms still require human review"
+
+  kimi-for-coding:
+    data_retention: unknown
+    cost_tier: paid-cloud
+    verified: "2026-09-11"
+    ref: "Kimi Code subscription entitlement and served catalog observed directly; retention terms still require human review"
+
+  kimi-k3:
+    data_retention: unknown
+    cost_tier: paid-cloud
+    verified: "2026-09-11"
+    ref: "Kimi Code subscription entitlement and served catalog observed directly; retention terms still require human review"

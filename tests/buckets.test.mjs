@@ -95,9 +95,12 @@ describe('C9: bucket addressing', () => {
     assert.deepEqual(v.sensitivity.values, ['public', 'internal', 'secret']);
     // risk is a SEPARATE axis and must not have been folded into the bucket id
     assert.deepEqual(v.risk.values, ['low', 'med', 'high', 'crit']);
-    assert.equal(allBuckets().length, 28, '12 scoped, 4 short public, and 12 provider-focused S/M/L buckets');
-    assert.equal(parseBucketId('sk-kimi-xl'), null);
-    assert.equal(looksLikeBucketAttempt('sk-kimi-xl').attempted, true);
+    assert.equal(allBuckets().length, 29, '12 scoped, 4 short public, 12 provider-focused S/M/L, and Kimi XL');
+    assert.deepEqual(parseBucketId('sk-kimi-xl'), {
+      bucket: 'sk-kimi-xl', model_class: 'XL', sensitivity: 'public', provider: 'kimi',
+    });
+    assert.equal(parseBucketId('sk-codex-xl'), null);
+    assert.equal(looksLikeBucketAttempt('sk-codex-xl').attempted, true);
     assert.equal(allBuckets().some(({ bucket }) => bucket.startsWith('sk-cursor-')), false);
   });
 });
@@ -326,6 +329,13 @@ describe('provider-focused buckets', () => {
     });
     assert.deepEqual(members, []);
     assert.match(rejected.find((item) => item.id === 'kimi-for-coding').reason, /not routable/);
+  });
+
+  test('Kimi exposes XL while every other provider XL remains rejected', () => {
+    assert.equal(parseBucketId('sk-kimi-xl').provider, 'kimi');
+    for (const provider of ['zai', 'glm', 'codex', 'cursor']) {
+      assert.equal(parseBucketId(`sk-${provider}-xl`), null);
+    }
   });
 });
 

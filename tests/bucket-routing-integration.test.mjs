@@ -542,12 +542,12 @@ ${extraRoles}defaults:
     }
   });
 
-  test('unsupported provider XL is rejected instead of falling through', async () => {
+  test('unsupported non-Kimi provider XL is rejected instead of falling through', async () => {
     await applyConfig({ buckets_enabled: true });
     const r = await routeAndSend(
       router,
-      { model: 'sk-kimi-xl', agentId: 't' },
-      '/chat/completions', 'POST', HEADERS, bodyFor('sk-kimi-xl'), false,
+      { model: 'sk-codex-xl', agentId: 't' },
+      '/chat/completions', 'POST', HEADERS, bodyFor('sk-codex-xl'), false,
     );
     assert.equal(r.status, 400);
     assert.equal(parseBody(r).error.type, 'invalid_bucket_id');
@@ -699,7 +699,7 @@ ${extraRoles}defaults:
     assert.equal(error.model, 'sk-xl-secrets');
     assert.match(error.reason, /sensitivity "secrets" is not/);
     assert.ok(error.valid_buckets.includes('sk-xl-secret'), 'the caller is told the correction, not left guessing');
-    assert.equal(error.valid_buckets.length, 28);
+    assert.equal(error.valid_buckets.length, 29);
     assert.equal(pool.state.count, 0, 'nothing was routed');
 
     const lines = audit.read();

@@ -83,7 +83,7 @@ export function classRank(cls, vocab = gradeVocabulary()) {
 /** Bucket ids look like `sk-<class>-<sensitivity>`, case-insensitive. */
 const BUCKET_RE = /^sk-(s|m|l|xl)-(public|internal|secret)$/i;
 const SHORT_BUCKET_RE = /^sk-(s|m|l|xl)$/i;
-const PROVIDER_BUCKET_RE = /^sk-(zai|glm|kimi|codex|cursor)-(s|m|l)$/i;
+const PROVIDER_BUCKET_RE = /^sk-(zai|glm|kimi|codex|cursor)-(s|m|l|xl)$/i;
 
 const PROVIDER_ALIASES = Object.freeze({ glm: 'zai' });
 const PUBLIC_L_SUBSCRIPTION_PROVIDERS = new Set(['zai', 'codex']);
@@ -142,6 +142,7 @@ export function parseBucketId(id) {
   };
   const focused = PROVIDER_BUCKET_RE.exec(value);
   if (!focused) return null;
+  if (focused[2].toLowerCase() === 'xl' && focused[1].toLowerCase() !== 'kimi') return null;
   return {
     bucket: `sk-${focused[1].toLowerCase()}-${focused[2].toLowerCase()}`,
     model_class: focused[2].toUpperCase(),
@@ -212,7 +213,7 @@ export function looksLikeBucketAttempt(id, vocab = gradeVocabulary()) {
   if (focused) {
     return {
       attempted: true,
-      reason: `provider-focused buckets support only S, M, or L; received "${focused[2]}"`,
+      reason: `provider-focused XL buckets are supported only for Kimi; received "${focused[2]}"`,
     };
   }
   const m = BUCKET_SHAPE_RE.exec(trimmed);
@@ -259,7 +260,7 @@ export function allBuckets(vocab = gradeVocabulary()) {
   // Cursor parses fail-closed now but is advertised only after its transport
   // adapter and health probes qualify it.
   for (const provider of ['zai', 'glm', 'kimi', 'codex']) {
-    for (const c of classes.filter((value) => value !== 'XL')) {
+    for (const c of classes.filter((value) => value !== 'XL' || provider === 'kimi')) {
       out.push({
         bucket: `sk-${provider}-${String(c).toLowerCase()}`,
         model_class: String(c).toUpperCase(),
@@ -747,4 +748,12 @@ export function selectMember(members, counter = 0, familyPreference = null) {
 
   // Return the first preferred member in the cheapest tier
   return preferredInCheapest[0] || null;
+}
+
+/** Prefer Kimi's exact declared class, retaining larger classes for fallback. */
+export function selectProviderBucketMember(bucket, members, counter = 0, familyPreference = null) {
+  const exact = bucket?.provider === 'kimi'
+    ? members.filter((member) => member.model_class === bucket.model_class)
+    : [];
+  return selectMember(exact.length > 0 ? exact : members, counter, familyPreference);
 }

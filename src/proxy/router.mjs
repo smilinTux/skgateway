@@ -73,7 +73,7 @@ import {
   orderMembersByCost,
   validateFamilyPreference,
   applyFamilyPreference,
-  selectMember,
+  selectProviderBucketMember,
   requiresToolUse,
   looksLikeBucketAttempt,
   allBuckets,
@@ -2974,7 +2974,7 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
 
   const n = (_bucketCounters.get(addr.bucket) || 0) + 1;
   _bucketCounters.set(addr.bucket, n);
-  
+
   // Read and validate family preference from x-sk-prefer header (card 1e26943e)
   const prefHeader = request.headers?.['x-sk-prefer'];
   let familyPreference = null;
@@ -3010,8 +3010,9 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
     }
   }
 
-  // Apply family preference within cheapest cost tier
-  const picked = selectMember(members, n, familyPreference);
+  // Kimi provider buckets declare one model at each class. Prefer that exact
+  // class while it is healthy, then retain larger Kimi models as failover.
+  const picked = selectProviderBucketMember(addr, members, n, familyPreference);
   
   if (!picked) {
     console.warn(`[router] bucket ${addr.bucket} no member selected after preference`);
