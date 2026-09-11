@@ -248,6 +248,23 @@ backends:
   ornith:
     enabled: false
     url: http://192.168.0.100:8082/v1
+    # Context preflight ceiling (card 9ed4a9f7). llama-server reports n_ctx 65536
+    # and the registry reserves min_output_tokens: 8192 for the visible answer,
+    # so ~57344 tokens is what the INPUT may actually occupy. Without this key
+    # the preflight is disabled for this backend and oversized requests are sent
+    # to be truncated instead of rejected.
+    #
+    # 2026-09-11: hermes agent cron jobs (daily-brief, infra-security-scan-daily)
+    # ship ~205,815-byte bodies -> ~68,605 estimated tokens. They were routed here
+    # anyway, llama-server truncated them, the model answered with reasoning and
+    # EMPTY content, and the response contract rejected that as
+    # "Upstream returned invalid completion evidence" (HTTP 502) after burning
+    # 32s per attempt. The 502 named nothing useful, so the jobs looked like an
+    # ornith fault rather than a request that never fit. With the ceiling
+    # declared, an oversized request is refused up front with an explicit 400
+    # naming the limit -- and because this backend is no_failover, it fails
+    # LOUDLY here rather than leaking Chef's traffic to a cloud provider.
+    context_limit: 57344
     auth_type: none
     models:
       - ornith-1.5-9b
