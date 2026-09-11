@@ -169,7 +169,7 @@ describe("router 429/402 rate-limit failover (card 9e28de88)", () => {
     assert.equal(primary.requestCount, primaryHitsBefore, "cooling-down door received no further requests");
   });
 
-  test("402/403 decision: a 402 fails over with the longer quota-scale cooldown, a 403 stays terminal", async () => {
+  test("402/403 decision: quota and provider entitlement failures can fail over", async () => {
     const modelId402 = `paid-tier/quota-exhausted-${Date.now()}`;
     const router402 = createRouter({
       backends: {
@@ -203,11 +203,11 @@ describe("router 429/402 rate-limit failover (card 9e28de88)", () => {
     const primaryHitsBefore = primary.requestCount;
     const secondaryHitsBefore = secondary.requestCount;
     const r403 = await routeAndSend(router403, { model: modelId403, agentId: "test" }, "/chat/completions", "POST", HEADERS, bodyFor(modelId403), false);
-    assert.equal(r403.status, 403, "a 403 is returned to the caller, NOT failed over (deliberate decision)");
-    assert.equal(r403.backendId, "primary");
-    assert.equal(r403.failover, false);
+    assert.equal(r403.status, 200, "provider entitlement is normalized before bounded failover");
+    assert.equal(r403.backendId, "secondary");
+    assert.equal(r403.failover, true);
     assert.equal(primary.requestCount, primaryHitsBefore + 1);
-    assert.equal(secondary.requestCount, secondaryHitsBefore, "secondary was never tried for a 403");
+    assert.equal(secondary.requestCount, secondaryHitsBefore + 1);
   });
 
   test("fix #3: an all-throttled chain returns one attributable 429 instead of hanging or a raw 500", async () => {
@@ -460,20 +460,19 @@ describe("router backoff and cooldown admission truth (card e7c2b4a9)", () => {
       false
     );
 
-    assert.equal(r2.status, 429, "cooldown-only rejection returns 429");
+    assert.equal(r2.status, 503, "cooldown-only rejection is a local 503");
     assert.equal(r2.admissionOutcome, "denied",
       "cooldown-only request must report denied, not admitted with zero inflight");
     assert.equal(r2.inflightConcurrency, 0,
       "no inflight concurrency when no admission occurred");
-    assert.equal(r2.backoffClassification, "provider_backoff",
-      "cooldown-only rejection preserves the underlying backoff classification");
+    assert.equal(r2.backoffClassification, "local_admission_denial",
+      "cooldown-only rejection is attributed to local admission");
+    assert.equal(r2.upstreamAttempted, false);
 
     // Verify both attempts were skipped without network calls
     const payload2 = JSON.parse(r2.body.toString("utf-8"));
-    assert.equal(payload2.error.type, "rate_limited_all_candidates");
-    assert.equal(payload2.attempted.length, 2);
-    assert.ok(payload2.attempted.every((a) => a.skipped === true),
-      "all attempts were skipped due to cooldown");
+    assert.equal(payload2.error.type, "gateway_unavailable");
+    assert.equal(payload2.error.code, "cooldown_active");
   });
 
   test("repair #2: mixed 402/429 cooldown rejection preserves truthful classification", async () => {
@@ -515,10 +514,10 @@ describe("router backoff and cooldown admission truth (card e7c2b4a9)", () => {
       false
     );
 
-    assert.equal(r2.status, 429);
+    assert.equal(r2.status, 503);
     assert.equal(r2.admissionOutcome, "denied", "cooldown-only reports denied");
     assert.equal(r2.inflightConcurrency, 0);
-    assert.equal(r2.backoffClassification, "provider_429",
-      "mixed status chain uses provider_429 when any 429 is present");
+    assert.equal(r2.backoffClassification, "local_admission_denial");
+    assert.equal(r2.upstreamAttempted, false);
   });
 });

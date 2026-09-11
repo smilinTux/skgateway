@@ -13,6 +13,24 @@ const TERMINAL_RETRY_MS = 30 * 60 * 1000;
 const MODEL_RECOVERY_RETRY_MS = 60 * 1000;
 const ZAI_RECOVERY_MODELS = Object.freeze(["glm-4.6", "glm-4.7", "glm-5.3"]);
 
+/** Legacy capacity shape derived from the durable provider-health snapshot. */
+export function capacityProjectionFromHealth(snapshot, { now = Date.now() } = {}) {
+  if (!snapshot || typeof snapshot !== "object") {
+    return { state: "unknown", reason: null, retry_at: null, probe_state: "none", current: false };
+  }
+  const throttled = ["open", "half_open"].includes(snapshot.circuit_state) ||
+    ["throttled", "unavailable", "disabled"].includes(snapshot.overall);
+  return {
+    state: throttled ? "throttled" : snapshot.overall === "available" ? "available" : "unknown",
+    scope: snapshot.quarantine_scope || snapshot.scope || "provider",
+    reason: snapshot.quarantine_reason || snapshot.last_provider_error_code || null,
+    retry_at: snapshot.reset_at ?? snapshot.next_due_at ?? null,
+    probe_state: snapshot.circuit_state === "half_open" ? "in_progress" : "none",
+    observed_at: snapshot.last_observation_at ?? null,
+    current: Number.isSafeInteger(snapshot.evidence_expires_at) && now <= snapshot.evidence_expires_at,
+  };
+}
+
 /** Keep shared provider recovery on the exact claims qualified for fleet use. */
 export function selectProviderRecoveryModels(provider, models) {
   const available = new Set((models || []).filter((model) => typeof model === "string"));

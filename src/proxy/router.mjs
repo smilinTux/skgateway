@@ -21,7 +21,7 @@ import path from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
-import { getConfig } from "../config.mjs";
+import { getConfig, providerConfiguredMode } from "../config.mjs";
 import { sendUpstream } from "./upstream.mjs";
 import { createEvent, EventType } from "../siem/events.mjs";
 import { isAnthropicBackend, toAnthropicRequest, toOpenAIResponse } from "./anthropic-adapter.mjs";
@@ -37,7 +37,13 @@ import { isRegistryRouted, resolve as resolveRegistry, getAutoConfig, getConfigE
 import { getFailoverConfig, isLocalUrl, probeLocalHealth, recordLocalOutcome } from "./local-failover.mjs";
 import { readMeter } from "./meter-client.mjs";
 import { marginalJoules, imputeJoules, resolveBasis, coeffsForModel, backendIsLocal, usageFromSSE, resolveMeterUrl } from "../metrics/energy.mjs";
-import { observeProviderUsage, providerUsageSnapshot } from "../metrics/provider-usage.mjs";
+import { observeProviderUsage, providerUsageSnapshot, providerHealthSnapshots } from "../metrics/provider-usage.mjs";
+import {
+  effectiveInferenceEligibility,
+  independentAttemptCandidates,
+  normalizeFailure,
+  selectTerminalFailure,
+} from "../health/failure.mjs";
 import { recordModelOutcome, getLifecycle } from "../discovery/model_catalog_store.mjs";
 import {
   admitCapacity, capacityStatus, clearCapacity, finishCapacityProbe,
@@ -3846,6 +3852,17 @@ export async function routeAndSend(router, request, upstreamPath, method, client
 
   let lastResult = null;
   let didFailover = false;
+  const operationTimeoutMs = (() => {
+    try { return Math.max(1, Number(getConfig()?.routing?.operation_timeout_ms) || 120_000); }
+    catch { return 120_000; }
+  })();
+  const operationDeadline = Date.now() + operationTimeoutMs;
+  const deadlineSignal = AbortSignal.timeout(operationTimeoutMs);
+  const operationSignal = abortSignal
+    ? AbortSignal.any([abortSignal, deadlineSignal])
+    : deadlineSignal;
+  const failureAttempts = [];
+  candidates = independentAttemptCandidates(candidates, { maxAttempts: 3 });
   // Doors that refused the context preflight (card 9ed4a9f7), bounded one
   // entry per candidate, used to synthesize the explicit 400 when EVERY
   // door is too small for the request.
@@ -3956,6 +3973,39 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     const capacityProbeOwner = publicSynthetic
       ? (request.capacityProbeOwner || Symbol(providerName))
       : null;
+    let configuredMode = "active";
+    try { configuredMode = providerConfiguredMode(getConfig(), providerName); } catch {}
+    const durableSnapshot = providerHealthSnapshots({
+      provider: providerName,
+      backend_id: backendId,
+      model_id: candidateModel,
+    })[0] || null;
+    const purpose = publicSynthetic ? "recovery" : "inference";
+    const eligible = durableSnapshot
+      ? effectiveInferenceEligibility({
+          mode: configuredMode,
+          circuit: durableSnapshot.circuit_state,
+          purpose,
+          lease: durableSnapshot.half_open_lease,
+          leaseOwner: capacityProbeOwner,
+          now: Date.now(),
+          scopeMatches: durableSnapshot.provider === providerName &&
+            durableSnapshot.backend_id === backendId && durableSnapshot.model_id === candidateModel,
+        })
+      : (purpose === "inference"
+          ? configuredMode === "active"
+          : ["active", "canary"].includes(configuredMode));
+    if (!eligible) {
+      failureAttempts.push(normalizeFailure({
+        origin: "gateway",
+        reason: configuredMode === "disabled" || configuredMode === "monitor_only"
+          ? "provider_disabled"
+          : "cooldown_active",
+        upstreamAttempted: false,
+        requestId: _siemRequestId,
+      }));
+      continue;
+    }
     const capacityAdmission = providerName === "codex" || providerName === "zai"
       ? admitCapacity(providerName, candidateModel, { publicSynthetic, probeOwner: capacityProbeOwner })
       : { admitted: true, probe: false };
@@ -3981,6 +4031,8 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       const remainingMs = Math.max(1000, (capacityAdmission.status.retry_at || Date.now() + 1000) - Date.now());
       throttledAttempts.push({ backendId, model: candidateModel, status: 429,
         cooldownMs: remainingMs, skipped: true, reason: capacityAdmission.status.reason });
+      failureAttempts.push(normalizeFailure({ origin: "gateway", reason: "cooldown_active",
+        upstreamAttempted: false, retryAt: capacityAdmission.status.retry_at, requestId: _siemRequestId }));
       continue;
     }
 
@@ -3995,8 +4047,19 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         backendId, model: candidateModel, status: state?.status ?? 429,
         cooldownMs: remainingMs, skipped: true,
       });
+      failureAttempts.push(normalizeFailure({ origin: "gateway", reason: "cooldown_active",
+        upstreamAttempted: false, retryAt: state?.untilMs, requestId: _siemRequestId }));
       continue;
     }
+
+    const remainingOperationMs = operationDeadline - Date.now();
+    if (remainingOperationMs <= 0) {
+      if (capacityAdmission.probe) releaseCapacityProbe(providerName, capacityProbeOwner);
+      failureAttempts.push(normalizeFailure({ origin: "gateway", reason: "operation_timeout",
+        upstreamAttempted: false, requestId: _siemRequestId }));
+      break;
+    }
+    attemptTimeoutMs = Math.max(1, Math.min(attemptTimeoutMs || remainingOperationMs, remainingOperationMs));
 
     // Merge auth headers into a sanitized copy of client headers.
     //
@@ -4052,7 +4115,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     let slot = null;
     if (pool) {
       try {
-        slot = await pool.acquire(backendId, { signal: abortSignal });
+        slot = await pool.acquire(backendId, { signal: operationSignal });
       } catch (err) {
         // Capacity admission owns a provider-wide half-open lock. Pool
         // rejection happens before the upstream try/finally below, so it must
@@ -4062,6 +4125,11 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         });
         // A client which leaves while queued is the same neutral 499 as one
         // which leaves after dispatch: no failover and no backend-health write.
+        if (err instanceof PoolAdmissionError && err.code === "client_closed" && !abortSignal?.aborted && deadlineSignal.aborted) {
+          failureAttempts.push(normalizeFailure({ origin: "gateway", reason: "operation_timeout",
+            upstreamAttempted: false, requestId: _siemRequestId }));
+          break;
+        }
         if (err instanceof PoolAdmissionError && err.code === "client_closed") {
           const queueWaitMs = err.queueWaitMs;
           await emitSiem("response", {
@@ -4228,7 +4296,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         if (tr) {
           const aHeaders = { ...forwardHeaders, ...tr.headers };
           delete aHeaders["content-length"];
-          const raw = await sendUpstream(tr.path, method, aHeaders, tr.body, targetUrl, attemptTimeoutMs, abortSignal);
+          const raw = await sendUpstream(tr.path, method, aHeaders, tr.body, targetUrl, attemptTimeoutMs, operationSignal);
           if (raw?.cancelled) {
             res = raw;
           } else {
@@ -4241,7 +4309,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
             res = toOpenAIResponse(raw, request.model);
           }
         } else {
-          res = await sendUpstream(upstreamPath, method, forwardHeaders, attemptBody, targetUrl, attemptTimeoutMs, abortSignal);
+          res = await sendUpstream(upstreamPath, method, forwardHeaders, attemptBody, targetUrl, attemptTimeoutMs, operationSignal);
         }
       } else if (isCodexBackend(backend)) {
         // Translate OpenAI chat-completions -> Codex Responses API (OpenAI
@@ -4260,11 +4328,11 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           const cHeaders = { ...forwardHeaders, ...tr.headers };
           delete cHeaders["content-length"];
           const raw = await sendUpstream(tr.path, method, cHeaders, tr.body, targetUrl,
-            attemptTimeoutMs, abortSignal, probeResponseLimit);
+            attemptTimeoutMs, operationSignal, probeResponseLimit);
           res = raw?.cancelled ? raw : fromCodexResponse(raw, candidateModel, tr.clientStream);
         } else {
           res = await sendUpstream(upstreamPath, method, forwardHeaders, attemptBody, targetUrl,
-            attemptTimeoutMs, abortSignal, probeResponseLimit);
+            attemptTimeoutMs, operationSignal, probeResponseLimit);
         }
       } else if (isCodexBackend(backend)) {
         // Translate OpenAI chat-completions -> Codex Responses API (OpenAI
@@ -4282,13 +4350,13 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           }
           const cHeaders = { ...forwardHeaders, ...tr.headers };
           delete cHeaders["content-length"];
-          const raw = await sendUpstream(tr.path, method, cHeaders, tr.body, targetUrl, backend.timeout_ms, abortSignal);
+          const raw = await sendUpstream(tr.path, method, cHeaders, tr.body, targetUrl, attemptTimeoutMs, operationSignal);
           res = raw?.cancelled ? raw : fromCodexResponse(raw, candidateModel, tr.clientStream);
         } else {
-          res = await sendUpstream(upstreamPath, method, forwardHeaders, attemptBody, targetUrl, backend.timeout_ms, abortSignal);
+          res = await sendUpstream(upstreamPath, method, forwardHeaders, attemptBody, targetUrl, attemptTimeoutMs, operationSignal);
         }
       } else {
-        res = await sendUpstream(upstreamPath, method, forwardHeaders, attemptBody, targetUrl, attemptTimeoutMs, abortSignal);
+        res = await sendUpstream(upstreamPath, method, forwardHeaders, attemptBody, targetUrl, attemptTimeoutMs, operationSignal);
       }
       attemptConcurrency = meterUrl ? inFlightOnMeter(meterUrl) : 1;
     } catch (err) {
@@ -4407,6 +4475,43 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           ? "response_budget"
           : "malformed_response"
         : res.status >= 500 ? "backend_cooldown" : null;
+    if (upstreamStatus === 401 || upstreamStatus === 403) {
+      const reason = upstreamStatus === 401
+        ? "provider_auth_unavailable"
+        : "provider_entitlement_unavailable";
+      res = {
+        ...res,
+        status: 503,
+        headers: { "content-type": "application/json", "cache-control": "no-store" },
+        body: Buffer.from(JSON.stringify({ error: {
+          message: "The selected provider is not currently authorized",
+          code: reason,
+          type: "provider_unavailable",
+          retryable: false,
+        } }), "utf8"),
+      };
+    }
+    if (upstreamStatus >= 200 && upstreamStatus < 300 && res.status === 502) {
+      delete res.headers?.["retry-after"];
+      delete res.headers?.["Retry-After"];
+    }
+    if (res.status >= 400) {
+      const retryHeader = res.headers?.["retry-after"] ?? res.headers?.["Retry-After"];
+      const parsedRetryMs = parseRetryAfterMs(retryHeader);
+      failureAttempts.push(normalizeFailure({
+        origin: "upstream",
+        upstreamStatus,
+        reason: upstreamStatus >= 200 && upstreamStatus < 300 && res.status === 502
+          ? "malformed_response"
+          : undefined,
+        quotaProven: upstreamStatus === 402 || [
+          "quota_exhausted", "subscription_exhausted", "usage_limit_exceeded",
+        ].includes(responseErrorCode),
+        retryAt: parsedRetryMs == null ? null : Date.now() + parsedRetryMs,
+        upstreamAttempted: true,
+        requestId: _siemRequestId,
+      }));
+    }
     if (providerName === "zai" && recoveryFailureClass === "malformed_response") {
       console.warn(`[router] malformed GLM response model=${candidateModel} code=${responseErrorCode || "unknown"}`);
     }
@@ -4468,6 +4573,11 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // Return immediately after releasing the pool/meter slot in `finally`,
     // before energy reads, health/lifecycle writes, or failover can run.
     if (res?.cancelled || res?.status === 499) {
+      if (!abortSignal?.aborted && deadlineSignal.aborted) {
+        failureAttempts.push(normalizeFailure({ origin: "gateway", reason: "operation_timeout",
+          upstreamAttempted: true, requestId: _siemRequestId }));
+        break;
+      }
       // A cancellation is not evidence of what was served: keep the value
       // enforceResponseContract observed (including null), never the
       // routing candidate. Card bc908525 / review b62e19f8 findings 1-2.
@@ -4655,6 +4765,17 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       backoffClassification: "nonterminal",
       firstByteMs: Number.isFinite(res?.firstByteMs) ? queueWaitMs + res.firstByteMs : null,
     };
+    if (res.status >= 400 && failureAttempts.length > 0) {
+      const failure = failureAttempts.at(-1);
+      Object.assign(lastResult, {
+        clientStatus: failure.clientStatus,
+        upstreamStatus: failure.upstreamStatus,
+        failureOrigin: failure.origin,
+        failureReason: failure.reason,
+        upstreamAttempted: failure.upstreamAttempted,
+        attemptCount: failureAttempts.filter((item) => item.upstreamAttempted).length,
+      });
+    }
     if (isBucketChain) {
       lastResult.bucket = bucketAddr.bucket;
       lastResult.bucketMember = candidateModel;
@@ -4808,7 +4929,10 @@ export async function routeAndSend(router, request, upstreamPath, method, client
   // Build one attributable 429 instead.
   if (candidates.length > 0 && throttledAttempts.length === candidates.length) {
     const waitsMs = throttledAttempts.map((t) => t.cooldownMs ?? DEFAULT_429_COOLDOWN_MS);
-    const retryAfterSec = Math.max(1, Math.ceil(Math.min(...waitsMs) / 1000));
+    const retryWaitMs = Math.min(...waitsMs);
+    const retryAfterSec = Date.now() + retryWaitMs <= operationDeadline
+      ? Math.max(1, Math.ceil(retryWaitMs / 1000))
+      : null;
 
     // Card e7c2b4a9 repair #1: derive final backoff classification from attempts.
     // If ALL throttled attempts are 402, preserve provider_backoff. Only if
@@ -4825,6 +4949,38 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     const inflightConcurrency = allSkipped ? 0 : (lastResult?.inflightConcurrency ?? 0);
     const queueWaitMs = lastResult?.queueWaitMs ?? 0;
     const backendId = lastResult?.backendId ?? null;
+
+    if (allSkipped) {
+      const terminal = selectTerminalFailure(failureAttempts, operationDeadline);
+      const error = {
+        message: "All eligible provider routes are locally cooling down",
+        code: terminal.reason,
+        type: "gateway_unavailable",
+        retryable: terminal.retryable,
+      };
+      await emitSiem("response", {
+        status: 503,
+        queue_wait_ms: queueWaitMs,
+        inflight_concurrency: 0,
+        admission_outcome: "denied",
+        backoff_classification: "local_admission_denial",
+        failover: didFailover,
+        all_backends_failed: true,
+        upstream_attempted: false,
+      }, { backend: null });
+      return {
+        status: 503,
+        headers: { "content-type": "application/json" },
+        body: Buffer.from(JSON.stringify({ error }), "utf-8"),
+        backendId: null,
+        queueWaitMs,
+        inflightConcurrency: 0,
+        admissionOutcome: "denied",
+        backoffClassification: "local_admission_denial",
+        upstreamAttempted: false,
+        failover: didFailover,
+      };
+    }
 
     const payload = JSON.stringify({
       error: {
@@ -4845,14 +5001,17 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       inflight_concurrency: inflightConcurrency,
       admission_outcome: admissionOutcome,
       backoff_classification: backoffClassification,
-      retry_after_seconds: retryAfterSec,
+      ...(retryAfterSec === null ? {} : { retry_after_seconds: retryAfterSec }),
       failover: didFailover,
       all_backends_failed: true,
       all_throttled: true,
     }, { backend: backendId });
     return {
       status: 429,
-      headers: { "content-type": "application/json", "retry-after": String(retryAfterSec) },
+      headers: {
+        "content-type": "application/json",
+        ...(retryAfterSec === null ? {} : { "retry-after": String(retryAfterSec) }),
+      },
       body: Buffer.from(payload, "utf-8"),
       backendId,
       queueWaitMs,
@@ -4897,10 +5056,48 @@ export async function routeAndSend(router, request, upstreamPath, method, client
 
   // All backends failed for some other (non-throttle) reason: return the
   // last response so the caller can relay the error.
+  if (!lastResult && failureAttempts.length > 0) {
+    const terminal = selectTerminalFailure(failureAttempts, operationDeadline);
+    const headers = { "content-type": "application/json" };
+    if (terminal.retryAt !== null) {
+      const seconds = Math.ceil((terminal.retryAt - Date.now()) / 1000);
+      if (seconds > 0) headers["retry-after"] = String(seconds);
+    }
+    await emitSiem("response", {
+      status: terminal.clientStatus,
+      failover: didFailover,
+      all_backends_failed: true,
+      upstream_attempted: terminal.upstreamAttempted,
+      attempt_count: terminal.attemptCount,
+      failure_origin: terminal.origin,
+      failure_reason: terminal.reason,
+    }, {});
+    return {
+      status: terminal.clientStatus,
+      headers,
+      body: Buffer.from(JSON.stringify({ error: {
+        message: "No provider route is currently eligible",
+        code: terminal.reason,
+        type: "gateway_unavailable",
+        retryable: terminal.retryable,
+      } }), "utf-8"),
+      backendId: null,
+      failover: didFailover,
+      upstreamAttempted: terminal.upstreamAttempted,
+      attemptCount: terminal.attemptCount,
+      failureOrigin: terminal.origin,
+      failureReason: terminal.reason,
+    };
+  }
   await emitSiem("response", {
     status: lastResult?.status ?? 502,
     failover: didFailover,
     all_backends_failed: true,
+    upstream_status: lastResult?.upstreamStatus ?? null,
+    upstream_attempted: lastResult?.upstreamAttempted ?? false,
+    attempt_count: lastResult?.attemptCount ?? failureAttempts.filter((item) => item.upstreamAttempted).length,
+    failure_origin: lastResult?.failureOrigin ?? null,
+    failure_reason: lastResult?.failureReason ?? null,
   }, { backend: lastResult?.backendId });
   return lastResult;
 }

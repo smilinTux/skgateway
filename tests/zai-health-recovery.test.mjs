@@ -164,7 +164,9 @@ test("routed 401 recovery attempt remains fail closed", async (t) => {
     model: "glm-4.7", messages: [{ role: "user", content: "Reply ok." }],
     max_tokens: 256, stream: false,
   })), false);
-  assert.equal(result.status, 401);
+  assert.equal(result.status, 503);
+  assert.equal(result.upstreamStatus, 401);
+  assert.equal(result.failureReason, "provider_auth_unavailable");
   assert.equal(backend.getHealth().status, "down");
   assert.ok(backend.getHealth().errorRate > 0);
   assert.equal(capacityStatus("zai", "glm-4.7", { path: CAPACITY_STORE_PATH }).reason,

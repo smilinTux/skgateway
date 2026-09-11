@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Normalize provider failure attribution, enforce durable circuit admission,
+  and bound failover to three independent capacity domains under one deadline.
+
 - Align durable provider health observations with the canonical `disabled`
   configured mode and reject the obsolete `off` value.
 

@@ -297,6 +297,13 @@ function hasValidCompletion(state) {
   return state.visibleContent && (reason === "stop" || reason === "length");
 }
 
+/** Build one terminal SSE error event. Callers must close immediately after it. */
+export function terminalSseFailure({ requestId = null, reason = "partial_stream_failed" } = {}) {
+  const payload = { error: { type: "upstream_error", code: reason, message: "Upstream stream ended before a valid terminal event" } };
+  if (requestId) payload.request_id = requestId;
+  return Buffer.from(`event: error\ndata: ${JSON.stringify(payload)}\n\n`, "utf8");
+}
+
 /** Preserve requested alias separately while exposing the upstream model exactly. */
 export function enforceResponseContract(response, requestedModel) {
   if (!response?.body) return { ...response, requestedModel, servedModel: null };

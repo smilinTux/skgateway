@@ -10,6 +10,12 @@ export function configureProviderHealthPersistence(store, defaults = null) {
   healthDefaults = defaults && typeof defaults === "object" ? { ...defaults } : null;
 }
 
+/** Read the durable provider-health projection used by routing admission. */
+export function providerHealthSnapshots(filter = {}) {
+  if (!healthSink?.snapshot) return [];
+  try { return healthSink.snapshot(filter); } catch { return []; }
+}
+
 const HEADER_SCHEMAS = {
   codex: [
     ["tokens", "x-ratelimit-limit-tokens", "x-ratelimit-remaining-tokens", "x-ratelimit-reset-tokens"],
