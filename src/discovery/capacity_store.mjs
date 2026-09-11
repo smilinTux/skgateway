@@ -102,10 +102,10 @@ export function admitCapacity(provider, model, {
   publicSynthetic = false, probeOwner = null, now = Date.now(), path = CAPACITY_STORE_PATH,
 } = {}) {
   const status = capacityStatus(provider, model, { now, path });
-  if (status.state !== "throttled") return { admitted: true, probe: false, status };
   if (probeOwner && probes.get(provider) === probeOwner) {
     return { admitted: true, probe: true, status: { ...status, probe_state: "in_progress" } };
   }
+  if (status.state !== "throttled") return { admitted: true, probe: false, status };
   if (!status.current || !Number.isFinite(status.retry_at) || now < status.retry_at ||
       !publicSynthetic || !probeOwner || probes.has(provider)) {
     return { admitted: false, probe: false, status };
