@@ -58,6 +58,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Card `e240fe09`: outbound chat requests now keep every system message ahead
+  of conversation history after tool-limit and history-trimming notices.
+
 - Normalize only legacy model-local Z.ai malformed-response and transport
   recovery deadlines at read time without rewriting persisted capacity state.
 
