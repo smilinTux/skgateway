@@ -13,80 +13,11 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 import {
-  normalizeSystemMessageOrder,
   repairToolPairing,
   recoverKimiToolCalls,
   sanitizeRequest,
   sanitizeResponse,
-  trimHistoryToBudget,
 } from "../src/proxy/sanitizer.mjs";
-
-describe("normalizeSystemMessageOrder", () => {
-  test("moves all system messages ahead of multi-turn tool history without changing either partition", () => {
-    const messages = [
-      { role: "system", content: "base" },
-      { role: "user", content: "find it" },
-      { role: "assistant", tool_calls: [{ id: "c1" }] },
-      { role: "tool", tool_call_id: "c1", content: "found" },
-      { role: "system", content: "trim notice" },
-      { role: "assistant", content: "done" },
-    ];
-
-    assert.equal(normalizeSystemMessageOrder(messages), true);
-    assert.deepEqual(messages, [
-      { role: "system", content: "base" },
-      { role: "system", content: "trim notice" },
-      { role: "user", content: "find it" },
-      { role: "assistant", tool_calls: [{ id: "c1" }] },
-      { role: "tool", tool_call_id: "c1", content: "found" },
-      { role: "assistant", content: "done" },
-    ]);
-  });
-
-  test("moves an appended tool-limit STOP message to the system prefix", () => {
-    const messages = [
-      { role: "system", content: "base" },
-      { role: "user", content: "continue" },
-      { role: "tool", tool_call_id: "c20", content: "result" },
-      { role: "system", content: "STOP calling tools" },
-    ];
-
-    assert.equal(normalizeSystemMessageOrder(messages), true);
-    assert.deepEqual(messages.map((message) => message.content), [
-      "base", "STOP calling tools", "continue", "result",
-    ]);
-  });
-
-  test("moves a generated trimming notice into the system prefix", () => {
-    const body = {
-      messages: [
-        { role: "system", content: "base" },
-        ...Array.from({ length: 8 }, (_, i) => ({
-          role: i % 2 ? "assistant" : "user",
-          content: `${i}:`.padEnd(500, "x"),
-        })),
-      ],
-    };
-
-    trimHistoryToBudget(body, { maxBodyBytes: 2_500, keepStart: 2, keepEnd: 3, log: () => {} });
-    assert.ok(body.messages.some((message) => message.role === "system" && /trimmed/.test(message.content)));
-    assert.equal(normalizeSystemMessageOrder(body.messages), true);
-    assert.deepEqual(body.messages.slice(0, 2).map((message) => message.role), ["system", "system"]);
-    assert.ok(body.messages.slice(2).every((message) => message.role !== "system"));
-  });
-
-  test("leaves an ordinary request unchanged", () => {
-    const messages = [
-      { role: "system", content: "base" },
-      { role: "user", content: "hello" },
-      { role: "assistant", content: "hi" },
-    ];
-    const before = JSON.stringify(messages);
-
-    assert.equal(normalizeSystemMessageOrder(messages), false);
-    assert.equal(JSON.stringify(messages), before);
-  });
-});
 
 describe("repairToolPairing", () => {
   test("returns input unchanged when no tool messages present", () => {

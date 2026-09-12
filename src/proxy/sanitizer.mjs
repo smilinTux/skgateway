@@ -496,39 +496,6 @@ export function repairToolPairing(slice) {
 // ---------------------------------------------------------------------------
 
 /**
- * Stable-partition messages so every system message precedes non-system
- * history. Returns whether the array changed.
- *
- * @param {object[]} messages Message array (mutated in place when needed).
- * @returns {boolean}
- */
-export function normalizeSystemMessageOrder(messages) {
-  if (!Array.isArray(messages)) return false;
-
-  let sawNonSystem = false;
-  let needsReorder = false;
-  for (const message of messages) {
-    if (message?.role === "system") {
-      if (sawNonSystem) {
-        needsReorder = true;
-        break;
-      }
-    } else {
-      sawNonSystem = true;
-    }
-  }
-  if (!needsReorder) return false;
-
-  messages.splice(
-    0,
-    messages.length,
-    ...messages.filter((message) => message?.role === "system"),
-    ...messages.filter((message) => message?.role !== "system"),
-  );
-  return true;
-}
-
-/**
  * Trim a request body's conversation history so the serialized body stays
  * under `maxBodyBytes`. Single source of truth for the history-trim algorithm
  * — both `sanitizeRequest` here and `trimConversationHistory` in core.mjs
