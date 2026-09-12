@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Validate every logical bucket member against the selected backend's exact
+  model claim before handoff, skipping stale catalog aliases with attributable
+  evidence while preserving the requested bucket and served-model identity.
+
 - Continue a provider-neutral bucket chain when one member has all exact
   backend claims quarantined, while concrete-model requests remain fail closed.
 
