@@ -3072,6 +3072,24 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
     provider: result?.backend?.discovery || inferProviderFromBackend(result?.backendId),
   }, addr);
   for (const member of orderedMembers) {
+    const memberClaimers = typeof router.getBackends === "function"
+      ? router.getBackends().filter(
+        (backend) => typeof backend?.supportsModel === "function" &&
+          backend.supportsModel(member.id),
+      )
+      : null;
+    if (memberClaimers?.length === 0) {
+      skipped.push(member.id);
+      await emitSiem(EventType.ANOMALY, {
+        type: "bucket_member_skipped",
+        outcome: "skipped",
+        bucket: addr.bucket,
+        member: member.id,
+        reason: "missing_backend_binding",
+        detail: "no configured backend claims the selected bucket member",
+      }, {});
+      continue;
+    }
     let results;
     try {
       results = await router.route({ ...request, model: member.id, agentId: request.agentId });
@@ -3121,6 +3139,7 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
         }
         const list2 = Array.isArray(results) ? results : results ? [results] : [];
         for (const result of list2) {
+          if (memberClaimers && !memberClaimers.includes(result.backend)) continue;
           if (!candidateAllowed(result)) continue;
           const key = `${result.backendId}:${member.id}`;
           if (seen.has(key)) continue;
@@ -3139,6 +3158,7 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
     }
     const list = Array.isArray(results) ? results : results ? [results] : [];
     for (const result of list) {
+      if (memberClaimers && !memberClaimers.includes(result.backend)) continue;
       if (!candidateAllowed(result)) continue;
       const key = `${result.backendId}:${member.id}`;
       if (seen.has(key)) continue;
