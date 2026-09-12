@@ -57,7 +57,11 @@ import { URL } from "node:url";
 
 import { sendUpstream } from "./upstream.mjs";
 import { reduceTools, stripToolCallHistory } from "./tools.mjs";
-import { sanitizeContent, trimHistoryToBudget } from "./sanitizer.mjs";
+import {
+  normalizeSystemMessageOrder,
+  sanitizeContent,
+  trimHistoryToBudget,
+} from "./sanitizer.mjs";
 import { parseRetryAfter, jitteredBackoff } from "./retry.mjs";
 import { shouldForceNonStream } from "../classifiers/classifier.mjs";
 
@@ -681,6 +685,9 @@ export async function handleRequest(clientReq, clientRes, cfg) {
   if (isChatCompletion) {
     try {
       parsed = JSON.parse(body.toString("utf-8"));
+      if (normalizeSystemMessageOrder(parsed.messages)) {
+        body = Buffer.from(JSON.stringify(parsed), "utf-8");
+      }
     } catch {
       // Parse failure — fall through to transparent relay
     }
@@ -841,6 +848,8 @@ export async function handleRequest(clientReq, clientRes, cfg) {
       toolCallCounters.set(modelKey, 0);
     }
   }
+
+  normalizeSystemMessageOrder(parsed.messages);
 
   const model = parsed.model || "unknown";
 
