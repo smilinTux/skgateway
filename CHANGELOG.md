@@ -58,6 +58,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Card `4f23a634`: normalize system-message order in the production entry
+  dispatch path after request trimming and before upstream serialization.
+
 - Card `e240fe09`: outbound chat requests now keep every system message ahead
   of conversation history after tool-limit and history-trimming notices.
 
