@@ -58,6 +58,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Card `2e817c54`: consolidate ordered system instructions into one leading
+  message so strict single-system Jinja templates accept multi-turn requests.
+
 - Card `4f23a634`: normalize system-message order in the production entry
   dispatch path after request trimming and before upstream serialization.
 

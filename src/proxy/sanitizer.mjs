@@ -496,8 +496,9 @@ export function repairToolPairing(slice) {
 // ---------------------------------------------------------------------------
 
 /**
- * Stable-partition messages so every system message precedes non-system
- * history. Returns whether the array changed.
+ * Move system instructions to the front and consolidate them into one message
+ * for strict templates that accept the system role only at index zero.
+ * Returns whether the array changed.
  *
  * @param {object[]} messages Message array (mutated in place when needed).
  * @returns {boolean}
@@ -505,24 +506,23 @@ export function repairToolPairing(slice) {
 export function normalizeSystemMessageOrder(messages) {
   if (!Array.isArray(messages)) return false;
 
-  let sawNonSystem = false;
-  let needsReorder = false;
-  for (const message of messages) {
-    if (message?.role === "system") {
-      if (sawNonSystem) {
-        needsReorder = true;
-        break;
-      }
-    } else {
-      sawNonSystem = true;
-    }
-  }
-  if (!needsReorder) return false;
+  const system = messages.filter((message) => message?.role === "system");
+  if (system.length === 0) return false;
+  if (system.length === 1 && messages[0] === system[0]) return false;
+
+  const content = system.every((message) => typeof message.content === "string")
+    ? system.map((message) => message.content).join("\n\n")
+    : system.flatMap((message, index) => [
+        ...(index === 0 ? [] : [{ type: "text", text: "\n\n" }]),
+        ...(Array.isArray(message.content)
+          ? message.content
+          : [{ type: "text", text: String(message.content ?? "") }]),
+      ]);
 
   messages.splice(
     0,
     messages.length,
-    ...messages.filter((message) => message?.role === "system"),
+    { ...system[0], content },
     ...messages.filter((message) => message?.role !== "system"),
   );
   return true;
