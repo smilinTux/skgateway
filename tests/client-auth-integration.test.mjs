@@ -179,7 +179,8 @@ test('live gateway authenticates before routing, reloads rotation, audits revisi
   })).status, 200);
   assert.deepEqual(JSON.parse(upstreamRequests.at(-2).body).messages, ordinaryMessages);
   assert.deepEqual(JSON.parse(upstreamRequests.at(-1).body).messages, [
-    interleavedMessages[0], interleavedMessages[2], interleavedMessages[1], interleavedMessages[3],
+    { role: 'system', content: 'base system\n\nlater system' },
+    interleavedMessages[1], interleavedMessages[3],
   ]);
 
   await new Promise((resolveWait) => setTimeout(resolveWait, 50));

@@ -22,7 +22,7 @@ import {
 } from "../src/proxy/sanitizer.mjs";
 
 describe("normalizeSystemMessageOrder", () => {
-  test("moves all system messages ahead of multi-turn tool history without changing either partition", () => {
+  test("consolidates all system messages ahead of multi-turn tool history without changing history order", () => {
     const messages = [
       { role: "system", content: "base" },
       { role: "user", content: "find it" },
@@ -34,8 +34,7 @@ describe("normalizeSystemMessageOrder", () => {
 
     assert.equal(normalizeSystemMessageOrder(messages), true);
     assert.deepEqual(messages, [
-      { role: "system", content: "base" },
-      { role: "system", content: "trim notice" },
+      { role: "system", content: "base\n\ntrim notice" },
       { role: "user", content: "find it" },
       { role: "assistant", tool_calls: [{ id: "c1" }] },
       { role: "tool", tool_call_id: "c1", content: "found" },
@@ -53,7 +52,7 @@ describe("normalizeSystemMessageOrder", () => {
 
     assert.equal(normalizeSystemMessageOrder(messages), true);
     assert.deepEqual(messages.map((message) => message.content), [
-      "base", "STOP calling tools", "continue", "result",
+      "base\n\nSTOP calling tools", "continue", "result",
     ]);
   });
 
@@ -71,8 +70,41 @@ describe("normalizeSystemMessageOrder", () => {
     trimHistoryToBudget(body, { maxBodyBytes: 2_500, keepStart: 2, keepEnd: 3, log: () => {} });
     assert.ok(body.messages.some((message) => message.role === "system" && /trimmed/.test(message.content)));
     assert.equal(normalizeSystemMessageOrder(body.messages), true);
-    assert.deepEqual(body.messages.slice(0, 2).map((message) => message.role), ["system", "system"]);
-    assert.ok(body.messages.slice(2).every((message) => message.role !== "system"));
+    assert.equal(body.messages[0].role, "system");
+    assert.match(body.messages[0].content, /^base\n\n/);
+    assert.ok(body.messages.slice(1).every((message) => message.role !== "system"));
+  });
+
+  test("consolidates an already-leading system prefix for strict single-system templates", () => {
+    const messages = [
+      { role: "system", content: "base" },
+      { role: "system", content: "policy" },
+      { role: "user", content: "hello" },
+    ];
+
+    assert.equal(normalizeSystemMessageOrder(messages), true);
+    assert.deepEqual(messages, [
+      { role: "system", content: "base\n\npolicy" },
+      { role: "user", content: "hello" },
+    ]);
+  });
+
+  test("preserves ordered text blocks when consolidating structured system content", () => {
+    const messages = [
+      { role: "system", content: "base" },
+      { role: "user", content: "hello" },
+      { role: "system", content: [{ type: "text", text: "policy" }] },
+    ];
+
+    assert.equal(normalizeSystemMessageOrder(messages), true);
+    assert.deepEqual(messages, [
+      { role: "system", content: [
+        { type: "text", text: "base" },
+        { type: "text", text: "\n\n" },
+        { type: "text", text: "policy" },
+      ] },
+      { role: "user", content: "hello" },
+    ]);
   });
 
   test("leaves an ordinary request unchanged", () => {
