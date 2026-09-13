@@ -1,6 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { isChatModel, parseNvidia, parseOpenRouterFree, mergeCatalog, discoverCatalog } from '../src/discovery.mjs';
+import {
+  isChatModel,
+  parseNvidia,
+  parseOpenRouterFree,
+  mergeCatalog,
+  discoverCatalog,
+  applyCardOverlay,
+  servingConfigModels,
+} from '../src/discovery.mjs';
 
 test('isChatModel drops embeddings, vision, safety', () => {
   assert.equal(isChatModel('meta/llama-3.3-70b-instruct'), true);
@@ -23,6 +31,32 @@ test('parseOpenRouterFree keeps only free chat models', () => {
   ] };
   const out = parseOpenRouterFree(json).map(m => m.id);
   assert.deepEqual(out, ['google/gemma-4-31b-it:free']);
+});
+
+test('paid-cloud card tier marks Kimi subscription models paid without changing routing metadata', () => {
+  const configured = servingConfigModels({ kimi_oauth: {
+    models: ['kimi-for-coding', 'kimi-for-coding-highspeed', 'k3', 'k3-256k'],
+  } });
+  const cards = {
+    'kimi-for-coding': { tier: 'paid-cloud', trust_zone: 4, data_handling: 'subscription' },
+    'kimi-for-coding-highspeed': { tier: 'paid-cloud' },
+    k3: { tier: 'paid-cloud' },
+    'k3-256k': { tier: 'paid-cloud' },
+  };
+  const overlaid = configured.map((model) => applyCardOverlay(model, { [model.id]: cards[model.id] }));
+  assert.deepEqual(overlaid.map((model) => model.free), [false, false, false, false]);
+  assert.equal(overlaid[0].provider, 'kimi_oauth');
+  assert.equal(overlaid[0].card.trust_zone, 4);
+  assert.equal(overlaid[0].card.data_handling, 'subscription');
+});
+
+test('paid-cloud card tier also corrects a stale provider free flag', () => {
+  const model = applyCardOverlay({
+    id: 'kimi-for-coding', provider: 'kimi_oauth', free: true,
+    card: { tier: 'paid-cloud', trust_zone: 4 },
+  }, {});
+  assert.equal(model.free, false);
+  assert.equal(model.card.trust_zone, 4);
 });
 
 test('mergeCatalog dedups by id, local wins', () => {
