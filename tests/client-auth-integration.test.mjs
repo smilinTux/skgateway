@@ -161,6 +161,27 @@ test('live gateway authenticates before routing, reloads rotation, audits revisi
   assert.match(output, /\[skgateway\] listening/);
   assert.equal((await invoke('/responses', syntheticNew, 'jarvis-r2')).status, 200);
 
+  const ordinaryMessages = [
+    { role: 'system', content: 'ordinary system' },
+    { role: 'user', content: 'ordinary user' },
+  ];
+  const interleavedMessages = [
+    { role: 'system', content: 'base system' },
+    { role: 'user', content: 'synthetic user' },
+    { role: 'system', content: 'later system' },
+    { role: 'assistant', content: 'synthetic assistant' },
+  ];
+  assert.equal((await invoke('/v1/chat/completions', syntheticNew, 'jarvis-r2', {
+    model: 'fixture-model', messages: ordinaryMessages,
+  })).status, 200);
+  assert.equal((await invoke('/v1/chat/completions', syntheticNew, 'jarvis-r2', {
+    model: 'fixture-model', messages: interleavedMessages,
+  })).status, 200);
+  assert.deepEqual(JSON.parse(upstreamRequests.at(-2).body).messages, ordinaryMessages);
+  assert.deepEqual(JSON.parse(upstreamRequests.at(-1).body).messages, [
+    interleavedMessages[0], interleavedMessages[2], interleavedMessages[1], interleavedMessages[3],
+  ]);
+
   await new Promise((resolveWait) => setTimeout(resolveWait, 50));
   const audit = readFileSync(auditPath, 'utf8');
   assert.match(audit, /client_auth\.denied/);
