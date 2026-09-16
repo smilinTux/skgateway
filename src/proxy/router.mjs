@@ -70,7 +70,7 @@ import {
 import {
   parseBucketId,
   resolveBucket,
-  orderMembersByCost,
+  orderMembersForClass,
   validateFamilyPreference,
   applyFamilyPreference,
   selectMember,
@@ -3011,7 +3011,7 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
   }
 
   // Apply family preference within cheapest cost tier
-  const picked = selectMember(members, n, familyPreference);
+  const picked = selectMember(members, n, familyPreference, addr.model_class);
   
   if (!picked) {
     console.warn(`[router] bucket ${addr.bucket} no member selected after preference`);
@@ -3054,15 +3054,13 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
   // path does await the same call; this one was simply missed, and no test ever
   // reached it. The normalization is kept for the resolved value, which really
   // can be a single object or an array.
-  // selectMember() returns the ONE best member (cheapest cost tier, preference
-  // applied within that tier). The candidate loop below still needs the full
-  // member list so failover, quarantine and pooling keep working when the
-  // chosen member's backend is down. Rebuild it with the picked member first,
-  // then every other member in cost order: the preference decides who serves,
-  // it does not remove anyone from the failover chain.
+  // selectMember() returns the ONE closest class fit, with cost and preference
+  // breaking ties. The candidate loop below still needs the full member list
+  // so failover, quarantine and pooling keep working when that member's backend
+  // is down. Larger classes remain upward-only capability failover candidates.
   const orderedMembers = [
     picked,
-    ...orderMembersByCost(members, n).filter((m) => m.id !== picked.id),
+    ...orderMembersForClass(members, addr.model_class, n).filter((m) => m.id !== picked.id),
   ];
 
   const candidates = [];
