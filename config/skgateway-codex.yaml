@@ -30,31 +30,48 @@ pooling:
   queue_timeout_ms: 300000
   capacity_domains:
     chiap08-qwen38:
-      members: [chiap08-qwen38, "reg:qwen38"]
       ## llama-server on chiap08:11439 runs --parallel 4 --cont-batching.
-      ## Take 3 of its 4 real slots and leave 1 for the dream engine, the wiki
+      ## 2026-09-18, set by Chef: TWO, down from 3. At 3 this backend ran
+      ## saturated (3/3 active, queue to 5) and absorbed nearly all estate
+      ## traffic, because the lanes were sending bare size buckets that resolve
+      ## here instead of their own lane models.
+      ## The other two real slots stay free for the dream engine, the wiki
       ## pipeline and Hermes, which hit llama-server directly and cannot see
-      ## this queue. Taking all 4 makes them queue invisibly behind us.
-      max: 3
+      ## this queue, so taking their slots queues them invisibly.
+      ## queueTimeoutMs is short on purpose: fail over to cloud fast.
+      members: [chiap08-qwen38, "reg:qwen38"]
+      max: 2
       maxQueue: 8
-      ## Short on purpose: fail over to cloud fast rather than wait on local.
       queueTimeoutMs: 30000
     chiap01-qwen38:
+      ## Arc Pro B70 card 1 runs --parallel 2 on chiap01:18810, independent
+      ## hardware from chiap08.
+      ## 2026-09-18, set by Chef: ONE, down from 2. At 2 this backend threw 149
+      ## errors on 214 requests in a single hour (70%), while chiap08-qwen38
+      ## under the same load threw almost none. Two concurrent requests is past
+      ## what the Arc card serves reliably. --parallel is what it will ACCEPT,
+      ## not what it will finish, so do not raise this back from the flag alone.
       members: [chiap01-qwen38]
-      ## Arc Pro B70 card 1 runs --parallel 2 on chiap01:18810.
-      ## This is independent hardware from chiap08 and owns both real slots.
-      max: 2
+      max: 1
       maxQueue: 4
       queueTimeoutMs: 30000
+    ## 2026-09-18, set by Chef: raise the estate kimi ceiling to NINE
+    ## concurrent sessions, 5 here plus 4 on kimi-k3. The previous 1+1 was
+    ## NOT a measured ceiling the way zai's 10 is. It was the conservative
+    ## admission gate: kimi routes stay gated until observed health is
+    ## established by the bounded compatibility probes.
+    ## There is no 429 telemetry for kimi yet, unlike zai. Watch count429
+    ## and back off if overshoot appears: on zai, overshoot does not queue,
+    ## it puts the WHOLE backend into a 30 second cooldown.
     kimi-for-coding:
-      members: [kimi-for-coding, "reg:kimi-for-coding"]
-      max: 1
-      maxQueue: 1
+      members: [kimi-for-coding, "reg:kimi-for-coding", "reg:kimi-for-coding-highspeed"]
+      max: 5
+      maxQueue: 8
       queueTimeoutMs: 30000
     kimi-k3:
-      members: [kimi-k3, "reg:k3"]
-      max: 1
-      maxQueue: 1
+      members: [kimi-k3, "reg:k3", "reg:k3-256k"]
+      max: 4
+      maxQueue: 8
       queueTimeoutMs: 30000
   per_backend:
     ## No ollama pool: the staged codex profile does not declare an ollama backend.
@@ -224,22 +241,52 @@ backends:
     auth_type: kimi_oauth
     credentials_path: ~/.kimi-code/credentials/kimi-code.json
     models:
+      - kimi-for-coding-highspeed
       - kimi-for-coding
     priority: 2
     timeout_ms: 30000
     context_limit: 262144
-    require_observed_health: true
+    ## 2026-09-18: cleared after the bounded probe PASSED. A direct
+    ## upstream call to https://api.kimi.ai/coding/v1 with the synced
+    ## credential returned HTTP 200 and a valid completion.
+    ## This flag cannot self-clear: router.mjs isAvailable() returns
+    ## false while _lastCheck === 0, and _lastCheck is only set by
+    ## recordOutcome() AFTER a request is served, so a backend that has
+    ## never served one never can. Re-arm it only alongside a probe that
+    ## can actually write _lastCheck.
+    require_observed_health: false
+    ## 2026-09-18: declared kimi ids must NOT fall through to another
+    ## provider. Measured 08:55:32Z: a kimi 502 put the owner backend into
+    ## cooldown and the declared id sprayed 4 requests at the codex backend,
+    ## 400 every time, in 13 seconds. Purity keeps a cooled-down owner
+    ## failing as itself instead of erroring as somebody else.
+    provider_purity: true
 
   kimi-k3:
     url: https://api.kimi.ai/coding/v1
     auth_type: kimi_oauth
     credentials_path: ~/.kimi-code/credentials/kimi-code.json
     models:
+      - k3-256k
       - k3
     priority: 2
     timeout_ms: 60000
     context_limit: 1048576
-    require_observed_health: true
+    ## 2026-09-18: cleared after the bounded probe PASSED. A direct
+    ## upstream call to https://api.kimi.ai/coding/v1 with the synced
+    ## credential returned HTTP 200 and a valid completion.
+    ## This flag cannot self-clear: router.mjs isAvailable() returns
+    ## false while _lastCheck === 0, and _lastCheck is only set by
+    ## recordOutcome() AFTER a request is served, so a backend that has
+    ## never served one never can. Re-arm it only alongside a probe that
+    ## can actually write _lastCheck.
+    require_observed_health: false
+    ## 2026-09-18: declared kimi ids must NOT fall through to another
+    ## provider. Measured 08:55:32Z: a kimi 502 put the owner backend into
+    ## cooldown and the declared id sprayed 4 requests at the codex backend,
+    ## 400 every time, in 13 seconds. Purity keeps a cooled-down owner
+    ## failing as itself instead of erroring as somebody else.
+    provider_purity: true
 
   ## REMOVED 2026-08-25 by Chef. Same box as above, his personal 5060, not part
   ## of the chi cluster. This pool had never been instantiated, meaning it had
@@ -327,7 +374,9 @@ model_aliases:
 model_limits:
   ## Kimi Code subscription routes. These stay admission-gated until observed
   ## health is established by the bounded compatibility probes.
+  kimi-for-coding-highspeed:               { max_body_bytes: 838000,   max_system_bytes: 335000  }
   kimi-for-coding:                         { max_body_bytes: 838000,   max_system_bytes: 335000  }
+  k3-256k:                                  { max_body_bytes: 838000,   max_system_bytes: 335000  }
   k3:                                      { max_body_bytes: 2000000,  max_system_bytes: 800000  }
   ornith-1.5-9b:                              { max_body_bytes: 209715,   max_system_bytes: 83886   }
   ornith-1.0-35b:                             { max_body_bytes: 800000,   max_system_bytes: 320000  }
