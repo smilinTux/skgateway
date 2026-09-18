@@ -143,8 +143,30 @@ backends:
   #     - ornith-big
   #   priority: 4
 
-  chiap01-qwen38:
-    url: http://100.80.180.78:18810/v1
+  ## 2026-09-18: chiap08 is declared FIRST on purpose. Both replicas serve the
+  ## same four qwen38 ids and the router load-balances across both (see
+  ## tests/qwen38-source-config.test.mjs "either physical replica can route the
+  ## canonical logical model"), but buildModelCatalog (src/proxy/advertise.mjs)
+  ## emits each model id ONCE and stamps owned_by/provider with the FIRST
+  ## backend that declares it. That single provider string is what every
+  ## capacity-aware consumer reads. skcapstone maps it to one capacity domain
+  ## (fleet/review_capacity.py _capacity_domain) and refuses to dispatch unless
+  ## that ONE domain has max-active > 0.
+  ##
+  ## With chiap01 first, the whole estate believed qwen capacity was
+  ## chiap01-qwen38: max 1, and that replica is the degraded Arc card (38%
+  ## error rate, 23s P50, 466 timeouts) which sits at 1/1 active essentially
+  ## always. Free capacity was therefore permanently 0, every qwen-only card
+  ## got SKIPPED_PRODUCER_ROUTE|reason=no-eligible-route forever, and chiap08
+  ## qwen38 (max 2, 0% errors, 1.2s P50, idle) was invisible while serving most
+  ## of the real traffic anyway.
+  ##
+  ## Declaring chiap08 first advertises the healthy replica that actually
+  ## serves these requests. NEITHER cap changes: chiap01-qwen38 stays max 1 and
+  ## chiap08-qwen38 stays max 2, and both remain live routing candidates. This
+  ## only fixes which one the advertised catalog names.
+  chiap08-qwen38:
+    url: http://100.81.238.58:11439/v1
     auth_type: none
     models:
       - qwen3.8-27b-huihui-abliterated-q4_k_m
@@ -153,8 +175,8 @@ backends:
       - qwen38-abliterated
     priority: 3
 
-  chiap08-qwen38:
-    url: http://100.81.238.58:11439/v1
+  chiap01-qwen38:
+    url: http://100.80.180.78:18810/v1
     auth_type: none
     models:
       - qwen3.8-27b-huihui-abliterated-q4_k_m
