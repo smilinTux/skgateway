@@ -88,6 +88,27 @@ const PROVIDER_BUCKET_RE = /^sk-(zai|glm|kimi|codex|cursor)-(s|m|l)$/i;
 const PROVIDER_ALIASES = Object.freeze({ glm: 'zai' });
 const PUBLIC_L_SUBSCRIPTION_PROVIDERS = new Set(['zai', 'codex']);
 
+/**
+ * Free remote pools that also satisfy `sk-l-public`, alongside the paid
+ * subscriptions above.
+ *
+ * Card a46b53e restricted this bucket to subscription providers for one
+ * reason, stated in its test name: keep public L work OFF sovereign-local
+ * hardware. Nothing about that intent excludes a free REMOTE pool, and the
+ * narrow allowlist it shipped had a practical cost — on a fleet with no Z.ai,
+ * Kimi or Codex credentials configured, `sk-l-public` fail-closed 503 with all
+ * 20 catalog members rejected for the same reason, while `sk-xl-public` and
+ * `sk-m-public` served fine. A public bucket that no deployment can satisfy
+ * teaches callers to stop using buckets.
+ *
+ * Both pools here are discovered `free_only` (skgateway.yaml `discovery:
+ * free`), and both sit in trust zone 2, which `public` already admits and
+ * `internal`/`secret` still refuse. So this widens the MEMBERSHIP of a bucket
+ * whose exposure ceiling is unchanged; it does not relax the ceiling, and the
+ * local-exclusion the card cared about still holds.
+ */
+const PUBLIC_L_FREE_REMOTE_PROVIDERS = new Set(['openrouter', 'nvidia']);
+
 function providerOwns(entry, requested) {
   if (!requested) return true;
   const provider = String(entry?.provider || '').toLowerCase();
@@ -99,7 +120,9 @@ function providerOwns(entry, requested) {
 export function publicLSubscriptionOwns(entry, bucket) {
   if (bucket.provider || !['sk-l-public', 'sk-l'].includes(bucket.bucket)) return true;
   const provider = String(entry?.provider || '').toLowerCase();
-  return PUBLIC_L_SUBSCRIPTION_PROVIDERS.has(provider) || provider === 'kimi' || provider.startsWith('kimi-');
+  return PUBLIC_L_SUBSCRIPTION_PROVIDERS.has(provider)
+    || PUBLIC_L_FREE_REMOTE_PROVIDERS.has(provider)
+    || provider === 'kimi' || provider.startsWith('kimi-');
 }
 
 /**
@@ -468,7 +491,7 @@ export function resolveBucket({
       continue;
     }
     if (!publicLSubscriptionOwns(entry, bucket)) {
-      rejected.push({ id: entry.id, reason: 'sk-l-public admits only Z.ai, Kimi, or Codex subscription providers' });
+      rejected.push({ id: entry.id, reason: 'sk-l-public admits only remote pools: Z.ai, Kimi or Codex subscriptions, or the OpenRouter/NIM free tiers' });
       continue;
     }
     const routabilityRejection = getRoutabilityRejection?.(entry);

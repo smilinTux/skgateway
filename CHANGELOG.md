@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `sk-l-public` and `sk-l` now admit the OpenRouter and NVIDIA NIM free tiers
+  alongside the Z.ai, Kimi and Codex subscriptions. The narrow allowlist landed
+  with a46b53e to keep public L work off sovereign-local hardware; free REMOTE
+  pools never conflicted with that intent, and on a fleet with no Z.ai/Kimi/Codex
+  credentials the bucket fail-closed 503 with all 20 catalog members rejected for
+  the same reason while `sk-m-public` and `sk-xl-public` served normally. Both
+  added pools are discovered `free_only` and sit in trust zone 2, which `public`
+  already admits, so the exposure ceiling is unchanged and `sk-l-internal` /
+  `sk-l-secret` still refuse them. Local models remain excluded.
+
 - Validate every logical bucket member against the selected backend's exact
   model claim before handoff, skipping stale catalog aliases with attributable
   evidence while preserving the requested bucket and served-model identity.

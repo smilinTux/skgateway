@@ -161,17 +161,35 @@ describe('C9: eligibility composes the floor with the sovereignty ceiling', () =
     assert.ok(rejected.find((r) => r.id === 'tiny-free').reason.includes('below floor M'));
   });
 
-  test('sk-l-public excludes local Qwen and keeps eligible subscription providers', () => {
+  test('sk-l-public excludes local Qwen and keeps every eligible remote pool', () => {
     const cloudCatalog = [
       { ...entry('qwen3.8-27b', { zone: TRUST_ZONES.SOVEREIGN_LOCAL, declared: 'L' }), provider: 'local' },
       { ...entry('glm-4.7', { zone: TRUST_ZONES.FREE_REMOTE, declared: 'L' }), provider: 'zai' },
       { ...entry('kimi-for-coding', { zone: TRUST_ZONES.FREE_REMOTE, declared: 'L' }), provider: 'kimi-for-coding' },
       { ...entry('gpt-5.6-luna', { zone: TRUST_ZONES.FREE_REMOTE, declared: 'L' }), provider: 'codex' },
+      { ...entry('vendor/model-30b:free', { zone: TRUST_ZONES.FREE_REMOTE, declared: 'L' }), provider: 'openrouter' },
+      { ...entry('nvidia/nemotron-3-ultra', { zone: TRUST_ZONES.FREE_REMOTE, declared: 'L' }), provider: 'nvidia' },
     ];
     for (const id of ['sk-l-public', 'sk-l']) {
       const { members, rejected } = resolveBucket({ bucket: parseBucketId(id), catalog: cloudCatalog });
-      assert.deepEqual(members.map((model) => model.id), ['glm-4.7', 'kimi-for-coding', 'gpt-5.6-luna']);
-      assert.match(rejected.find((model) => model.id === 'qwen3.8-27b').reason, /subscription providers/);
+      assert.deepEqual(members.map((model) => model.id), [
+        'glm-4.7', 'kimi-for-coding', 'gpt-5.6-luna', 'vendor/model-30b:free', 'nvidia/nemotron-3-ultra',
+      ]);
+      // The local exclusion card a46b53e exists for is the part that must hold.
+      assert.match(rejected.find((model) => model.id === 'qwen3.8-27b').reason, /admits only remote pools/);
+      assert.equal(members.some((model) => model.id === 'qwen3.8-27b'), false);
+    }
+  });
+
+  test('the free remote pools stay out of internal and secret L buckets', () => {
+    const cloudCatalog = [
+      { ...entry('vendor/model-30b:free', { zone: TRUST_ZONES.FREE_REMOTE, declared: 'L' }), provider: 'openrouter' },
+      { ...entry('nvidia/nemotron-3-ultra', { zone: TRUST_ZONES.FREE_REMOTE, declared: 'L' }), provider: 'nvidia' },
+    ];
+    for (const id of ['sk-l-internal', 'sk-l-secret']) {
+      const { members, rejected } = resolveBucket({ bucket: parseBucketId(id), catalog: cloudCatalog });
+      assert.deepEqual(members, [], `${id} must not admit a free remote pool`);
+      assert.ok(rejected.every((model) => /trust zone|exceeds ceiling/i.test(model.reason)));
     }
   });
 

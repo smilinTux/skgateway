@@ -77,11 +77,9 @@ test('evaluated catalog carries capabilities and an explicit decision for every 
   assert.equal(entry.capabilities.tool_use.score, 1);
   assert.equal(entry.capabilities.trust_zone, 2);
   assert.equal(entry.bucket_placement.length, 28);
-  assert.equal(entry.bucket_placement.find((item) => item.bucket === 'sk-l-public').eligible, false);
-  assert.match(
-    entry.bucket_placement.find((item) => item.bucket === 'sk-l-public').reason,
-    /subscription providers/,
-  );
+  // An OpenRouter free model is a REMOTE pool at trust zone 2, so the public L
+  // bucket admits it; only the internal/secret ceilings below still refuse it.
+  assert.equal(entry.bucket_placement.find((item) => item.bucket === 'sk-l-public').eligible, true);
   assert.match(
     entry.bucket_placement.find((item) => item.bucket === 'sk-l-internal').reason,
     /trust_zone 2 exceeds ceiling 1/,
