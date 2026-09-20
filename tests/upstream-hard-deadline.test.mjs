@@ -22,11 +22,11 @@ function listen(handler) {
   });
 }
 
-async function call(port, { timeoutMs = 0, hardMs = 0 } = {}) {
+async function call(port, { timeoutMs = 0, hardMs = 0, signal = null } = {}) {
   const startedAt = Date.now();
   const res = await sendUpstream(
     "/v1/chat/completions", "POST", {}, Buffer.from("{}"),
-    new URL(`http://127.0.0.1:${port}`), timeoutMs, null, 0, hardMs,
+    new URL(`http://127.0.0.1:${port}`), timeoutMs, signal, 0, hardMs,
   );
   let code = null;
   try { code = JSON.parse(res.body.toString())?.error?.code ?? null; } catch { /* non-JSON body */ }
@@ -85,9 +85,19 @@ test("timeout_ms=0 derives no ceiling and keeps the existing behaviour", async (
   const { server, port } = await listen(dribble);
   t.after(() => server.close());
   // A backend that declares no idle timeout is not given one implicitly.
+  //
+  // This request is EXPECTED never to settle, which is the assertion. It must
+  // therefore be cancelled explicitly once observed: leaving it pending holds a
+  // live socket and an unresolved promise open, and under full-suite load that
+  // is enough to keep the runner alive after the last test reports. Observed as
+  // a hang of the whole 160-file suite while this file passed alone.
+  const controller = new AbortController();
+  const pending = call(port, { timeoutMs: 0, signal: controller.signal });
   const outcome = await Promise.race([
-    call(port, { timeoutMs: 0 }).then(() => "settled"),
+    pending.then(() => "settled"),
     new Promise((r) => setTimeout(() => r("still-open"), 4000)),
   ]);
   assert.equal(outcome, "still-open");
+  controller.abort();
+  await pending;
 });
