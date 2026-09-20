@@ -4621,9 +4621,19 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       failureClass: recoveryFailureClass,
       authoritativeRecovery: recoveryProbeSucceeded,
     });
+    // Model-claim tracking always sees the gateway's outward status, never
+    // the raw upstream one. When modelContractFailure is true, res.status is
+    // already 502 (it is part of the condition above), so the two arms below
+    // were never meant to diverge: passing upstreamStatus (the original 2xx)
+    // here fed recordModelClaimOutcome's success branch, which deletes the
+    // failure entry, so every content-invalid completion was recorded as a
+    // claim success and could never accumulate toward exact-claim
+    // quarantine. Passing res.status lets a repeated malformed_response or
+    // response_budget 502 accumulate and eventually quarantine the exact
+    // model claim, as the comment above already said it should.
     const claimTransition = backend.recordModelClaimOutcome(
       candidateModel,
-      modelContractFailure ? upstreamStatus : res.status,
+      res.status,
     );
     if (claimTransition) {
       const quarantined = claimTransition.transition === "quarantined";
