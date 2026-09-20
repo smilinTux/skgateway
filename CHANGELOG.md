@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Record a response-contract failure against model-claim quarantine instead of
+  clearing it. `recordModelClaimOutcome()` was being passed `upstreamStatus`
+  (the original 2xx) rather than `res.status` (the gateway 502) whenever
+  `modelContractFailure` was true, and since any 2xx is treated as success and
+  DELETES the failure entry, every `invalid_upstream_completion`,
+  `invalid_upstream_tool_calls` and non-budget `empty_upstream_response` was
+  counted as a clean success. The counter that should detect "this exact model
+  keeps returning garbage" could therefore never accumulate, which is the
+  opposite of what the adjacent comment already stated. Measured live:
+  `chiap08-qwen38` showed 80 errors of 3,941 requests, about 8 percent lifetime,
+  while still reporting `quarantined: false, consecutiveFailures: 0`. Shared
+  transport health is deliberately unchanged, since the transport genuinely
+  worked; only the model-claim argument is corrected.
+
 - Poll `kimi_oauth` backends so their tokens refresh without traffic. The
   existing refresh ran only as a side effect of a request reaching
   `buildAuthHeaders()`, so once a backend went quiet, from a lull or because the
