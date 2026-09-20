@@ -84,6 +84,10 @@ import { codexPurityProblems } from "../policy/codex-purity.mjs";
 const KIMI_OAUTH_HOST = "https://auth.kimi.com";
 const KIMI_OAUTH_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098";
 const KIMI_REFRESH_BUFFER_MS = 60_000;
+// How often startKimiAuthKeepalive polls kimi_oauth backends (see that
+// function below). Well under KIMI_REFRESH_BUFFER_MS so the poll cannot
+// step over the refresh window between two ticks.
+const KIMI_KEEPALIVE_INTERVAL_MS = 30_000;
 const kimiRefreshes = new Map();
 
 function writeJsonAtomic(filePath, value) {
@@ -1695,6 +1699,66 @@ export class Backend {
       return null;
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Kimi OAuth proactive keepalive
+// ---------------------------------------------------------------------------
+
+/**
+ * Poll every kimi_oauth backend on a timer so its cached token is refreshed
+ * and persisted to disk before it expires, independent of request traffic.
+ *
+ * Kimi access tokens are short lived (observed expires_in: 900 seconds), and
+ * the design this backend shipped with (see the kimi_oauth feat commit above
+ * _getKimiAuthHeaders) assumed an external kimi CLI keepalive timer kept the
+ * credentials file fresh, with the gateway only re-reading it. That external
+ * timer was never installed on either chi host: systemctl reports
+ * kimi-auth-keepalive.timer as not-found, not merely disabled. PR #137 added
+ * a fallback so _getKimiAuthHeaders refreshes the cached token itself near
+ * expiry, but only as a side effect of a request calling buildAuthHeaders.
+ * If a backend goes quiet, whether from a lull in traffic or because the
+ * router failed it over to another backend after an earlier error, nothing
+ * ever calls that path again. The in-memory token and the on-disk file both
+ * go stale, and because the actual failure mode on an expired Kimi token is
+ * a hang rather than a clean 401, no error ever arrives to shake it loose.
+ * The process then serves (or hangs) on a dead token until it is restarted.
+ *
+ * This scheduler closes that gap: it does not duplicate the refresh logic,
+ * it just calls the existing, already-tested buildAuthHeaders() on a timer
+ * so the near-expiry check inside it fires on a schedule instead of only on
+ * demand.
+ *
+ * @param {object} options
+ * @param {() => Backend[]} options.getBackends
+ * @param {number} [options.intervalMs]
+ * @param {typeof setInterval} [options.setIntervalFn]
+ * @returns {{ tick: () => Promise<void>, timer: NodeJS.Timeout }}
+ */
+export function startKimiAuthKeepalive({
+  getBackends, intervalMs = KIMI_KEEPALIVE_INTERVAL_MS, setIntervalFn = setInterval,
+}) {
+  let inFlight = false;
+  const tick = async () => {
+    if (inFlight) return;
+    inFlight = true;
+    try {
+      const backends = getBackends() || [];
+      for (const backend of backends) {
+        if (!backend || backend.auth_type !== "kimi_oauth") continue;
+        try {
+          await backend.buildAuthHeaders();
+        } catch (error) {
+          console.error(`[router] backend=${backend.id} kimi keepalive tick failed: ${error.message}`);
+        }
+      }
+    } finally {
+      inFlight = false;
+    }
+  };
+  const timer = setIntervalFn(tick, intervalMs);
+  timer?.unref?.();
+  return { tick, timer };
 }
 
 // ---------------------------------------------------------------------------
