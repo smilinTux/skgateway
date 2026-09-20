@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Poll `kimi_oauth` backends so their tokens refresh without traffic. The
+  existing refresh ran only as a side effect of a request reaching
+  `buildAuthHeaders()`, so once a backend went quiet, from a lull or because the
+  router failed it over after an earlier error, nothing called that path again
+  and both the in-memory token and the on-disk file went stale with nothing to
+  wake them. An expired kimi token fails by HANGING rather than returning a
+  clean 401, so no error ever arrived to trigger the reactive check either, and
+  only a gateway restart recovered it. A `setInterval` keepalive, following the
+  existing `startCapacityProbeScheduler` pattern, polls every `kimi_oauth`
+  backend independent of traffic, persists refreshed tokens through the existing
+  write path, is unref'd so it cannot hold the process open, guards against
+  overlapping ticks, and logs and continues on a failed refresh.
+
 - Bound an upstream attempt by wall clock so a wedged backend becomes visible to
   health. `timeout_ms` is applied as a Node socket IDLE timer, which resets on
   any socket activity, so an upstream that dribbles bytes never trips it and

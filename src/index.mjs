@@ -12,7 +12,7 @@
 import http from "node:http";
 import { loadConfig, getConfig } from "./config.mjs";
 import { createProxyServer, handleRequest, buildConfig, trimSystemMessages, trimConversationHistory } from "./proxy/core.mjs";
-import { createRouter, routeAndSend } from "./proxy/router.mjs";
+import { createRouter, routeAndSend, startKimiAuthKeepalive } from "./proxy/router.mjs";
 import { normalizeSystemMessageOrder, sanitizeResponse } from "./proxy/sanitizer.mjs";
 import { applyCapacityView, availabilityState, buildModelCatalog, reconcileModeFromConfig, tagLocalModels, mergeDiscoveredCatalog, isModelAvailable, excludedModelIds, withoutExcludedModels } from "./proxy/advertise.mjs";
 import { loadAllowlist, saveAllowlist, applyAllowlist } from "./advertise.mjs";
@@ -784,6 +784,13 @@ const recoveryProbeTargets = () => Object.entries(config.backends || {})
     });
   })
   .filter((target) => target.model);
+
+// Kimi OAuth tokens (900s TTL) used to only refresh as a side effect of a
+// request reaching buildAuthHeaders(). A quiet backend, or one the router
+// failed over away from after an earlier error, stopped calling that path
+// and its token went stale until a restart. This polls it independently of
+// traffic; see startKimiAuthKeepalive in proxy/router.mjs for the full story.
+startKimiAuthKeepalive({ getBackends: router.getBackends });
 
 startCapacityProbeScheduler({
   targets: recoveryProbeTargets,
