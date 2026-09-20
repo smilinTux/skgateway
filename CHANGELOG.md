@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Bound an upstream attempt by wall clock so a wedged backend becomes visible to
+  health. `timeout_ms` is applied as a Node socket IDLE timer, which resets on
+  any socket activity, so an upstream that dribbles bytes never trips it and
+  hangs indefinitely. Because backend health is recorded only from a COMPLETED
+  attempt, a request that never resolves never reaches `recordOutcome()`.
+  Measured 2026-09-19: `kimi-for-coding` carried `timeout_ms: 30000`, hung past
+  45s, and `/health` reported `status=up errorRate=0 totalRequests=486
+  totalErrors=0` while every request to it was dead. The new ceiling is armed
+  once at send time and never reset by activity, derived as `timeout_ms * 3` so
+  a slow completion is never cut off while a wedge still terminates and reaches
+  `recordOutcome(false)`. A backend with no `timeout_ms` keeps the previous
+  unbounded behaviour, because giving it a ceiling is a config decision.
+
 - `sk-l-public` and `sk-l` now admit the OpenRouter and NVIDIA NIM free tiers
   alongside the Z.ai, Kimi and Codex subscriptions. The narrow allowlist landed
   with a46b53e to keep public L work off sovereign-local hardware; free REMOTE
