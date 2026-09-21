@@ -4089,12 +4089,25 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     const claimsHere = candidateModel && typeof backend.supportsModel === "function"
       ? backend.supportsModel(candidateModel)
       : false;
-    const anyClaimer = typeof router.getBackends === "function" && candidateModel
-      ? router.getBackends().some(
+    const claimerCount = typeof router.getBackends === "function" && candidateModel
+      ? router.getBackends().filter(
           (b) => typeof b.supportsModel === "function" && b.supportsModel(candidateModel)
-        )
-      : false;
-    recordModelOutcome(candidateModel, { status: res.status, now: Date.now(), claiming: claimsHere || !anyClaimer });
+        ).length
+      : 0;
+    // A permanent error from one of several claiming backends is evidence for
+    // that exact backend-model claim, not for global model EOL. With zero or
+    // one claimants it remains the best lifecycle evidence available;
+    // successful completions always remain valid evidence from any door.
+    const lifecycleClaiming = res.status >= 200 && res.status < 300
+      ? true
+      : res.status === 404
+        ? claimerCount <= 1
+        : (claimsHere || claimerCount === 0);
+    recordModelOutcome(candidateModel, {
+      status: res.status,
+      now: Date.now(),
+      claiming: lifecycleClaiming,
+    });
 
     // Feed the real completion outcome back into the local-health verdict so a
     // wedged local backend that got past the probe but then hung/errored is
