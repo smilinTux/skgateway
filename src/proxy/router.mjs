@@ -1051,6 +1051,12 @@ export class Backend {
       totalErrors: this._totalErrors,
       quarantined: this._quarantined,
       consecutiveFailures: this._consecutiveFailures,
+      // Expose exact backend-model claims quarantined by repeated fast
+      // failures. A model claim is narrower than backend health: another
+      // backend may continue serving the same model.
+      quarantinedModels: [...this._modelClaimFailures]
+        .filter(([, state]) => state?.quarantinedAt)
+        .map(([model]) => model),
     };
   }
 
