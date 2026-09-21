@@ -420,7 +420,11 @@ function parseRetryAfterMs(value) {
  * @returns {boolean}
  */
 function isFailoverStatus(status) {
-  return status >= 500 || status === 429 || status === 402;
+  // A model-specific 404 means this backend cannot serve the requested model;
+  // try another exact claimant rather than returning a misleading terminal
+  // error. The claim quarantine counter then removes only this backend-model
+  // door after repeated observations.
+  return status === 404 || status >= 500 || status === 429 || status === 402;
 }
 
 /**
@@ -958,6 +962,13 @@ export class Backend {
    * wrong answers quarantine. Success clears the exact claim. 504 and other
    * slow/ambiguous outcomes do not participate.
    */
+  recordModelStatus(model, status) {
+    // Compatibility wrapper for callers that report a backend-model result
+    // directly. Completion timeouts are not fast claim failures and must not
+    // quarantine a claim.
+    return this.recordModelClaimOutcome(model, status);
+  }
+
   recordModelClaimOutcome(model, status) {
     if (!model || !this.supportsModel(model) || this.model_claim_quarantine_threshold <= 0) return null;
     if (status >= 200 && status < 300) {
