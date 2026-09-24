@@ -14,17 +14,19 @@ import { ConnectionPool } from "../src/proxy/connection-pool.mjs";
 const config = loadYaml(readFileSync(new URL("../config/skgateway-codex.yaml", import.meta.url), "utf8"));
 
 describe("Kimi admission contract", () => {
-  test("declares exact one-active/one-queued family domains and mappings", () => {
+  test("declares current Kimi family domains and mappings", () => {
     assert.deepEqual(config.pooling.capacity_domains["kimi-for-coding"], {
-      members: ["kimi-for-coding", "reg:kimi-for-coding"], max: 1, maxQueue: 1, queueTimeoutMs: 30000,
+      members: ["kimi-for-coding", "reg:kimi-for-coding", "reg:kimi-for-coding-highspeed"],
+      max: 5, maxQueue: 8, queueTimeoutMs: 30000,
     });
     assert.deepEqual(config.pooling.capacity_domains["kimi-k3"], {
-      members: ["kimi-k3", "reg:k3"], max: 1, maxQueue: 1, queueTimeoutMs: 30000,
+      members: ["kimi-k3", "reg:k3", "reg:k3-256k"],
+      max: 4, maxQueue: 8, queueTimeoutMs: 30000,
     });
-    assert.equal(config.backends["kimi-for-coding"].models[0], "kimi-for-coding");
-    assert.equal(config.backends["kimi-k3"].models[0], "k3");
-    assert.equal(config.backends["kimi-for-coding"].require_observed_health, true);
-    assert.equal(config.backends["kimi-k3"].require_observed_health, true);
+    assert.deepEqual(config.backends["kimi-for-coding"].models, ["kimi-for-coding-highspeed", "kimi-for-coding"]);
+    assert.deepEqual(config.backends["kimi-k3"].models, ["k3-256k", "k3"]);
+    assert.equal(config.backends["kimi-for-coding"].require_observed_health, false);
+    assert.equal(config.backends["kimi-k3"].require_observed_health, false);
   });
 
   test("unknown Kimi health fails closed and auth is read-only", async () => {
