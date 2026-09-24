@@ -263,7 +263,14 @@ function _openaiJsonToSSE(writer, resBody, chunkSize) {
     });
   }
 
-  if (resBody.usage) writer.write({ ...base, choices: [], usage: resBody.usage });
+  if (resBody.usage) {
+    const usage = { ...resBody.usage };
+    // vLLM JSON uses null for absent optional breakdowns; canonical SSE omits them.
+    for (const key of ["prompt_tokens_details", "completion_tokens_details"]) {
+      if (usage[key] === null) delete usage[key];
+    }
+    writer.write({ ...base, choices: [], usage });
+  }
 
   writer.writeDone();
 }
