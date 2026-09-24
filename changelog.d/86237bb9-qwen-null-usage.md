@@ -1,0 +1,1 @@
+- Omit absent null token breakdowns when converting Qwen/vLLM buffered completions to canonical SSE. Preserve strict response validation and the upstream usage object.
