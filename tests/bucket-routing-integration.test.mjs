@@ -582,6 +582,7 @@ ${extraRoles}defaults:
       zai: ['glm-s', 'glm-m', 'glm-l'],
       kimi: ['kimi-s', 'kimi-m', 'kimi-l'],
       codex: ['gpt-test-s', 'gpt-test-m', 'gpt-test-l'],
+      deepseek: ['deepseek-s', 'deepseek-m', 'deepseek-l'],
     };
     const classes = ['S', 'M', 'L'];
     const models = [];
@@ -604,6 +605,7 @@ ${extraRoles}defaults:
         const routed = await backing.route({ ...request, model: 'pool-l-local' });
         const candidate = Array.isArray(routed) ? routed[0] : routed;
         if (request.model.startsWith('gpt-')) candidate.backend.provider = 'codex';
+        if (request.model.startsWith('deepseek-')) candidate.backend.provider = 'deepseek';
         return { ...candidate, model: request.model };
       },
     };
@@ -789,7 +791,7 @@ ${extraRoles}defaults:
     assert.equal(error.model, 'sk-xl-secrets');
     assert.match(error.reason, /sensitivity "secrets" is not/);
     assert.ok(error.valid_buckets.includes('sk-xl-secret'), 'the caller is told the correction, not left guessing');
-    assert.equal(error.valid_buckets.length, 28);
+    assert.equal(error.valid_buckets.length, 31);
     assert.equal(pool.state.count, 0, 'nothing was routed');
 
     const lines = audit.read();

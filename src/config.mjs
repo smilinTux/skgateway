@@ -331,6 +331,7 @@ const DEFAULTS = {
       nvidia: { enabled: true, free_only: true, chat_only: true },
       openrouter: { enabled: true, free_only: true, chat_only: true },
       anthropic: { enabled: false, free_only: false, chat_only: true },
+      deepseek: { enabled: false, free_only: false, chat_only: true },
     },
   },
 
@@ -1018,6 +1019,10 @@ function validate(cfg, removedBackendIds = new Set()) {
   // discovery
   if (typeof cfg.discovery.enabled !== 'boolean')
     errs.push('discovery.enabled must be a boolean');
+  for (const [name, provider] of Object.entries(cfg.discovery.providers ?? {})) {
+    if (typeof provider?.enabled !== 'boolean')
+      errs.push(`discovery.providers.${name}.enabled must be a boolean`);
+  }
 
   // authorization
   if (typeof cfg.authz.enforce !== 'boolean')

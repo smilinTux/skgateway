@@ -83,10 +83,21 @@ export function classRank(cls, vocab = gradeVocabulary()) {
 /** Bucket ids look like `sk-<class>-<sensitivity>`, case-insensitive. */
 const BUCKET_RE = /^sk-(s|m|l|xl)-(public|internal|secret)$/i;
 const SHORT_BUCKET_RE = /^sk-(s|m|l|xl)$/i;
-const PROVIDER_BUCKET_RE = /^sk-(zai|glm|kimi|codex|cursor)-(s|m|l)$/i;
+const PROVIDER_BUCKET_RE = /^sk-(zai|glm|kimi|codex|cursor|deepseek)-(s|m|l)$/i;
 
 const PROVIDER_ALIASES = Object.freeze({ glm: 'zai' });
 const PUBLIC_L_SUBSCRIPTION_PROVIDERS = new Set(['zai', 'codex']);
+
+/**
+ * Paid cloud providers that also satisfy `sk-l-public` by per-model
+ * qualification. DeepSeek publishes no pricing in its catalog (`free: false`,
+ * tier `paid-cloud`), so it is not a subscription and not a free pool, but a
+ * DeepSeek model that independently clears the L floor is a remote pool whose
+ * exposure ceiling is unchanged: it sits in the least-trusted zone, which
+ * `public` already admits and `internal`/`secret` still refuse. Admitting it
+ * widens MEMBERSHIP only, exactly like the free-remote pools above.
+ */
+const PUBLIC_L_PAID_CLOUD_PROVIDERS = new Set(['deepseek']);
 
 /**
  * Free remote pools that also satisfy `sk-l-public`, alongside the paid
@@ -122,6 +133,7 @@ export function publicLSubscriptionOwns(entry, bucket) {
   const provider = String(entry?.provider || '').toLowerCase();
   return PUBLIC_L_SUBSCRIPTION_PROVIDERS.has(provider)
     || PUBLIC_L_FREE_REMOTE_PROVIDERS.has(provider)
+    || PUBLIC_L_PAID_CLOUD_PROVIDERS.has(provider)
     || provider === 'kimi' || provider.startsWith('kimi-');
 }
 
@@ -184,7 +196,7 @@ export function isBucketId(id) {
  * `sk-code-review-fast` has four and never matches.
  */
 const BUCKET_SHAPE_RE = /^sk-([^-]*)-([^-]*)$/i;
-const FOCUSED_BUCKET_SHAPE_RE = /^sk-(zai|glm|kimi|codex|cursor)-([^-]+)$/i;
+const FOCUSED_BUCKET_SHAPE_RE = /^sk-(zai|glm|kimi|codex|cursor|deepseek)-([^-]+)$/i;
 
 /**
  * Did the caller MEAN to address a bucket and get it wrong?
@@ -281,7 +293,7 @@ export function allBuckets(vocab = gradeVocabulary()) {
   for (const c of classes) out.push({ bucket: `sk-${String(c).toLowerCase()}`, model_class: String(c).toUpperCase(), sensitivity: 'public' });
   // Cursor parses fail-closed now but is advertised only after its transport
   // adapter and health probes qualify it.
-  for (const provider of ['zai', 'glm', 'kimi', 'codex']) {
+  for (const provider of ['zai', 'glm', 'kimi', 'codex', 'deepseek']) {
     for (const c of classes.filter((value) => value !== 'XL')) {
       out.push({
         bucket: `sk-${provider}-${String(c).toLowerCase()}`,

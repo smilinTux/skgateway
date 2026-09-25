@@ -70,6 +70,15 @@ describe('C9: bucket addressing', () => {
     assert.deepEqual(parseBucketId('sk-kimi-m'), {
       bucket: 'sk-kimi-m', model_class: 'M', sensitivity: 'public', provider: 'kimi',
     });
+    assert.deepEqual(parseBucketId('sk-deepseek-s'), {
+      bucket: 'sk-deepseek-s', model_class: 'S', sensitivity: 'public', provider: 'deepseek',
+    });
+    assert.deepEqual(parseBucketId('sk-deepseek-m'), {
+      bucket: 'sk-deepseek-m', model_class: 'M', sensitivity: 'public', provider: 'deepseek',
+    });
+    assert.deepEqual(parseBucketId('sk-deepseek-l'), {
+      bucket: 'sk-deepseek-l', model_class: 'L', sensitivity: 'public', provider: 'deepseek',
+    });
   });
 
   test('an ordinary model id is not a bucket', () => {
@@ -95,10 +104,33 @@ describe('C9: bucket addressing', () => {
     assert.deepEqual(v.sensitivity.values, ['public', 'internal', 'secret']);
     // risk is a SEPARATE axis and must not have been folded into the bucket id
     assert.deepEqual(v.risk.values, ['low', 'med', 'high', 'crit']);
-    assert.equal(allBuckets().length, 28, '12 scoped, 4 short public, and 12 provider-focused S/M/L buckets');
+    assert.equal(allBuckets().length, 31, '12 scoped, 4 short public, and 15 provider-focused S/M/L buckets');
     assert.equal(parseBucketId('sk-kimi-xl'), null);
     assert.equal(looksLikeBucketAttempt('sk-kimi-xl').attempted, true);
     assert.equal(allBuckets().some(({ bucket }) => bucket.startsWith('sk-cursor-')), false);
+    // DeepSeek is advertised for S/M/L only. There is no XL focused bucket.
+    const deepseekBuckets = allBuckets()
+      .filter(({ bucket }) => bucket.startsWith('sk-deepseek-'))
+      .map(({ bucket }) => bucket)
+      .sort();
+    assert.deepEqual(deepseekBuckets, ['sk-deepseek-l', 'sk-deepseek-m', 'sk-deepseek-s']);
+  });
+
+  test('DeepSeek focused buckets are S/M/L only, never XL', () => {
+    for (const cls of ['s', 'm', 'l']) {
+      assert.deepEqual(parseBucketId(`sk-deepseek-${cls}`), {
+        bucket: `sk-deepseek-${cls}`,
+        model_class: cls.toUpperCase(),
+        sensitivity: 'public',
+        provider: 'deepseek',
+      });
+    }
+    // No XL, and no sensitivity-scoped DeepSeek bucket.
+    for (const near of ['sk-deepseek-xl', 'sk-deepseek-public', 'sk-deepseek-internal', 'sk-deepseek-secret']) {
+      assert.equal(parseBucketId(near), null, `${near} must not resolve`);
+    }
+    assert.equal(looksLikeBucketAttempt('sk-deepseek-xl').attempted, true);
+    assert.match(looksLikeBucketAttempt('sk-deepseek-xl').reason, /S, M, or L/);
   });
 });
 
@@ -310,10 +342,11 @@ describe('provider-focused buckets', () => {
     { ...entry('kimi-for-coding', { zone: 2, declared: 'M' }), provider: 'kimi-for-coding' },
     { ...entry('gpt-5.6-luna', { zone: 2, declared: 'L' }), provider: 'codex' },
     { ...entry('cursor-model', { zone: 2, declared: 'L' }), provider: 'cursor' },
+    { ...entry('deepseek-v4-pro', { zone: 2, declared: 'L' }), provider: 'deepseek' },
   ];
 
   test('provider routes never cross ownership', () => {
-    for (const id of ['sk-zai-m', 'sk-glm-m', 'sk-kimi-m', 'sk-codex-m', 'sk-cursor-m']) {
+    for (const id of ['sk-zai-m', 'sk-glm-m', 'sk-kimi-m', 'sk-codex-m', 'sk-cursor-m', 'sk-deepseek-m']) {
       const bucket = parseBucketId(id);
       const { members } = resolveBucket({ bucket, catalog });
       assert.ok(members.length > 0, `${id} has an eligible member`);
@@ -323,9 +356,18 @@ describe('provider-focused buckets', () => {
           ? ['kimi-for-coding']
           : bucket.provider === 'codex'
             ? ['gpt-5.6-luna']
-            : ['cursor-model'];
+            : bucket.provider === 'cursor'
+              ? ['cursor-model']
+              : ['deepseek-v4-pro'];
       assert.deepEqual(members.map(({ id: memberId }) => memberId), expected, `${id} stays with its provider`);
     }
+  });
+
+  test('DeepSeek focus never admits another provider or a private variant', () => {
+    const { members } = resolveBucket({ bucket: parseBucketId('sk-deepseek-l'), catalog });
+    assert.deepEqual(members.map((model) => model.id), ['deepseek-v4-pro']);
+    assert.equal(parseBucketId('sk-deepseek-l-internal'), null);
+    assert.equal(parseBucketId('sk-deepseek-l-secret'), null);
   });
 
   test('sk-glm-l and sk-zai-l remain exact Z.ai-only', () => {
