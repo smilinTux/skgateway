@@ -28,6 +28,7 @@ import { homedir } from 'node:os';
 import { load as yamlLoad } from 'js-yaml';
 import { isRegistryRouted, loadRegistry } from './proxy/registry.mjs';
 import { assertCodexConfigPurity, assertCodexRegistryPurity } from './policy/codex-purity.mjs';
+import { normalizeGenericParticipation } from './policy/generic-participation.mjs';
 
 // ─── paths ────────────────────────────────────────────────────────────────────
 
@@ -265,6 +266,18 @@ const DEFAULTS = {
   routing: {
     strict_targets: true,
     match_enabled: false,
+    // Generic bucket participation (card 8aca26e9 / G3). Strict, hot-reloadable
+    // policy over the open generic S/M/L buckets only: favor or disable a
+    // provider or model there without touching direct routes or provider-focused
+    // `sk-<provider>-<bucket>` routes. Normalized by
+    // normalizeGenericParticipation() in validate(), so boot and SIGHUP reload
+    // share one validator and an invalid candidate never replaces the active
+    // policy. Empty means every routable provider participates with weight 1.
+    generic_participation: {
+      providers: {},
+      models: {},
+      buckets: {},
+    },
   },
 
   // CapAuth agent-identity (SKGateway P2.1). Every /v1/* request is resolved to
@@ -903,6 +916,25 @@ export function assertProviderRoutes(
     }
   }
 
+  // Generic participation policy (card 8aca26e9 / G3). Run the SAME strict
+  // normalizer at boot and on every SIGHUP reload; on any schema violation push
+  // an error so the candidate config is rejected and the active policy is left
+  // untouched. Normalizing in place means consumers always read a frozen,
+  // validated policy.
+  try {
+    const routing = cfg.routing;
+    const normalized = normalizeGenericParticipation(
+      routing && typeof routing === 'object'
+        ? routing.generic_participation
+        : undefined,
+    );
+    if (routing && typeof routing === 'object') {
+      routing.generic_participation = normalized;
+    }
+  } catch (err) {
+    errs.push(`routing.generic_participation: ${err.message}`);
+  }
+
   // Codex is a provider boundary, not a capability hint. Validate both the
   // configured backends and live registry at boot and reload so a Codex-named
   // direct target, alias or bucket cannot point at another provider even
@@ -1218,8 +1250,10 @@ function _handleSighup(silent) {
     _current = next;
     emitter.emit('config-changed', next, prev);
     if (!silent) process.stderr.write('[skgateway:config] Config reloaded successfully.\n');
+    return { ok: true };
   } catch (err) {
     process.stderr.write(`[skgateway:config] Reload failed — keeping old config: ${err.message}\n`);
+    return { ok: false, error: err };
   }
 }
 
@@ -1231,12 +1265,7 @@ function _handleSighup(silent) {
  * @returns {{ ok: boolean, error?: Error }}
  */
 export function reloadConfig(silent = false) {
-  try {
-    _handleSighup(silent);
-    return { ok: true };
-  } catch (err) {
-    return { ok: false, error: err };
-  }
+  return _handleSighup(silent);
 }
 
 /**
