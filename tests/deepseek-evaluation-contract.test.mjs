@@ -5,6 +5,8 @@ import {
   CASE_TYPES,
   evaluateDeepSeekQualification,
   loadQualificationCases,
+  qualificationResultHash,
+  serializeQualificationResult,
 } from '../qualification/deepseek/evaluate.mjs';
 
 const attribution = {
@@ -23,7 +25,7 @@ function passingFixtures(cases) {
     return [item.id, {
       status: 200,
       latency_ms: 25,
-      attribution,
+      attribution: { ...attribution },
       body: { model: attribution.served_model, choices: [{ message }], usage: {
         prompt_tokens: 20, completion_tokens: 5, total_tokens: 25,
       } },
@@ -100,5 +102,52 @@ describe('G5 DeepSeek public synthetic qualification contract', () => {
     await assert.rejects(() => evaluateDeepSeekQualification({
       gatewayUrl: 'http://127.0.0.1:18780/v1', route: 'sk-deepseek-l', fixtureResponses: fixtures,
     }), /malformed/);
+  });
+
+  test('multi-megabyte and syntactically invalid attribution values fail closed', async () => {
+    const cases = loadQualificationCases();
+    for (const servedModel of [
+      'x'.repeat(2_000_000),
+      'deepseek-v4-pro\ncredential=value',
+      '../deepseek-v4-pro',
+    ]) {
+      const fixtures = passingFixtures(cases);
+      for (const response of Object.values(fixtures)) {
+        response.attribution = { ...response.attribution, served_model: servedModel };
+        response.body = { ...response.body, model: servedModel };
+      }
+      await assert.rejects(() => evaluateDeepSeekQualification({
+        gatewayUrl: 'http://127.0.0.1:18780/v1',
+        route: 'sk-deepseek-l',
+        fixtureResponses: fixtures,
+      }), /attribution mismatch/);
+    }
+  });
+
+  test('reviewed result digests reproduce exactly from bounded deterministic fixtures', async () => {
+    const cases = loadQualificationCases();
+    const expected = {
+      'deepseek-ai/deepseek-v4-flash': '4da76f516db4ef54613f54907dc7238fce22487123a2c388ffcb89937c0cf091',
+      'deepseek-ai/deepseek-v4-pro': '387fc51742819e5185a87a3b2514925ba82d70070b2fe8a9ba816c26c7e2e199',
+    };
+    for (const [servedModel, digest] of Object.entries(expected)) {
+      const fixtures = passingFixtures(cases);
+      for (const response of Object.values(fixtures)) {
+        response.attribution = {
+          ...response.attribution,
+          served_model: servedModel,
+          policy_revision: '6c0f392f1757d850da42da17fe17587e0b291d2e54df3b49b20cfc5caa504170',
+        };
+        response.body = { ...response.body, model: servedModel };
+      }
+      const result = await evaluateDeepSeekQualification({
+        gatewayUrl: 'http://127.0.0.1:18780/v1',
+        route: 'sk-deepseek-l',
+        fixtureResponses: fixtures,
+        now: () => Date.UTC(2026, 8, 25),
+      });
+      assert.ok(serializeQualificationResult(result).length < 16_384);
+      assert.equal(qualificationResultHash(result), digest);
+    }
   });
 });

@@ -9,6 +9,8 @@ const ROUTE_RE = /^sk-deepseek-(s|m|l)$/;
 const HASH_RE = /^[a-f0-9]{64}$/;
 const MAX_LATENCY_MS = 600_000;
 const MAX_TOKENS = 1_000_000;
+const MAX_ATTRIBUTION_LENGTH = 128;
+const SERVED_MODEL_RE = /^[A-Za-z0-9](?:[A-Za-z0-9._:/-]{0,126}[A-Za-z0-9])?$/;
 
 export const CASE_TYPES = Object.freeze([
   'tool_use',
@@ -75,8 +77,12 @@ export function qualificationCaseSetHash() {
   return sha256(loadQualificationCases());
 }
 
+export function serializeQualificationResult(result) {
+  return canonical(result);
+}
+
 export function qualificationResultHash(result) {
-  return sha256(result);
+  return sha256(serializeQualificationResult(result));
 }
 
 function validateOptions(options) {
@@ -124,8 +130,11 @@ function normalizeAttribution(response, route) {
   if (!attr || typeof attr !== 'object') {
     throw new Error('malformed qualification response: missing attribution');
   }
-  if (attr.logical_route !== route || attr.provider_family !== 'deepseek' ||
-      typeof attr.served_model !== 'string' || !attr.served_model ||
+  if (attr.logical_route !== route || attr.logical_route.length > MAX_ATTRIBUTION_LENGTH ||
+      attr.provider_family !== 'deepseek' || attr.provider_family.length > MAX_ATTRIBUTION_LENGTH ||
+      typeof attr.served_model !== 'string' ||
+      attr.served_model.length > MAX_ATTRIBUTION_LENGTH ||
+      !SERVED_MODEL_RE.test(attr.served_model) ||
       !HASH_RE.test(attr.policy_revision || '')) {
     throw new Error('qualification attribution mismatch');
   }
