@@ -328,7 +328,7 @@ export function enforceResponseContract(response, requestedModel) {
       try {
         const parsed = JSON.parse(payload);
         if (!servedModel && typeof parsed.model === "string" && parsed.model) servedModel = parsed.model;
-        if (Object.hasOwn(parsed, "usage")) {
+        if (Object.hasOwn(parsed, "usage") && parsed.usage !== null) {
           const choices = Array.isArray(parsed.choices) ? parsed.choices : null;
           const attachedTerminalUsage = choices?.length > 0 && choices.every((choice) => {
             const output = choice?.delta || {};
