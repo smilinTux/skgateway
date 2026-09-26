@@ -44,6 +44,10 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve as resolvePath } from 'node:path';
 
 import { resolveZoneCeiling, isZoneAllowed, TRUST_ZONES } from './sensitivity.mjs';
+import {
+  genericParticipationDecision,
+  genericPolicyRevision,
+} from './generic-participation.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -542,6 +546,10 @@ export function resolveBucket({
     }
     members.push({
       id: entry.id,
+      ...(entry.provider ? {
+        provider: PROVIDER_ALIASES[String(entry.provider).toLowerCase()] ||
+          String(entry.provider).toLowerCase(),
+      } : {}),
       class_basis: floor.basis,
       model_class: floor.modelClass,
       trust_zone: zone ?? null,
@@ -747,6 +755,100 @@ export function orderMembersByCost(members, counter = 0) {
     const group = groups.get(key);
     const start = n % group.length;
     ordered.push(...group.slice(start), ...group.slice(0, start));
+  }
+  return ordered;
+}
+
+/**
+ * Order a generic bucket's eligible members by bounded provider tickets.
+ * Provider aliases collapse before weights are counted, and model aliases do
+ * not create additional tickets. The returned first member is the selection;
+ * the rest form a deterministic failover chain containing enabled providers
+ * only. Focused provider routes keep their existing cost order.
+ */
+export function orderMembersByGenericWeight(members, counter, bucket, policy) {
+  if (!Array.isArray(members) || members.length === 0) return [];
+  if (!Number.isSafeInteger(counter) || counter < 0) return [];
+
+  const parsed = typeof bucket === 'string' ? parseBucketId(bucket) : bucket;
+  if (!parsed || typeof parsed.bucket !== 'string') return [];
+  const revision = genericPolicyRevision(policy);
+
+  if (parsed.provider) {
+    return orderMembersByCost(members, counter).map((member) => ({
+      ...member,
+      generic_policy_revision: revision,
+      generic_rotation_counter: counter,
+      generic_provider_weight: 1,
+      generic_participation_reason: 'focused-route',
+    }));
+  }
+
+  const seenModelProviders = new Map();
+  const groups = new Map();
+  for (const member of [...members].sort((a, b) =>
+    String(a?.id || '').localeCompare(String(b?.id || '')))) {
+    const provider = PROVIDER_ALIASES[String(member?.provider || '').toLowerCase()] ||
+      String(member?.provider || '').toLowerCase();
+    if (!provider || !member?.id) return [];
+    const previous = seenModelProviders.get(member.id);
+    if (previous && previous !== provider) return [];
+    seenModelProviders.set(member.id, provider);
+
+    const decision = genericParticipationDecision({ ...member, provider }, parsed, policy);
+    if (!decision.eligible || decision.weight === 0) continue;
+    if (!groups.has(provider)) groups.set(provider, { members: [], decisions: [] });
+    groups.get(provider).members.push({ ...member, provider });
+    groups.get(provider).decisions.push(decision);
+  }
+
+  const families = [...groups.keys()].sort();
+  const weighted = [];
+  let totalWeight = 0;
+  for (const provider of families) {
+    const group = groups.get(provider);
+    const providerDecision = genericParticipationDecision({ provider }, parsed, policy);
+    const modelWeights = new Set(group.decisions
+      .filter((decision) => decision.scope === 'model' || decision.scope === 'bucket-model')
+      .map((decision) => decision.weight));
+    if (modelWeights.size > 1) return [];
+    const weight = modelWeights.size === 1 ? [...modelWeights][0] : providerDecision.weight;
+    if (!providerDecision.eligible || !Number.isInteger(weight) || weight <= 0) continue;
+    totalWeight += weight;
+    weighted.push({ provider, weight, group });
+  }
+  if (!Number.isSafeInteger(totalWeight) || totalWeight <= 0) return [];
+
+  const ticket = counter % totalWeight;
+  let cursor = 0;
+  let selectedIndex = -1;
+  for (let i = 0; i < weighted.length; i++) {
+    cursor += weighted[i].weight;
+    if (ticket < cursor) {
+      selectedIndex = i;
+      break;
+    }
+  }
+  if (selectedIndex < 0) return [];
+
+  const providerOrder = [
+    ...weighted.slice(selectedIndex),
+    ...weighted.slice(0, selectedIndex),
+  ];
+  const ordered = [];
+  for (const item of providerOrder) {
+    const models = item.group.members;
+    const start = counter % models.length;
+    for (const member of [...models.slice(start), ...models.slice(0, start)]) {
+      const decision = genericParticipationDecision(member, parsed, policy);
+      ordered.push({
+        ...member,
+        generic_policy_revision: revision,
+        generic_rotation_counter: counter,
+        generic_provider_weight: item.weight,
+        generic_participation_reason: decision.reason,
+      });
+    }
   }
   return ordered;
 }

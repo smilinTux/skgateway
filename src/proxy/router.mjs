@@ -71,6 +71,7 @@ import {
   parseBucketId,
   resolveBucket,
   orderMembersByCost,
+  orderMembersByGenericWeight,
   validateFamilyPreference,
   applyFamilyPreference,
   selectMember,
@@ -3036,8 +3037,8 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
     };
   }
 
-  const n = (_bucketCounters.get(addr.bucket) || 0) + 1;
-  _bucketCounters.set(addr.bucket, n);
+  const n = _bucketCounters.get(addr.bucket) || 0;
+  _bucketCounters.set(addr.bucket, n + 1);
   
   // Read and validate family preference from x-sk-prefer header (card 1e26943e)
   const prefHeader = request.headers?.['x-sk-prefer'];
@@ -3074,8 +3075,21 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
     }
   }
 
-  // Apply family preference within cheapest cost tier
-  const picked = selectMember(members, n, familyPreference);
+  const isWeightedGeneric = !addr.provider && ['S', 'M', 'L'].includes(addr.model_class);
+  const genericPolicy = isWeightedGeneric
+    ? getConfig()?.routing?.generic_participation
+    : null;
+  let orderedMembers = isWeightedGeneric
+    ? orderMembersByGenericWeight(members, n, addr, genericPolicy)
+    : orderMembersByCost(members, n);
+  if (familyPreference && orderedMembers.length > 0) {
+    const selectedProvider = orderedMembers[0].provider;
+    const sameProvider = orderedMembers.filter((member) => member.provider === selectedProvider);
+    const rest = orderedMembers.filter((member) => member.provider !== selectedProvider);
+    orderedMembers = [...applyFamilyPreference(sameProvider, familyPreference), ...rest];
+  }
+  const picked = isWeightedGeneric ? (orderedMembers[0] || null)
+    : selectMember(members, n, familyPreference);
   
   if (!picked) {
     console.warn(`[router] bucket ${addr.bucket} no member selected after preference`);
@@ -3085,9 +3099,9 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
         headers: { "content-type": "application/json" },
         body: Buffer.from(JSON.stringify({
           error: {
-            message: `No model available for bucket ${addr.bucket}`,
+            message: `No enabled provider is eligible for bucket ${addr.bucket}`,
             code: 503,
-            type: "bucket_no_member",
+            type: "bucket_no_eligible_provider",
           },
         }), "utf-8"),
       },
@@ -3124,10 +3138,12 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
   // chosen member's backend is down. Rebuild it with the picked member first,
   // then every other member in cost order: the preference decides who serves,
   // it does not remove anyone from the failover chain.
-  const orderedMembers = [
-    picked,
-    ...orderMembersByCost(members, n).filter((m) => m.id !== picked.id),
-  ];
+  if (!isWeightedGeneric) {
+    orderedMembers = [
+      picked,
+      ...orderMembersByCost(members, n).filter((m) => m.id !== picked.id),
+    ];
+  }
 
   const candidates = [];
   const seen = new Set();
@@ -3214,6 +3230,10 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
             model: member.id,
             bucket: addr.bucket,
             bucketMember: member.id,
+            genericPolicyRevision: member.generic_policy_revision,
+            genericProviderWeight: member.generic_provider_weight,
+            genericParticipationReason: member.generic_participation_reason,
+            genericRotationCounter: member.generic_rotation_counter,
           });
         }
         continue;
@@ -3233,6 +3253,10 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
         model: member.id,
         bucket: addr.bucket,
         bucketMember: member.id,
+        genericPolicyRevision: member.generic_policy_revision,
+        genericProviderWeight: member.generic_provider_weight,
+        genericParticipationReason: member.generic_participation_reason,
+        genericRotationCounter: member.generic_rotation_counter,
       });
     }
   }
@@ -3263,6 +3287,14 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
     phase: "candidate_chain",
     outcome: "candidate_chain_built",
     bucket: addr.bucket,
+    logical_route: addr.bucket,
+    selected_provider: picked.provider || null,
+    selected_model: picked.id,
+    generic_policy_revision: picked.generic_policy_revision || null,
+    generic_provider_weight: picked.generic_provider_weight ?? null,
+    generic_participation_reason: picked.generic_participation_reason || null,
+    generic_exclusion_reason: null,
+    generic_rotation_counter: picked.generic_rotation_counter ?? null,
     chain_length: candidates.length,
     skipped,
   }, {});

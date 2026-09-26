@@ -57,7 +57,13 @@ import { REGISTRY_PATH } from "./proxy/registry.mjs";
 import { energyRowsFrom, energyHeaders } from "./metrics/energy.mjs";
 import { attributionHeaders } from "./metrics/attribution.mjs";
 import { sampleTokenRatio } from "./metrics/token-ratio.mjs";
-import { allBuckets, capacityRoutabilityRejection, resolveBucket } from "./policy/buckets.mjs";
+import {
+  allBuckets,
+  capacityRoutabilityRejection,
+  orderMembersByGenericWeight,
+  resolveBucket,
+} from "./policy/buckets.mjs";
+import { genericPolicyRevision } from "./policy/generic-participation.mjs";
 import { loadRegistry, REGISTRY_PATH as _REGISTRY_PATH } from "./proxy/registry.mjs";
 import { policyFromRegistry } from "./policy/sensitivity.mjs";
 import { readFileSync } from "node:fs";
@@ -1969,6 +1975,8 @@ export const server = http.createServer(async (req, res) => {
         return capacityRoutabilityRejection(capacityStatus(e.provider, e.id));
       };
       const bucketsEnabled = cfg?.routing?.buckets_enabled === true;
+      const genericPolicy = cfg?.routing?.generic_participation;
+      const genericRevision = genericPolicyRevision(genericPolicy);
       const all = allBuckets();
       const out = [];
       for (const b of all) {
@@ -1980,6 +1988,22 @@ export const server = http.createServer(async (req, res) => {
             getRoutabilityRejection,
           });
           const physicalResources = new Set(members.map((m) => m.physical_resource_id));
+          const isGeneric = !b.provider && ["S", "M", "L"].includes(b.model_class);
+          const effectiveWeights = isGeneric
+            ? Object.entries(genericPolicy?.providers || {}).sort(([a], [z]) => a.localeCompare(z))
+              .map(([provider, override]) => {
+                const hasEligibleMember = members.some((member) => member.provider === provider);
+                return {
+                  provider,
+                  weight: override.enabled && hasEligibleMember ? override.weight : 0,
+                  reason: !override.enabled ? "disabled"
+                    : hasEligibleMember ? "enabled" : "no-eligible-member",
+                };
+              })
+            : [];
+          const preview = isGeneric
+            ? orderMembersByGenericWeight(members, 0, b, genericPolicy)[0]
+            : null;
           out.push({
             bucket: b.bucket,
             model_class: b.model_class,
@@ -1989,6 +2013,9 @@ export const server = http.createServer(async (req, res) => {
             member_alias_count: members.length,
             physical_server_count: physicalResources.size,
             physical_resources: [...physicalResources],
+            generic_policy_revision: isGeneric ? genericRevision : null,
+            generic_effective_weights: effectiveWeights,
+            generic_next_provider: preview?.provider || null,
             rejected,
           });
         } catch (e) {
@@ -2005,7 +2032,11 @@ export const server = http.createServer(async (req, res) => {
         }
       }
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ buckets_enabled: bucketsEnabled, buckets: out }));
+      res.end(JSON.stringify({
+        buckets_enabled: bucketsEnabled,
+        generic_policy_revision: genericRevision,
+        buckets: out,
+      }));
     } catch (e) {
       console.warn("[skgateway] /admin/buckets failed:", e.message);
       res.writeHead(500, { "content-type": "application/json" });

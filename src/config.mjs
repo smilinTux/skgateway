@@ -274,7 +274,12 @@ const DEFAULTS = {
     // share one validator and an invalid candidate never replaces the active
     // policy. Empty means every routable provider participates with weight 1.
     generic_participation: {
-      providers: {},
+      providers: {
+        deepseek: { enabled: true, weight: 45 },
+        zai: { enabled: true, weight: 35 },
+        kimi: { enabled: true, weight: 10 },
+        codex: { enabled: false, weight: 10 },
+      },
       models: {},
       buckets: {},
     },
