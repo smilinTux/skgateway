@@ -3336,20 +3336,19 @@ export function createRouteSiemEmitter(siem, requestSource = {}, requestId = ran
 
 /**
  * Preserve logical routing for synthetic traffic unless the concrete model has
- * an exact admission-gated owner whose initial health this request can prove.
+ * an exact configured owner that this request is intended to probe.
  */
 export function shouldUseRegistryRouting(router, request, bootstrapProbe = false) {
   if (!isRegistryRouted(request)) return false;
   if (!bootstrapProbe) return true;
   const model = request?.model;
   if (typeof model !== "string") return true;
-  const exactAdmissionOwner = (typeof router.getBackends === "function"
+  const exactOwner = (typeof router.getBackends === "function"
     ? [...router.getBackends().values()]
     : []
-  ).some((backend) => backend?.require_observed_health === true &&
-    backend.models?.some((pattern) =>
+  ).some((backend) => backend?.models?.some((pattern) =>
       typeof pattern === "string" && pattern.toLowerCase() === model.toLowerCase()));
-  return !exactAdmissionOwner;
+  return !exactOwner;
 }
 
 export function configuredModelAlias(model, config = null) {
