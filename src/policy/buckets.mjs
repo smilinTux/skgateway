@@ -374,6 +374,45 @@ export function effectiveClass(declared, measured) {
     : { cls: declared, basis: 'declared-size-prior' };
 }
 
+const QUALIFICATION_HASH_RE = /^[a-f0-9]{64}$/;
+
+/**
+ * Fold a reviewed qualification into a declared capability prior.
+ * An absent or unreviewed result preserves existing behavior. Once a result
+ * is marked reviewed, malformed, failed, or expired evidence fails closed for
+ * generic membership. A passing result can lower the prior and cannot raise it.
+ */
+export function effectiveQualifiedClass(declared, qualification, now = Date.now()) {
+  if (!qualification || qualification.reviewed !== true) {
+    return { cls: declared || null, basis: declared ? 'declared-size-prior' : 'unknown', eligible: true };
+  }
+  const hashesValid = ['case_set_hash', 'response_schema_hash', 'result_hash']
+    .every((key) => QUALIFICATION_HASH_RE.test(qualification[key] || ''));
+  const expiresAt = Date.parse(qualification.expires_at);
+  if (!hashesValid || !Number.isFinite(expiresAt) || !Number.isFinite(now)) {
+    return { cls: null, basis: 'reviewed-qualification-malformed', eligible: false };
+  }
+  if (expiresAt <= now) {
+    return { cls: null, basis: 'reviewed-qualification-expired', eligible: false };
+  }
+  if (qualification.status !== 'pass') {
+    return { cls: null, basis: 'reviewed-qualification-failed', eligible: false };
+  }
+  const declaredRank = classRank(declared);
+  const qualifiedRank = classRank(qualification.qualified_class);
+  if (declaredRank === null || qualifiedRank === null) {
+    return { cls: null, basis: 'reviewed-qualification-malformed', eligible: false };
+  }
+  const cls = declaredRank <= qualifiedRank ? declared : qualification.qualified_class;
+  return {
+    cls,
+    basis: cls === declared
+      ? 'reviewed-qualification capped by declared prior'
+      : `reviewed-qualification ${qualification.qualified_class} below declared ${declared}`,
+    eligible: true,
+  };
+}
+
 /**
  * Does this model meet the bucket's capability FLOOR?
  *
@@ -393,7 +432,10 @@ export function effectiveClass(declared, measured) {
  * @param {string} floorClass required model_class
  * @returns {{ok: boolean, basis: string, modelClass: string|null}}
  */
-export function meetsClassFloor(entry, floorClass) {
+export function meetsClassFloor(entry, floorClass, {
+  applyReviewedQualification = false,
+  now = Date.now(),
+} = {}) {
   const need = classRank(floorClass);
   if (need === null) return { ok: false, basis: 'unknown-floor', modelClass: null };
 
@@ -406,7 +448,17 @@ export function meetsClassFloor(entry, floorClass) {
   const declared = caps.size_class || entry?.card?.size_class || null;
   const measured = entry?.lifecycle?.measured_capabilities || entry?.measured_capabilities || null;
 
-  const { cls, basis } = effectiveClass(declared, measured);
+  let { cls, basis } = effectiveClass(declared, measured);
+  if (applyReviewedQualification && entry?.card?.qualification?.reviewed === true) {
+    const qualified = effectiveQualifiedClass(declared, entry.card.qualification, now);
+    if (!qualified.eligible) {
+      return { ok: false, basis: qualified.basis, modelClass: null };
+    }
+    if (!cls || classRank(qualified.cls) < classRank(cls)) {
+      cls = qualified.cls;
+      basis = qualified.basis;
+    }
+  }
   if (!cls) {
     // S is the floor everything clears; anything higher needs actual evidence.
     return { ok: need === 0, basis: 'unknown', modelClass: null };
@@ -529,7 +581,9 @@ export function resolveBucket({
       });
       continue;
     }
-    const floor = meetsClassFloor(entry, bucket.model_class);
+    const floor = meetsClassFloor(entry, bucket.model_class, {
+      applyReviewedQualification: !bucket.provider,
+    });
     if (!floor.ok) {
       rejected.push({
         id: entry.id,

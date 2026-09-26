@@ -27,6 +27,7 @@ import {
   gradeVocabulary,
   measuredClassCeiling,
   effectiveClass,
+  effectiveQualifiedClass,
 } from '../src/policy/buckets.mjs';
 import { TRUST_ZONES } from '../src/policy/sensitivity.mjs';
 
@@ -333,6 +334,66 @@ describe('C9: eligibility composes the floor with the sovereignty ceiling', () =
     });
     assert.equal(members.length, 0);
     assert.ok(rejected.length > 0, 'and it must be able to explain why');
+  });
+});
+
+describe('G5: reviewed qualification caps generic capability only', () => {
+  const validHashes = {
+    case_set_hash: 'a'.repeat(64),
+    response_schema_hash: 'b'.repeat(64),
+    result_hash: 'c'.repeat(64),
+  };
+  const qualification = (overrides = {}) => ({
+    reviewed: true,
+    status: 'pass',
+    qualified_class: 'L',
+    reviewed_at: '2026-09-25T00:00:00.000Z',
+    expires_at: '2027-09-25T00:00:00.000Z',
+    ...validHashes,
+    ...overrides,
+  });
+
+  test('reviewed qualification is capped by the declared prior and can lower it', () => {
+    assert.equal(effectiveQualifiedClass('M', qualification({ qualified_class: 'L' }), Date.UTC(2026, 8, 26)).cls, 'M');
+    assert.equal(effectiveQualifiedClass('XL', qualification({ qualified_class: 'L' }), Date.UTC(2026, 8, 26)).cls, 'L');
+  });
+
+  test('failed and expired reviewed results remove generic eligibility', () => {
+    assert.equal(effectiveQualifiedClass('L', qualification({ status: 'fail' }), Date.UTC(2026, 8, 26)).eligible, false);
+    assert.equal(effectiveQualifiedClass('L', qualification({ expires_at: '2026-09-25T00:00:00.000Z' }), Date.UTC(2026, 8, 26)).eligible, false);
+  });
+
+  test('models without reviewed qualification preserve prior behavior', () => {
+    assert.deepEqual(effectiveQualifiedClass('L', null, Date.UTC(2026, 8, 26)), {
+      cls: 'L', basis: 'declared-size-prior', eligible: true,
+    });
+  });
+
+  test('DeepSeek reviewed L models enter generic S/M/L and never XL', () => {
+    for (const id of ['deepseek-v4-flash', 'deepseek-v4-pro']) {
+      const model = {
+        ...entry(id, { zone: TRUST_ZONES.FREE_REMOTE, declared: 'XL' }),
+        provider: 'deepseek',
+        card: { size_class: 'XL', qualification: qualification() },
+      };
+      for (const bucket of ['sk-s', 'sk-m', 'sk-l']) {
+        assert.deepEqual(resolveBucket({ bucket: parseBucketId(bucket), catalog: [model] }).members.map((m) => m.id), [id]);
+      }
+      assert.deepEqual(resolveBucket({ bucket: parseBucketId('sk-xl'), catalog: [model] }).members, []);
+    }
+  });
+
+  test('failed qualification removes generic membership but focused routing remains available', () => {
+    const model = {
+      ...entry('deepseek-v4-pro', { zone: TRUST_ZONES.FREE_REMOTE, declared: 'L' }),
+      provider: 'deepseek',
+      card: { size_class: 'L', qualification: qualification({ status: 'fail', qualified_class: null }) },
+    };
+    assert.deepEqual(resolveBucket({ bucket: parseBucketId('sk-s'), catalog: [model] }).members, []);
+    assert.deepEqual(
+      resolveBucket({ bucket: parseBucketId('sk-deepseek-l'), catalog: [model] }).members.map((m) => m.id),
+      ['deepseek-v4-pro'],
+    );
   });
 });
 

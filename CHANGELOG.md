@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add deterministic public synthetic DeepSeek qualification with bounded,
+  credential-free results and reviewed effective-class caps for generic
+  bucket membership.
+
 - Record a response-contract failure against model-claim quarantine instead of
   clearing it. `recordModelClaimOutcome()` was being passed `upstreamStatus`
   (the original 2xx) rather than `res.status` (the gateway 502) whenever
