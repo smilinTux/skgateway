@@ -285,6 +285,35 @@ ${extraRoles}defaults:
     assert.equal(new Set(decisions.map((e) => e.request_id)).size, 1);
   });
 
+  test('a selected bucket member keeps its canonical identity while its backend receives the wire model', async () => {
+    const canonical = 'pool-l-local';
+    const wire = 'pool-l-wire';
+    const mappedRouter = createRouter({
+      backends: {
+        poolbackend: {
+          url: pool.base,
+          auth_type: 'none',
+          models: [canonical],
+          model_map: { [canonical]: wire },
+          priority: 1,
+        },
+      },
+    });
+    await applyConfig({ buckets_enabled: true });
+
+    const result = await routeAndSend(
+      mappedRouter,
+      { model: 'sk-l-secret', agentId: 'model-map-bucket' },
+      '/chat/completions', 'POST', HEADERS, bodyFor('sk-l-secret'), false,
+    );
+
+    assert.equal(result.status, 200);
+    assert.equal(result.bucketMember, canonical);
+    assert.equal(pool.state.lastModel, wire);
+    assert.equal(result.requestedModel, 'sk-l-secret');
+    assert.equal(result.servedModel, wire);
+  });
+
   test('a bucket skips multiple members whose exact model claims are quarantined', async () => {
     const deadFirst = await startUpstream('dead-first');
     const deadSecond = await startUpstream('dead-second');

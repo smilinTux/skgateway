@@ -845,6 +845,9 @@ export class Backend {
     this.auth_optional = config.auth_optional === true;
     this.api_key_env = config.api_key_env || null;
     this.models = Array.isArray(config.models) ? config.models : [];
+    this.model_map = new Map(Object.entries(config.model_map || {}).map(
+      ([canonical, wire]) => [canonical.toLowerCase(), wire],
+    ));
     // Marks a discovery-driven backend (e.g. openrouter, see config.mjs
     // backends.*.discovery). Its `models` array starts empty and is populated
     // at runtime by registerDiscoveredRoutes() once a discovery fetch
@@ -997,6 +1000,12 @@ export class Backend {
     if (!model) return true;
     if (this.models.length === 0) return !this.discovery;
     return this.models.some((pattern) => modelMatches(pattern, model));
+  }
+
+  /** Return this backend's provider wire id for one exact canonical model. */
+  wireModelFor(model) {
+    if (typeof model !== "string") return model;
+    return this.model_map.get(model.toLowerCase()) || model;
   }
 
   /** Whether this exact declared backend-model claim is currently selectable. */
@@ -3972,6 +3981,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // candidate rewrites the model to a cloud-served id). Default to the shared
     // body when no override is present.
     let attemptBody = candidates[i].bodyOverride || attemptBodyBase;
+    const candidateModel = candidates[i].model || request.model;
 
     // Context preflight (card 9ed4a9f7): a backend may declare context_limit,
     // the true serving-engine token ceiling (e.g. llama.cpp --ctx-size 32768
@@ -4011,7 +4021,6 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // every other candidate serves the same model as every other candidate
     // in the list (candidatesFor() only ever matches on model id), so
     // request.model is the correct default.
-    const candidateModel = candidates[i].model || request.model;
     attemptBody = applyBodyFloor(
       attemptBody,
       candidateModel,
@@ -4320,6 +4329,12 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // configured for this backend): the disabled path stays byte-identical.
     enterMeter(meterUrl);
     try {
+      const wireModel = typeof backend?.wireModelFor === "function"
+        ? backend.wireModelFor(candidateModel)
+        : candidateModel;
+      if (wireModel !== candidateModel) {
+        attemptBody = rewriteBodyModel(attemptBody, wireModel);
+      }
       if (isAnthropicBackend(backend)) {
         // Translate OpenAI chat-completions → Anthropic Messages API.
         const tr = toAnthropicRequest(attemptBody, {

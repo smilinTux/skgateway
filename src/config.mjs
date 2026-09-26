@@ -995,6 +995,38 @@ function validate(cfg, removedBackendIds = new Set()) {
         if (!Number.isInteger(backend.priority) || backend.priority < 1)
           errs.push(`backends.${name}.priority must be a positive integer`);
       }
+      if (backend.model_map !== undefined) {
+        if (!isMapping(backend.model_map)) {
+          errs.push(`backends.${name}.model_map must be a mapping`);
+        } else {
+          const foldedKeys = new Set();
+          for (const [canonical, wire] of Object.entries(backend.model_map)) {
+            if (!canonical.trim()) {
+              errs.push(`backends.${name}.model_map key must be a non-empty string`);
+              continue;
+            }
+            if (typeof wire !== 'string' || !wire.trim()) {
+              errs.push(`backends.${name}.model_map value must be a non-empty string`);
+              continue;
+            }
+            if (canonical.includes('*') || wire.includes('*')) {
+              errs.push(`backends.${name}.model_map wildcards are not allowed`);
+            }
+            const folded = canonical.toLowerCase();
+            if (foldedKeys.has(folded)) {
+              errs.push(`backends.${name}.model_map keys collide case-insensitively`);
+            }
+            foldedKeys.add(folded);
+            const claims = Array.isArray(backend.models)
+              ? backend.models.filter((model) =>
+                typeof model === 'string' && model.toLowerCase() === folded)
+              : [];
+            if (claims.length !== 1) {
+              errs.push(`backends.${name}.model_map key "${canonical}" must name exactly one declared model`);
+            }
+          }
+        }
+      }
     }
   }
 
