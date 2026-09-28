@@ -10,6 +10,7 @@ import {
   Backend, createRouter, routeAndSend, ModelOwnerDownError, shouldUseRegistryRouting,
 } from "../src/proxy/router.mjs";
 import { ConnectionPool } from "../src/proxy/connection-pool.mjs";
+import { closeTestServer } from "./support/http-test-server.mjs";
 
 const config = loadYaml(readFileSync(new URL("../config/skgateway-codex.yaml", import.meta.url), "utf8"));
 
@@ -122,7 +123,7 @@ describe("Kimi synthetic request probes", () => {
     const timeout = await routeAndSend(router, { model: "kimi-for-coding", agentId: "probe" }, "/chat/completions", "POST",
       { "content-type": "application/json" }, body("kimi-for-coding"), false);
     assert.equal(timeout.status, 504);
-    await new Promise((resolve) => server.close(resolve));
+    await closeTestServer(server);
   });
 
   test("temporary upstream error remains retryable evidence", async () => {
@@ -138,6 +139,6 @@ describe("Kimi synthetic request probes", () => {
     const result = await routeAndSend(router, { model: "kimi-for-coding", agentId: "probe" }, "/chat/completions", "POST",
       { "content-type": "application/json" }, Buffer.from(JSON.stringify({ model: "kimi-for-coding", messages: [] })), false);
     assert.equal(result.status, 503);
-    await new Promise((resolve) => server.close(resolve));
+    await closeTestServer(server);
   });
 });
