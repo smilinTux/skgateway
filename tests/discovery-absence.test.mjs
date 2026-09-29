@@ -70,6 +70,12 @@ describe('reconcilePresence (pure)', () => {
     assert.equal(store['nvidia/dying'].state, 'eol');
     assert.equal(store['nvidia/dying'].eol_reason, 'dropped_from_catalog');
     assert.equal(store['nvidia/dying'].absent_cycles, THRESHOLDS.absentEolThreshold);
+
+    // Provider recovery must reverse the catalog tombstone on the next refresh.
+    store = reconcilePresence(store, ['nvidia/dying'], 'nvidia', 4000);
+    assert.equal(store['nvidia/dying'].state, 'active');
+    assert.equal(store['nvidia/dying'].eol_reason, null);
+    assert.equal(store['nvidia/dying'].absent_cycles, 0);
   });
 
   test('reappearance after eol (with a prior verification) recovers eol -> active', () => {

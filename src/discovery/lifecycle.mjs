@@ -221,10 +221,10 @@ export function applyCompletionOutcome(lc, { status, now, provider, thresholds =
  * the affa0aac / C2 rule below):
  *
  *   - `eol_reason === 'dropped_from_catalog'` means the provider simply
- *     stopped listing it. A reappearance is a DIRECT rebuttal of that, so if
- *     the record was ever verified (`last_verified_at != null`) it is
- *     trusted straight back to `active`; if it was never verified, presence
- *     alone still only earns `suspect` (see the affa0aac / C2 note below).
+ *     stopped listing it. A reappearance is a DIRECT rebuttal of that, so it
+ *     is trusted straight back to `active`. This applies even when the record
+ *     has no prior verification: the catalog absence and reappearance cycle
+ *     itself is the evidence that reverses this specific tombstone.
  *   - `eol_reason === 'provider_410'` or `'probe_failed'` means something
  *     STRONGER than catalog membership condemned it: a real completion or an
  *     active probe. Catalog presence is demonstrably weaker evidence (NVIDIA
@@ -275,28 +275,15 @@ export function applyCatalogPresence(lc, { present, provider, now, thresholds = 
         return { ...lc, absent_cycles: 0 };
       }
 
-      if (lc.last_verified_at != null) {
-        return {
-          ...lc,
-          state: LIFECYCLE_STATES.ACTIVE,
-          absent_cycles: 0,
-          consecutive_permanent_errors: 0,
-          consecutive_successes: 0,
-          eol_reason: null,
-          eol_at: null,
-          last_verified_at: now,
-        };
-      }
-
-      // Presence is genuinely weaker evidence than a verified completion, so it
-      // does NOT earn `active`. It earns `suspect`: routable again, and flagged
-      // as such on /v1/models, where real traffic or a probe can settle it.
       return {
         ...lc,
-        state: LIFECYCLE_STATES.SUSPECT,
+        state: LIFECYCLE_STATES.ACTIVE,
         absent_cycles: 0,
+        consecutive_permanent_errors: 0,
+        consecutive_successes: 0,
         eol_reason: null,
         eol_at: null,
+        last_verified_at: now,
       };
     }
 

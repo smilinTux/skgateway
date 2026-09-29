@@ -271,10 +271,10 @@ test('absent 3 cycles (default provider): suspect -> eol with dropped_from_catal
   assert.equal(lc.eol_at, T0 + 3000);
 });
 
-test('reappear in catalog with a prior probe: eol -> active', () => {
-  // lc previously verified (last_verified_at set) then dropped out of the
-  // catalog until it hit eol via absence.
-  let lc = { ...defaultLifecycle(), last_verified_at: T0 - 10000 };
+test('reappear in catalog after absence tombstone: eol -> active', () => {
+  // A model can be tombstoned before any completion or probe verifies it.
+  // Reappearance directly rebuts the dropped_from_catalog reason.
+  let lc = defaultLifecycle();
   for (let i = 1; i <= 3; i++) {
     lc = applyCatalogPresence(lc, {
       present: false,
