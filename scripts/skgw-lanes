@@ -1,50 +1,170 @@
 #!/usr/bin/env bash
-# skgw-lanes: what each model lane actually did, from the gateway's own metrics.
-#
-# Reads request_log in the skgateway metrics store. Two traps this avoids, both
-# of which produced wrong answers on 2026-08-27:
-#   started_at is epoch MILLISECONDS, not an ISO string. Filtering it as text
-#   returns nothing and reads as "no traffic".
-#   id is random hex, not sequential. `ORDER BY id DESC` returns random rows,
-#   not the newest ones.
+# skgw-lanes: live gateway traffic, provider capacity, and worker evidence.
 set -euo pipefail
-WINDOW="${1:-60}"          # minutes
-DB="${SKGW_METRICS_DB:-$HOME/skgateway-codex/data/metrics.db}"
-[ -f "$DB" ] || { echo "no metrics db at $DB" >&2; exit 1; }
+WINDOW="${1:-60}"
+GATEWAY_URL="${SKGW_GATEWAY_URL:-http://chiap01:18790}"
+FLEET_HOME="${SKCAPSTONE_HOME:-$HOME/.skcapstone}"
+TARGET_CODEX="${SKGW_TARGET_CODEX:-30}"
+TARGET_GLM="${SKGW_TARGET_GLM:-9}"
+TARGET_DEEPSEEK="${SKGW_TARGET_DEEPSEEK:-20}"
+DB="${SKGW_METRICS_DB:-}"
+REMOTE_DB=""
 
-WINDOW="$WINDOW" DB="$DB" python3 - <<'PY'
-import os, sqlite3, time, datetime
-db = os.environ["DB"]; mins = int(os.environ["WINDOW"])
-now = int(time.time() * 1000); cut = now - mins * 60 * 1000
-c = sqlite3.connect(db)
-rows = list(c.execute(
-    "select backend, model, count(*) n, "
-    "sum(case when status_code >= 400 then 1 else 0 end) errs, "
-    "round(avg(total_ms)) avg_ms "
-    "from request_log where started_at > ? "
-    "group by backend, model order by n desc", (cut,)))
+if [ -z "$DB" ]; then
+  JOURNAL_UNIT="${SKGW_JOURNAL_UNIT:-skgateway-codex.service}"
+  pid=$(systemctl --user show "$JOURNAL_UNIT" -p MainPID --value 2>/dev/null || true)
+  if [ -n "$pid" ] && [ "$pid" != 0 ]; then
+    DB=$(find "/proc/$pid/fd" -lname '*/metrics.db' -printf '%l\n' 2>/dev/null | head -1 || true)
+  fi
+  [ -n "$DB" ] || DB="$HOME/skgateway-codex/data/metrics.db"
+fi
+if [ ! -f "$DB" ]; then
+  gateway_host=${GATEWAY_URL#*://}; gateway_host=${gateway_host%%:*}
+  if command -v ssh >/dev/null && ssh -o BatchMode=yes -o ConnectTimeout=2 "$gateway_host" true 2>/dev/null; then
+    REMOTE_DB=$(ssh -o BatchMode=yes "$gateway_host" 'pid=$(systemctl --user show skgateway-codex.service -p MainPID --value 2>/dev/null); find "/proc/$pid/fd" -lname "*/metrics.db" -printf "%l\n" 2>/dev/null | head -1' || true)
+  fi
+fi
+
+WINDOW="$WINDOW" DB="$DB" REMOTE_DB="$REMOTE_DB" GATEWAY_URL="$GATEWAY_URL" FLEET_HOME="$FLEET_HOME" TARGET_CODEX="$TARGET_CODEX" TARGET_GLM="$TARGET_GLM" TARGET_DEEPSEEK="$TARGET_DEEPSEEK" python3 - <<'PY'
+import collections, datetime, glob, json, os, re, sqlite3, subprocess, sys, time, urllib.request
+
+mins = int(os.environ["WINDOW"])
+cut_ms = int((time.time() - mins * 60) * 1000)
+cut_s = time.time() - mins * 60
+home = os.environ["FLEET_HOME"]
+
+def get_json(path):
+    try:
+        with urllib.request.urlopen(os.environ["GATEWAY_URL"].rstrip("/") + path, timeout=5) as r:
+            return json.load(r)
+    except Exception as e:
+        print("  gateway %s unavailable: %s" % (path, e))
+        return {}
+
+def open_metrics():
+    db = os.environ["DB"]
+    if os.path.isfile(db):
+        return sqlite3.connect("file:%s?mode=ro" % db, uri=True), db
+    remote = os.environ["REMOTE_DB"]
+    if not remote:
+        return None, db
+    host = os.environ["GATEWAY_URL"].split("://", 1)[-1].split(":", 1)[0]
+    p = subprocess.run(["ssh", "-o", "BatchMode=yes", host, "python3", "-", remote, str(cut_ms)],
+        input='''import json,sqlite3,sys\nc=sqlite3.connect("file:%s?mode=ro"%sys.argv[1],uri=True)\ncut=int(sys.argv[2])\nrows=list(c.execute("select backend,model,count(*),sum(case when status_code>=400 then 1 else 0 end),round(avg(total_ms)) from request_log where started_at>? group by backend,model order by count(*) desc",(cut,)))\nfor r in rows:\n v=[x[0] for x in c.execute("select total_ms from request_log where started_at>? and backend is ? and model is ? and total_ms is not null",(cut,r[0],r[1]))];v.sort();print(json.dumps(list(r)+[round(v[min(len(v)-1,int(len(v)*.95))]) if v else 0]))\n''',
+        text=True, capture_output=True, timeout=10)
+    return ([json.loads(x) for x in p.stdout.splitlines()] if p.returncode == 0 else []), "%s:%s" % (host, remote)
+
+metric, source = open_metrics()
+if isinstance(metric, sqlite3.Connection):
+    rows = list(metric.execute("select backend,model,count(*),sum(case when status_code>=400 then 1 else 0 end),round(avg(total_ms)) from request_log where started_at>? group by backend,model order by count(*) desc", (cut_ms,)))
+    full = []
+    for r in rows:
+        vals = sorted(x[0] for x in metric.execute("select total_ms from request_log where started_at>? and backend is ? and model is ? and total_ms is not null", (cut_ms, r[0], r[1])))
+        full.append(list(r) + [round(vals[min(len(vals)-1, int(len(vals)*.95))]) if vals else 0])
+    rows = full
+else:
+    rows = metric or []
 total = sum(r[2] for r in rows)
-print("gateway lanes, last %d min   (%d requests)" % (mins, total))
-print("-" * 74)
-if not total:
-    print("  no traffic in this window. Widen it: skgw-lanes 360")
-for b, m, n, e, ms in rows:
-    share = 100.0 * n / total if total else 0
-    flag = "  <-- ERRORS" if e else ""
-    print("  %-12s %-24s %6d  %5.1f%%  errors=%-5d avg=%sms%s"
-          % (str(b)[:12], str(m)[:24], n, share, e, ms, flag))
-print()
-lanes = {}
-for b, m, n, e, ms in rows:
-    key = "codex" if (b == "codex" or str(m).startswith("sk-codex")) else (
-          "glm/zai" if (b == "zai" or "glm" in str(m)) else str(b))
-    a, x = lanes.get(key, (0, 0)); lanes[key] = (a + n, x + e)
-print("by lane:")
-for k, (n, e) in sorted(lanes.items(), key=lambda x: -x[1][0]):
-    print("  %-10s %6d requests, %d errors" % (k, n, e))
-print()
-print("a lane missing here means it sent nothing, NOT that it is broken.")
-print("cross-check what the rotation launched:")
-print("  grep -h 'LAUNCHED|' ~/.skcapstone/evidence/fleet-rotation/*/actions.log \\")
-print("    | grep -oE 'lane=[a-z]+' | sort | uniq -c")
+print("gateway traffic, last %d min (%d requests)" % (mins, total))
+print("-" * 88)
+if not rows:
+    print("  no traffic in this window" + ("; metrics unavailable at %s" % source if not os.path.isfile(os.environ["DB"]) and not os.environ["REMOTE_DB"] else ""))
+for b, m, n, e, avg, p95 in rows:
+    print("  %-16s %-24s %6d %5.1f%% errors=%-5d avg=%-7sms p95=%sms%s" %
+          (str(b)[:16], str(m)[:24], n, 100*n/total if total else 0, e or 0, avg, p95, "  BROKEN TRAFFIC" if e else ""))
+
+queue = get_json("/queue")
+health = get_json("/health")
+print("\ngateway capacity and health")
+print("-" * 88)
+pool = queue.get("pool", {})
+if pool:
+    print("  pool active=%s queued=%s capacity=%s utilization=%.0f%%" % (pool.get("totalActive", "?"), pool.get("totalQueued", "?"), pool.get("totalCapacity", "?"), 100*float(pool.get("utilization", 0))))
+for name, cap in sorted(queue.get("backends", {}).items()):
+    h = health.get("backends", {}).get(name, {})
+    state = h.get("status", "unknown")
+    traffic = sum(r[2] for r in rows if str(r[0]) == name)
+    meaning = "idle" if traffic == 0 and state in ("up", "unknown") else ("broken" if state in ("down", "degraded") else "active")
+    print("  %-18s %2s/%-2s queued=%-3s health=%-8s traffic=%-5s state=%s" % (name, cap.get("active", "?"), cap.get("max", "?"), cap.get("queued", "?"), state, traffic, meaning))
+
+# Only fresh fleet-live snapshots count as workers. Coordination projections do not.
+live_dir = os.path.join(home, "evidence", "fleet-live")
+workers = []
+for path in glob.glob(os.path.join(live_dir, "*.json")):
+    try:
+        d = json.load(open(path)); age = time.time() - float(d.get("ts", 0))
+        if age <= 1800:
+            for w in d.get("workers", []):
+                owner = str(w.get("owner", "")); lane = owner.split("-")[1] if owner.startswith("pi-") else "unknown"
+                workers.append((d.get("host", "?"), lane, w.get("card_id", "?"), owner, int(age)))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+print("\nauthoritative fleet workers (fresh fleet-live, <=30m)")
+print("-" * 88)
+if not workers: print("  none")
+for host, lane, card, owner, age in workers:
+    print("  %-10s %-10s card=%-10s age=%3ss %s" % (host, lane, card, age, owner))
+
+# Recent receipts show both useful launches and the reasons unused slots stayed unused.
+events = collections.Counter(); launched = collections.Counter()
+for path in glob.glob(os.path.join(home, "evidence", "fleet-rotation", "*", "actions.log")):
+    try:
+        if os.path.getmtime(path) < cut_s: continue
+        for line in open(path, errors="replace"):
+            kind = line.split("|", 1)[0]
+            if kind == "LAUNCHED":
+                lane = re.search(r"(?:^|\|)lane=([^|]+)", line)
+                launched[lane.group(1).strip() if lane else "unknown"] += 1
+            elif kind not in ("SLOTS", "POOL", "POOL_V2", "ASSIGNABLE"):
+                events[kind] += 1
+    except OSError: pass
+print("\nrotation receipts, last %d min" % mins)
+print("-" * 88)
+print("  launches: " + (" ".join("%s=%d" % x for x in sorted(launched.items())) if launched else "none"))
+blocker_words = ("BLOCK", "FAIL", "EXCLUD", "COOLDOWN", "RACED", "FAULT", "WITHHELD", "HOLD")
+blockers = [(k,v) for k,v in events.most_common() if any(word in k for word in blocker_words)]
+print("  blockers: " + (" ".join("%s=%d" % x for x in blockers[:8]) if blockers else "none"))
+
+# Node object plus heartbeat is the source of node readiness, not SSH reachability.
+print("\nfleet nodes")
+print("-" * 88)
+covered = collections.Counter(h for h, *_ in workers)
+ready_uncovered = []
+for obj in sorted(glob.glob(os.path.join(home, "fleet", "objects", "node", "*.json"))):
+    try:
+        d=json.load(open(obj)); name=d.get("name", "?"); spec=d.get("spec", {}); hb=os.path.join(home,"fleet","status",name,"heartbeat.json")
+        if os.path.isfile(hb):
+            stamp=json.load(open(hb)).get("ts", ""); dt=datetime.datetime.fromisoformat(stamp.replace("Z", "+00:00")); age=int((datetime.datetime.now(datetime.timezone.utc)-dt).total_seconds())
+        else: age=None
+        state="Ready" if age is not None and age <= 300 and not spec.get("cordoned") else ("Pending" if age is not None and age <= 1800 else "Stale")
+        host=spec.get("address",{}).get("hostname") or name.removeprefix("node-")
+        count=covered.get(host, 0)
+        print("  %-14s %-7s beat=%-5s role=%-16s workers=%d" % (name, state, (str(age)+"s") if age is not None else "never", spec.get("role") or "-", count))
+        if state == "Ready" and not count: ready_uncovered.append(name)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError): pass
+print("  Ready nodes without authoritative workers: " + (", ".join(ready_uncovered) if ready_uncovered else "none"))
+
+# Herdr's live API is authoritative for local interactive crews. Names identify lane.
+print("\nlocal Herdr crews")
+print("-" * 88)
+try:
+    p=subprocess.run(["herdr","agent","list"],capture_output=True,text=True,timeout=5)
+    agents=json.loads(p.stdout).get("result",{}).get("agents",[])
+    crews=[]
+    for a in agents:
+        n=str(a.get("name", ""))
+        if not n.startswith(("glm-","glm2-","glm3-","glm4-","ds-","dsw-","codexw-")): continue
+        lane="codex" if n.startswith("codexw-") else ("deepseek" if n.startswith(("ds-","dsw-")) else "glm")
+        crews.append((lane,a.get("agent_status","unknown"),n))
+    counts=collections.Counter((l,s) for l,s,_ in crews)
+    for lane in ("glm","deepseek","codex"):
+        bits=["%s=%d"%(s,counts[lane,s]) for s in ("working","idle","done","unknown") if counts[lane,s]]
+        print("  %-10s %s" % (lane, " ".join(bits) if bits else "none"))
+    target={lane:int(os.environ["TARGET_"+lane.upper()]) for lane in ("codex","glm","deepseek")}
+    fleet_active=collections.Counter(lane for _,lane,*_ in workers)
+    local_active=collections.Counter({lane:counts[lane,"working"] for lane in target})
+    print("  target/local/fleet: " + " ".join("%s=%d/%d/%d"%(lane,target[lane],local_active[lane],fleet_active[lane]) for lane in ("glm","deepseek","codex")))
+except Exception as e: print("  unavailable: %s" % e)
+print("\nSources: gateway /queue+/health, metrics request_log, fresh fleet-live snapshots,")
+print("rotation receipts, node heartbeats, and Herdr API. Stale coord projections are excluded.")
 PY
