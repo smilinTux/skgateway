@@ -9,29 +9,37 @@ TARGET_GLM="${SKGW_TARGET_GLM:-9}"
 TARGET_DEEPSEEK="${SKGW_TARGET_DEEPSEEK:-20}"
 DB="${SKGW_METRICS_DB:-}"
 REMOTE_DB=""
+JOURNAL_UNIT="${SKGW_JOURNAL_UNIT:-skgateway-codex.service}"
+GATEWAY_HOST=${GATEWAY_URL#*://}; GATEWAY_HOST=${GATEWAY_HOST%%:*}
 
+# An explicit DB is an operator/test override. Otherwise discover the database
+# on the host serving GATEWAY_URL. A stale local replica must never override it.
 if [ -z "$DB" ]; then
-  JOURNAL_UNIT="${SKGW_JOURNAL_UNIT:-skgateway-codex.service}"
-  pid=$(systemctl --user show "$JOURNAL_UNIT" -p MainPID --value 2>/dev/null || true)
-  if [ -n "$pid" ] && [ "$pid" != 0 ]; then
-    DB=$(find "/proc/$pid/fd" -lname '*/metrics.db' -printf '%l\n' 2>/dev/null | head -1 || true)
-  fi
-  [ -n "$DB" ] || DB="$HOME/skgateway-codex/data/metrics.db"
-fi
-if [ ! -f "$DB" ]; then
-  gateway_host=${GATEWAY_URL#*://}; gateway_host=${gateway_host%%:*}
-  if command -v ssh >/dev/null && ssh -o BatchMode=yes -o ConnectTimeout=2 "$gateway_host" true 2>/dev/null; then
-    REMOTE_DB=$(ssh -o BatchMode=yes "$gateway_host" 'pid=$(systemctl --user show skgateway-codex.service -p MainPID --value 2>/dev/null); find "/proc/$pid/fd" -lname "*/metrics.db" -printf "%l\n" 2>/dev/null | head -1' || true)
+  local_short=$(hostname -s 2>/dev/null || hostname)
+  local_full=$(hostname -f 2>/dev/null || hostname)
+  if [ "$GATEWAY_HOST" = localhost ] || [ "$GATEWAY_HOST" = 127.0.0.1 ] \
+      || [ "$GATEWAY_HOST" = "$local_short" ] || [ "$GATEWAY_HOST" = "$local_full" ]; then
+    pid=$(systemctl --user show "$JOURNAL_UNIT" -p MainPID --value 2>/dev/null || true)
+    if [ -n "$pid" ] && [ "$pid" != 0 ]; then
+      DB=$(find "/proc/$pid/fd" -lname '*/metrics.db' -printf '%l\n' 2>/dev/null | head -1 || true)
+    fi
+    [ -n "$DB" ] || DB="$HOME/skgateway-codex/data/metrics.db"
+  elif command -v ssh >/dev/null; then
+    REMOTE_DB=$(ssh -o BatchMode=yes -o ConnectTimeout=3 "$GATEWAY_HOST" \
+      'pid=$(systemctl --user show skgateway-codex.service -p MainPID --value 2>/dev/null); find "/proc/$pid/fd" -lname "*/metrics.db" -printf "%l\n" 2>/dev/null | head -1' 2>/dev/null || true)
   fi
 fi
 
-WINDOW="$WINDOW" DB="$DB" REMOTE_DB="$REMOTE_DB" GATEWAY_URL="$GATEWAY_URL" FLEET_HOME="$FLEET_HOME" TARGET_CODEX="$TARGET_CODEX" TARGET_GLM="$TARGET_GLM" TARGET_DEEPSEEK="$TARGET_DEEPSEEK" python3 - <<'PY'
+WINDOW="$WINDOW" DB="$DB" REMOTE_DB="$REMOTE_DB" GATEWAY_URL="$GATEWAY_URL" GATEWAY_HOST="$GATEWAY_HOST" FLEET_HOME="$FLEET_HOME" JOURNAL_UNIT="$JOURNAL_UNIT" TARGET_CODEX="$TARGET_CODEX" TARGET_GLM="$TARGET_GLM" TARGET_DEEPSEEK="$TARGET_DEEPSEEK" python3 - <<'PY'
 import collections, datetime, glob, json, os, re, sqlite3, subprocess, sys, time, urllib.request
 
 mins = int(os.environ["WINDOW"])
 cut_ms = int((time.time() - mins * 60) * 1000)
 cut_s = time.time() - mins * 60
 home = os.environ["FLEET_HOME"]
+gateway_host = os.environ["GATEWAY_HOST"]
+local_names = {"localhost", "127.0.0.1", os.uname().nodename, os.uname().nodename.split(".")[0]}
+gateway_local = gateway_host in local_names
 
 def get_json(path):
     try:
@@ -41,18 +49,24 @@ def get_json(path):
         print("  gateway %s unavailable: %s" % (path, e))
         return {}
 
+def remote_run(args, timeout=10):
+    command = list(args) if gateway_local else ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3", gateway_host] + list(args)
+    try:
+        return subprocess.run(command, text=True, capture_output=True, timeout=timeout, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
 def open_metrics():
     db = os.environ["DB"]
-    if os.path.isfile(db):
+    if db and os.path.isfile(db):
         return sqlite3.connect("file:%s?mode=ro" % db, uri=True), db
     remote = os.environ["REMOTE_DB"]
     if not remote:
-        return None, db
-    host = os.environ["GATEWAY_URL"].split("://", 1)[-1].split(":", 1)[0]
-    p = subprocess.run(["ssh", "-o", "BatchMode=yes", host, "python3", "-", remote, str(cut_ms)],
+        return None, db or "%s:<open metrics.db not found>" % gateway_host
+    p = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3", gateway_host, "python3", "-", remote, str(cut_ms)],
         input='''import json,sqlite3,sys\nc=sqlite3.connect("file:%s?mode=ro"%sys.argv[1],uri=True)\ncut=int(sys.argv[2])\nrows=list(c.execute("select backend,model,count(*),sum(case when status_code>=400 then 1 else 0 end),round(avg(total_ms)) from request_log where started_at>? group by backend,model order by count(*) desc",(cut,)))\nfor r in rows:\n v=[x[0] for x in c.execute("select total_ms from request_log where started_at>? and backend is ? and model is ? and total_ms is not null",(cut,r[0],r[1]))];v.sort();print(json.dumps(list(r)+[round(v[min(len(v)-1,int(len(v)*.95))]) if v else 0]))\n''',
         text=True, capture_output=True, timeout=10)
-    return ([json.loads(x) for x in p.stdout.splitlines()] if p.returncode == 0 else []), "%s:%s" % (host, remote)
+    return ([json.loads(x) for x in p.stdout.splitlines()] if p.returncode == 0 else None), "%s:%s" % (gateway_host, remote)
 
 metric, source = open_metrics()
 if isinstance(metric, sqlite3.Connection):
@@ -62,13 +76,17 @@ if isinstance(metric, sqlite3.Connection):
         vals = sorted(x[0] for x in metric.execute("select total_ms from request_log where started_at>? and backend is ? and model is ? and total_ms is not null", (cut_ms, r[0], r[1])))
         full.append(list(r) + [round(vals[min(len(vals)-1, int(len(vals)*.95))]) if vals else 0])
     rows = full
+    metric.close()
 else:
     rows = metric or []
 total = sum(r[2] for r in rows)
 print("gateway traffic, last %d min (%d requests)" % (mins, total))
 print("-" * 88)
-if not rows:
-    print("  no traffic in this window" + ("; metrics unavailable at %s" % source if not os.path.isfile(os.environ["DB"]) and not os.environ["REMOTE_DB"] else ""))
+print("  metrics source: %s" % source)
+if metric is None:
+    print("  metrics unavailable; no local fallback was used")
+elif not rows:
+    print("  no traffic in this window")
 for b, m, n, e, avg, p95 in rows:
     print("  %-16s %-24s %6d %5.1f%% errors=%-5d avg=%-7sms p95=%sms%s" %
           (str(b)[:16], str(m)[:24], n, 100*n/total if total else 0, e or 0, avg, p95, "  BROKEN TRAFFIC" if e else ""))
@@ -87,62 +105,158 @@ for name, cap in sorted(queue.get("backends", {}).items()):
     meaning = "idle" if traffic == 0 and state in ("up", "unknown") else ("broken" if state in ("down", "degraded") else "active")
     print("  %-18s %2s/%-2s queued=%-3s health=%-8s traffic=%-5s state=%s" % (name, cap.get("active", "?"), cap.get("max", "?"), cap.get("queued", "?"), state, traffic, meaning))
 
-# Only fresh fleet-live snapshots count as workers. Coordination projections do not.
+def load_object(path, quality, category, missing_bad=True):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            value = json.load(handle)
+        if not isinstance(value, dict):
+            raise TypeError("top level is not an object")
+        return value
+    except FileNotFoundError:
+        if missing_bad:
+            quality[category] += 1
+        return None
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        quality[category] += 1
+        return None
+
+def canonical_lane(worker, owner):
+    fields = [worker.get(key) for key in ("lane", "provider", "backend", "model", "model_or_bucket", "route")]
+    fields.append(owner)
+    text = " ".join(str(value).lower() for value in fields if value)
+    aliases = (
+        ("deepseek", (r"deepseek", r"(?:^|[-_ ])dsw?(?:[-_ ]|$)")),
+        ("glm", (r"(?:^|[-_ ])glm(?:[-_ ]|$)", r"(?:^|[-_ ])zai(?:[-_ ]|$)", r"z\.ai")),
+        ("codex", (r"codex", r"(?:^|[-_ ])gpt(?:[-_ .]|$)")),
+        ("qwen", (r"qwen",)), ("kimi", (r"kimi",)),
+        ("escalate", (r"escalat", r"(?:^|[-_ ])esc(?:[-_ ]|$)")),
+    )
+    for lane, patterns in aliases:
+        if any(re.search(pattern, text) for pattern in patterns):
+            return lane
+    return "unknown"
+
+# Only fresh, well-formed fleet-live snapshots count as workers.
+quality = collections.Counter()
 live_dir = os.path.join(home, "evidence", "fleet-live")
 workers = []
+seen_workers = set()
 for path in glob.glob(os.path.join(live_dir, "*.json")):
+    d = load_object(path, quality, "fleet-live files")
+    if d is None:
+        continue
     try:
-        d = json.load(open(path)); age = time.time() - float(d.get("ts", 0))
-        if age <= 1800:
-            for w in d.get("workers", []):
-                owner = str(w.get("owner", "")); lane = owner.split("-")[1] if owner.startswith("pi-") else "unknown"
-                workers.append((d.get("host", "?"), lane, w.get("card_id", "?"), owner, int(age)))
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        pass
+        age = max(0, int(time.time() - float(d["ts"])))
+    except (KeyError, TypeError, ValueError, OverflowError):
+        quality["fleet-live files"] += 1
+        continue
+    if age > 1800:
+        continue
+    rows_value = d.get("workers", [])
+    if not isinstance(rows_value, list):
+        quality["fleet-live files"] += 1
+        continue
+    for w in rows_value:
+        if not isinstance(w, dict):
+            quality["fleet-live workers"] += 1
+            continue
+        owner = str(w.get("owner", ""))
+        key = (str(d.get("host", "?")), str(w.get("card_id", "?")), owner)
+        if key in seen_workers:
+            quality["duplicate workers"] += 1
+            continue
+        seen_workers.add(key)
+        workers.append((key[0], canonical_lane(w, owner), key[1], owner, age))
 print("\nauthoritative fleet workers (fresh fleet-live, <=30m)")
 print("-" * 88)
 if not workers: print("  none")
 for host, lane, card, owner, age in workers:
     print("  %-10s %-10s card=%-10s age=%3ss %s" % (host, lane, card, age, owner))
 
-# Recent receipts show both useful launches and the reasons unused slots stayed unused.
-events = collections.Counter(); launched = collections.Counter()
+# Recent receipts show launches, failures, blockers, contention, and eligibility.
+events = collections.Counter(); launched = collections.Counter(); latest = {}
 for path in glob.glob(os.path.join(home, "evidence", "fleet-rotation", "*", "actions.log")):
     try:
         if os.path.getmtime(path) < cut_s: continue
-        for line in open(path, errors="replace"):
-            kind = line.split("|", 1)[0]
-            if kind == "LAUNCHED":
-                lane = re.search(r"(?:^|\|)lane=([^|]+)", line)
-                launched[lane.group(1).strip() if lane else "unknown"] += 1
-            elif kind not in ("SLOTS", "POOL", "POOL_V2", "ASSIGNABLE"):
+        with open(path, errors="replace") as handle:
+            for sequence, line in enumerate(handle):
+                parts = line.rstrip().split("|")
+                kind = parts[0] if parts else ""
+                host = parts[1] if len(parts) > 1 else "unknown"
                 events[kind] += 1
-    except OSError: pass
+                latest[(host, kind)] = (os.path.getmtime(path), sequence, line.rstrip())
+                if kind == "LAUNCHED":
+                    lane = re.search(r"(?:^|\|)lane=([^|]+)", line)
+                    launched[lane.group(1).strip() if lane else "unknown"] += 1
+    except OSError:
+        quality["rotation logs"] += 1
 print("\nrotation receipts, last %d min" % mins)
 print("-" * 88)
 print("  launches: " + (" ".join("%s=%d" % x for x in sorted(launched.items())) if launched else "none"))
-blocker_words = ("BLOCK", "FAIL", "EXCLUD", "COOLDOWN", "RACED", "FAULT", "WITHHELD", "HOLD")
-blockers = [(k,v) for k,v in events.most_common() if any(word in k for word in blocker_words)]
-print("  blockers: " + (" ".join("%s=%d" % x for x in blockers[:8]) if blockers else "none"))
+failure_words = ("FAIL", "FAULT", "ERROR")
+blocker_words = ("BLOCK", "EXCLUD", "COOLDOWN", "WITHHELD", "HOLD", "DEFER", "SKIPPED")
+failures = [(kind, count) for kind, count in events.most_common() if any(word in kind for word in failure_words)]
+blockers = [(kind, count) for kind, count in events.most_common() if any(word in kind for word in blocker_words) and not any(word in kind for word in failure_words)]
+contention = [(kind, count) for kind, count in events.most_common() if "RACED" in kind or "OVERLAP" in kind]
+print("  failures: " + (" ".join("%s=%d" % item for item in failures[:8]) if failures else "none"))
+print("  blockers: " + (" ".join("%s=%d" % item for item in blockers[:8]) if blockers else "none"))
+print("  contention: " + (" ".join("%s=%d" % item for item in contention[:8]) if contention else "none"))
 
 # Node object plus heartbeat is the source of node readiness, not SSH reachability.
-print("\nfleet nodes")
+print("\nfleet nodes and distribution")
 print("-" * 88)
-covered = collections.Counter(h for h, *_ in workers)
-ready_uncovered = []
+covered = collections.Counter(h.lower() for h, *_ in workers)
+ready_nodes = []; ready_uncovered = []
 for obj in sorted(glob.glob(os.path.join(home, "fleet", "objects", "node", "*.json"))):
-    try:
-        d=json.load(open(obj)); name=d.get("name", "?"); spec=d.get("spec", {}); hb=os.path.join(home,"fleet","status",name,"heartbeat.json")
-        if os.path.isfile(hb):
-            stamp=json.load(open(hb)).get("ts", ""); dt=datetime.datetime.fromisoformat(stamp.replace("Z", "+00:00")); age=int((datetime.datetime.now(datetime.timezone.utc)-dt).total_seconds())
-        else: age=None
-        state="Ready" if age is not None and age <= 300 and not spec.get("cordoned") else ("Pending" if age is not None and age <= 1800 else "Stale")
-        host=spec.get("address",{}).get("hostname") or name.removeprefix("node-")
-        count=covered.get(host, 0)
-        print("  %-14s %-7s beat=%-5s role=%-16s workers=%d" % (name, state, (str(age)+"s") if age is not None else "never", spec.get("role") or "-", count))
-        if state == "Ready" and not count: ready_uncovered.append(name)
-    except (OSError, ValueError, TypeError, json.JSONDecodeError): pass
-print("  Ready nodes without authoritative workers: " + (", ".join(ready_uncovered) if ready_uncovered else "none"))
+    d = load_object(obj, quality, "node files")
+    if d is None:
+        continue
+    name = str(d.get("name", "?")); spec = d.get("spec", {})
+    if not isinstance(spec, dict):
+        quality["node files"] += 1
+        continue
+    hb = load_object(os.path.join(home, "fleet", "status", name, "heartbeat.json"), quality, "heartbeat files", missing_bad=False)
+    age = None
+    if hb is not None:
+        try:
+            stamp = str(hb.get("ts", "")); dt = datetime.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+            age = max(0, int((datetime.datetime.now(datetime.timezone.utc)-dt).total_seconds()))
+        except (ValueError, TypeError, OverflowError):
+            quality["heartbeat files"] += 1
+    state = "Ready" if age is not None and age <= 300 and not spec.get("cordoned") else ("Pending" if age is not None and age <= 1800 else "Stale")
+    address = spec.get("address", {}) if isinstance(spec.get("address", {}), dict) else {}
+    host = str(address.get("hostname") or name.removeprefix("node-")).lower()
+    count = covered.get(host, 0)
+    rotation_state = "recent" if any(event_host.lower() == host for event_host, _ in latest) else "none"
+    print("  %-14s %-7s beat=%-5s role=%-16s workers=%-2d rotation=%s" % (name, state, (str(age)+"s") if age is not None else "never", spec.get("role") or "-", count, rotation_state))
+    if state == "Ready":
+        ready_nodes.append((name, host))
+        if not count: ready_uncovered.append(name)
+print("  Ready coverage: %d/%d nodes; without workers: %s" % (len(ready_nodes)-len(ready_uncovered), len(ready_nodes), ", ".join(ready_uncovered) if ready_uncovered else "none"))
+
+print("\nfleet eligibility and placement, latest receipts in window")
+print("-" * 88)
+rotation_hosts = sorted({host for host, _kind in latest})
+if not rotation_hosts:
+    print("  no recent rotation evidence")
+for host in rotation_hosts:
+    def line_for(kind):
+        return latest.get((host, kind), (0, 0, ""))[2]
+    slots = line_for("SLOTS").split("|", 2)[-1] if line_for("SLOTS") else "slots=unknown"
+    authority = line_for("POOL_AUTHORITY"); pool_v2 = line_for("POOL_V2"); receipt = line_for("CYCLE_RECEIPT")
+    eligible = re.search(r"(?:^|\|)ready=(\d+)", authority)
+    attempted = re.search(r"(?:^|\|)attempted=(\d+)", receipt)
+    launched_count = re.search(r"(?:^|\|)launched=(\d+)", receipt)
+    print("  %-10s eligible=%-4s attempted=%-3s launched=%-3s %s" % (host, eligible.group(1) if eligible else "?", attempted.group(1) if attempted else "?", launched_count.group(1) if launched_count else "?", slots))
+    reasons = re.search(r"reasons=(\{.*\})", pool_v2)
+    if reasons:
+        try:
+            reason_counts = json.loads(reasons.group(1))
+            print("    ineligible: " + " ".join("%s=%s" % item for item in sorted(reason_counts.items(), key=lambda item: -item[1])[:10]))
+        except (ValueError, TypeError):
+            quality["rotation logs"] += 1
+ready_without_rotation = [name for name, host in ready_nodes if host not in {value.lower() for value in rotation_hosts}]
+print("  Ready nodes without recent rotation evidence: " + (", ".join(ready_without_rotation) if ready_without_rotation else "none"))
 
 # Herdr's live API is authoritative for local interactive crews. Names identify lane.
 print("\nlocal Herdr crews")
@@ -165,6 +279,76 @@ try:
     local_active=collections.Counter({lane:counts[lane,"working"] for lane in target})
     print("  target/local/fleet: " + " ".join("%s=%d/%d/%d"%(lane,target[lane],local_active[lane],fleet_active[lane]) for lane in ("glm","deepseek","codex")))
 except Exception as e: print("  unavailable: %s" % e)
-print("\nSources: gateway /queue+/health, metrics request_log, fresh fleet-live snapshots,")
+
+# Restore the journal-derived safety signals from the original lane report.
+journal_file = os.environ.get("SKGW_JOURNAL_FILE", "")
+if journal_file:
+    try:
+        with open(journal_file, encoding="utf-8", errors="replace") as handle:
+            journal = handle.read()
+    except OSError:
+        journal = ""
+else:
+    result = remote_run(["journalctl", "--user", "-u", os.environ["JOURNAL_UNIT"], "--since", "-%d min" % mins, "--no-pager"], 15)
+    journal = result.stdout if result and result.returncode == 0 else ""
+signal_names = re.findall(r'"event"\s*:\s*"([a-z_.]+)"', journal)
+selected = collections.Counter(name for name in signal_names if re.search(r"owner_backend_down|claims?_quarantined|context_preflight|context_overflow|semantic_cache", name))
+print("\ngateway safety signals, last %d min" % mins)
+print("-" * 88)
+if selected:
+    for name, count in selected.most_common():
+        print("  %-32s %d" % (name, count))
+else:
+    print("  none fired in this window")
+
+audit_path = os.environ.get("SKGW_AUDIT", os.path.expanduser("~/skgateway-codex/logs/audit.jsonl"))
+audit = ""
+if gateway_local:
+    try:
+        with open(os.path.expanduser(audit_path), "rb") as handle:
+            end = handle.seek(0, 2); handle.seek(max(0, end - 2_000_000))
+            audit = handle.read().decode("utf-8", "replace")
+    except OSError:
+        pass
+else:
+    result = remote_run(["tail", "-c", "2000000", audit_path], 15)
+    audit = result.stdout if result and result.returncode == 0 else ""
+
+def json_event(line):
+    try:
+        value = json.loads(line[line.index("{"):])
+        return value if isinstance(value, dict) else None
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+shadow = None
+for line in (journal + "\n" + audit).splitlines():
+    if "semantic_cache.shadow" not in line:
+        continue
+    value = json_event(line)
+    if not value:
+        continue
+    stamp = str(value.get("ts", ""))
+    try:
+        event_time = datetime.datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp() if stamp else time.time()
+    except (ValueError, OverflowError):
+        continue
+    if event_time >= cut_s:
+        shadow = value
+print("\nsemantic cache shadow")
+print("-" * 88)
+if shadow:
+    observed, would_hit = int(shadow.get("observed", 0)), int(shadow.get("would_hit", 0))
+    rate = 100.0 * would_hit / observed if observed else 0.0
+    print("  observed=%d would_hit=%d (%.1f%% upper bound) sim=%.2f embed_ms=%s" % (observed, would_hit, rate, float(shadow.get("similarity", 0)), shadow.get("embed_ms", "?")))
+    print("  upper bound only: shadow keys truncate at 1100 chars and skip the system prompt")
+    print("  review scripts/semantic-cache-report.mjs before enabling serve mode")
+else:
+    print("  no recent shadow events: cache is disabled or idle")
+
+print("\ndata quality")
+print("-" * 88)
+print("  " + (" ".join("%s=%d" % item for item in sorted(quality.items())) if quality else "all inspected runtime records were well formed"))
+print("\nSources: gateway-host /queue, /health, request_log and journal; fresh fleet-live,")
 print("rotation receipts, node heartbeats, and Herdr API. Stale coord projections are excluded.")
 PY
