@@ -720,13 +720,48 @@ overrides:
     params_b: 675
     size_class: XL
     latency_class: batch
+  deepseek-ai/deepseek-v4-flash:
+    display_name: "DeepSeek V4 Flash"
+    org: DeepSeek
+    context_length: 1048576
+    supported_parameters: [tools, tool_choice, structured_outputs, reasoning]
+    tier: paid-cloud
+    size_class: L
+    qualification:
+      reviewed: true
+      status: pass
+      qualified_class: L
+      logical_route: sk-deepseek-l
+      provider_family: deepseek
+      served_model: deepseek-ai/deepseek-v4-flash
+      policy_revision: 6c0f392f1757d850da42da17fe17587e0b291d2e54df3b49b20cfc5caa504170
+      case_set_hash: e508d411d3a4b8f2ee3b72a4b82e8edcf444f5f07386659dfbbd4078de05dbd5
+      response_schema_hash: 4b7403e7972d145d5c82d0957092711801dd4ea84b31df10332b101ef690039a
+      result_hash: 4da76f516db4ef54613f54907dc7238fce22487123a2c388ffcb89937c0cf091
+      reviewed_at: "2026-09-25T00:00:00.000Z"
+      expires_at: "2026-12-24T00:00:00.000Z"
+    notes: "Reviewed public-synthetic qualification caps generic membership at L. Focused routing remains available after expiry."
   deepseek-ai/deepseek-v4-pro:
     context_length: 1048576
     tier: free-remote
     # Card N2: latency_class locked batch on the measured ~46s note above;
     # no metrics.db p50 is wired into this file yet (that's card P5.4).
     latency_class: batch
-    notes: "slow (~46s), batch/cron use"
+    size_class: L
+    qualification:
+      reviewed: true
+      status: pass
+      qualified_class: L
+      logical_route: sk-deepseek-l
+      provider_family: deepseek
+      served_model: deepseek-ai/deepseek-v4-pro
+      policy_revision: 6c0f392f1757d850da42da17fe17587e0b291d2e54df3b49b20cfc5caa504170
+      case_set_hash: e508d411d3a4b8f2ee3b72a4b82e8edcf444f5f07386659dfbbd4078de05dbd5
+      response_schema_hash: 4b7403e7972d145d5c82d0957092711801dd4ea84b31df10332b101ef690039a
+      result_hash: 387fc51742819e5185a87a3b2514925ba82d70070b2fe8a9ba816c26c7e2e199
+      reviewed_at: "2026-09-25T00:00:00.000Z"
+      expires_at: "2026-12-24T00:00:00.000Z"
+    notes: "slow (~46s), batch/cron use; reviewed public-synthetic qualification caps generic membership at L"
   minimaxai/minimax-m2.7:
     context_length: 204800
     tier: free-remote
