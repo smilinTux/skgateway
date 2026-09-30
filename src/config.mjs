@@ -283,6 +283,7 @@ const DEFAULTS = {
       models: {},
       buckets: {},
     },
+    bucket_excluded_models: [],
   },
 
   // CapAuth agent-identity (SKGateway P2.1). Every /v1/* request is resolved to
@@ -964,6 +965,12 @@ export function assertProviderRoutes(
  */
 function validate(cfg, removedBackendIds = new Set()) {
   const errs = [];
+
+  const bucketExcluded = cfg.routing?.bucket_excluded_models;
+  if (!Array.isArray(bucketExcluded) || bucketExcluded.some((id) =>
+    typeof id !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9._:/-]*$/.test(id))) {
+    errs.push('routing.bucket_excluded_models must be an array of exact model IDs');
+  }
 
   // server
   if (!Number.isInteger(cfg.server.port) || cfg.server.port < 1 || cfg.server.port > 65535)

@@ -77,11 +77,11 @@ let _cfgSeq = 0;
  * Deliberately minimal: config.mjs fills the rest from its DEFAULTS, so these
  * tests move exactly one variable at a time.
  */
-function writeConfig({ buckets_enabled = false, sensitivity_enforced = false, match_enabled = false } = {}) {
+function writeConfig({ buckets_enabled = false, sensitivity_enforced = false, match_enabled = false, bucket_excluded_models = [] } = {}) {
   const p = join(FIX_DIR, `gw-${_cfgSeq++}.yaml`);
   writeFileSync(
     p,
-    `routing:\n  buckets_enabled: ${buckets_enabled}\n  sensitivity_enforced: ${sensitivity_enforced}\n  match_enabled: ${match_enabled}\n`,
+    `routing:\n  buckets_enabled: ${buckets_enabled}\n  sensitivity_enforced: ${sensitivity_enforced}\n  match_enabled: ${match_enabled}\n  bucket_excluded_models: ${JSON.stringify(bucket_excluded_models)}\n`,
     'utf8',
   );
   return p;
@@ -248,6 +248,48 @@ ${extraRoles}defaults:
     pool.state.lastModel = null;
     pool.state.lastMaxTokens = null;
     pool.state.lastMaxCompletionTokens = null;
+  });
+
+  test('configured bucket exclusions fence legacy GLM without changing the logical route', async () => {
+    const models = ['glm-4.6', 'glm-4.7', 'glm-5.3'];
+    writeFileSync(CATALOG_CACHE_PATH, JSON.stringify({ models: models.map((id) => ({
+      id, provider: 'zai', free: false,
+      card: { tier: 'paid-cloud', size_class: 'XL', supported_parameters: ['tools'] },
+    })) }));
+    const glmRouter = createRouter({ backends: {
+      zai: { url: pool.base, auth_type: 'none', models, priority: 1 },
+    } });
+    await applyConfig({ buckets_enabled: true, bucket_excluded_models: models.slice(0, 2) });
+    for (let i = 0; i < 4; i++) {
+      const result = await routeAndSend(glmRouter, { model: 'sk-zai-m' },
+        '/chat/completions', 'POST', HEADERS, bodyFor('sk-zai-m'), false);
+      assert.equal(result.status, 200);
+      assert.equal(result.bucketMember, 'glm-5.3');
+      assert.equal(pool.state.lastModel, 'glm-5.3');
+    }
+  });
+
+  test('excluding every eligible member fails closed and clearing exclusions restores routing', async () => {
+    await applyConfig({ buckets_enabled: true, bucket_excluded_models: ['pool-l-local'] });
+    const call = () => routeAndSend(router, { model: 'sk-l-secret' },
+      '/chat/completions', 'POST', HEADERS, bodyFor('sk-l-secret'), false);
+    assert.equal((await call()).status, 503);
+    assert.equal(pool.state.count, 0);
+    await applyConfig({ buckets_enabled: true });
+    assert.equal((await call()).status, 200);
+    assert.equal(pool.state.lastModel, 'pool-l-local');
+  });
+
+  test('invalid exclusion config is rejected without replacing the active configuration', async () => {
+    await applyConfig({ buckets_enabled: true, bucket_excluded_models: ['pool-l-local'] });
+    for (const invalid of ['glm-4.6', null, [42], [''], [' glm-4.6'], ['glm-*']]) {
+      await assert.rejects(applyConfig({ buckets_enabled: true, bucket_excluded_models: invalid }),
+        /bucket_excluded_models/);
+    }
+    const result = await routeAndSend(router, { model: 'sk-l-secret' },
+      '/chat/completions', 'POST', HEADERS, bodyFor('sk-l-secret'), false);
+    assert.equal(result.status, 503);
+    assert.equal(pool.state.count, 0);
   });
 
   test('SIEM call sites 1 + 3: both bucket_resolve decisions write one typed, attributable line', async () => {

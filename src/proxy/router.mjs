@@ -2978,12 +2978,16 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
     wantsTools = false;
   }
 
+  // Operator fences survive discovery refresh without fabricating lifecycle state.
+  // They affect bucket selection only; explicit diagnostic model requests remain available.
+  const excluded = new Set(getConfig().routing?.bucket_excluded_models || []);
   const { members, rejected, ceiling } = resolveBucket({
     bucket: addr,
     catalog,
     sensitivityPolicy: policy,
     requireToolUse: wantsTools,
     isRoutable: (e) => {
+      if (excluded.has(e.id)) return false;
       const claimers = typeof router.getBackends === "function"
         ? router.getBackends()
           .filter((backend) => backend.supportsModel(e.id))
