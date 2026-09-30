@@ -23,6 +23,10 @@ import {
   discoverCatalog,
   CARD_OVERRIDES_PATH,
 } from '../src/discovery.mjs';
+import {
+  QUALIFICATION_RESPONSE_SCHEMA_HASH,
+  qualificationCaseSetHash,
+} from '../qualification/deepseek/evaluate.mjs';
 
 const DIR = mkdtempSync(join(tmpdir(), 'skgw-card-overrides-'));
 let _seq = 0;
@@ -35,6 +39,35 @@ test('loadCardOverrides reads the real committed overlay file', () => {
   assert.ok(overrides['deepseek-ai/deepseek-v4-pro'], 'deepseek-v4-pro should have an overlay entry');
   assert.equal(overrides['deepseek-ai/deepseek-v4-pro'].context_length, 1048576);
   assert.match(overrides['deepseek-ai/deepseek-v4-pro'].notes, /slow/);
+});
+
+test('DeepSeek Flash and Pro carry bounded reviewed qualification evidence', () => {
+  const overrides = loadCardOverrides(CARD_OVERRIDES_PATH);
+  for (const id of ['deepseek-ai/deepseek-v4-flash', 'deepseek-ai/deepseek-v4-pro']) {
+    const card = overrides[id];
+    assert.equal(card.size_class, 'L');
+    assert.equal(card.qualification.reviewed, true);
+    assert.equal(card.qualification.status, 'pass');
+    assert.equal(card.qualification.qualified_class, 'L');
+    for (const key of ['case_set_hash', 'response_schema_hash', 'result_hash']) {
+      assert.match(card.qualification[key], /^[a-f0-9]{64}$/);
+    }
+    assert.equal(card.qualification.case_set_hash, qualificationCaseSetHash());
+    assert.equal(card.qualification.response_schema_hash, QUALIFICATION_RESPONSE_SCHEMA_HASH);
+  }
+});
+
+test('DeepSeek reviewed evidence survives card overlay enrichment', () => {
+  const overrides = loadCardOverrides(CARD_OVERRIDES_PATH);
+  const model = {
+    id: 'deepseek-ai/deepseek-v4-flash',
+    provider: 'deepseek',
+    card: { source: 'deepseek', size_class: null },
+  };
+  const out = applyCardOverlay(model, overrides);
+  assert.equal(out.card.size_class, 'L');
+  assert.equal(out.card.qualification.reviewed, true);
+  assert.equal(out.card.source, 'manual');
 });
 
 test('loadCardOverrides is fail-soft on a missing file', () => {

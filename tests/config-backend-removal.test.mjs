@@ -44,6 +44,7 @@ describe("config loader backend removal contract", () => {
     assert.equal(cfg.server.port, 18780, "unrelated server default must still merge");
     assert.equal(cfg.tools.max_budget, 16, "unrelated tools default must still merge");
     assert.equal(cfg.discovery.providers.anthropic.enabled, false);
+    assert.equal(cfg.discovery.providers.deepseek.enabled, false);
     assert.equal(cfg.discovery.providers.nvidia.enabled, false);
     assert.equal(cfg.discovery.providers.openrouter.enabled, false);
   });
@@ -103,6 +104,69 @@ describe("config loader backend removal contract", () => {
         assert.match(error.message, /members references disabled or removed backend anthropic/);
         return true;
       },
+    );
+  });
+
+  test("DeepSeek discovery requires a same-named backend", async () => {
+    const enabled = await load([
+      "backends:",
+      "  deepseek:",
+      "    url: http://127.0.0.1:9000/v1",
+      "    auth_type: none",
+      "    models: [deepseek-model]",
+      "    priority: 1",
+      "discovery:",
+      "  providers:",
+      "    deepseek:",
+      "      enabled: true",
+    ]);
+    assert.equal(enabled.discovery.providers.deepseek.enabled, true);
+
+    const removed = await load([
+      "backends:",
+      "  local:",
+      "    url: http://127.0.0.1:9000/v1",
+      "    auth_type: none",
+      "    models: [local-model]",
+      "    priority: 1",
+      "discovery:",
+      "  providers:",
+      "    deepseek:",
+      "      enabled: true",
+    ]);
+    assert.equal(removed.discovery.providers.deepseek.enabled, false);
+
+    const disabled = await load([
+      "backends:",
+      "  deepseek: { enabled: false }",
+      "  local:",
+      "    url: http://127.0.0.1:9000/v1",
+      "    auth_type: none",
+      "    models: [local-model]",
+      "    priority: 1",
+      "discovery:",
+      "  providers:",
+      "    deepseek:",
+      "      enabled: true",
+    ]);
+    assert.equal(disabled.discovery.providers.deepseek.enabled, false);
+  });
+
+  test("malformed DeepSeek discovery enabled fails validation", async () => {
+    await assert.rejects(
+      () => load([
+        "backends:",
+        "  deepseek:",
+        "    url: http://127.0.0.1:9000/v1",
+        "    auth_type: none",
+        "    models: [deepseek-model]",
+        "    priority: 1",
+        "discovery:",
+        "  providers:",
+        "    deepseek:",
+        "      enabled: enabled",
+      ]),
+      /discovery\.providers\.deepseek\.enabled must be a boolean/,
     );
   });
 

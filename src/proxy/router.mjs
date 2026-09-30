@@ -71,6 +71,7 @@ import {
   parseBucketId,
   resolveBucket,
   orderMembersByCost,
+  orderMembersByGenericWeight,
   validateFamilyPreference,
   applyFamilyPreference,
   selectMember,
@@ -84,6 +85,10 @@ import { codexPurityProblems } from "../policy/codex-purity.mjs";
 const KIMI_OAUTH_HOST = "https://auth.kimi.com";
 const KIMI_OAUTH_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098";
 const KIMI_REFRESH_BUFFER_MS = 60_000;
+// How often startKimiAuthKeepalive polls kimi_oauth backends (see that
+// function below). Well under KIMI_REFRESH_BUFFER_MS so the poll cannot
+// step over the refresh window between two ticks.
+const KIMI_KEEPALIVE_INTERVAL_MS = 30_000;
 const kimiRefreshes = new Map();
 
 function writeJsonAtomic(filePath, value) {
@@ -1698,6 +1703,66 @@ export class Backend {
 }
 
 // ---------------------------------------------------------------------------
+// Kimi OAuth proactive keepalive
+// ---------------------------------------------------------------------------
+
+/**
+ * Poll every kimi_oauth backend on a timer so its cached token is refreshed
+ * and persisted to disk before it expires, independent of request traffic.
+ *
+ * Kimi access tokens are short lived (observed expires_in: 900 seconds), and
+ * the design this backend shipped with (see the kimi_oauth feat commit above
+ * _getKimiAuthHeaders) assumed an external kimi CLI keepalive timer kept the
+ * credentials file fresh, with the gateway only re-reading it. That external
+ * timer was never installed on either chi host: systemctl reports
+ * kimi-auth-keepalive.timer as not-found, not merely disabled. PR #137 added
+ * a fallback so _getKimiAuthHeaders refreshes the cached token itself near
+ * expiry, but only as a side effect of a request calling buildAuthHeaders.
+ * If a backend goes quiet, whether from a lull in traffic or because the
+ * router failed it over to another backend after an earlier error, nothing
+ * ever calls that path again. The in-memory token and the on-disk file both
+ * go stale, and because the actual failure mode on an expired Kimi token is
+ * a hang rather than a clean 401, no error ever arrives to shake it loose.
+ * The process then serves (or hangs) on a dead token until it is restarted.
+ *
+ * This scheduler closes that gap: it does not duplicate the refresh logic,
+ * it just calls the existing, already-tested buildAuthHeaders() on a timer
+ * so the near-expiry check inside it fires on a schedule instead of only on
+ * demand.
+ *
+ * @param {object} options
+ * @param {() => Backend[]} options.getBackends
+ * @param {number} [options.intervalMs]
+ * @param {typeof setInterval} [options.setIntervalFn]
+ * @returns {{ tick: () => Promise<void>, timer: NodeJS.Timeout }}
+ */
+export function startKimiAuthKeepalive({
+  getBackends, intervalMs = KIMI_KEEPALIVE_INTERVAL_MS, setIntervalFn = setInterval,
+}) {
+  let inFlight = false;
+  const tick = async () => {
+    if (inFlight) return;
+    inFlight = true;
+    try {
+      const backends = getBackends() || [];
+      for (const backend of backends) {
+        if (!backend || backend.auth_type !== "kimi_oauth") continue;
+        try {
+          await backend.buildAuthHeaders();
+        } catch (error) {
+          console.error(`[router] backend=${backend.id} kimi keepalive tick failed: ${error.message}`);
+        }
+      }
+    } finally {
+      inFlight = false;
+    }
+  };
+  const timer = setIntervalFn(tick, intervalMs);
+  timer?.unref?.();
+  return { tick, timer };
+}
+
+// ---------------------------------------------------------------------------
 // Router factory
 // ---------------------------------------------------------------------------
 
@@ -2972,8 +3037,8 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
     };
   }
 
-  const n = (_bucketCounters.get(addr.bucket) || 0) + 1;
-  _bucketCounters.set(addr.bucket, n);
+  const n = _bucketCounters.get(addr.bucket) || 0;
+  _bucketCounters.set(addr.bucket, n + 1);
   
   // Read and validate family preference from x-sk-prefer header (card 1e26943e)
   const prefHeader = request.headers?.['x-sk-prefer'];
@@ -3010,8 +3075,21 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
     }
   }
 
-  // Apply family preference within cheapest cost tier
-  const picked = selectMember(members, n, familyPreference);
+  const isWeightedGeneric = !addr.provider && ['S', 'M', 'L'].includes(addr.model_class);
+  const genericPolicy = isWeightedGeneric
+    ? getConfig()?.routing?.generic_participation
+    : null;
+  let orderedMembers = isWeightedGeneric
+    ? orderMembersByGenericWeight(members, n, addr, genericPolicy)
+    : orderMembersByCost(members, n);
+  if (familyPreference && orderedMembers.length > 0) {
+    const selectedProvider = orderedMembers[0].provider;
+    const sameProvider = orderedMembers.filter((member) => member.provider === selectedProvider);
+    const rest = orderedMembers.filter((member) => member.provider !== selectedProvider);
+    orderedMembers = [...applyFamilyPreference(sameProvider, familyPreference), ...rest];
+  }
+  const picked = isWeightedGeneric ? (orderedMembers[0] || null)
+    : selectMember(members, n, familyPreference);
   
   if (!picked) {
     console.warn(`[router] bucket ${addr.bucket} no member selected after preference`);
@@ -3021,9 +3099,9 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
         headers: { "content-type": "application/json" },
         body: Buffer.from(JSON.stringify({
           error: {
-            message: `No model available for bucket ${addr.bucket}`,
+            message: `No enabled provider is eligible for bucket ${addr.bucket}`,
             code: 503,
-            type: "bucket_no_member",
+            type: "bucket_no_eligible_provider",
           },
         }), "utf-8"),
       },
@@ -3060,10 +3138,12 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
   // chosen member's backend is down. Rebuild it with the picked member first,
   // then every other member in cost order: the preference decides who serves,
   // it does not remove anyone from the failover chain.
-  const orderedMembers = [
-    picked,
-    ...orderMembersByCost(members, n).filter((m) => m.id !== picked.id),
-  ];
+  if (!isWeightedGeneric) {
+    orderedMembers = [
+      picked,
+      ...orderMembersByCost(members, n).filter((m) => m.id !== picked.id),
+    ];
+  }
 
   const candidates = [];
   const seen = new Set();
@@ -3150,6 +3230,10 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
             model: member.id,
             bucket: addr.bucket,
             bucketMember: member.id,
+            genericPolicyRevision: member.generic_policy_revision,
+            genericProviderWeight: member.generic_provider_weight,
+            genericParticipationReason: member.generic_participation_reason,
+            genericRotationCounter: member.generic_rotation_counter,
           });
         }
         continue;
@@ -3169,6 +3253,10 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
         model: member.id,
         bucket: addr.bucket,
         bucketMember: member.id,
+        genericPolicyRevision: member.generic_policy_revision,
+        genericProviderWeight: member.generic_provider_weight,
+        genericParticipationReason: member.generic_participation_reason,
+        genericRotationCounter: member.generic_rotation_counter,
       });
     }
   }
@@ -3199,6 +3287,14 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
     phase: "candidate_chain",
     outcome: "candidate_chain_built",
     bucket: addr.bucket,
+    logical_route: addr.bucket,
+    selected_provider: picked.provider || null,
+    selected_model: picked.id,
+    generic_policy_revision: picked.generic_policy_revision || null,
+    generic_provider_weight: picked.generic_provider_weight ?? null,
+    generic_participation_reason: picked.generic_participation_reason || null,
+    generic_exclusion_reason: null,
+    generic_rotation_counter: picked.generic_rotation_counter ?? null,
     chain_length: candidates.length,
     skipped,
   }, {});
@@ -3240,20 +3336,19 @@ export function createRouteSiemEmitter(siem, requestSource = {}, requestId = ran
 
 /**
  * Preserve logical routing for synthetic traffic unless the concrete model has
- * an exact admission-gated owner whose initial health this request can prove.
+ * an exact configured owner that this request is intended to probe.
  */
 export function shouldUseRegistryRouting(router, request, bootstrapProbe = false) {
   if (!isRegistryRouted(request)) return false;
   if (!bootstrapProbe) return true;
   const model = request?.model;
   if (typeof model !== "string") return true;
-  const exactAdmissionOwner = (typeof router.getBackends === "function"
+  const exactOwner = (typeof router.getBackends === "function"
     ? [...router.getBackends().values()]
     : []
-  ).some((backend) => backend?.require_observed_health === true &&
-    backend.models?.some((pattern) =>
+  ).some((backend) => backend?.models?.some((pattern) =>
       typeof pattern === "string" && pattern.toLowerCase() === model.toLowerCase()));
-  return !exactAdmissionOwner;
+  return !exactOwner;
 }
 
 export function configuredModelAlias(model, config = null) {
@@ -4557,9 +4652,19 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       failureClass: recoveryFailureClass,
       authoritativeRecovery: recoveryProbeSucceeded,
     });
+    // Model-claim tracking always sees the gateway's outward status, never
+    // the raw upstream one. When modelContractFailure is true, res.status is
+    // already 502 (it is part of the condition above), so the two arms below
+    // were never meant to diverge: passing upstreamStatus (the original 2xx)
+    // here fed recordModelClaimOutcome's success branch, which deletes the
+    // failure entry, so every content-invalid completion was recorded as a
+    // claim success and could never accumulate toward exact-claim
+    // quarantine. Passing res.status lets a repeated malformed_response or
+    // response_budget 502 accumulate and eventually quarantine the exact
+    // model claim, as the comment above already said it should.
     const claimTransition = backend.recordModelClaimOutcome(
       candidateModel,
-      modelContractFailure ? upstreamStatus : res.status,
+      res.status,
     );
     if (claimTransition) {
       const quarantined = claimTransition.transition === "quarantined";

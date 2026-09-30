@@ -352,6 +352,22 @@ describe("card P3.3: GET /admin/models/rank (suggest-only rank API)", () => {
     assert.equal(res.status, 400);
   });
 
+  test("GET /admin/buckets exposes sanitized generic policy revision and effective weights", async () => {
+    const res = await fetch(`http://127.0.0.1:${PORT}/admin/buckets`);
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.match(body.generic_policy_revision, /^[a-f0-9]{64}$/);
+    const generic = body.buckets.find((bucket) => bucket.bucket === "sk-l");
+    assert.ok(generic);
+    assert.equal(generic.generic_policy_revision, body.generic_policy_revision);
+    assert.ok(Array.isArray(generic.generic_effective_weights));
+    assert.deepEqual(
+      generic.generic_effective_weights.find((entry) => entry.provider === "codex"),
+      { provider: "codex", weight: 0, reason: "disabled" },
+    );
+    assert.equal(JSON.stringify(body).includes("api_key"), false);
+  });
+
   test("never routes anything: the fake upstream saw zero requests across every rank call above", () => {
     assert.equal(upstreamRequestCount, 0, "GET /admin/models/rank must never trigger a completion");
   });

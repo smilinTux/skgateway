@@ -27,6 +27,7 @@ import {
   gradeVocabulary,
   measuredClassCeiling,
   effectiveClass,
+  effectiveQualifiedClass,
 } from '../src/policy/buckets.mjs';
 import { TRUST_ZONES } from '../src/policy/sensitivity.mjs';
 
@@ -70,6 +71,15 @@ describe('C9: bucket addressing', () => {
     assert.deepEqual(parseBucketId('sk-kimi-m'), {
       bucket: 'sk-kimi-m', model_class: 'M', sensitivity: 'public', provider: 'kimi',
     });
+    assert.deepEqual(parseBucketId('sk-deepseek-s'), {
+      bucket: 'sk-deepseek-s', model_class: 'S', sensitivity: 'public', provider: 'deepseek',
+    });
+    assert.deepEqual(parseBucketId('sk-deepseek-m'), {
+      bucket: 'sk-deepseek-m', model_class: 'M', sensitivity: 'public', provider: 'deepseek',
+    });
+    assert.deepEqual(parseBucketId('sk-deepseek-l'), {
+      bucket: 'sk-deepseek-l', model_class: 'L', sensitivity: 'public', provider: 'deepseek',
+    });
   });
 
   test('an ordinary model id is not a bucket', () => {
@@ -95,10 +105,33 @@ describe('C9: bucket addressing', () => {
     assert.deepEqual(v.sensitivity.values, ['public', 'internal', 'secret']);
     // risk is a SEPARATE axis and must not have been folded into the bucket id
     assert.deepEqual(v.risk.values, ['low', 'med', 'high', 'crit']);
-    assert.equal(allBuckets().length, 28, '12 scoped, 4 short public, and 12 provider-focused S/M/L buckets');
+    assert.equal(allBuckets().length, 31, '12 scoped, 4 short public, and 15 provider-focused S/M/L buckets');
     assert.equal(parseBucketId('sk-kimi-xl'), null);
     assert.equal(looksLikeBucketAttempt('sk-kimi-xl').attempted, true);
     assert.equal(allBuckets().some(({ bucket }) => bucket.startsWith('sk-cursor-')), false);
+    // DeepSeek is advertised for S/M/L only. There is no XL focused bucket.
+    const deepseekBuckets = allBuckets()
+      .filter(({ bucket }) => bucket.startsWith('sk-deepseek-'))
+      .map(({ bucket }) => bucket)
+      .sort();
+    assert.deepEqual(deepseekBuckets, ['sk-deepseek-l', 'sk-deepseek-m', 'sk-deepseek-s']);
+  });
+
+  test('DeepSeek focused buckets are S/M/L only, never XL', () => {
+    for (const cls of ['s', 'm', 'l']) {
+      assert.deepEqual(parseBucketId(`sk-deepseek-${cls}`), {
+        bucket: `sk-deepseek-${cls}`,
+        model_class: cls.toUpperCase(),
+        sensitivity: 'public',
+        provider: 'deepseek',
+      });
+    }
+    // No XL, and no sensitivity-scoped DeepSeek bucket.
+    for (const near of ['sk-deepseek-xl', 'sk-deepseek-public', 'sk-deepseek-internal', 'sk-deepseek-secret']) {
+      assert.equal(parseBucketId(near), null, `${near} must not resolve`);
+    }
+    assert.equal(looksLikeBucketAttempt('sk-deepseek-xl').attempted, true);
+    assert.match(looksLikeBucketAttempt('sk-deepseek-xl').reason, /S, M, or L/);
   });
 });
 
@@ -161,17 +194,35 @@ describe('C9: eligibility composes the floor with the sovereignty ceiling', () =
     assert.ok(rejected.find((r) => r.id === 'tiny-free').reason.includes('below floor M'));
   });
 
-  test('sk-l-public excludes local Qwen and keeps eligible subscription providers', () => {
+  test('sk-l-public excludes local Qwen and keeps every eligible remote pool', () => {
     const cloudCatalog = [
       { ...entry('qwen3.8-27b', { zone: TRUST_ZONES.SOVEREIGN_LOCAL, declared: 'L' }), provider: 'local' },
       { ...entry('glm-4.7', { zone: TRUST_ZONES.FREE_REMOTE, declared: 'L' }), provider: 'zai' },
       { ...entry('kimi-for-coding', { zone: TRUST_ZONES.FREE_REMOTE, declared: 'L' }), provider: 'kimi-for-coding' },
       { ...entry('gpt-5.6-luna', { zone: TRUST_ZONES.FREE_REMOTE, declared: 'L' }), provider: 'codex' },
+      { ...entry('vendor/model-30b:free', { zone: TRUST_ZONES.FREE_REMOTE, declared: 'L' }), provider: 'openrouter' },
+      { ...entry('nvidia/nemotron-3-ultra', { zone: TRUST_ZONES.FREE_REMOTE, declared: 'L' }), provider: 'nvidia' },
     ];
     for (const id of ['sk-l-public', 'sk-l']) {
       const { members, rejected } = resolveBucket({ bucket: parseBucketId(id), catalog: cloudCatalog });
-      assert.deepEqual(members.map((model) => model.id), ['glm-4.7', 'kimi-for-coding', 'gpt-5.6-luna']);
-      assert.match(rejected.find((model) => model.id === 'qwen3.8-27b').reason, /subscription providers/);
+      assert.deepEqual(members.map((model) => model.id), [
+        'glm-4.7', 'kimi-for-coding', 'gpt-5.6-luna', 'vendor/model-30b:free', 'nvidia/nemotron-3-ultra',
+      ]);
+      // The local exclusion card a46b53e exists for is the part that must hold.
+      assert.match(rejected.find((model) => model.id === 'qwen3.8-27b').reason, /admits only remote pools/);
+      assert.equal(members.some((model) => model.id === 'qwen3.8-27b'), false);
+    }
+  });
+
+  test('the free remote pools stay out of internal and secret L buckets', () => {
+    const cloudCatalog = [
+      { ...entry('vendor/model-30b:free', { zone: TRUST_ZONES.FREE_REMOTE, declared: 'L' }), provider: 'openrouter' },
+      { ...entry('nvidia/nemotron-3-ultra', { zone: TRUST_ZONES.FREE_REMOTE, declared: 'L' }), provider: 'nvidia' },
+    ];
+    for (const id of ['sk-l-internal', 'sk-l-secret']) {
+      const { members, rejected } = resolveBucket({ bucket: parseBucketId(id), catalog: cloudCatalog });
+      assert.deepEqual(members, [], `${id} must not admit a free remote pool`);
+      assert.ok(rejected.every((model) => /trust zone|exceeds ceiling/i.test(model.reason)));
     }
   });
 
@@ -286,16 +337,77 @@ describe('C9: eligibility composes the floor with the sovereignty ceiling', () =
   });
 });
 
+describe('G5: reviewed qualification caps generic capability only', () => {
+  const validHashes = {
+    case_set_hash: 'a'.repeat(64),
+    response_schema_hash: 'b'.repeat(64),
+    result_hash: 'c'.repeat(64),
+  };
+  const qualification = (overrides = {}) => ({
+    reviewed: true,
+    status: 'pass',
+    qualified_class: 'L',
+    reviewed_at: '2026-09-25T00:00:00.000Z',
+    expires_at: '2027-09-25T00:00:00.000Z',
+    ...validHashes,
+    ...overrides,
+  });
+
+  test('reviewed qualification is capped by the declared prior and can lower it', () => {
+    assert.equal(effectiveQualifiedClass('M', qualification({ qualified_class: 'L' }), Date.UTC(2026, 8, 26)).cls, 'M');
+    assert.equal(effectiveQualifiedClass('XL', qualification({ qualified_class: 'L' }), Date.UTC(2026, 8, 26)).cls, 'L');
+  });
+
+  test('failed and expired reviewed results remove generic eligibility', () => {
+    assert.equal(effectiveQualifiedClass('L', qualification({ status: 'fail' }), Date.UTC(2026, 8, 26)).eligible, false);
+    assert.equal(effectiveQualifiedClass('L', qualification({ expires_at: '2026-09-25T00:00:00.000Z' }), Date.UTC(2026, 8, 26)).eligible, false);
+  });
+
+  test('models without reviewed qualification preserve prior behavior', () => {
+    assert.deepEqual(effectiveQualifiedClass('L', null, Date.UTC(2026, 8, 26)), {
+      cls: 'L', basis: 'declared-size-prior', eligible: true,
+    });
+  });
+
+  test('DeepSeek reviewed L models enter generic S/M/L and never XL', () => {
+    for (const id of ['deepseek-v4-flash', 'deepseek-v4-pro']) {
+      const model = {
+        ...entry(id, { zone: TRUST_ZONES.FREE_REMOTE, declared: 'XL' }),
+        provider: 'deepseek',
+        card: { size_class: 'XL', qualification: qualification() },
+      };
+      for (const bucket of ['sk-s', 'sk-m', 'sk-l']) {
+        assert.deepEqual(resolveBucket({ bucket: parseBucketId(bucket), catalog: [model] }).members.map((m) => m.id), [id]);
+      }
+      assert.deepEqual(resolveBucket({ bucket: parseBucketId('sk-xl'), catalog: [model] }).members, []);
+    }
+  });
+
+  test('failed qualification removes generic membership but focused routing remains available', () => {
+    const model = {
+      ...entry('deepseek-v4-pro', { zone: TRUST_ZONES.FREE_REMOTE, declared: 'L' }),
+      provider: 'deepseek',
+      card: { size_class: 'L', qualification: qualification({ status: 'fail', qualified_class: null }) },
+    };
+    assert.deepEqual(resolveBucket({ bucket: parseBucketId('sk-s'), catalog: [model] }).members, []);
+    assert.deepEqual(
+      resolveBucket({ bucket: parseBucketId('sk-deepseek-l'), catalog: [model] }).members.map((m) => m.id),
+      ['deepseek-v4-pro'],
+    );
+  });
+});
+
 describe('provider-focused buckets', () => {
   const catalog = [
     { ...entry('glm-4.7', { zone: 2, declared: 'L' }), provider: 'zai' },
     { ...entry('kimi-for-coding', { zone: 2, declared: 'M' }), provider: 'kimi-for-coding' },
     { ...entry('gpt-5.6-luna', { zone: 2, declared: 'L' }), provider: 'codex' },
     { ...entry('cursor-model', { zone: 2, declared: 'L' }), provider: 'cursor' },
+    { ...entry('deepseek-v4-pro', { zone: 2, declared: 'L' }), provider: 'deepseek' },
   ];
 
   test('provider routes never cross ownership', () => {
-    for (const id of ['sk-zai-m', 'sk-glm-m', 'sk-kimi-m', 'sk-codex-m', 'sk-cursor-m']) {
+    for (const id of ['sk-zai-m', 'sk-glm-m', 'sk-kimi-m', 'sk-codex-m', 'sk-cursor-m', 'sk-deepseek-m']) {
       const bucket = parseBucketId(id);
       const { members } = resolveBucket({ bucket, catalog });
       assert.ok(members.length > 0, `${id} has an eligible member`);
@@ -305,9 +417,18 @@ describe('provider-focused buckets', () => {
           ? ['kimi-for-coding']
           : bucket.provider === 'codex'
             ? ['gpt-5.6-luna']
-            : ['cursor-model'];
+            : bucket.provider === 'cursor'
+              ? ['cursor-model']
+              : ['deepseek-v4-pro'];
       assert.deepEqual(members.map(({ id: memberId }) => memberId), expected, `${id} stays with its provider`);
     }
+  });
+
+  test('DeepSeek focus never admits another provider or a private variant', () => {
+    const { members } = resolveBucket({ bucket: parseBucketId('sk-deepseek-l'), catalog });
+    assert.deepEqual(members.map((model) => model.id), ['deepseek-v4-pro']);
+    assert.equal(parseBucketId('sk-deepseek-l-internal'), null);
+    assert.equal(parseBucketId('sk-deepseek-l-secret'), null);
   });
 
   test('sk-glm-l and sk-zai-l remain exact Z.ai-only', () => {

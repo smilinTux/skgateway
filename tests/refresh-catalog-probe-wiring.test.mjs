@@ -82,12 +82,17 @@ describe("card C3: refreshCatalog wires discovery.probe_* into discoverCatalog",
 
     process.env.SKGATEWAY_CONFIG = cfgPath;
     process.env.SKGATEWAY_MODEL_CATALOG_STORE_PATH = storePath;
+    // Same guard exists for the discovery cache (discovery.mjs binds the path
+    // at module load); redirect it like the store above or refreshCatalog's
+    // saveCache() refuses to write the real user cache from a test run.
+    process.env.SKGATEWAY_MODEL_CATALOG_CACHE_PATH = join(tmpDir, "model_catalog_cache.json");
     mod = await import(pathToFileURL(INDEX).href);
   });
 
   after(() => {
     delete process.env.SKGATEWAY_CONFIG;
     delete process.env.SKGATEWAY_MODEL_CATALOG_STORE_PATH;
+    delete process.env.SKGATEWAY_MODEL_CATALOG_CACHE_PATH;
     try { mod.server.close(); } catch { /* best effort */ }
     try { mod.dashboard?.close?.(); } catch { /* best effort */ }
     try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best effort */ }
@@ -171,6 +176,49 @@ describe("card C3: refreshCatalog wires discovery.probe_* into discoverCatalog",
       discovery: { enabled: true, providers: { zai: { enabled: true } } },
     }, spy);
     assert.equal(typeof captured.zaiFetch, "function");
+  });
+
+  test("deepseek stays OFF without exact opt-in and a same-named backend", async () => {
+    for (const cfg of [
+      { backends: {}, discovery: { providers: {} } },
+      { backends: { deepseek: {} }, discovery: { providers: { deepseek: { enabled: false } } } },
+      { backends: { deepseek: {} }, discovery: { providers: { deepseek: { enabled: 1 } } } },
+      { backends: {}, discovery: { providers: { deepseek: { enabled: true } } } },
+    ]) {
+      let captured;
+      await mod.refreshCatalog(cfg, async (opts) => { captured = opts; return { models: [] }; });
+      assert.deepEqual(await captured.deepseekFetch(), { data: [] });
+    }
+  });
+
+  test("deepseek uses only backend api_key_env, defaulting to DEEPSEEK_API_KEY", async () => {
+    const originalFetch = globalThis.fetch;
+    const oldDefault = process.env.DEEPSEEK_API_KEY;
+    const oldCustom = process.env.DEEPSEEK_TEST_KEY;
+    const seen = [];
+    globalThis.fetch = async (_url, opts) => {
+      seen.push(opts.headers.authorization);
+      return { ok: true, json: async () => ({ data: [] }) };
+    };
+    process.env.DEEPSEEK_API_KEY = "default-secret";
+    process.env.DEEPSEEK_TEST_KEY = "custom-secret";
+    try {
+      for (const backend of [{}, { api_key_env: "DEEPSEEK_TEST_KEY" }]) {
+        let captured;
+        await mod.refreshCatalog(
+          { backends: { deepseek: backend }, discovery: { providers: { deepseek: { enabled: true } } } },
+          async (opts) => { captured = opts; return { models: [] }; },
+        );
+        await captured.deepseekFetch();
+      }
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (oldDefault === undefined) delete process.env.DEEPSEEK_API_KEY;
+      else process.env.DEEPSEEK_API_KEY = oldDefault;
+      if (oldCustom === undefined) delete process.env.DEEPSEEK_TEST_KEY;
+      else process.env.DEEPSEEK_TEST_KEY = oldCustom;
+    }
+    assert.deepEqual(seen, ["Bearer default-secret", "Bearer custom-secret"]);
   });
 
   test("opencode stays OFF when the config does not opt in, and OFF means an empty stub not a live call", async () => {

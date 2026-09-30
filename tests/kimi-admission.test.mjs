@@ -66,11 +66,15 @@ describe("Kimi admission contract", () => {
 });
 
 describe("Kimi synthetic request probes", () => {
-  test("only an exact admission-owner bootstrap bypasses public registry routing", () => {
+  test("only an exact-owner bootstrap bypasses public registry routing", () => {
     const router = createRouter({ backends: {
       kimi: {
         url: "http://127.0.0.1:9/v1", auth_type: "none", models: ["kimi-for-coding"],
         require_observed_health: true,
+      },
+      deepseek: {
+        url: "http://127.0.0.1:8/v1", auth_type: "none",
+        models: ["deepseek-ai/deepseek-v4-flash"],
       },
     }, siem_log: false });
 
@@ -78,8 +82,14 @@ describe("Kimi synthetic request probes", () => {
       model: "kimi-for-coding", context: "public",
     }, true), false);
     assert.equal(shouldUseRegistryRouting(router, {
+      model: "deepseek-ai/deepseek-v4-flash", context: "public",
+    }, true), false);
+    assert.equal(shouldUseRegistryRouting(router, {
       model: "ordinary-synthetic", context: "public",
     }, true), true);
+    assert.equal(shouldUseRegistryRouting(router, {
+      model: "deepseek-ai/deepseek-v4-flash", context: "public",
+    }, false), true);
   });
 
   test("chat and tool schema succeed; timeout is bounded", async () => {

@@ -76,6 +76,49 @@ function contentFrame(finishReason, content = "PUBLIC_SYNTHETIC_OK", index = 0) 
   return `data: ${JSON.stringify({ model: MODEL, choices: [choice] })}`;
 }
 
+function deepSeekToolStream({
+  duplicateUsage = false,
+  malformedUsage = false,
+  postDoneNullUsage = false,
+  incompleteTool = false,
+  includeDone = true,
+} = {}) {
+  const usage = { prompt_tokens: 20, completion_tokens: 5, total_tokens: malformedUsage ? 24 : 25 };
+  const chunk = (delta, finishReason = null, eventUsage = null) => `data: ${JSON.stringify({
+    id: "deepseek-synthetic",
+    object: "chat.completion.chunk",
+    created: 0,
+    model: "deepseek-flash",
+    choices: [{ index: 0, delta, finish_reason: finishReason }],
+    usage: eventUsage,
+  })}`;
+  const lines = [
+    chunk({ role: "assistant", content: null }),
+    chunk({ reasoning_content: "private chain" }),
+    chunk({ tool_calls: [{
+      index: 0,
+      id: "call_1",
+      type: "function",
+      function: { name: "lookup_public_fixture", arguments: '{"key"' },
+    }] }),
+    chunk({ tool_calls: [{
+      index: 0,
+      function: { arguments: incompleteTool ? "" : ':"alpha"}' },
+    }] }),
+    chunk({}, "tool_calls", usage),
+  ];
+  if (duplicateUsage) {
+    lines.push(`data: ${JSON.stringify({
+      model: "deepseek-flash",
+      choices: [],
+      usage: { prompt_tokens: 20, completion_tokens: 5, total_tokens: 25 },
+    })}`);
+  }
+  if (includeDone) lines.push("data: [DONE]");
+  if (postDoneNullUsage) lines.push(chunk({}));
+  return rawResponse(lines);
+}
+
 function sanitizedLiveQwenSse() {
   const chunk = (delta, finishReason = null) => `data: ${JSON.stringify({
     choices: [{ finish_reason: finishReason, index: 0, delta }],
@@ -125,6 +168,23 @@ function sanitizedLiveQwenSse() {
 }
 
 describe("completed SSE tool-call structure", () => {
+  test("accepts DeepSeek fragmented tools with null usage placeholders", () => {
+    const result = deepSeekToolStream();
+    assert.equal(result.status, 200);
+    assert.equal(result.servedModel, "deepseek-flash");
+    assert.equal(result.body.includes(Buffer.from("private chain")), false);
+  });
+
+  test("DeepSeek null usage placeholders preserve every fail-closed invariant", () => {
+    for (const options of [
+      { duplicateUsage: true },
+      { malformedUsage: true },
+      { postDoneNullUsage: true },
+      { incompleteTool: true },
+      { includeDone: false },
+    ]) assert.equal(deepSeekToolStream(options).status, 502);
+  });
+
   test("accepts sanitized concrete-Qwen live SSE framing", () => {
     const result = enforceResponseContract({
       status: 200,
@@ -196,7 +256,6 @@ describe("completed SSE tool-call structure", () => {
     assert.match(result.body.toString(), /"total_tokens":5/);
 
     for (const usage of [
-      null,
       [],
       { prompt_tokens: 1 },
       { prompt_tokens: 1, completion_tokens: "1", total_tokens: 2 },

@@ -12,11 +12,11 @@
 import http from "node:http";
 import { loadConfig, getConfig } from "./config.mjs";
 import { createProxyServer, handleRequest, buildConfig, trimSystemMessages, trimConversationHistory } from "./proxy/core.mjs";
-import { createRouter, routeAndSend } from "./proxy/router.mjs";
+import { createRouter, routeAndSend, startKimiAuthKeepalive } from "./proxy/router.mjs";
 import { normalizeSystemMessageOrder, sanitizeResponse } from "./proxy/sanitizer.mjs";
 import { applyCapacityView, availabilityState, buildModelCatalog, reconcileModeFromConfig, tagLocalModels, mergeDiscoveredCatalog, isModelAvailable, excludedModelIds, withoutExcludedModels } from "./proxy/advertise.mjs";
 import { loadAllowlist, saveAllowlist, applyAllowlist } from "./advertise.mjs";
-import { discoverCatalog, loadCache, saveCache, fetchNvidia, fetchOpenRouter, fetchOpencode, fetchAnthropicWrapper, fetchCodex, fetchZai, catalogStatus, loadCardOverrides, applyCardOverlays, buildServingCatalog } from "./discovery.mjs";
+import { discoverCatalog, loadCache, saveCache, fetchNvidia, fetchOpenRouter, fetchOpencode, fetchAnthropicWrapper, fetchCodex, fetchZai, fetchDeepSeek, catalogStatus, loadCardOverrides, applyCardOverlays, buildServingCatalog } from "./discovery.mjs";
 import { getPool, resetPool } from "./proxy/connection-pool.mjs";
 import { loadAgentRegistry, extractIdentity, normalizeAgentId, ANONYMOUS_AGENT_ID } from "./identity/capauth.mjs";
 import { ClientAuthenticator, classifyAuthenticationRoute, stripCallerCredentials, stripCredentialQuery } from "./identity/client-auth.mjs";
@@ -57,7 +57,13 @@ import { REGISTRY_PATH } from "./proxy/registry.mjs";
 import { energyRowsFrom, energyHeaders } from "./metrics/energy.mjs";
 import { attributionHeaders } from "./metrics/attribution.mjs";
 import { sampleTokenRatio } from "./metrics/token-ratio.mjs";
-import { allBuckets, capacityRoutabilityRejection, resolveBucket } from "./policy/buckets.mjs";
+import {
+  allBuckets,
+  capacityRoutabilityRejection,
+  orderMembersByGenericWeight,
+  resolveBucket,
+} from "./policy/buckets.mjs";
+import { genericPolicyRevision } from "./policy/generic-participation.mjs";
 import { loadRegistry, REGISTRY_PATH as _REGISTRY_PATH } from "./proxy/registry.mjs";
 import { policyFromRegistry } from "./policy/sensitivity.mjs";
 import { readFileSync } from "node:fs";
@@ -627,6 +633,14 @@ export async function refreshCatalog(cfg, discoverCatalogFn = discoverCatalog) {
   const codexCreds = cfg.backends?.codex?.credentials_path || cfg.backends?.codex?.credentials_file;
   const zaiEnabled = d.providers?.zai?.enabled === true && Boolean(cfg.backends?.zai);
   const zaiCreds = cfg.backends?.zai?.credentials_path || cfg.backends?.zai?.credentials_file || ZAI_CREDENTIALS_PATH;
+  // DeepSeek (card e089089c): same opt-in rule as zai/opencode/codex (
+  // `=== true`, not `!== false`) and the same same-named-backend gate: a
+  // provider without backends.deepseek never makes a network call. The
+  // credential is read ONLY through the backend's api_key_env name (default
+  // DEEPSEEK_API_KEY); it is used to build the authorization header but is
+  // never logged.
+  const deepseekEnabled = d.providers?.deepseek?.enabled === true && Boolean(cfg.backends?.deepseek);
+  const deepseekKey = process.env[cfg.backends?.deepseek?.api_key_env || "DEEPSEEK_API_KEY"];
   const nvidiaKey = process.env[cfg.backends?.nvidia?.api_key_env || "NVIDIA_API_KEY"];
   const openrouterKey = process.env[cfg.backends?.openrouter?.api_key_env || "OPENROUTER_API_KEY"];
   const { models } = await discoverCatalogFn({
@@ -647,6 +661,9 @@ export async function refreshCatalog(cfg, discoverCatalogFn = discoverCatalog) {
       : async () => ({ models: [] }),
     zaiFetch: zaiEnabled
       ? () => fetchZai(readZaiAuthHeaders(zaiCreds))
+      : async () => ({ data: [] }),
+    deepseekFetch: deepseekEnabled
+      ? async () => fetchDeepSeek(deepseekKey ? { authorization: `Bearer ${deepseekKey}` } : {})
       : async () => ({ data: [] }),
     cache: _discoveryCache,
     probeSeconds: d.probe_seconds || 0,
@@ -684,6 +701,17 @@ export async function refreshCatalog(cfg, discoverCatalogFn = discoverCatalog) {
       ok: zaiProvider?.ok !== false,
       stale: zaiProvider?.ok === false,
       at: zaiProvider?.lastAttemptAt || Date.now(),
+    });
+  }
+  // Same absence-record for DeepSeek, mirroring the zai block above: a
+  // declared model list with no discovered DeepSeek models still records the
+  // attempt outcome so pending becomes attributable failed/stale.
+  const deepseekProvider = _discoveryCache.providers?.deepseek;
+  if (cfg.backends?.deepseek && !models.some((m) => m.provider === "deepseek")) {
+    router.registerDiscoveredModels?.("deepseek", [], {
+      ok: deepseekProvider?.ok !== false,
+      stale: deepseekProvider?.ok === false,
+      at: deepseekProvider?.lastAttemptAt || Date.now(),
     });
   }
   saveCache(_discoveryCache);
@@ -784,6 +812,13 @@ const recoveryProbeTargets = () => Object.entries(config.backends || {})
     });
   })
   .filter((target) => target.model);
+
+// Kimi OAuth tokens (900s TTL) used to only refresh as a side effect of a
+// request reaching buildAuthHeaders(). A quiet backend, or one the router
+// failed over away from after an earlier error, stopped calling that path
+// and its token went stale until a restart. This polls it independently of
+// traffic; see startKimiAuthKeepalive in proxy/router.mjs for the full story.
+startKimiAuthKeepalive({ getBackends: router.getBackends });
 
 startCapacityProbeScheduler({
   targets: recoveryProbeTargets,
@@ -1940,6 +1975,8 @@ export const server = http.createServer(async (req, res) => {
         return capacityRoutabilityRejection(capacityStatus(e.provider, e.id));
       };
       const bucketsEnabled = cfg?.routing?.buckets_enabled === true;
+      const genericPolicy = cfg?.routing?.generic_participation;
+      const genericRevision = genericPolicyRevision(genericPolicy);
       const all = allBuckets();
       const out = [];
       for (const b of all) {
@@ -1951,6 +1988,22 @@ export const server = http.createServer(async (req, res) => {
             getRoutabilityRejection,
           });
           const physicalResources = new Set(members.map((m) => m.physical_resource_id));
+          const isGeneric = !b.provider && ["S", "M", "L"].includes(b.model_class);
+          const effectiveWeights = isGeneric
+            ? Object.entries(genericPolicy?.providers || {}).sort(([a], [z]) => a.localeCompare(z))
+              .map(([provider, override]) => {
+                const hasEligibleMember = members.some((member) => member.provider === provider);
+                return {
+                  provider,
+                  weight: override.enabled && hasEligibleMember ? override.weight : 0,
+                  reason: !override.enabled ? "disabled"
+                    : hasEligibleMember ? "enabled" : "no-eligible-member",
+                };
+              })
+            : [];
+          const preview = isGeneric
+            ? orderMembersByGenericWeight(members, 0, b, genericPolicy)[0]
+            : null;
           out.push({
             bucket: b.bucket,
             model_class: b.model_class,
@@ -1960,6 +2013,9 @@ export const server = http.createServer(async (req, res) => {
             member_alias_count: members.length,
             physical_server_count: physicalResources.size,
             physical_resources: [...physicalResources],
+            generic_policy_revision: isGeneric ? genericRevision : null,
+            generic_effective_weights: effectiveWeights,
+            generic_next_provider: preview?.provider || null,
             rejected,
           });
         } catch (e) {
@@ -1976,7 +2032,11 @@ export const server = http.createServer(async (req, res) => {
         }
       }
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ buckets_enabled: bucketsEnabled, buckets: out }));
+      res.end(JSON.stringify({
+        buckets_enabled: bucketsEnabled,
+        generic_policy_revision: genericRevision,
+        buckets: out,
+      }));
     } catch (e) {
       console.warn("[skgateway] /admin/buckets failed:", e.message);
       res.writeHead(500, { "content-type": "application/json" });

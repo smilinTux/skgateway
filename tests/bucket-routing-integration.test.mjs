@@ -521,7 +521,7 @@ ${extraRoles}defaults:
     assert.equal(pool.state.count, 0, 'foreign backend must not receive the request');
   });
 
-  test('sk-l-public skips local Qwen and falls through a down subscription member', async () => {
+  test('sk-l-public fails closed when only disabled Codex remains after Z.ai is down', async () => {
     writeFileSync(CATALOG_CACHE_PATH, JSON.stringify({ models: [
       { id: 'qwen3.8-27b', provider: 'local', card: { tier: 'local', size_class: 'L' } },
       { id: 'glm-4.7', provider: 'zai', card: { tier: 'paid-cloud', size_class: 'L' } },
@@ -567,13 +567,12 @@ ${extraRoles}defaults:
       '/chat/completions', 'POST', HEADERS, bodyFor('sk-l-public'), false,
     );
 
-    assert.equal(result.status, 200);
-    assert.ok(['glm-4.7', 'kimi-for-coding', 'gpt-5.6-luna'].includes(result.bucketMember));
-    assert.notEqual(result.bucketMember, downMember);
+    assert.equal(result.status, 503);
+    assert.equal(parseBody(result).error.type, 'bucket_no_eligible_member');
     assert.deepEqual(attempts.slice(0, 2), [downMember, downMember]);
     assert.equal(attempts.includes('qwen3.8-27b'), false);
-    assert.match(result.backendId, /^(zai|kimi|codex)-subscription$/);
-    assert.equal(pool.state.lastModel, result.bucketMember);
+    assert.equal(attempts.includes('gpt-5.6-luna'), false, 'disabled Codex must not enter failover');
+    assert.equal(pool.state.count, 0, 'no subscription backend may receive a failed-closed request');
     assert.equal(hanging.state.count, 0, 'filtered local expansion must never reach its upstream');
   });
 
@@ -582,6 +581,7 @@ ${extraRoles}defaults:
       zai: ['glm-s', 'glm-m', 'glm-l'],
       kimi: ['kimi-s', 'kimi-m', 'kimi-l'],
       codex: ['gpt-test-s', 'gpt-test-m', 'gpt-test-l'],
+      deepseek: ['deepseek-s', 'deepseek-m', 'deepseek-l'],
     };
     const classes = ['S', 'M', 'L'];
     const models = [];
@@ -604,6 +604,7 @@ ${extraRoles}defaults:
         const routed = await backing.route({ ...request, model: 'pool-l-local' });
         const candidate = Array.isArray(routed) ? routed[0] : routed;
         if (request.model.startsWith('gpt-')) candidate.backend.provider = 'codex';
+        if (request.model.startsWith('deepseek-')) candidate.backend.provider = 'deepseek';
         return { ...candidate, model: request.model };
       },
     };
@@ -789,7 +790,7 @@ ${extraRoles}defaults:
     assert.equal(error.model, 'sk-xl-secrets');
     assert.match(error.reason, /sensitivity "secrets" is not/);
     assert.ok(error.valid_buckets.includes('sk-xl-secret'), 'the caller is told the correction, not left guessing');
-    assert.equal(error.valid_buckets.length, 28);
+    assert.equal(error.valid_buckets.length, 31);
     assert.equal(pool.state.count, 0, 'nothing was routed');
 
     const lines = audit.read();
