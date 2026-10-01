@@ -32,7 +32,9 @@ does not alter its configuration or credential boundary.
   Already-qualified alternative candidates may serve unchanged history;
   local size rejection does not penalize provider health.
 - src/proxy/core.mjs applies explicit ingress/body/system rejection on its
-  compatibility path and removes active byte-budget history trimming.
+  compatibility path and removes active byte-budget history trimming. Its
+  upstream400 tool retries retain the complete conversation through all four
+  attempts rather than deleting tool results and rewriting prior calls.
 - src/proxy/request-limits.mjs shares positive safe-integer byte validation,
   UTF-8 system/developer totals and structured nonretryable 413 responses.
 - HTTP, bucket, compatibility and authentication regression tests cover the
@@ -52,8 +54,8 @@ Final command, from the isolated worktree:
 node --test --import ./tests/_setup.mjs tests/request-history-contract.test.mjs tests/live-pipeline-wiring.test.mjs tests/model-alias-parity.test.mjs tests/qwen-context-preflight.test.mjs tests/client-auth-integration.test.mjs tests/client-auth.test.mjs tests/attribution-headers.test.mjs tests/bucket-routing-integration.test.mjs tests/bucket-tool-use-filter.test.mjs tests/tool-result-continuity.test.mjs tests/nonstream-response-contract.test.mjs tests/sse-tool-call-contract.test.mjs tests/upstream-url.test.mjs tests/stream-anthropic.test.mjs
 ```
 
-Result: 167 tests passed, zero failed, zero skipped, exit 0, 20.142 seconds.
-Log: ~/.skcapstone/evidence/work/011ae1ba/FINAL-BOUNDARY-TESTS-2.log.
+Result: 167 tests passed, zero failed, zero skipped, exit 0, 20.128 seconds.
+Log: ~/.skcapstone/evidence/work/011ae1ba/FINAL-BOUNDARY-TESTS-3.log.
 All provider traffic in these tests uses local synthetic HTTP servers. The
 auth test specifically checks chunked overflow still emits client_auth.denied
 with request_too_large, with no upstream call or credential disclosure.
@@ -62,9 +64,11 @@ with request_too_large, with no upstream call or credential disclosure.
 
 This source candidate does not claim production installation or trial success.
 Existing context preflight, upstream error failover and compatibility tool
-instructions remain. Existing compatibility tool-error retries can still
-transform tool protocol after explicit upstream errors; this repair removes
-silent byte-budget truncation, not that separate established behavior.
+instructions remain. Tool retries may reduce the available tool definitions
+or force a tool choice, but never delete or rewrite prior conversation history.
+The added four-attempt real HTTP regression failed on the initially reviewed
+candidate320cde and passes after the narrow retry correction. The original
+actual Zai PASS remains prior coverage, not approval of the later correction.
 Deprecated standalone trimming utilities remain for existing callers/tests.
 
 No model context sizes are invented, no provider or worker quota changes are

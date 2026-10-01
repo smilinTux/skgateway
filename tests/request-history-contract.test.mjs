@@ -12,6 +12,7 @@ import { ingressRequestLimit, modelRequestLimits, requestLimitError } from '../s
 
 let upstream, child, directory, endpoint;
 const received = [];
+let remainingToolRejections = 0;
 async function freePort() {
   const server = http.createServer();
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -43,6 +44,12 @@ before(async () => {
     for await (const chunk of request) chunks.push(chunk);
     const value = JSON.parse(Buffer.concat(chunks));
     received.push(value);
+    if (remainingToolRejections > 0) {
+      remainingToolRejections--;
+      response.writeHead(400, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ error: { message: 'single tool-calls required' } }));
+      return;
+    }
     response.writeHead(200, { 'content-type': 'application/json' });
     response.end(JSON.stringify({ model: value.model,
       choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: 'ok' } }],
@@ -174,6 +181,17 @@ test('compatibility HTTP handler preserves large accepted history and rejects ov
       'existing single-tool instruction may prefix but must preserve the original system content');
     assert.deepEqual(toolMessages.slice(1), messages.slice(1),
       'compatibility tool processing must preserve every original conversation and tool result');
+    const retryStart = received.length;
+    remainingToolRejections = 3;
+    assert.equal((await send({ model: 'history-model', messages,
+      tools: [{ type: 'function', function: { name: 'read', parameters: { type: 'object' } } }],
+    })).status, 200);
+    const retries = received.slice(retryStart);
+    assert.equal(retries.length, 4, 'exercise every established tool retry stage');
+    for (const request of retries) {
+      assert.deepEqual(request.messages, toolMessages,
+        'upstream400 retries must retain complete tool calls/results and every original message');
+    }
     const before = received.length;
     const response = await send({ model: 'history-model', messages: [{ role: 'system', content: 's'.repeat(800001) }] });
     assert.equal(response.status, 413);

@@ -18,7 +18,7 @@
  * requests that carry tools:
  *
  *   Attempt 1  — proactively reduces to N tools (default 16: 5 guaranteed + 11 scored)
- *   Attempt 2  — 400 "single tool-calls": reduce to 8 tools, strip tool_call history
+ *   Attempt 2: 400 "single tool-calls": reduce to 8 tools, preserve history
  *   Attempt 3  — 400 again: single tool with forced tool_choice
  *   Attempt 4  — 400 again: strip all tools, text-only response
  *
@@ -57,7 +57,7 @@ import { URL } from "node:url";
 
 import { sendUpstream } from "./upstream.mjs";
 import { ingressRequestLimit, requestLimitError, requestLimitResponse } from "./request-limits.mjs";
-import { reduceTools, stripToolCallHistory } from "./tools.mjs";
+import { reduceTools } from "./tools.mjs";
 import {
   normalizeSystemMessageOrder,
   sanitizeContent,
@@ -937,13 +937,10 @@ export async function handleRequest(clientReq, clientRes, cfg) {
         log(`400 parallel tool-calls rejected, retrying (${attempt}/${cfg.maxRetries})...`);
 
         if (attempt === 1) {
-          // Attempt 2: reduce to 8 tools + strip tool_call history.
-          // Tool call history in prior turns "teaches" the model to call
-          // multiple tools, so stripping it is critical here.
+          // Attempt 2: reduce the available tools, preserving request history.
           parsed.tools = cfg.toolReducer(allTools, parsed.messages, 8);
-          stripToolCallHistory(parsed.messages);
           const toolNames = parsed.tools.map((t) => t.function?.name).join(",");
-          log(`retry: ${parsed.tools.length} tools [${toolNames}], stripped history`);
+          log(`retry: ${parsed.tools.length} tools [${toolNames}], history preserved`);
         } else if (attempt === 2) {
           // Attempt 3: single tool with forced tool_choice
           parsed.tools = cfg.toolReducer(allTools, parsed.messages, 1);
@@ -957,7 +954,6 @@ export async function handleRequest(clientReq, clientRes, cfg) {
           delete parsed.tools;
           delete parsed.tool_choice;
           delete parsed.parallel_tool_calls;
-          stripToolCallHistory(parsed.messages);
           log(`final retry: stripped all tools, text-only`);
         }
         continue;
