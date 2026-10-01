@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Preserve complete accepted request histories at inference ingress and reject
+  transport overflow explicitly. Resolve byte limits against the selected
+  canonical model while retaining explicit alias and client restrictions.
+
 - Validate every logical bucket member against the selected backend's exact
   model claim before handoff, skipping stale catalog aliases with attributable
   evidence while preserving the requested bucket and served-model identity.

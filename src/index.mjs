@@ -11,7 +11,8 @@
 
 import http from "node:http";
 import { loadConfig, getConfig } from "./config.mjs";
-import { createProxyServer, handleRequest, buildConfig, trimSystemMessages, trimConversationHistory } from "./proxy/core.mjs";
+import { createProxyServer, handleRequest, buildConfig } from "./proxy/core.mjs";
+import { ingressRequestLimit, requestLimitResponse } from "./proxy/request-limits.mjs";
 import { createRouter, routeAndSend, startKimiAuthKeepalive } from "./proxy/router.mjs";
 import { normalizeSystemMessageOrder, sanitizeResponse } from "./proxy/sanitizer.mjs";
 import { applyCapacityView, availabilityState, buildModelCatalog, reconcileModeFromConfig, tagLocalModels, mergeDiscoveredCatalog, isModelAvailable, excludedModelIds, withoutExcludedModels } from "./proxy/advertise.mjs";
@@ -2210,12 +2211,21 @@ export const server = http.createServer(async (req, res) => {
     // Buffer the request body so we can read the model for routing.
     const chunks = [];
     let receivedBytes = 0;
+    const ingressLimit = ingressRequestLimit(getConfig());
     for await (const chunk of req) {
       receivedBytes += chunk.length;
       if (clientAuthenticator && receivedBytes > config.client_auth.max_request_body_bytes) {
         siemHook({ ts: new Date().toISOString(), event: 'client_auth.denied', reason: 'request_too_large', status: 413, agent_id: identity.agent_id, path: req.url });
         res.writeHead(413, { 'content-type': 'application/json', 'cache-control': 'no-store' });
         res.end(JSON.stringify({ error: { message: 'Request body exceeds configured limit', code: 'request_too_large', status: 413 } }));
+        return;
+      }
+      if (receivedBytes > ingressLimit) {
+        const rejected = requestLimitResponse({ message: 'Request body exceeds the configured transport limit; history was not modified',
+          code: 'request_too_large', type: 'invalid_request_error', param: 'body',
+          actual_bytes: receivedBytes, limit_bytes: ingressLimit, retryable: false });
+        res.writeHead(rejected.status, rejected.headers);
+        res.end(rejected.body);
         return;
       }
       chunks.push(chunk);
@@ -2419,40 +2429,13 @@ export const server = http.createServer(async (req, res) => {
       }
     }
 
-    // ── Apply model limits to request body (card 080e032e) ──
-    // Fail-closed: reject before any provider dispatch if limits are exceeded.
-    // Uses the same model_limits config section as core.mjs, with the same
-    // per-model overrides for maxBodyBytes and maxSystemBytes.
+    // Preserve all history. Candidate-specific transport bounds are checked
+    // after alias/bucket resolution in routeAndSend, before upstream admission.
     let transformedBody = routeBody;
     let transformedMessages = parsedMessages;
     try {
       if (parsedModel && parsedMessages && Array.isArray(parsedMessages)) {
-        // Build a minimal parsed body object for the trim functions
         const parsedBody = { model: parsedModel, messages: [...parsedMessages] };
-
-        // Resolve per-model limits (overrides global defaults)
-        const modelLimits = buildModelLimits(config.model_limits || {});
-        const perModel = modelLimits[parsedModel] || {};
-        const maxBodyBytes = perModel.maxBodyBytes || 120000;
-        const maxSystemBytes = perModel.maxSystemBytes || 40000;
-
-        // trimSystemMessages() and trimConversationHistory() both do
-        //     const log = cfg.logger.log.bind(cfg.logger);
-        // so a cfg without a logger throws on the FIRST line of the trim, the
-        // fail-closed catch below turns that into a 500, and every request the
-        // gateway serves 500s. A logger is not optional here.
-        const cfg = {
-          maxBodyBytes,
-          maxSystemBytes,
-          logger: { log: (msg) => console.log(`[skgateway] ${msg}`) },
-        };
-
-        // Trim system messages first (to free budget for history)
-        trimSystemMessages(parsedBody, cfg);
-
-        // Trim conversation history
-        trimConversationHistory(parsedBody, cfg);
-
         normalizeSystemMessageOrder(parsedBody.messages);
 
         // Update the transformed messages for dispatch

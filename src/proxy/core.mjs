@@ -56,6 +56,7 @@ import http from "node:http";
 import { URL } from "node:url";
 
 import { sendUpstream } from "./upstream.mjs";
+import { ingressRequestLimit, requestLimitError, requestLimitResponse } from "./request-limits.mjs";
 import { reduceTools, stripToolCallHistory } from "./tools.mjs";
 import {
   normalizeSystemMessageOrder,
@@ -671,8 +672,29 @@ export async function handleRequest(clientReq, clientRes, cfg) {
   const error = cfg.logger.error.bind(cfg.logger);
 
   // --- Buffer the full request body ---
+  const transportConfig = {
+    sanitizer: { max_body_bytes: cfg.maxBodyBytes, max_system_bytes: cfg.maxSystemBytes },
+    model_limits: Object.fromEntries(Object.entries(cfg.modelLimits || {}).map(([model, limits]) =>
+      [model, { max_body_bytes: limits.maxBodyBytes, max_system_bytes: limits.maxSystemBytes }])),
+  };
+  const ingressLimit = ingressRequestLimit(transportConfig);
+  const reject = rejection => {
+    const result = requestLimitResponse(rejection);
+    clientRes.writeHead(result.status, result.headers);
+    clientRes.end(result.body);
+  };
   const chunks = [];
-  for await (const chunk of clientReq) chunks.push(chunk);
+  let receivedBytes = 0;
+  for await (const chunk of clientReq) {
+    receivedBytes += chunk.length;
+    if (receivedBytes > ingressLimit) {
+      reject({ message: 'Request body exceeds the configured transport limit; history was not modified',
+        code: 'request_too_large', type: 'invalid_request_error', param: 'body',
+        actual_bytes: receivedBytes, limit_bytes: ingressLimit, retryable: false });
+      return;
+    }
+    chunks.push(chunk);
+  }
   let body = Buffer.concat(chunks);
 
   const contentType = clientReq.headers["content-type"] || "";
@@ -691,6 +713,11 @@ export async function handleRequest(clientReq, clientRes, cfg) {
     } catch {
       // Parse failure — fall through to transparent relay
     }
+  }
+
+  if (parsed) {
+    const rejection = requestLimitError(body, { ...cfg, ...cfg.modelLimits?.[parsed.model || ""] });
+    if (rejection) { reject(rejection); return; }
   }
 
   // --- Transparent relay for non-tool or non-chat requests ---
@@ -804,16 +831,6 @@ export async function handleRequest(clientReq, clientRes, cfg) {
       parsed.messages.unshift({ role: "system", content: SINGLE_TOOL_INSTRUCTION });
     }
   }
-
-  // --- Resolve per-model limits (overrides global maxBodyBytes / maxSystemBytes) ---
-  const perModel = cfg.modelLimits?.[parsed.model || ""];
-  const effectiveCfg = perModel ? { ...cfg, ...perModel } : cfg;
-
-  // --- Trim system messages first (to free budget for history) ---
-  trimSystemMessages(parsed, effectiveCfg);
-
-  // --- Trim conversation history ---
-  trimConversationHistory(parsed, effectiveCfg);
 
   // --- Tool round limit check ---
   // Track consecutive tool result turns per model to prevent infinite loops.

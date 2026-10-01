@@ -22,6 +22,7 @@ import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
 import { sendUpstream } from "./upstream.mjs";
+import { modelRequestLimits, requestLimitError, requestLimitResponse } from "./request-limits.mjs";
 import { createEvent, EventType } from "../siem/events.mjs";
 import { isAnthropicBackend, toAnthropicRequest, toOpenAIResponse } from "./anthropic-adapter.mjs";
 import {
@@ -3372,6 +3373,8 @@ export function configuredModelAlias(model, config = null) {
 export async function routeAndSend(router, request, upstreamPath, method, clientHeaders, body, usePool = true, siem = null, abortSignal = null, exactBackendId = null) {
   const pool = usePool ? getPool() : null;
   const requestedModel = request?.model;
+  let requestLimitsConfig;
+  try { requestLimitsConfig = getConfig(); } catch { /* Direct callers may not load configuration. */ }
   const aliasTarget = configuredModelAlias(requestedModel);
   if (!exactBackendId && aliasTarget) {
     request = { ...request, model: aliasTarget };
@@ -3969,6 +3972,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
   // synthesis at the bottom of the loop, and is the attribution payload
   // itself: {backendId, model, status, cooldownMs, skipped?}.
   const throttledAttempts = [];
+  const transportRejections = [];
 
   for (let i = 0; i < candidates.length; i++) {
     const { backendId, backendUrl, authHeaders, backend } = candidates[i];
@@ -3976,6 +3980,15 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // candidate rewrites the model to a cloud-served id). Default to the shared
     // body when no override is present.
     let attemptBody = candidates[i].bodyOverride || attemptBodyBase;
+    const candidateModel = candidates[i].model || request.model;
+    if (requestLimitsConfig) {
+      const rejection = requestLimitError(attemptBody,
+        modelRequestLimits(requestLimitsConfig, candidateModel, requestedModel));
+      if (rejection) {
+        transportRejections.push({ ...rejection, backend: backendId, model: candidateModel });
+        continue;
+      }
+    }
 
     // Context preflight (card 9ed4a9f7): a backend may declare context_limit,
     // the true serving-engine token ceiling (e.g. llama.cpp --ctx-size 32768
@@ -4015,7 +4028,6 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // every other candidate serves the same model as every other candidate
     // in the list (candidatesFor() only ever matches on model id), so
     // request.model is the correct default.
-    const candidateModel = candidates[i].model || request.model;
     attemptBody = applyBodyFloor(
       attemptBody,
       candidateModel,
@@ -4976,6 +4988,11 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       retryAfterSeconds: retryAfterSec,
       failover: didFailover,
     };
+  }
+
+  if (!lastResult && transportRejections.length > 0) {
+    await emitSiem("response", { status: 413, failover: false, request_too_large: true }, {});
+    return requestLimitResponse({ ...transportRejections[0], candidates: transportRejections });
   }
 
   // Context preflight rejected every door (card 9ed4a9f7): the request can

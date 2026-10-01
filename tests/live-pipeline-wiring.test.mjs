@@ -5,7 +5,7 @@
  * live /v1 routeAndSend path in index.mjs.
  *
  * Proves:
- *  1. Model limits transform before the selected backend receives bytes
+ *  1. Transport limits reject before the selected backend receives bytes
  *  2. Response sanitization occurs before the client receives bytes
  *  3. Processing failures reject before any backend or provider dispatch
  *  4. Accepted inputs preserve normal routing behavior
@@ -24,14 +24,14 @@ describe("live pipeline wiring (card 080e032e)", () => {
   test("imports are present in index.mjs", () => {
     const indexContent = readFileSync("./src/index.mjs", "utf-8");
 
-    // Verify core.mjs imports for model limits
+    // Destructive trims must not return to the active serving entrypoint.
     assert.ok(
-      indexContent.includes('trimSystemMessages'),
-      "index.mjs must import trimSystemMessages from core.mjs"
+      !indexContent.includes('trimSystemMessages'),
+      "index.mjs must not trim system instructions"
     );
     assert.ok(
-      indexContent.includes('trimConversationHistory'),
-      "index.mjs must import trimConversationHistory from core.mjs"
+      !indexContent.includes('trimConversationHistory'),
+      "index.mjs must not trim conversation history"
     );
 
     // Verify sanitizer.mjs import
@@ -46,17 +46,16 @@ describe("live pipeline wiring (card 080e032e)", () => {
 
     // Verify model limits application exists
     assert.ok(
-      indexContent.includes("Apply model limits to request body"),
-      "Model limits application section must be present"
+      indexContent.includes("ingressRequestLimit"),
+      "Bounded ingress must be present"
     );
     assert.ok(
       indexContent.includes("buildModelLimits"),
       "buildModelLimits function must be used"
     );
     assert.ok(
-      indexContent.includes("trimSystemMessages") &&
-      indexContent.includes("trimConversationHistory"),
-      "Model limit trim functions must be called"
+      readFileSync("./src/proxy/router.mjs", "utf-8").includes("requestLimitError"),
+      "Resolved candidate must enforce transport policy"
     );
     assert.ok(
       indexContent.includes("fail-closed") &&

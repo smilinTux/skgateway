@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { createServer } from 'node:http';
+import { createServer, request as httpRequest } from 'node:http';
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -111,6 +111,18 @@ test('live gateway authenticates before routing, reloads rotation, audits revisi
   for (const [path, body] of denialCases) assert.equal((await invoke(path, null, undefined, body)).status, 401, path);
   assert.equal(upstreamRequests.length, 0);
 
+  // No Content-Length: exercise the streaming body gate, not the header gate.
+  const oversizedStatus = await new Promise((resolveResponse, reject) => {
+    const request = httpRequest(`http://127.0.0.1:${gatewayPort}/v1/chat/completions`, {
+      method: 'POST', headers: clientHeaders(syntheticOld),
+    }, response => { response.resume(); response.once('end', () => resolveResponse(response.statusCode)); });
+    request.on('error', reject);
+    request.write(JSON.stringify({ model: 'fixture-model', messages: [{ role: 'user', content: 'x'.repeat(130000) }] }));
+    request.end();
+  });
+  assert.equal(oversizedStatus, 413);
+  assert.equal(upstreamRequests.length, 0);
+
   assert.equal((await fetch(`http://127.0.0.1:${gatewayPort}/admin/models`)).status, 401);
   const forwardedAdmin = await fetch(`http://127.0.0.1:${gatewayPort}/admin/models`, {
     headers: { ...clientHeaders(syntheticOld), 'x-forwarded-for': '100.64.0.8' },
@@ -186,6 +198,9 @@ test('live gateway authenticates before routing, reloads rotation, audits revisi
   await new Promise((resolveWait) => setTimeout(resolveWait, 50));
   const audit = readFileSync(auditPath, 'utf8');
   assert.match(audit, /client_auth\.denied/);
+  assert.ok(audit.split('\n').filter(Boolean).map(line => JSON.parse(line)).some(event =>
+    JSON.stringify(event).includes('client_auth.denied') && JSON.stringify(event).includes('request_too_large')),
+  'chunked client overflow must retain its authentication denial audit');
   assert.match(audit, /"agent_id":"jarvis"/);
   assert.match(audit, /"client_id":"chiap08-pi"/);
   assert.match(audit, /"credential_revision":"jarvis-r2"/);
