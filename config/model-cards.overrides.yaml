@@ -83,6 +83,9 @@
 # deriveTrustZone remains exclusively authoritative for where data may go.
 
 overrides:
+  # Explicit worker generation policy, separate from physical model limits.
+  deepseek-flash: { generation_default_tokens: 8192 }
+  sk-zai-m: { generation_default_tokens: 8192 }
 
   # ───────────────────────── OUR CLAUDE FLEET (paid cloud) ────────────────────
   # Reached via the Anthropic backend (OAuth + OpenAI<->Messages translation).
@@ -246,6 +249,7 @@ overrides:
   # matches the fleet rule that protected matter content never leaves the local
   # stack through this route.
   gpt-5.6-sol:
+    generation_default_tokens: 8192
     display_name: "GPT-5.6 Sol"
     org: OpenAI
     summary: "Subscription frontier agentic-coding model. Top of the Codex catalog."
@@ -519,6 +523,7 @@ overrides:
   # It has the same <think>-starvation trait as the Ornith models above
   # (registry.yaml backends.qwen38.min_output_tokens: 8192).
   qwen3.8-27b-huihui-abliterated-q4_k_m:
+    generation_default_tokens: 8192
     display_name: "Huihui Qwen3.8 27B Abliterated Q4_K_M"
     org: "Huihui AI / Qwen (self-hosted)"
     summary: "Canonical model served by independent chiap01 and chiap08 replicas; sovereign abliterated reasoning, tool use, and vision."

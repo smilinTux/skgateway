@@ -85,6 +85,8 @@ describe("card P2.4: /admin/models cards+lifecycle, /v1/models picker badges", (
         `  port: ${DASH}`,
         "discovery:",
         "  enabled: false",
+        "routing:",
+        "  buckets_enabled: true",
         "identity:",
         "  enabled: false",
         "backends:",
@@ -104,6 +106,9 @@ describe("card P2.4: /admin/models cards+lifecycle, /v1/models picker badges", (
         "      - p24-active-1",
         "      - p24-suspect-1",
         "      - p24-eol-1",
+        "      - deepseek-flash",
+        "      - gpt-5.6-sol",
+        "      - qwen3.8-27b-huihui-abliterated-q4_k_m",
         "",
       ].join("\n"),
     );
@@ -122,6 +127,63 @@ describe("card P2.4: /admin/models cards+lifecycle, /v1/models picker badges", (
   });
 
   // ── Pure helper: deriveModelBadges ──
+
+  test("generation policy preserves all physical and provider card metadata", () => {
+    const entry = { id: 'qwen', provider: 'local', card: {
+      context_length: 131072, max_output_tokens: 16384, min_output_tokens: 8192,
+      source: 'provider', notes: 'fixture', supported_parameters: ['tools'],
+    } };
+    const before = structuredClone(entry);
+    const [out] = mod.applyGenerationDefaults([entry], { qwen: { generation_default_tokens: 8192 } });
+    assert.deepEqual(out, { ...entry, card: { ...entry.card, generation_default_tokens: 8192 } });
+    assert.deepEqual(entry, before);
+    assert.deepEqual(mod.applyGenerationDefaults([entry], {}), [entry]);
+  });
+
+  test("missing and malformed operator policy cannot inherit or invent a generation default", () => {
+    const entry = { id: 'x', card: { source: 'provider', max_output_tokens: 16384,
+      generation_default_tokens: 4096 } };
+    for (const value of [undefined, null, true, false, 0, -1, 1.5, '8192',
+      NaN, Infinity, -Infinity, Number.MAX_SAFE_INTEGER + 1, {}, []]) {
+      const [out] = mod.applyGenerationDefaults([entry], { x: { generation_default_tokens: value } });
+      assert.deepEqual(out.card, { source: 'provider', max_output_tokens: 16384 });
+    }
+    assert.equal(mod.applyGenerationDefaults([entry], {})[0].card.generation_default_tokens, undefined);
+    assert.deepEqual(mod.applyGenerationDefaults([{ id: 'absent' }], {}), [{ id: 'absent' }]);
+    for (const value of [1, Number.MAX_SAFE_INTEGER]) {
+      assert.equal(mod.applyGenerationDefaults([{ id: 'x' }],
+        { x: { generation_default_tokens: value } })[0].card.generation_default_tokens, value);
+    }
+    assert.equal(entry.card.generation_default_tokens, 4096);
+  });
+
+  async function assertGenerationCatalog() {
+    const res = await fetch(`http://127.0.0.1:${PORT}/v1/models`);
+    assert.equal(res.status, 200);
+    const { data } = await res.json();
+    for (const id of ['deepseek-flash', 'sk-zai-m', 'gpt-5.6-sol',
+      'qwen3.8-27b-huihui-abliterated-q4_k_m']) {
+      const entries = data.filter((entry) => entry.id === id);
+      assert.equal(entries.length, 1, id);
+      assert.equal(entries[0].card?.generation_default_tokens, 8192, id);
+    }
+    assert.equal(data.find((entry) => entry.id === 'sk-zai-m').kind, 'bucket');
+    assert.equal(data.find((entry) => entry.id === 'p24-active-1').card?.generation_default_tokens, undefined);
+  }
+
+  test("GET /v1/models advertises one generation policy per qualified ID including late aliases", async () => {
+    await assertGenerationCatalog();
+  });
+
+  test("GET /v1/models fallback retains the same explicit generation policies", async () => {
+    const { getConfig } = await import('../src/config.mjs');
+    const cfg = getConfig();
+    const original = Object.getOwnPropertyDescriptor(cfg, 'discovery');
+    Object.defineProperty(cfg, 'discovery', { configurable: true,
+      get() { throw new Error('fixture discovery unavailable'); } });
+    try { await assertGenerationCatalog(); }
+    finally { Object.defineProperty(cfg, 'discovery', original); }
+  });
 
   test("deriveModelBadges: derives ctx_tokens/tools/vision from a full card", () => {
     const card = {

@@ -41,6 +41,19 @@ test('loadCardOverrides reads the real committed overlay file', () => {
   assert.match(overrides['deepseek-ai/deepseek-v4-pro'].notes, /slow/);
 });
 
+test('qualified worker IDs have explicit generation policy distinct from model limits', () => {
+  const overrides = loadCardOverrides(CARD_OVERRIDES_PATH);
+  for (const id of ['deepseek-flash', 'sk-zai-m', 'gpt-5.6-sol',
+    'qwen3.8-27b-huihui-abliterated-q4_k_m']) {
+    assert.equal(overrides[id]?.generation_default_tokens, 8192, id);
+  }
+  const qwen = overrides['qwen3.8-27b-huihui-abliterated-q4_k_m'];
+  assert.equal(qwen.context_length, 131072);
+  assert.equal(qwen.max_output_tokens, 16384);
+  assert.equal(qwen.min_output_tokens, 8192);
+  assert.equal(overrides['gpt-5.6-sol'].max_output_tokens, null);
+});
+
 test('DeepSeek Flash and Pro carry bounded reviewed qualification evidence', () => {
   const overrides = loadCardOverrides(CARD_OVERRIDES_PATH);
   for (const id of ['deepseek-ai/deepseek-v4-flash', 'deepseek-ai/deepseek-v4-pro']) {

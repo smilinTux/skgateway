@@ -524,6 +524,21 @@ export function applyPickerBadges(data) {
   return data.map((m) => ({ ...m, ...deriveModelBadges(m.card) }));
 }
 
+/** Project explicit operator generation policy after concrete models and aliases merge. */
+export function applyGenerationDefaults(data, overrides = loadCardOverrides()) {
+  return data.map((model) => {
+    const value = Object.hasOwn(overrides || {}, model.id)
+      ? overrides[model.id]?.generation_default_tokens : undefined;
+    const valid = Number.isSafeInteger(value) && value > 0;
+    if (!valid && !Object.hasOwn(model.card || {}, 'generation_default_tokens')) return model;
+    const card = { ...model.card };
+    // Provider maxima and stale cached defaults do not establish operator policy.
+    delete card.generation_default_tokens;
+    if (valid) card.generation_default_tokens = value;
+    return { ...model, card };
+  });
+}
+
 /**
  * Public-safe card projection for `/v1/models` (the funnel-exposed catalog +
  * the model dex). Strips operator-internal card fields (currently `notes`,
@@ -1649,7 +1664,7 @@ export const server = http.createServer(async (req, res) => {
       // Claimer-aware lifecycle view (incident inc-2026-08-18-qwen38-eol):
       // the advertised set honors the same claim-over-verdict rule as the
       // router's gate, so /v1/models and routability stay consistent.
-      const data = stripInternalCardFields(applyPickerBadges(applyLifecycleView(enriched, getLifecycle, modelClaimersFor(advertiseBackends))));
+      const data = stripInternalCardFields(applyPickerBadges(applyGenerationDefaults(applyLifecycleView(enriched, getLifecycle, modelClaimersFor(advertiseBackends)))));
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ object: "list", data }));
     } catch (e) {
@@ -1663,7 +1678,7 @@ export const server = http.createServer(async (req, res) => {
       const seenIds = new Set(allowed.map((m) => m.id));
       let data = [...allowed, ...aliases.filter((e) => !seenIds.has(e.id))];
       try {
-        data = stripInternalCardFields(applyPickerBadges(applyLifecycleView(data, getLifecycle, modelClaimersFor(advertiseBackends))));
+        data = stripInternalCardFields(applyPickerBadges(applyGenerationDefaults(applyLifecycleView(data, getLifecycle, modelClaimersFor(advertiseBackends)))));
       } catch (e2) {
         console.warn("[skgateway] /v1/models static catalog fallback also failed, serving empty list:", e2.message);
         data = [];
