@@ -539,6 +539,41 @@ export function applyGenerationDefaults(data, overrides = loadCardOverrides()) {
   });
 }
 
+/** Project only provider-focused aliases whose entire current pool is qualified. */
+export function applyFocusedAliasMetadata(data, cfg, { sensitivityPolicy, lifecycle = getLifecycle, membership = data } = {}) {
+  const concrete = data.filter((entry) => !entry.kind);
+  const catalog = buildCapabilityCatalog(membership.filter((entry) => !entry.kind), { getLifecycleFn: lifecycle });
+  const buckets = new Map(allBuckets().filter((bucket) => bucket.provider)
+    .map((bucket) => [bucket.bucket, bucket]));
+  const policy = sensitivityPolicy ?? policyFromRegistry(loadRegistry());
+  return data.map((entry) => {
+    const bucket = entry.kind === 'bucket' ? buckets.get(entry.id) : null;
+    if (!bucket) return entry;
+    const unavailable = { ...entry, provider: 'skgateway', owned_by: 'skgateway',
+      advertised: false, stale: true };
+    const backend = cfg?.backends?.[bucket.provider];
+    if (!backend || backend.enabled === false) return unavailable;
+    const { members } = resolveBucket({ bucket, catalog, sensitivityPolicy: policy });
+    if (!members.length) return unavailable;
+    const rows = members.map((member) => concrete.filter((row) =>
+      row.id === member.id && row.provider === bucket.provider));
+    if (rows.some((matches) => matches.length !== 1)) return unavailable;
+    const selected = rows.map(([row]) => row);
+    if (selected.some((row) => row.advertised !== true || row.stale !== false
+      || row.status === 'unavailable' || row.capacity?.state === 'unavailable'
+      || row.card?.reasoning !== true
+      || !Array.isArray(row.card?.supported_parameters)
+      || !row.card?.supported_parameters?.includes('tools')
+      || !row.card?.supported_parameters?.includes('tool_choice'))) return unavailable;
+    return { ...entry, provider: bucket.provider, owned_by: bucket.provider,
+      advertised: true, stale: false,
+      card: { ...entry.card, size_class: bucket.model_class, reasoning: true,
+        supported_parameters: ['tools', 'tool_choice', 'reasoning'],
+        ...(selected.every((row) => row.card?.tier === selected[0].card?.tier)
+          ? { tier: selected[0].card.tier } : {}) } };
+  });
+}
+
 /**
  * Public-safe card projection for `/v1/models` (the funnel-exposed catalog +
  * the model dex). Strips operator-internal card fields (currently `notes`,
@@ -1664,7 +1699,12 @@ export const server = http.createServer(async (req, res) => {
       // Claimer-aware lifecycle view (incident inc-2026-08-18-qwen38-eol):
       // the advertised set honors the same claim-over-verdict rule as the
       // router's gate, so /v1/models and routability stay consistent.
-      const data = stripInternalCardFields(applyPickerBadges(applyGenerationDefaults(applyLifecycleView(enriched, getLifecycle, modelClaimersFor(advertiseBackends)))));
+      const visible = applyCardOverlays(applyLifecycleView(enriched, getLifecycle,
+        modelClaimersFor(advertiseBackends)), loadCardOverrides());
+      const focused = applyFocusedAliasMetadata(visible, getConfig(), {
+        membership: applyCardOverlays(merged, loadCardOverrides()),
+      });
+      const data = stripInternalCardFields(applyPickerBadges(applyGenerationDefaults(focused)));
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ object: "list", data }));
     } catch (e) {
@@ -1678,7 +1718,12 @@ export const server = http.createServer(async (req, res) => {
       const seenIds = new Set(allowed.map((m) => m.id));
       let data = [...allowed, ...aliases.filter((e) => !seenIds.has(e.id))];
       try {
-        data = stripInternalCardFields(applyPickerBadges(applyGenerationDefaults(applyLifecycleView(data, getLifecycle, modelClaimersFor(advertiseBackends)))));
+        const visible = applyCardOverlays(applyLifecycleView(data, getLifecycle,
+          modelClaimersFor(advertiseBackends)), loadCardOverrides());
+        const focused = applyFocusedAliasMetadata(visible, getConfig(), {
+          membership: applyCardOverlays(fallback, loadCardOverrides()),
+        });
+        data = stripInternalCardFields(applyPickerBadges(applyGenerationDefaults(focused)));
       } catch (e2) {
         console.warn("[skgateway] /v1/models static catalog fallback also failed, serving empty list:", e2.message);
         data = [];

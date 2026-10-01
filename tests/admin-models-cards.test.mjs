@@ -98,6 +98,11 @@ describe("card P2.4: /admin/models cards+lifecycle, /v1/models picker badges", (
         "    models: [_p24-neutral]",
         "  openrouter:",
         "    models: []",
+        "  zai:",
+        "    url: http://127.0.0.1:1/v1",
+        "    auth_type: none",
+        "    priority: 1",
+        "    models: [glm-5.3]",
         "  local:",
         "    url: http://127.0.0.1:1/v1",
         "    auth_type: none",
@@ -115,12 +120,14 @@ describe("card P2.4: /admin/models cards+lifecycle, /v1/models picker badges", (
 
     process.env.SKGATEWAY_CONFIG = cfgPath;
     process.env.SKGATEWAY_MODEL_CATALOG_STORE_PATH = storePath;
+    process.env.SKGATEWAY_MODEL_CATALOG_CACHE_PATH = join(tmpDir, 'discovery-cache.json');
     mod = await import(pathToFileURL(INDEX).href);
   });
 
   after(() => {
     delete process.env.SKGATEWAY_CONFIG;
     delete process.env.SKGATEWAY_MODEL_CATALOG_STORE_PATH;
+    delete process.env.SKGATEWAY_MODEL_CATALOG_CACHE_PATH;
     try { mod.server.close(); } catch { /* best effort */ }
     try { mod.dashboard?.close?.(); } catch { /* best effort */ }
     try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best effort */ }
@@ -183,6 +190,85 @@ describe("card P2.4: /admin/models cards+lifecycle, /v1/models picker badges", (
       get() { throw new Error('fixture discovery unavailable'); } });
     try { await assertGenerationCatalog(); }
     finally { Object.defineProperty(cfg, 'discovery', original); }
+  });
+
+  test("focused provider alias derives capability only from its complete qualified pool", () => {
+    const member = { id: 'glm-5.3', provider: 'zai', advertised: true, stale: false,
+      card: { size_class: 'XL', tier: 'paid-cloud', reasoning: true,
+        supported_parameters: ['tools', 'tool_choice', 'reasoning'] } };
+    const alias = { id: 'sk-zai-m', provider: 'skgateway', kind: 'bucket' };
+    const mixed = { id: 'sk-m', provider: 'skgateway', kind: 'bucket' };
+    const cfg = { backends: { zai: { models: ['glm-5.3'] } } };
+    const options = { sensitivityPolicy: {}, lifecycle: () => ({ state: 'active' }) };
+    const original = structuredClone([member, alias, mixed]);
+    const result = mod.applyFocusedAliasMetadata([member, alias, mixed], cfg, options);
+    assert.equal(result[1].provider, 'zai');
+    assert.equal(result[1].card.size_class, 'M');
+    assert.equal(result[1].card.reasoning, true);
+    assert.equal(result[1].advertised, true);
+    assert.equal(result[1].stale, false);
+    assert.deepEqual(result[2], mixed);
+    assert.deepEqual([member, alias, mixed], original);
+    for (const change of [{ stale: true }, { advertised: false }, { provider: 'codex' },
+      { status: 'unavailable' }, { card: { ...member.card, reasoning: false } },
+      { card: { ...member.card, supported_parameters: ['reasoning'] } }]) {
+      const rows = mod.applyFocusedAliasMetadata([{ ...member, ...change }, alias], cfg, options);
+      assert.equal(rows[1].advertised, false);
+      assert.equal(rows[1].stale, true);
+      assert.equal(rows[1].provider, 'skgateway');
+    }
+    for (const members of [[], [member, member], [member, { ...member, id: 'other', stale: true }]]) {
+      const rows = mod.applyFocusedAliasMetadata([...members, alias], cfg, options);
+      assert.equal(rows.at(-1).advertised, false);
+    }
+    assert.equal(mod.applyFocusedAliasMetadata([member, alias],
+      { backends: { zai: { enabled: false } } }, options)[1].advertised, false);
+    assert.equal(mod.applyFocusedAliasMetadata([member, alias], cfg,
+      { ...options, membership: [member, { ...member, id: 'hidden-member' }] })[1].advertised, false);
+  });
+
+  test("HTTP catalog publishes measured DeepSeek and current focused Zai metadata", async () => {
+    const { getConfig } = await import('../src/config.mjs');
+    const cfg = getConfig();
+    const fixtureModels = (await mod.getDiscoveredCatalog()).map((row) => ({ ...row, stale: false }));
+    await mod.refreshCatalog(cfg, async () => ({ models: fixtureModels }));
+    cfg.discovery.enabled = true;
+    try {
+    const { data } = await (await fetch(`http://127.0.0.1:${PORT}/v1/models`)).json();
+    const deepseek = data.find((row) => row.id === 'deepseek-flash');
+    assert.equal(deepseek.tools, true);
+    assert.equal(deepseek.card.reasoning, true);
+    assert.equal(deepseek.card.size_class, 'M');
+    assert.equal(deepseek.card.generation_default_tokens, 8192);
+    assert.equal(deepseek.card.context_length, undefined);
+    assert.equal(deepseek.card.max_output_tokens, undefined);
+    const zai = data.find((row) => row.id === 'sk-zai-m');
+    assert.equal(zai.provider, 'zai');
+    assert.equal(zai.advertised, true);
+    assert.equal(zai.stale, false);
+    assert.equal(zai.tools, true);
+    assert.equal(zai.card.reasoning, true);
+    assert.equal(zai.card.size_class, 'M');
+    assert.equal(zai.card.generation_default_tokens, 8192);
+    assert.equal(data.find((row) => row.id === 'sk-m').provider, 'skgateway');
+    } finally { cfg.discovery.enabled = false; }
+  });
+
+  test("HTTP fallback never fabricates fresh focused-alias membership", async () => {
+    const { getConfig } = await import('../src/config.mjs');
+    const cfg = getConfig();
+    const original = Object.getOwnPropertyDescriptor(cfg, 'discovery');
+    Object.defineProperty(cfg, 'discovery', { configurable: true,
+      get() { throw new Error('fixture discovery unavailable'); } });
+    try {
+      const { data } = await (await fetch(`http://127.0.0.1:${PORT}/v1/models`)).json();
+      const zai = data.find((row) => row.id === 'sk-zai-m');
+      assert.equal(zai.provider, 'skgateway');
+      assert.equal(zai.advertised, false);
+      assert.equal(zai.stale, true);
+      assert.equal(zai.card.generation_default_tokens, 8192);
+      assert.equal(data.find((row) => row.id === 'deepseek-flash').card.size_class, 'M');
+    } finally { Object.defineProperty(cfg, 'discovery', original); }
   });
 
   test("deriveModelBadges: derives ctx_tokens/tools/vision from a full card", () => {

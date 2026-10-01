@@ -84,7 +84,15 @@
 
 overrides:
   # Explicit worker generation policy, separate from physical model limits.
-  deepseek-flash: { generation_default_tokens: 8192 }
+  deepseek-flash:
+    generation_default_tokens: 8192
+    display_name: DeepSeek Flash
+    org: DeepSeek
+    tier: paid-cloud
+    size_class: M
+    supported_parameters: [tools, tool_choice, reasoning]
+    reasoning: true
+    notes: "Measured M source card a31d4e54, exact ec34a793a23756f0a4681d639cb6c84f5a944562, independent review and external tests PASS; 02a236d6 exact deepseek-flash two-turn tool and reasoning attribution. No L or physical-max claim."
   sk-zai-m: { generation_default_tokens: 8192 }
 
   # ───────────────────────── OUR CLAUDE FLEET (paid cloud) ────────────────────
