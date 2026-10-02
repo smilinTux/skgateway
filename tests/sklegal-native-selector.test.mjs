@@ -62,3 +62,41 @@ test('same-path explicit scopes are allowed but ambiguous configuration is rejec
   assert.equal(resolver.resolve('POST', route.path, bearer('draft', { purpose: draft.context.purpose }, false)).resource.material_id, 'draft');
   assert.throws(() => createSkLegalQualificationResolver({ enabled: true, routes: [route, route] }), /duplicated/);
 });
+
+test('governed request policy is explicit, bounded and validated before serving', () => {
+  for (const request_policy of [null, {}, { model_only: false, max_requests: 8, window_ms: 60000 },
+    { model_only: true, max_requests: 0, window_ms: 60000 },
+    { model_only: true, max_requests: 1001, window_ms: 60000 },
+    { model_only: true, max_requests: 8, window_ms: 0 },
+    { model_only: true, max_requests: 8, window_ms: 3600001 },
+    { model_only: true, max_requests: 8.5, window_ms: 60000 },
+    { model_only: true, max_requests: 8, window_ms: 60000, extra: true }]) {
+    assert.throws(() => createSkLegalQualificationResolver({ enabled: true,
+      routes: [{ ...route, request_policy }] }), /request policy/);
+  }
+});
+
+test('admission state follows the trusted tuple, not material or selector aliases', () => {
+  const request_policy = { model_only: true, max_requests: 1, window_ms: 60000 };
+  const entry = { ...route, request_policy };
+  const alias = { ...entry, model_route: 'alias-qwen' };
+  const resolver = createSkLegalQualificationResolver({ enabled: true, routes: [entry, alias] });
+  const first = resolver.resolve('POST', route.path, bearer('first'));
+  const second = resolver.resolve('POST', route.path, bearer('second', { model_route: 'alias-qwen' }));
+  assert.equal(first.admit, second.admit);
+  const body = Buffer.from(JSON.stringify({ messages: [] }));
+  assert.equal(first.admit(body), null);
+  assert.equal(second.admit(body).status, 429);
+  assert.throws(() => createSkLegalQualificationResolver({ enabled: true,
+    routes: [entry, { ...alias, request_policy: { ...request_policy, max_requests: 2 } }] }), /policy conflicts/);
+  assert.throws(() => createSkLegalQualificationResolver({ enabled: true,
+    routes: [entry, { ...alias, request_policy: undefined }] }), /policy conflicts/);
+  assert.throws(() => createSkLegalQualificationResolver({ enabled: true,
+    routes: [{ ...entry, path: '/v1/messages' }] }), /native chat completion/);
+  const fixed = createSkLegalQualificationResolver({ enabled: true, routes: [{ ...entry,
+    request_capability: false, resource: { ...entry.resource, material_id: 'fixed', material_version: '1' } }] });
+  const fixedScope = fixed.resolve('POST', route.path);
+  assert.equal(fixedScope.resource.material_id, 'fixed');
+  assert.equal(fixedScope.admit(body), null);
+  assert.equal(fixedScope.admit(body).status, 429);
+});

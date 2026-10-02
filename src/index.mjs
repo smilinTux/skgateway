@@ -1055,7 +1055,12 @@ async function enforceAuthz(req, res, identity) {
     remote: req.socket?.remoteAddress ?? null,
   });
 
-  if (verdict.allowed) return false;
+  if (verdict.allowed) {
+    // Only a strict PDP allow can attach the trusted request admission hook.
+    req.sklegalAdmission = qualification?.admit ? { ...qualification,
+      decision_id: verdict.decision_id, correlation_id: verdict.correlation_id } : null;
+    return false;
+  }
 
   if (!res.headersSent) {
     const status = verdict.failure_kind === "dependency_unavailable" ? 503 : 403;
@@ -2236,6 +2241,22 @@ export const server = http.createServer(async (req, res) => {
       chunks.push(chunk);
     }
     const body = Buffer.concat(chunks);
+
+    if (req.sklegalAdmission) {
+      const scope = req.sklegalAdmission;
+      const denied = scope.admit(body);
+      if (denied) {
+        siemHook({ ts: new Date().toISOString(), event: "authz.request_denied",
+          subject: scope.subject, tenant_id: scope.resource.tenant_id,
+          matter_id: scope.resource.matter_id, route_id: scope.resource.route_id,
+          purpose: scope.context.purpose, decision_id: scope.decision_id, correlation_id: scope.correlation_id,
+          reason: denied.code, status: denied.status });
+        res.writeHead(denied.status, { "content-type": "application/json", "cache-control": "no-store",
+          ...(denied.retryAfter ? { "retry-after": String(denied.retryAfter) } : {}) });
+        res.end(JSON.stringify({ error: { message: denied.message, code: denied.code, status: denied.status } }));
+        return;
+      }
+    }
 
     // ── Anthropic Messages FRONTEND (POST /v1/messages) ──
     // Accept the Anthropic wire format and route it through the SAME OpenAI path

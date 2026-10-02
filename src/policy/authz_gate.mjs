@@ -21,6 +21,7 @@
  */
 
 import { classifyRoute, subjectFromIdentity } from "./authz_routes.mjs";
+import { createSkLegalRequestAdmission } from "./sklegal_request_admission.mjs";
 
 export const SKLEGAL_RESOURCE_FIELDS = Object.freeze([
   "tenant_id",
@@ -64,6 +65,7 @@ export function createSkLegalQualificationResolver(config = {}) {
   }
 
   const routes = new Map();
+  const admissions = new Map();
   for (const entry of config.routes) {
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
       throw new Error("SKLegal qualification route is malformed");
@@ -83,6 +85,17 @@ export function createSkLegalQualificationResolver(config = {}) {
     if (!method || !path.startsWith("/") || path.includes("?") || !subject || subject.length > 256 || !resource || !context) {
       throw new Error("SKLegal qualification route lacks exact trusted scope");
     }
+    const policy = entry.request_policy;
+    if (policy !== undefined && (method !== "POST" || path !== "/v1/chat/completions")) {
+      throw new Error("SKLegal request policy requires the native chat completion route");
+    }
+    const admit = policy === undefined ? null : createSkLegalRequestAdmission(policy);
+    const admissionKey = JSON.stringify([subject, resource.tenant_id, resource.matter_id, resource.route_id, context.purpose]);
+    const policyKey = JSON.stringify([policy?.model_only, policy?.max_requests, policy?.window_ms]);
+    if (admissions.has(admissionKey) && admissions.get(admissionKey).policyKey !== policyKey) {
+      throw new Error("SKLegal request policy conflicts for one trusted scope");
+    }
+    if (!admissions.has(admissionKey)) admissions.set(admissionKey, { admit, policyKey });
     const key = `${method} ${path}`;
     const entries = routes.get(key) || [];
     if (entries.some(previous => !dynamic || !previous.dynamic || (
@@ -90,7 +103,8 @@ export function createSkLegalQualificationResolver(config = {}) {
       && previous.resource.matter_id === resource.matter_id
       && previous.modelRoute === modelRoute.model_route && previous.context.purpose === context.purpose
     ))) throw new Error("SKLegal qualification route is duplicated");
-    entries.push(Object.freeze({ subject, resource, context, dynamic, modelRoute: modelRoute?.model_route }));
+    entries.push(Object.freeze({ subject, resource, context, dynamic, modelRoute: modelRoute?.model_route,
+      admit: admissions.get(admissionKey).admit }));
     routes.set(key, entries);
   }
 
@@ -101,8 +115,8 @@ export function createSkLegalQualificationResolver(config = {}) {
       const entries = routes.get(`${(method || "GET").toUpperCase()} ${pathname}`);
       if (!entries) return null;
       if (!entries[0].dynamic) {
-        const { subject, resource, context } = entries[0];
-        return { subject, resource, context };
+        const { subject, resource, context, admit } = entries[0];
+        return { subject, resource, context, ...(admit ? { admit } : {}) };
       }
       const selectors = unverifiedCapabilitySelectors(authorization);
       const match = selectors && entries.find(entry => entry.subject === selectors.subject
@@ -113,7 +127,8 @@ export function createSkLegalQualificationResolver(config = {}) {
       // A configured path remains governed even when its selectors are invalid.
       if (!match) return { invalid: true };
       return { subject: match.subject,
-        resource: Object.freeze({ ...selectors.resource, route_id: match.resource.route_id }), context: match.context };
+        resource: Object.freeze({ ...selectors.resource, route_id: match.resource.route_id }), context: match.context,
+        ...(match.admit ? { admit: match.admit } : {}) };
     },
   };
 }

@@ -511,3 +511,140 @@ describe("SKLegal governed qualification wire contract on the live server", () =
     assert.equal(response.status, 503);
   });
 });
+
+async function governedAdmissionFixture(policy = { model_only: true, max_requests: 8, window_ms: 60000 }, enabled = true) {
+  const directory = mkdtempSync(join(tmpdir(), "skgw-admission-"));
+  const credential = join(directory, "service-token");
+  writeFileSync(credential, "synthetic-admission-secret", { mode: 0o600 });
+  const fixture = { mode: "allow", dispatches: 0, pdpCalls: [], logs: "" };
+  const backend = createServer((req, res) => {
+    if (req.method === "POST") fixture.dispatches++;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ choices: [{ message: { role: "assistant", content: "synthetic" } }] }));
+  });
+  const pdp = createServer(async (req, res) => {
+    let raw = "";
+    for await (const chunk of req) raw += chunk;
+    fixture.pdpCalls.push({ headers: req.headers, body: JSON.parse(raw) });
+    res.writeHead(fixture.mode === "outage" ? 503 : 200, { "content-type": "application/json" });
+    res.end(JSON.stringify(fixture.mode === "outage" ? { secret: "private-admission-upstream" }
+      : { allow: fixture.mode === "allow", reason: fixture.mode === "allow" ? "allow" : "policy_denied", obligations: [] }));
+  });
+  for (const server of [backend, pdp]) await new Promise(resolveListen => server.listen(0, "127.0.0.1", resolveListen));
+  const scopes = [
+    { tenant_id: "tenant-a", matter_id: "matter-a", purpose: "research" },
+    { tenant_id: "tenant-a", matter_id: "matter-a", purpose: "draft" },
+    { tenant_id: "tenant-a", matter_id: "matter-b", purpose: "research" },
+    { tenant_id: "tenant-b", matter_id: "matter-b", purpose: "research" },
+  ];
+  const config = {
+    enforce: true, trust_internal: true,
+    sklegal_qualification: { enabled: true, url: `http://127.0.0.1:${pdp.address().port}/v1/authz/decide`,
+      service_credential_file: credential,
+      routes: scopes.map(({ purpose, ...scope }) => ({ method: "POST", path: "/v1/chat/completions",
+        subject: "synthetic-agent", request_capability: true, model_route: "local_qwen",
+        resource: { ...scope, route_id: "governed-corpus-qwen" },
+        context: { purpose, classification: "public", privilege: "none", ethical_wall: "clear" }, request_policy: policy })) },
+  };
+  let handle;
+  async function shutdown() {
+    if (!handle) return;
+    fixture.logs += handle.out;
+    const exited = new Promise(resolveExit => handle.child.once("exit", resolveExit));
+    stop(handle);
+    await exited;
+    handle = null;
+  }
+  fixture.restart = async () => {
+    await shutdown();
+    handle = await bootGateway({ port: 18954, dashPort: 18955,
+      env: { SKGATEWAY_AUTHZ_ENFORCE: enabled ? "1" : "0", SKLEGAL_AUTHZ_SERVICE_TOKEN: undefined },
+      backends: ["backends:", "  synthetic:", `    url: http://127.0.0.1:${backend.address().port}/v1`,
+        "    auth_type: none", "    models: [x]", "    priority: 1"],
+      extraConfig: ["authz: " + JSON.stringify(config)],
+    });
+  };
+  let material = 0;
+  fixture.request = async (scopeIndex = 0, overrides = {}) => {
+    const materialId = "material-" + material++;
+    const authorization = "Bearer " + JSON.stringify({ payload: { metadata: { sklegal_capability: {
+      principal: { subject: "synthetic-agent" }, grant: { audience: "model", ...scopes[scopeIndex],
+        resource_id: materialId, resource_version: 1, model_route: "local_qwen" },
+    } } } });
+    const response = await httpResponse("POST", 18954, "/v1/chat/completions",
+      { model: "x", messages: [{ role: "user", content: "private-admission-prompt" }], ...overrides },
+      { authorization, "x-sklegal-tenant-id": "forged-tenant", "x-agent-id": "forged-agent" });
+    const body = await response.json();
+    assert.doesNotMatch(JSON.stringify(body) + handle.out, /synthetic-admission-secret|private-admission-upstream|private-admission-prompt|private-tool-argument|sklegal_capability/);
+    if (enabled) assert.equal(fixture.pdpCalls.find(call => call.body.resource.material_id === materialId)?.headers.authorization, authorization);
+    return { response, body };
+  };
+  fixture.close = async () => {
+    await shutdown();
+    for (const server of [backend, pdp]) await new Promise(resolveClose => server.close(resolveClose));
+    rmSync(directory, { recursive: true, force: true });
+  };
+  await fixture.restart();
+  return fixture;
+}
+
+test("native governed model-only controls reject every tool form without dispatch or budget consumption", async () => {
+  const fixture = await governedAdmissionFixture();
+  try {
+    const toolForms = [
+      ...["tools", "tool_choice", "parallel_tool_calls", "functions", "function_call"].flatMap(key => [{ [key]: [] }, { [key]: null }]),
+      ...["tool", "toolResult", "function"].map(role => ({ messages: [{ role, content: "private-tool-argument" }] })),
+      ...["tool_calls", "tool_call_id", "function_call"].map(key => ({ messages: [{ role: "assistant", [key]: "private-tool-argument" }] })),
+      ...["tool_use", "tool_result", "function_call", "function_call_output"].map(type => ({ messages: [{ role: "user", content: [{ type, text: "private-tool-argument" }] }] })),
+    ];
+    for (const body of toolForms) {
+      const denied = await fixture.request(0, body);
+      assert.equal(denied.response.status, 403);
+      assert.equal(denied.body.error.code, "model_only_required");
+    }
+    assert.equal(fixture.dispatches, 0);
+    for (let i = 0; i < 8; i++) assert.equal((await fixture.request()).response.status, 200);
+    const limited = await fixture.request();
+    assert.equal(limited.response.status, 429);
+    assert.equal(limited.body.error.code, "request_rate_limited");
+    assert.ok(Number(limited.response.headers.get("retry-after")) >= 1);
+    assert.ok(Number(limited.response.headers.get("retry-after")) <= 60);
+    assert.equal(fixture.dispatches, 8);
+    // A different purpose, Matter or Tenant has its own trusted budget.
+    const concurrent = await Promise.all(Array.from({ length: 10 }, () => fixture.request(1)));
+    assert.equal(concurrent.filter(row => row.response.status === 200).length, 8);
+    assert.equal(concurrent.filter(row => row.response.status === 429).length, 2);
+    for (const scope of [2, 3]) assert.equal((await fixture.request(scope)).response.status, 200);
+    assert.equal(fixture.dispatches, 18);
+    for (const [mode, status] of [["deny", 403], ["outage", 503]]) {
+      fixture.mode = mode;
+      assert.equal((await fixture.request()).response.status, status);
+    }
+    assert.equal(fixture.dispatches, 18);
+    fixture.mode = "allow";
+    await fixture.restart();
+    assert.equal((await fixture.request()).response.status, 200, "process restart explicitly resets local admission");
+    assert.equal(fixture.dispatches, 19);
+    assert.doesNotMatch(JSON.stringify(fixture.pdpCalls.map(call => call.body)), /private-admission-prompt|private-tool-argument/);
+  } finally { await fixture.close(); }
+});
+
+test("native governed rate window recovers after elapsed monotonic time", async () => {
+  const fixture = await governedAdmissionFixture({ model_only: true, max_requests: 1, window_ms: 250 });
+  try {
+    assert.equal((await fixture.request()).response.status, 200);
+    assert.equal((await fixture.request()).response.status, 429);
+    await new Promise(resolveWait => setTimeout(resolveWait, 300));
+    assert.equal((await fixture.request()).response.status, 200);
+    assert.equal(fixture.dispatches, 2);
+  } finally { await fixture.close(); }
+});
+
+test("flag-off leaves native tool requests and request admission unchanged", async () => {
+  const fixture = await governedAdmissionFixture({ model_only: true, max_requests: 1, window_ms: 60000 }, false);
+  try {
+    for (let i = 0; i < 2; i++) assert.equal((await fixture.request(0, { tools: [] })).response.status, 200);
+    assert.equal(fixture.pdpCalls.length, 0);
+    assert.equal(fixture.dispatches, 2);
+  } finally { await fixture.close(); }
+});
