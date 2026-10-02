@@ -313,8 +313,14 @@ test("source config pins two independent Qwen replica capacity domains", async (
   assert.deepEqual(config.pooling.capacity_domains["chiap08-qwen38"], {
     members: ["chiap08-qwen38", "reg:qwen38"],
     max: 2,
-    maxQueue: 2,
-    queueTimeoutMs: 10_000,
+    // 2026-09-11 (6e684df): live config had drifted to max 4 while this said
+    // max 2, and a burst of agent cron jobs drove peakActive/peakQueue to their
+    // ceiling, which llama-server answered with completions the response
+    // contract rejected as invalid_upstream_completion. max is the real
+    // concurrency ceiling; maxQueue is deliberately deep (and the timeout
+    // generous) so a burst waits instead of erroring.
+    maxQueue: 24,
+    queueTimeoutMs: 120_000,
   });
   assert.deepEqual(config.pooling.capacity_domains["chiap01-qwen38"], {
     members: ["chiap01-qwen38"],
