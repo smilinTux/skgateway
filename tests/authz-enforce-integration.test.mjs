@@ -28,7 +28,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const INDEX = resolve(__dirname, "..", "src", "index.mjs");
 
 /** Boot the gateway with the given env; resolve once it logs "listening". */
-function bootGateway({ port, dashPort, env, extraConfig = [] }) {
+function bootGateway({ port, dashPort, env, extraConfig = [], backends = ["backends: {}"] }) {
   const dir = mkdtempSync(join(tmpdir(), "skgw-authz-"));
   const cfgPath = join(dir, "gw.yaml");
   writeFileSync(
@@ -44,7 +44,7 @@ function bootGateway({ port, dashPort, env, extraConfig = [] }) {
       `  port: ${dashPort}`,
       "identity:",
       "  enabled: false",
-      "backends: {}",
+      ...backends,
       ...extraConfig,
       "",
     ].join("\n"),
@@ -64,7 +64,7 @@ function bootGateway({ port, dashPort, env, extraConfig = [] }) {
     const onData = (buf) => {
       out += buf.toString();
       if (/\[skgateway\] listening/.test(out)) {
-        resolveBoot({ child, dir, out });
+        resolveBoot({ child, dir, get out() { return out; } });
       }
     };
     child.stdout.on("data", onData);
@@ -242,12 +242,20 @@ test('native dynamic selectors reach the strict PDP through the actual server', 
 describe("SKLegal governed qualification wire contract on the live server", () => {
   let handle;
   let pdp;
+  let backend;
+  let dispatches = 0;
   let credentialDir;
   let serviceCredential;
   let mode = "allow";
   const calls = [];
 
   before(async () => {
+    backend = createServer((req, res) => {
+      if (req.method === "POST") dispatches++;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ choices: [{ message: { role: "assistant", content: "synthetic" } }] }));
+    });
+    await new Promise(resolveListen => backend.listen(0, "127.0.0.1", resolveListen));
     credentialDir = mkdtempSync(join(tmpdir(), "skgw-authz-credential-"));
     serviceCredential = join(credentialDir, "skgateway-authz-service-token");
     writeFileSync(serviceCredential, "synthetic-service-secret", { mode: 0o600 });
@@ -256,6 +264,22 @@ describe("SKLegal governed qualification wire contract on the live server", () =
       let raw = "";
       for await (const chunk of req) raw += chunk;
       calls.push({ headers: req.headers, body: JSON.parse(raw) });
+      if (mode === "timeout") return;
+      if (mode === "body-timeout") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.write('{"allow":');
+        return;
+      }
+      if (["503", "500", "401", "403"].includes(mode)) {
+        res.writeHead(Number(mode), { "content-type": "application/json" });
+        res.end(JSON.stringify({ secret: "private-upstream-body" }));
+        return;
+      }
+      if (mode === "invalid-json") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end("private-invalid-json");
+        return;
+      }
       const base = {
         allow: mode === "allow" || mode === "leak",
         reason: mode === "allow" || mode === "leak" ? "allow" : "policy_denied",
@@ -281,12 +305,15 @@ describe("SKLegal governed qualification wire contract on the live server", () =
         SKLEGAL_CAPAUTH_AUTHZ_ENDPOINT: `http://127.0.0.1:${SKLEGAL_PDP_PORT}/v1/authz/decide`,
         SKLEGAL_AUTHZ_SERVICE_TOKEN: undefined,
       },
+      backends: ["backends:", "  synthetic:", `    url: http://127.0.0.1:${backend.address().port}/v1`,
+        "    auth_type: none", "    models: [x]", "    priority: 1"],
       extraConfig: [
         "authz:",
         "  enforce: true",
         "  trust_internal: true",
         "  sklegal_qualification:",
         "    enabled: true",
+        "    timeout_ms: 250",
         `    service_credential_file: ${serviceCredential}`,
         "    service_credential_max_age_ms: 300000",
         "    routes:",
@@ -310,6 +337,7 @@ describe("SKLegal governed qualification wire contract on the live server", () =
 
   after(async () => {
     stop(handle);
+    if (backend?.listening) await new Promise(resolveClose => backend.close(resolveClose));
     if (pdp?.listening) await new Promise((resolveClose) => pdp.close(resolveClose));
     if (credentialDir) rmSync(credentialDir, { recursive: true, force: true });
   });
@@ -390,7 +418,7 @@ describe("SKLegal governed qualification wire contract on the live server", () =
         { model: "x", messages: [] },
         { authorization: "Bearer synthetic-request-capauth" },
       );
-      assert.equal(denied.status, 403, `byte 0x${byte.toString(16)} must deny`);
+      assert.equal(denied.status, 503, `byte 0x${byte.toString(16)} must fail closed`);
       assert.equal(calls.length, before, "unsafe credential must not reach the PDP");
     }
     writeFileSync(serviceCredential, "synthetic-service-secret", { mode: 0o600 });
@@ -423,7 +451,7 @@ describe("SKLegal governed qualification wire contract on the live server", () =
       { model: "x", messages: [] },
       { authorization: "Bearer synthetic-request-capauth" },
     );
-    assert.equal(denied.status, 403);
+    assert.equal(denied.status, 503);
     assert.equal(calls.length, before);
 
     writeFileSync(serviceCredential, "synthetic-service-restored", { mode: 0o600 });
@@ -442,9 +470,32 @@ describe("SKLegal governed qualification wire contract on the live server", () =
         { model: "x", messages: [] },
         { authorization: "Bearer synthetic-request-capauth" },
       );
-      assert.equal(response.status, 403);
+      assert.equal(response.status, 503);
       const text = await response.text();
       assert.doesNotMatch(text, /protected-synthetic-content|synthetic-service-secret|synthetic-request-capauth/);
+    }
+  });
+
+  test("outages return 503, bounded denials return 403, and neither dispatches", async () => {
+    const before = dispatches;
+    assert.ok(before > 0, "allow scenarios must prove the synthetic backend is reachable");
+    for (const [responseMode, status] of [
+      ["503", 503], ["500", 503], ["timeout", 503], ["body-timeout", 503],
+      ["invalid-json", 503], ["malformed", 503], ["leak", 503],
+      ["deny", 403], ["401", 403], ["403", 403],
+    ]) {
+      mode = responseMode;
+      const response = await httpResponse("POST", SKLEGAL_PORT, "/v1/chat/completions",
+        { model: "x", messages: [{ role: "user", content: "private-request-prompt" }] },
+        { authorization: "Bearer synthetic-request-capauth" });
+      const body = await response.json();
+      assert.equal(response.status, status, responseMode);
+      assert.equal(body.error.code, status, responseMode);
+      assert.equal(dispatches, before, responseMode);
+      assert.doesNotMatch(JSON.stringify(body) + handle.out,
+        /private-upstream-body|private-invalid-json|protected-synthetic-content|synthetic-service-(secret|restored)|synthetic-request-capauth|private-request-prompt/);
+      assert.equal(calls.at(-1).headers.authorization, "Bearer synthetic-request-capauth");
+      assert.doesNotMatch(JSON.stringify(calls.at(-1).body), /private-request-prompt/);
     }
   });
 
@@ -457,6 +508,6 @@ describe("SKLegal governed qualification wire contract on the live server", () =
       { model: "x", messages: [] },
       { authorization: "Bearer synthetic-request-capauth" },
     );
-    assert.equal(response.status, 403);
+    assert.equal(response.status, 503);
   });
 });

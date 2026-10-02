@@ -1012,7 +1012,7 @@ if (authzEnforce) {
 
 /**
  * Enforce PDP authorization for one request when the flag is ON. Returns true if
- * the request was DENIED and a 403 was already written (caller must stop). Returns
+ * the request was denied and a 403 or 503 was written (caller must stop). Returns
  * false to let the request proceed normally. NEVER called when authzEnforce is off.
  *
  * Fail-closed everywhere: any transport/HTTP fault from the PDP is a deny (handled
@@ -1058,9 +1058,14 @@ async function enforceAuthz(req, res, identity) {
   if (verdict.allowed) return false;
 
   if (!res.headersSent) {
-    res.writeHead(403, { "content-type": "application/json" });
+    const status = verdict.failure_kind === "dependency_unavailable" ? 503 : 403;
+    res.writeHead(status, { "content-type": "application/json" });
     res.end(JSON.stringify({
-      error: { message: "Forbidden by authorization policy", reason: verdict.reason, code: 403 },
+      error: {
+        message: status === 503 ? "Authorization service unavailable" : "Forbidden by authorization policy",
+        reason: verdict.reason,
+        code: status,
+      },
     }));
   }
   return true;
@@ -1518,7 +1523,7 @@ export const server = http.createServer(async (req, res) => {
       }
     }
     try {
-      if (await enforceAuthz(req, res, gateIdentity)) return; // denied → 403 already written
+      if (await enforceAuthz(req, res, gateIdentity)) return; // Denial response already written.
     } catch (e) {
       // Fail closed: an unexpected fault in the gate itself denies rather than
       // silently allowing a gated route through.

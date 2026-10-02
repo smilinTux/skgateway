@@ -56,9 +56,10 @@ const CONTEXT_FIELDS = [
   "ethical_wall",
 ];
 
-function deny(reason) {
+function deny(reason, failureKind = "denied") {
   return {
     allow: false,
+    failure_kind: failureKind,
     reason: `authz_decide fail-closed: ${reason}`,
     decision_id: null,
     policy_revision: null,
@@ -290,7 +291,7 @@ export function createSkLegalAuthzClient(opts = {}) {
       return deny("request-local CapAuth credential is required");
     }
     if (!configured || typeof fetchImpl !== "function") {
-      return deny("authorization backend unavailable");
+      return deny("authorization backend unavailable", "dependency_unavailable");
     }
 
     let credential;
@@ -306,7 +307,7 @@ export function createSkLegalAuthzClient(opts = {}) {
         serviceAuthorization = `Bearer ${legacyServiceToken}`;
       }
     } catch {
-      return deny("authorization backend unavailable");
+      return deny("authorization backend unavailable", "dependency_unavailable");
     }
 
     calls++;
@@ -324,25 +325,28 @@ export function createSkLegalAuthzClient(opts = {}) {
         body: JSON.stringify({ subject, capability, resource, context }),
         signal: ac.signal,
       });
+      // Classify HTTP failures without reading or exposing upstream bodies.
+      if (response?.status === 401 || response?.status === 403) {
+        return deny("authorization denied");
+      }
+      if (!response || response.status !== 200) {
+        return deny("authorization backend unavailable", "dependency_unavailable");
+      }
+      let data;
+      try {
+        data = await response.json();
+      } catch {
+        return deny("malformed authorization response", "dependency_unavailable");
+      }
+      return validateSkLegalDecisionResponse(data)
+        || deny("malformed authorization response", "dependency_unavailable");
     } catch {
-      return deny("authorization backend unavailable");
+      return deny("authorization backend unavailable", "dependency_unavailable");
     } finally {
       clearTimeout(timer);
       if (credential) credential.fill(0);
       serviceAuthorization = null;
     }
-
-    if (!response || response.status !== 200) {
-      return deny("authorization backend unavailable");
-    }
-    let data;
-    try {
-      data = await response.json();
-    } catch {
-      return deny("malformed authorization response");
-    }
-    return validateSkLegalDecisionResponse(data)
-      || deny("malformed authorization response");
   }
 
   return {

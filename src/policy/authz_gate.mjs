@@ -11,7 +11,8 @@
  *     resolve the subject from the authenticated identity, and (for a gated
  *     route) delegate to the PDP client. Returns a plain verdict object; it does
  *     NO I/O of its own beyond calling client.decide, and never throws for a
- *     policy outcome. index.mjs turns a `denied` verdict into a 403 + a SIEM line.
+ *     policy outcome. index.mjs emits 503 for SKLegal dependency failures and
+ *     403 for authorization denials, plus a SIEM line.
  *
  * Keeping this composition out of index.mjs is what lets the "flag-off = no
  * decide call" and "flag-on = enforced" guarantees be tested directly.
@@ -163,6 +164,7 @@ export function authzEnforceEnabled(env = process.env, config = {}) {
  * @property {string|null} capability The mapped capability (null for public / unmapped).
  * @property {string} subject         Resolved PDP subject ("" when anonymous).
  * @property {string} reason          Human-readable justification.
+ * @property {"denied"|"dependency_unavailable"|null} [failure_kind] Internal failure type.
  * @property {Array}  obligations     PDP obligations (audit records) to honor.
  */
 
@@ -223,6 +225,8 @@ export async function authorizeRequest({
       kind: "gated",
       governed: true,
       allowed: decision.allow === true,
+      failure_kind: decision.allow === true ? null
+        : decision.failure_kind === "dependency_unavailable" ? "dependency_unavailable" : "denied",
       capability: route.capability,
       subject,
       reason: decision.reason || "",

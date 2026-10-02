@@ -153,6 +153,35 @@ describe("SKLegal authorization client", () => {
     assert.deepEqual(strictClient.stats(), { calls: 2, configured: true, cacheEnabled: false });
   });
 
+  test("classifies dependency failures separately from bounded denials", async () => {
+    for (const [status, expected] of [[503, "dependency_unavailable"], [500, "dependency_unavailable"], [401, "denied"], [403, "denied"]]) {
+      let bodyRead = false;
+      const decision = await request(recordingFetch({ status, json: async () => {
+        bodyRead = true;
+        return { secret: "private-upstream-body" };
+      } }));
+      assert.equal(decision.allow, false);
+      assert.equal(decision.failure_kind, expected);
+      assert.equal(bodyRead, false);
+      assert.doesNotMatch(JSON.stringify(decision), /private-upstream-body|service-secret|request-local-capauth/);
+    }
+    for (const result of [
+      () => { throw new Error("private-transport-error"); },
+      { status: 200, json: async () => { throw new Error("private-json-error"); } },
+      response(200, { ...ALLOW, failure_kind: "denied" }),
+    ]) {
+      const decision = await request(recordingFetch(result));
+      assert.equal(decision.allow, false);
+      assert.equal(decision.failure_kind, "dependency_unavailable");
+      assert.doesNotMatch(JSON.stringify(decision), /private-|service-secret|request-local-capauth/);
+    }
+    for (const reason of ["policy_denied", "capability_denied"]) {
+      const decision = await request(recordingFetch(response(200, { allow: false, reason, obligations: [] })));
+      assert.equal(decision.allow, false);
+      assert.notEqual(decision.failure_kind, "dependency_unavailable");
+    }
+  });
+
   test("rejects malformed, expanded, or leaking response bodies", async () => {
     const bodies = [
       { ...ALLOW, prompt: "protected-content" },
@@ -239,6 +268,22 @@ describe("SKLegal qualification route", () => {
     assert.equal(verdict.allowed, false);
     assert.equal(verdict.governed, true);
     assert.equal(calls.length, 1);
+  });
+
+  test("gate propagates only typed dependency failure, never inferring from reason text", async () => {
+    for (const [decision, expected] of [
+      [{ reason: "authorization backend unavailable" }, "denied"],
+      [{ reason: "policy_denied", failure_kind: "dependency_unavailable" }, "dependency_unavailable"],
+      [{ reason: "policy_denied", failure_kind: "untrusted" }, "denied"],
+    ]) {
+      const verdict = await authorizeRequest({
+        method: "POST", url: "/v1/chat/completions", identity: null,
+        sklegalQualification: { subject: "synthetic-agent", resource: RESOURCE, context: CONTEXT },
+        sklegalClient: { decideSkLegal: async () => ({ allow: false, obligations: [], ...decision }) },
+      });
+      assert.equal(verdict.allowed, false);
+      assert.equal(verdict.failure_kind, expected);
+    }
   });
 });
 
