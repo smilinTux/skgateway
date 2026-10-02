@@ -112,10 +112,17 @@ function buildConfigRepo(instances) {
 function writeInstance(configRepoDir, name, opts) {
   const {
     port, release, secretsMethod = 'none', secretsContent = 'API_KEY=fixture-secret\n', nodeOptions, extraEnv = {},
+    // Matches MIN_CONFIG_SCHEMA in deploy/skgateway-deploy. Every fixture gets
+    // a valid schema by default so existing tests don't have to know about
+    // this; the CONFIG_SCHEMA-specific tests below override it explicitly.
+    // `null` omits the key entirely (simulates a config repo written before
+    // CONFIG_SCHEMA existed).
+    configSchema = 1,
   } = opts;
   const instDir = join(configRepoDir, name);
   mkdirSync(instDir, { recursive: true });
   const envLines = [`PORT=${port}`, `RELEASE=${release}`, `SECRETS_METHOD=${secretsMethod}`];
+  if (configSchema !== null) envLines.push(`CONFIG_SCHEMA=${configSchema}`);
   if (nodeOptions) envLines.push(`NODE_OPTIONS=${nodeOptions}`);
   for (const [k, v] of Object.entries(extraEnv)) envLines.push(`${k}=${v}`);
   writeFileSync(join(instDir, 'instance.env'), `${envLines.join('\n')}\n`);
@@ -661,6 +668,75 @@ describe('skgateway-deploy', () => {
 
       assert.equal(statSync(secretsPath(home, 'demo')).mode & 0o777, 0o600);
       assert.equal(statSync(unitPath(home, 'demo')).mode & 0o777, 0o600);
+    } finally {
+      await stopServer(health);
+    }
+  });
+
+  // ─── CONFIG_SCHEMA (task G2b) ───────────────────────────────────────────────
+  //
+  // instance.env carries CONFIG_SCHEMA=<n>. skgateway-deploy refuses to deploy
+  // a config repo pinned to a schema older than this release's minimum
+  // supported schema (MIN_CONFIG_SCHEMA in the script), and names what to
+  // change rather than just failing. A config repo written before
+  // CONFIG_SCHEMA existed (the key is simply absent) is treated the same as
+  // schema 0.
+
+  test('refuses a CONFIG_SCHEMA older than the release minimum, naming the fix', async () => {
+    const home = freshHome();
+    const configRepo = buildConfigRepo({ demo: { port: 19218, release: source.tagV1, configSchema: 0 } });
+
+    const r = await runDeploy(
+      ['--release', source.tagV1, '--config-repo', configRepo, '--instance', 'demo', '--execute'],
+      { home, repoRoot: source.dir },
+    );
+
+    assert.notEqual(r.status, 0);
+    assert.match(r.stderr, /CONFIG_SCHEMA/);
+    assert.match(r.stderr, /CONFIG_SCHEMA=1/); // names the value to set
+    assert.equal(existsSync(releaseDir(home, source.tagV1)), false);
+    assert.equal(existsSync(unitPath(home, 'demo')), false);
+  });
+
+  test('refuses a config repo with no CONFIG_SCHEMA key at all (treated as schema 0)', async () => {
+    const home = freshHome();
+    const configRepo = buildConfigRepo({ demo: { port: 19219, release: source.tagV1, configSchema: null } });
+
+    const r = await runDeploy(
+      ['--release', source.tagV1, '--config-repo', configRepo, '--instance', 'demo', '--execute'],
+      { home, repoRoot: source.dir },
+    );
+
+    assert.notEqual(r.status, 0);
+    assert.match(r.stderr, /CONFIG_SCHEMA/);
+    assert.equal(existsSync(unitPath(home, 'demo')), false);
+  });
+
+  test('refuses a non-numeric CONFIG_SCHEMA with a clear message', async () => {
+    const home = freshHome();
+    const configRepo = buildConfigRepo({ demo: { port: 19220, release: source.tagV1, configSchema: 'banana' } });
+
+    const r = await runDeploy(
+      ['--release', source.tagV1, '--config-repo', configRepo, '--instance', 'demo', '--execute'],
+      { home, repoRoot: source.dir },
+    );
+
+    assert.notEqual(r.status, 0);
+    assert.match(r.stderr, /CONFIG_SCHEMA/i);
+    assert.equal(existsSync(unitPath(home, 'demo')), false);
+  });
+
+  test('accepts a CONFIG_SCHEMA at or above the release minimum', async () => {
+    const home = freshHome();
+    const configRepo = buildConfigRepo({ demo: { port: 19221, release: source.tagV1, configSchema: 2 } });
+    const health = await startHealthServer(19221);
+    try {
+      const r = await runDeploy(
+        ['--release', source.tagV1, '--config-repo', configRepo, '--instance', 'demo', '--execute'],
+        { home, repoRoot: source.dir, extraEnv: FAST_HEALTH },
+      );
+      assert.equal(r.status, 0, r.stderr + r.stdout);
+      assert.equal(existsSync(unitPath(home, 'demo')), true);
     } finally {
       await stopServer(health);
     }

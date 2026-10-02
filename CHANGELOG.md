@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add a config-repo schema version. `<instance>/instance.env` now carries
+  `CONFIG_SCHEMA=<n>`, and `deploy/skgateway-deploy` refuses to deploy a
+  config repo whose `CONFIG_SCHEMA` is lower than this release's minimum
+  supported schema (`MIN_CONFIG_SCHEMA` in the script, currently `1`),
+  naming the value to set in the error rather than failing on a missing key
+  or an assumption the old config repo doesn't meet. A config repo written
+  before this key existed is treated as schema `0` and refused the same way.
+  See `docs/DEPLOYING.md#config-schema`. Tests in
+  `tests/deploy-script.test.mjs`.
+
 - Add `deploy/skgateway-deploy`, a deploy/rollback/status tool for running a
   tagged release of this repo as a systemd `--user` instance, configured from
   a private per-site config repo (`deploy/example-config-repo/`,

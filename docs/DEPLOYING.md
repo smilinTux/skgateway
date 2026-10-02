@@ -60,6 +60,7 @@ Required keys:
 
 | Key | Meaning |
 |---|---|
+| `CONFIG_SCHEMA` | The config-repo schema this instance.env is written against. See [Config schema](#config-schema). |
 | `PORT` | The port this instance's gateway process listens on. |
 | `RELEASE` | The release tag this instance is pinned to. `--release` on the command line must match this, or the deploy refuses (see `--force-release`). |
 
@@ -74,6 +75,33 @@ Optional keys:
 The release tag lives in `instance.env`, so **changing the release is a PR**:
 bump `RELEASE`, merge, then run `skgateway-deploy` on the host. That PR is
 the upgrade record.
+
+### Config schema
+
+`CONFIG_SCHEMA` is a plain integer naming the shape of `instance.env` (and,
+going forward, anything else `skgateway-deploy` reads from the config repo)
+that this instance.env was written against. Each release of this repo knows
+the minimum schema it can run: `skgateway-deploy` refuses to deploy a config
+repo pinned to an older schema, and the error names the value to set, e.g.:
+
+```
+instance.env CONFIG_SCHEMA=0 is older than this release's minimum supported
+schema (1): .../demo/instance.env -- set CONFIG_SCHEMA=1 (see
+docs/DEPLOYING.md#config-schema for what changed since your config repo was
+written)
+```
+
+A config repo that predates `CONFIG_SCHEMA` (the key is simply absent) is
+treated as schema `0`. This exists so a future breaking change to the
+config-repo shape (a renamed key, a new required file, a changed meaning)
+can ship as "bump `MIN_CONFIG_SCHEMA` in `deploy/skgateway-deploy` and say
+here what changed" instead of a deploy silently misreading an old config
+repo. Bumping it is a deliberate act by whoever lands that change; it does
+not happen automatically with every release.
+
+History:
+
+- **1** (current minimum): initial schema. No prior shape to migrate from.
 
 ## Secrets
 
