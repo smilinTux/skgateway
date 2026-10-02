@@ -43,7 +43,7 @@ import { fromAnthropicRequest, toAnthropicMessage, modelRetrieveObject } from ".
 import { readCodexAuthHeaders } from "./proxy/codex-adapter.mjs";
 import { readZaiAuthHeaders, ZAI_CREDENTIALS_PATH } from "./proxy/zai-adapter.mjs";
 import { SSEWriter, jsonToSSE } from "./proxy/stream.mjs";
-import { handleEmbeddings, handleTranscriptions } from "./proxy/media-routes.mjs";
+import { handleEmbeddings, handleTranscriptions, createMediaLimiter } from "./proxy/media-routes.mjs";
 import { getLifecycle } from "./discovery/model_catalog_store.mjs";
 import {
   capacityStatus,
@@ -1360,7 +1360,7 @@ const proxyConfig = buildConfig({
  * same one /v1/chat/completions passes through): if that boundary is enabled
  * and the caller failed it, the handler already wrote 401/403 and returned,
  * so this function is never reached for a rejected caller. If the boundary is
- * disabled (client_auth.enabled: false, operator_auth.enabled: false — the
+ * disabled (client_auth.enabled: false, operator_auth.enabled: false: the
  * default), chat completions allow any unauthenticated LAN caller through
  * with no identity check at all, and this function allows the same for
  * embeddings/transcriptions: same trust rules, no stricter and no looser.
@@ -1377,6 +1377,15 @@ function authorizeClient(req) {
   const consumer = req.identity?.client_id || req.identity?.agent_id || "anonymous";
   return { ok: true, consumer };
 }
+
+// One limiter instance for the process lifetime: config.media.max_concurrent_stt
+// / max_concurrent_embed bound how many /v1/audio/transcriptions and
+// /v1/embeddings requests may be in flight to the backend at once, since each
+// aliases a single local backend with real capacity (one whisper-server
+// process, one embedding server), not a pool. A shared instance here (rather
+// than one built fresh per request) is what makes the count actually count
+// concurrent requests across the whole process.
+const mediaLimiter = createMediaLimiter();
 
 // ─── Create HTTP server ───
 // Exported purely so tests can close it after a direct import of this module
@@ -1610,10 +1619,10 @@ export const server = http.createServer(async (req, res) => {
   // is unreached); if it is disabled (the default), chat completions allow any
   // unauthenticated LAN caller, and these routes allow the same.
   if (req.url === "/v1/embeddings" && req.method === "POST") {
-    return handleEmbeddings(req, res, { mediaCfg: config.media || {}, fetch: globalThis.fetch, authorize: authorizeClient });
+    return handleEmbeddings(req, res, { mediaCfg: config.media || {}, fetch: globalThis.fetch, authorize: authorizeClient, limiter: mediaLimiter });
   }
   if (req.url === "/v1/audio/transcriptions" && req.method === "POST") {
-    return handleTranscriptions(req, res, { mediaCfg: config.media || {}, fetch: globalThis.fetch, authorize: authorizeClient });
+    return handleTranscriptions(req, res, { mediaCfg: config.media || {}, fetch: globalThis.fetch, authorize: authorizeClient, limiter: mediaLimiter });
   }
 
   // ── Aggregated model catalog: discovered + statically-configured backends ──

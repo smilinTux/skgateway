@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Readable } from "node:stream";
-import { resolveMediaAlias, handleEmbeddings, handleTranscriptions } from "../src/proxy/media-routes.mjs";
+import { resolveMediaAlias, handleEmbeddings, handleTranscriptions, MAX_BODY } from "../src/proxy/media-routes.mjs";
 
 const cfg = { aliases: {
   "sk-stt":   { kind: "stt",   url: "http://stt.local/v1/audio/transcriptions", model: "whisper-1", timeout_ms: 1000 },
@@ -88,4 +88,79 @@ test("unauthorized consumer gets 401 and no backend call", async () => {
   const res = fakeRes();
   await handleEmbeddings(jsonReq({ model: "sk-embed", input: "x" }), res, { mediaCfg: cfg, fetch, authorize: async () => ({ ok: false }) });
   assert.equal(res.status, 401); assert.equal(called, false);
+});
+
+test("oversized embeddings body returns 413 with the real message, not the JSON-parse fallback", async () => {
+  let called = false; const fetch = async () => { called = true; };
+  const res = fakeRes();
+  const big = Buffer.alloc(MAX_BODY + 1, 1);
+  const req = Readable.from([big]); req.headers = { "content-type": "application/json" }; req.method = "POST";
+  await handleEmbeddings(req, res, { mediaCfg: cfg, fetch, authorize: allow });
+  assert.equal(res.status, 413);
+  assert.match(JSON.parse(res.body).error.message, /body too large/);
+  assert.equal(called, false);
+});
+
+test("a model field value hidden inside a preceding file part's bytes is not mistaken for the real field", async () => {
+  // The file part comes FIRST and its own bytes contain the literal sequence
+  // a naive full-buffer string search would key on. The real "model" field
+  // (the part actually named model="model" per its own header) comes after.
+  // Both the file bytes and the swapped model value must be correct: the
+  // decoy inside the file must reach the backend untouched, and the real
+  // field must be swapped from the alias to the backend's model name.
+  const decoy = Buffer.from('name="model"\r\n\r\nsk-stt\r\n');
+  const filler = Buffer.alloc(4096, 9);
+  const fileBytes = Buffer.concat([filler, decoy, filler]);
+  const head = Buffer.from("--b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\nContent-Type: audio/wav\r\n\r\n");
+  const mid = Buffer.from("\r\n--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nsk-stt\r\n--b--\r\n");
+  const sentBody = Buffer.concat([head, fileBytes, mid]);
+  let got;
+  const fetch = async (url, init) => {
+    got = Buffer.from(await new Response(init.body).arrayBuffer());
+    return new Response(JSON.stringify({ text: "ok" }), { status: 200 });
+  };
+  const req = Readable.from([sentBody]); req.headers = { "content-type": "multipart/form-data; boundary=b" }; req.method = "POST";
+  const res = fakeRes();
+  await handleTranscriptions(req, res, { mediaCfg: cfg, fetch, authorize: allow });
+  assert.equal(res.status, 200);
+  // The decoy bytes inside the file part must survive unchanged.
+  const gotFileRegionStart = head.length;
+  const gotFileRegion = got.subarray(gotFileRegionStart, gotFileRegionStart + fileBytes.length);
+  assert.ok(gotFileRegion.equals(fileBytes), "file bytes (including the embedded decoy) must reach the backend unchanged");
+  // The real model field, after the file part, must be swapped to the backend model.
+  assert.match(got.toString("latin1", gotFileRegionStart + fileBytes.length), /name="model"\r\n\r\nwhisper-1\r\n/);
+  assert.equal(res.headers["x-sk-model-served"], "sk-stt=whisper-1");
+});
+
+test("a second concurrent transcription is rejected with 429 while max_concurrent_stt:1 holds the first in flight", async () => {
+  const limitedCfg = { aliases: cfg.aliases, max_concurrent_stt: 1 };
+  let firstFetchStarted;
+  const firstStarted = new Promise((resolve) => { firstFetchStarted = resolve; });
+  let releaseFirst;
+  const firstBackendHeld = new Promise((resolve) => { releaseFirst = resolve; });
+  let fetchCallCount = 0;
+  const fetch = async () => {
+    fetchCallCount += 1;
+    firstFetchStarted();
+    await firstBackendHeld;
+    return new Response(JSON.stringify({ text: "ok" }), { status: 200 });
+  };
+  const bodyBytes = Buffer.from("--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nsk-stt\r\n--b--\r\n");
+  function mkReq() {
+    const req = Readable.from([bodyBytes]); req.headers = { "content-type": "multipart/form-data; boundary=b" }; req.method = "POST";
+    return req;
+  }
+  const res1 = fakeRes();
+  const res2 = fakeRes();
+  const p1 = handleTranscriptions(mkReq(), res1, { mediaCfg: limitedCfg, fetch, authorize: allow });
+  await firstStarted; // the first request now holds its slot inside the backend call
+  const p2 = handleTranscriptions(mkReq(), res2, { mediaCfg: limitedCfg, fetch, authorize: allow });
+  await p2;
+  assert.equal(res2.status, 429);
+  assert.equal(fetchCallCount, 1, "the second request must never reach the backend");
+  assert.match(res2.body, /sk-stt/);
+  assert.ok(res2.headers["retry-after"], "a 429 must carry Retry-After");
+  releaseFirst();
+  await p1;
+  assert.equal(res1.status, 200);
 });
