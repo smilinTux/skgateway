@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add `deploy/skgateway-deploy`, a deploy/rollback/status tool for running a
+  tagged release of this repo as a systemd `--user` instance, configured from
+  a private per-site config repo (`deploy/example-config-repo/`,
+  `docs/DEPLOYING.md`). It refuses an unreachable-from-`main` release tag and
+  a dirty config repo, decrypts per-instance secrets (`ansible-vault`, `sops`,
+  or `none`) to a `0600` runtime file, renders the instance's systemd unit
+  from `deploy/templates/skgateway-instance.service.tmpl`, and automatically
+  rolls back to the previous release if the new one fails its
+  `/healthz` + `/v1/models` health check. Also adds three optional,
+  instance.env-flag-gated add-on templates generalized from the
+  `deploy/chiap01`/`deploy/chiap08` site units (a secondary shadow instance,
+  tailnet ingress via systemd socket activation, and an SSH canary loopback
+  health check); all three are off by default and, even enabled, are
+  installed but never auto-started. Tests in `tests/deploy-script.test.mjs`.
+
 - Add local-only speech-to-text and embeddings routes, `POST
   /v1/audio/transcriptions` and `POST /v1/embeddings`, OpenAI-compatible, for
   the `sk-stt` and `sk-embed` model aliases (`src/proxy/media-routes.mjs`,

@@ -1,0 +1,434 @@
+#!/usr/bin/env bash
+#
+# skgateway-deploy: deploy one skgateway instance from a tagged public
+# release plus a private per-site config repo.
+#
+# Usage:
+#   skgateway-deploy --release <tag> --config-repo <dir> --instance <name> [--execute] [--force-release]
+#   skgateway-deploy --rollback --instance <name> [--execute]
+#   skgateway-deploy --status --instance <name>
+#
+# Dry-run is the default: every step is printed, nothing is changed. Pass
+# --execute to actually install and (re)start the instance. See
+# docs/DEPLOYING.md for the full walkthrough and the config-repo layout.
+#
+# This script only ever touches the invoking user's own systemd --user scope
+# and XDG dirs ($HOME/.config, $HOME/.local/share, $HOME/.local/state):
+# ~/.config/systemd/user, ~/.config/skgateway, ~/.local/share/skgateway,
+# ~/.local/state/skgateway, ~/.local/libexec/skgateway.
+#
+set -euo pipefail
+
+# ─── internal test knobs (not part of the public interface) ────────────────
+# SKGATEWAY_DEPLOY_REPO_ROOT overrides which git checkout is used to verify
+# release-tag reachability and as the clone source for a release checkout.
+# It defaults to the checkout this script itself lives in (deploy/.. ), which
+# is what every real install uses. Tests point it at a throwaway fixture repo
+# so they never touch tags or history in a developer's real checkout.
+# SKGATEWAY_DEPLOY_HEALTH_TIMEOUT_S / _INTERVAL_S let tests shrink the health
+# wait well below the real 60s default.
+
+SCRIPT_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(dirname "$SCRIPT_SELF")"
+TEMPLATE_DIR="$SCRIPT_DIR/templates"
+REPO_ROOT="${SKGATEWAY_DEPLOY_REPO_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+HEALTH_TIMEOUT_S="${SKGATEWAY_DEPLOY_HEALTH_TIMEOUT_S:-60}"
+HEALTH_INTERVAL_S="${SKGATEWAY_DEPLOY_HEALTH_INTERVAL_S:-2}"
+
+RELEASES_DIR="$HOME/.local/share/skgateway/releases"
+UNIT_DIR="$HOME/.config/systemd/user"
+LIBEXEC_DIR="$HOME/.local/libexec/skgateway"
+
+log() { printf '%s\n' "$*"; }
+die() { printf 'skgateway-deploy: error: %s\n' "$*" >&2; exit 2; }
+
+usage() {
+  cat <<'EOF'
+usage:
+  skgateway-deploy --release <tag> --config-repo <dir> --instance <name> [--execute] [--force-release]
+  skgateway-deploy --rollback --instance <name> [--execute]
+  skgateway-deploy --status --instance <name>
+
+Dry-run (no --execute) prints every action and changes nothing.
+See docs/DEPLOYING.md for the config-repo layout and secrets handling.
+EOF
+}
+
+# ─── arg parsing ─────────────────────────────────────────────────────────────
+
+MODE=""
+RELEASE_ARG=""
+CONFIG_REPO=""
+INSTANCE=""
+EXECUTE=0
+FORCE_RELEASE=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --release) RELEASE_ARG="${2:-}"; shift 2 ;;
+    --config-repo) CONFIG_REPO="${2:-}"; shift 2 ;;
+    --instance) INSTANCE="${2:-}"; shift 2 ;;
+    --execute) EXECUTE=1; shift ;;
+    --force-release) FORCE_RELEASE=1; shift ;;
+    --rollback) MODE="rollback"; shift ;;
+    --status) MODE="status"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown argument: $1" ;;
+  esac
+done
+
+[ -n "$INSTANCE" ] || { usage >&2; die "--instance is required"; }
+case "$INSTANCE" in
+  *[!a-zA-Z0-9_-]*|'') die "invalid --instance '$INSTANCE': must match ^[a-zA-Z0-9_-]+\$ (no / . or whitespace)" ;;
+esac
+
+if [ -z "$MODE" ]; then
+  [ -n "$RELEASE_ARG" ] && [ -n "$CONFIG_REPO" ] || { usage >&2; die "--release and --config-repo are required for a deploy"; }
+  MODE="deploy"
+fi
+
+UNIT_NAME="skgateway-$INSTANCE.service"
+UNIT_PATH="$UNIT_DIR/$UNIT_NAME"
+SECRETS_HOME="$HOME/.config/skgateway/$INSTANCE"
+STATE_DIR="$HOME/.local/state/skgateway/$INSTANCE"
+
+# ─── small helpers ───────────────────────────────────────────────────────────
+
+# read_env_value FILE KEY: last KEY=value line in FILE, quotes stripped.
+# Returns 1 (no output) if the file or the key is missing.
+read_env_value() {
+  local file="$1" key="$2" line val
+  [ -f "$file" ] || return 1
+  if ! line="$(command grep -E "^${key}=" "$file" | tail -n1)"; then
+    return 1
+  fi
+  [ -n "$line" ] || return 1
+  val="${line#*=}"
+  val="${val%\"}"; val="${val#\"}"
+  val="${val%\'}"; val="${val#\'}"
+  printf '%s' "$val"
+}
+
+# render_template_file TEMPLATE [PLACEHOLDER VALUE]...
+render_template_file() {
+  local tmpl="$1"; shift
+  local content
+  content="$(cat "$tmpl")"
+  while [ $# -gt 0 ]; do
+    content="${content//$1/$2}"
+    shift 2
+  done
+  printf '%s\n' "$content"
+}
+
+# install_or_print DESCRIPTION DEST_PATH CONTENT [MODE]
+install_or_print() {
+  local desc="$1" dest="$2" content="$3" mode="${4:-644}"
+  if [ "$EXECUTE" -eq 1 ]; then
+    mkdir -p "$(dirname "$dest")"
+    printf '%s\n' "$content" > "$dest"
+    chmod "$mode" "$dest"
+    log "installed $desc -> $dest"
+  else
+    log "DRY-RUN: would install $desc -> $dest (mode $mode)"
+  fi
+}
+
+git_is_clean() {
+  local dir="$1" status
+  status="$(git -C "$dir" status --porcelain 2>&1)" || return 1
+  [ -z "$status" ]
+}
+
+# ─── optional per-instance add-ons (G2 brief amendment) ─────────────────────
+#
+# Three patterns generalized from the site-specific deploy/chiap01 and
+# deploy/chiap08 units: a secondary "shadow" instance, tailnet ingress via
+# systemd socket activation, and an SSH canary loopback health check. All
+# three are OFF unless the matching instance.env flag is set, and installing
+# them never enables or starts them: skgateway-deploy only writes the files,
+# the same "disabled until qualified" posture the originals used. Variables
+# come only from instance.env; see docs/DEPLOYING.md.
+
+handle_optional_units() {
+  local flag
+
+  flag="$(read_env_value "$INSTANCE_ENV" SHADOW_ENABLED || true)"
+  if [ "$flag" = "1" ]; then
+    local shadow_port shadow_config content
+    shadow_port="$(read_env_value "$INSTANCE_ENV" SHADOW_PORT)" || die "SHADOW_ENABLED=1 requires SHADOW_PORT in instance.env"
+    shadow_config="$(read_env_value "$INSTANCE_ENV" SHADOW_CONFIG || true)"
+    [ -n "$shadow_config" ] || shadow_config="$CONFIG_REPO_ABS/$INSTANCE/skgateway.shadow.yaml"
+    content="$(render_template_file "$TEMPLATE_DIR/skgateway-shadow@.service.tmpl" \
+      __INSTANCE__ "$INSTANCE" __SHADOW_PORT__ "$shadow_port" \
+      __RELEASE_DIR__ "$RELEASE_DIR" __SHADOW_CONFIG__ "$shadow_config" \
+      __SECRETS_ENV_PATH__ "$SECRETS_DEST")"
+    install_or_print "shadow instance unit for '$INSTANCE'" "$UNIT_DIR/skgateway-shadow-$INSTANCE.service" "$content"
+  fi
+
+  flag="$(read_env_value "$INSTANCE_ENV" INGRESS_SOCKET || true)"
+  if [ "$flag" = "1" ]; then
+    local tailnet_interface ingress_port socket_content service_content
+    tailnet_interface="$(read_env_value "$INSTANCE_ENV" TAILNET_INTERFACE || true)"
+    [ -n "$tailnet_interface" ] || tailnet_interface="tailscale0"
+    ingress_port="$(read_env_value "$INSTANCE_ENV" INGRESS_PORT || true)"
+    [ -n "$ingress_port" ] || ingress_port="$PORT"
+    socket_content="$(render_template_file "$TEMPLATE_DIR/skgateway-ingress@.socket.tmpl" \
+      __INSTANCE__ "$INSTANCE" __TAILNET_INTERFACE__ "$tailnet_interface" __INGRESS_PORT__ "$ingress_port")"
+    service_content="$(render_template_file "$TEMPLATE_DIR/skgateway-ingress@.service.tmpl" \
+      __INSTANCE__ "$INSTANCE" __PORT__ "$PORT")"
+    install_or_print "tailnet ingress socket for '$INSTANCE'" "$UNIT_DIR/skgateway-ingress-$INSTANCE.socket" "$socket_content"
+    install_or_print "tailnet ingress proxy unit for '$INSTANCE'" "$UNIT_DIR/skgateway-ingress-$INSTANCE.service" "$service_content"
+  fi
+
+  flag="$(read_env_value "$INSTANCE_ENV" CANARY || true)"
+  if [ "$flag" = "1" ]; then
+    local local_port remote_host remote_port ssh_config health_script_path health_content service_content
+    local_port="$(read_env_value "$INSTANCE_ENV" CANARY_LOCAL_PORT)" || die "CANARY=1 requires CANARY_LOCAL_PORT in instance.env"
+    remote_host="$(read_env_value "$INSTANCE_ENV" CANARY_REMOTE_HOST)" || die "CANARY=1 requires CANARY_REMOTE_HOST in instance.env"
+    remote_port="$(read_env_value "$INSTANCE_ENV" CANARY_REMOTE_PORT)" || die "CANARY=1 requires CANARY_REMOTE_PORT in instance.env"
+    ssh_config="$(read_env_value "$INSTANCE_ENV" CANARY_SSH_CONFIG || true)"
+    [ -n "$ssh_config" ] || ssh_config="$HOME/.ssh/config"
+    health_script_path="$LIBEXEC_DIR/canary-$INSTANCE-health"
+    health_content="$(render_template_file "$TEMPLATE_DIR/skgateway-canary-health.tmpl" __CANARY_LOCAL_PORT__ "$local_port")"
+    install_or_print "canary health script for '$INSTANCE'" "$health_script_path" "$health_content" 755
+    service_content="$(render_template_file "$TEMPLATE_DIR/skgateway-canary@.service.tmpl" \
+      __INSTANCE__ "$INSTANCE" __CANARY_SSH_CONFIG__ "$ssh_config" \
+      __CANARY_LOCAL_PORT__ "$local_port" __CANARY_REMOTE_PORT__ "$remote_port" \
+      __CANARY_REMOTE_HOST__ "$remote_host" __CANARY_HEALTH_SCRIPT__ "$health_script_path")"
+    install_or_print "canary loopback unit for '$INSTANCE'" "$UNIT_DIR/skgateway-canary-$INSTANCE.service" "$service_content"
+  fi
+}
+
+# ─── deploy ──────────────────────────────────────────────────────────────────
+
+do_deploy() {
+  # Closes a permission race on the decrypted secrets file: without this, a
+  # tool that creates the file fresh (cp, ansible-vault --output, a `>`
+  # redirect) would briefly leave it at the inherited umask's default mode
+  # (often group/other-readable) in the window before the explicit `chmod
+  # 600` below runs. Setting the umask before anything in this function
+  # creates a file means every file created from here on (secrets, the
+  # rendered unit, optional add-on units) is group/other-inaccessible from
+  # its very first write, not just after a later chmod.
+  umask 077
+
+  local instance_dir="$CONFIG_REPO/$INSTANCE"
+  [ -d "$instance_dir" ] || die "no such instance in config repo: $instance_dir"
+
+  if ! git_is_clean "$CONFIG_REPO"; then
+    die "config repo has uncommitted changes (or is not a git checkout), refusing to deploy from a dirty checkout: $CONFIG_REPO"
+  fi
+
+  INSTANCE_ENV="$instance_dir/instance.env"
+  [ -f "$INSTANCE_ENV" ] || die "missing instance.env: $INSTANCE_ENV"
+
+  PORT="$(read_env_value "$INSTANCE_ENV" PORT)" || die "instance.env missing PORT: $INSTANCE_ENV"
+  local release_pin
+  release_pin="$(read_env_value "$INSTANCE_ENV" RELEASE)" || die "instance.env missing RELEASE: $INSTANCE_ENV"
+  NODE_OPTIONS_VAL="$(read_env_value "$INSTANCE_ENV" NODE_OPTIONS || true)"
+  local secrets_method
+  secrets_method="$(read_env_value "$INSTANCE_ENV" SECRETS_METHOD || echo none)"
+
+  if [ "$RELEASE_ARG" != "$release_pin" ] && [ "$FORCE_RELEASE" -ne 1 ]; then
+    die "--release $RELEASE_ARG does not match RELEASE=$release_pin in $INSTANCE_ENV (pass --force-release to override)"
+  fi
+  local TAG="$RELEASE_ARG"
+
+  # Release tag must exist and be reachable from main: production never runs
+  # a release that was not merged.
+  git -C "$REPO_ROOT" rev-parse -q --verify "refs/tags/$TAG" >/dev/null \
+    || die "release tag not found in $REPO_ROOT: $TAG"
+  local main_ref="refs/remotes/origin/main"
+  git -C "$REPO_ROOT" rev-parse -q --verify "$main_ref" >/dev/null 2>&1 || main_ref="refs/heads/main"
+  git -C "$REPO_ROOT" rev-parse -q --verify "$main_ref" >/dev/null 2>&1 \
+    || die "cannot find a main branch in $REPO_ROOT to verify release reachability"
+  git -C "$REPO_ROOT" merge-base --is-ancestor "refs/tags/$TAG" "$main_ref" \
+    || die "release tag $TAG is not reachable from main; refusing to deploy an unmerged release"
+
+  CONFIG_REPO_ABS="$(cd "$CONFIG_REPO" && pwd)"
+  local config_path_abs="$CONFIG_REPO_ABS/$INSTANCE/skgateway.yaml"
+  [ -f "$config_path_abs" ] || die "missing config: $config_path_abs"
+  local secrets_src="$CONFIG_REPO_ABS/$INSTANCE/secrets.env.enc"
+  [ -f "$secrets_src" ] || die "missing secrets file: $secrets_src"
+
+  RELEASE_DIR="$RELEASES_DIR/$TAG"
+  local origin_url
+  origin_url="$(git -C "$REPO_ROOT" remote get-url origin 2>/dev/null || echo "$REPO_ROOT")"
+
+  local need_clone=1
+  if [ -d "$RELEASE_DIR/.git" ] && git_is_clean "$RELEASE_DIR"; then
+    need_clone=0
+  fi
+  if [ "$need_clone" -eq 1 ]; then
+    if [ "$EXECUTE" -eq 1 ]; then
+      rm -rf "$RELEASE_DIR"
+      mkdir -p "$RELEASES_DIR"
+      git clone --quiet --depth 1 --branch "$TAG" "$origin_url" "$RELEASE_DIR"
+    else
+      log "DRY-RUN: would clone $TAG from $origin_url into $RELEASE_DIR"
+    fi
+  else
+    log "release $TAG already checked out at $RELEASE_DIR (reusing)"
+  fi
+  if [ "$EXECUTE" -eq 1 ]; then
+    ( cd "$RELEASE_DIR" && npm ci --omit=dev --no-audit --no-fund --loglevel=error )
+  else
+    log "DRY-RUN: would run 'npm ci --omit=dev' in $RELEASE_DIR"
+  fi
+
+  SECRETS_DEST="$SECRETS_HOME/secrets.env"
+  if [ "$EXECUTE" -eq 1 ]; then
+    mkdir -p "$SECRETS_HOME"
+    case "$secrets_method" in
+      none) cp "$secrets_src" "$SECRETS_DEST" ;;
+      ansible-vault)
+        local vault_password_file
+        vault_password_file="$(read_env_value "$INSTANCE_ENV" VAULT_PASSWORD_FILE)" \
+          || die "SECRETS_METHOD=ansible-vault requires VAULT_PASSWORD_FILE in instance.env"
+        ansible-vault decrypt --vault-password-file "$vault_password_file" --output "$SECRETS_DEST" "$secrets_src"
+        ;;
+      sops)
+        sops --decrypt "$secrets_src" > "$SECRETS_DEST"
+        ;;
+      *) die "unknown SECRETS_METHOD: $secrets_method" ;;
+    esac
+    chmod 600 "$SECRETS_DEST"
+  else
+    log "DRY-RUN: would decrypt ($secrets_method) $secrets_src -> $SECRETS_DEST (mode 0600)"
+  fi
+
+  local node_options_line=""
+  [ -n "$NODE_OPTIONS_VAL" ] && node_options_line="Environment=NODE_OPTIONS=$NODE_OPTIONS_VAL"
+  local new_unit_content
+  new_unit_content="$(render_template_file "$TEMPLATE_DIR/skgateway-instance.service.tmpl" \
+    __INSTANCE__ "$INSTANCE" __PORT__ "$PORT" __RELEASE_DIR__ "$RELEASE_DIR" \
+    __SKGATEWAY_CONFIG__ "$config_path_abs" __SECRETS_ENV_PATH__ "$SECRETS_DEST" \
+    __NODE_OPTIONS_LINE__ "$node_options_line")"
+
+  local old_current_unit="$STATE_DIR/current/unit"
+  local old_current_release=""
+  [ -f "$STATE_DIR/current/release" ] && old_current_release="$(cat "$STATE_DIR/current/release")"
+
+  if [ "$EXECUTE" -eq 1 ]; then
+    mkdir -p "$UNIT_DIR"
+    printf '%s\n' "$new_unit_content" > "$UNIT_PATH"
+    systemctl --user daemon-reload
+    if ! systemctl --user restart "$UNIT_NAME" 2>/dev/null; then
+      systemctl --user enable --now "$UNIT_NAME"
+    fi
+  else
+    log "DRY-RUN: would write unit -> $UNIT_PATH"
+    log "DRY-RUN: rendered unit content:"
+    printf '%s\n' "$new_unit_content"
+    log "DRY-RUN: would run 'systemctl --user daemon-reload' and restart $UNIT_NAME"
+  fi
+
+  handle_optional_units
+
+  if [ "$EXECUTE" -ne 1 ]; then
+    log "DRY-RUN: would health-check http://127.0.0.1:$PORT/healthz and /v1/models (timeout ${HEALTH_TIMEOUT_S}s)"
+    log "DRY-RUN: no changes were made."
+    exit 0
+  fi
+
+  local deadline healthy
+  deadline=$((SECONDS + HEALTH_TIMEOUT_S))
+  healthy=0
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if curl -fsS --max-time 2 "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1 \
+      && curl -fsS --max-time 2 "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1; then
+      healthy=1
+      break
+    fi
+    sleep "$HEALTH_INTERVAL_S"
+  done
+
+  if [ "$healthy" -eq 1 ]; then
+    mkdir -p "$STATE_DIR"
+    if [ -d "$STATE_DIR/current" ]; then
+      rm -rf "$STATE_DIR/previous"
+      mv "$STATE_DIR/current" "$STATE_DIR/previous"
+    fi
+    mkdir -p "$STATE_DIR/current"
+    printf '%s\n' "$TAG" > "$STATE_DIR/current/release"
+    cp "$UNIT_PATH" "$STATE_DIR/current/unit"
+    log "deployed instance '$INSTANCE' to release $TAG"
+    exit 0
+  fi
+
+  printf 'skgateway-deploy: health check failed for instance %s after %ss; rolling back\n' "$INSTANCE" "$HEALTH_TIMEOUT_S" >&2
+  if [ -f "$old_current_unit" ]; then
+    cp "$old_current_unit" "$UNIT_PATH"
+    systemctl --user daemon-reload
+    systemctl --user restart "$UNIT_NAME" || true
+    printf 'skgateway-deploy: rolled back instance %s to release %s\n' "$INSTANCE" "$old_current_release" >&2
+  else
+    systemctl --user stop "$UNIT_NAME" 2>/dev/null || true
+    printf 'skgateway-deploy: no previous release to roll back to; stopped %s\n' "$UNIT_NAME" >&2
+  fi
+  exit 3
+}
+
+# ─── rollback ────────────────────────────────────────────────────────────────
+
+do_rollback() {
+  [ -d "$STATE_DIR/previous" ] || die "no previous release recorded for instance '$INSTANCE'; nothing to roll back to"
+  local prev_release
+  prev_release="$(cat "$STATE_DIR/previous/release")"
+
+  if [ "$EXECUTE" -ne 1 ]; then
+    log "DRY-RUN: would restore unit for release $prev_release and swap current/previous for '$INSTANCE'"
+    log "DRY-RUN: no changes were made."
+    exit 0
+  fi
+
+  cp "$STATE_DIR/previous/unit" "$UNIT_PATH"
+  systemctl --user daemon-reload
+  systemctl --user restart "$UNIT_NAME"
+
+  local tmp="$STATE_DIR/.rollback-swap-tmp"
+  rm -rf "$tmp"
+  mv "$STATE_DIR/current" "$tmp"
+  mv "$STATE_DIR/previous" "$STATE_DIR/current"
+  mv "$tmp" "$STATE_DIR/previous"
+  log "rolled back instance '$INSTANCE' to release $prev_release"
+}
+
+# ─── status ──────────────────────────────────────────────────────────────────
+
+do_status() {
+  local current="none" previous="none" port="unknown" active="unknown"
+  [ -f "$STATE_DIR/current/release" ] && current="$(cat "$STATE_DIR/current/release")"
+  [ -f "$STATE_DIR/previous/release" ] && previous="$(cat "$STATE_DIR/previous/release")"
+  # --status takes no --config-repo, so the port comes from whichever unit
+  # file is on disk (the installed one, falling back to the recorded
+  # "current" copy), not from re-reading the config repo.
+  local unit_for_port=""
+  if [ -f "$UNIT_PATH" ]; then
+    unit_for_port="$UNIT_PATH"
+  elif [ -f "$STATE_DIR/current/unit" ]; then
+    unit_for_port="$STATE_DIR/current/unit"
+  fi
+  if [ -n "$unit_for_port" ]; then
+    port="$(command grep -oE -- '--port [0-9]+' "$unit_for_port" | head -n1 | awk '{print $2}')"
+    [ -n "$port" ] || port="unknown"
+  fi
+  active="$(systemctl --user is-active "$UNIT_NAME" 2>/dev/null || echo unknown)"
+
+  log "instance: $INSTANCE"
+  log "current release: $current"
+  log "previous release: $previous"
+  log "port: $port"
+  if [ -f "$UNIT_PATH" ]; then log "unit: $UNIT_PATH"; else log "unit: not installed"; fi
+  log "service state: $active"
+}
+
+# ─── dispatch ────────────────────────────────────────────────────────────────
+
+case "$MODE" in
+  deploy) do_deploy ;;
+  rollback) do_rollback ;;
+  status) do_status ;;
+  *) die "internal error: unknown mode $MODE" ;;
+esac
