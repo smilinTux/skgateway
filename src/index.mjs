@@ -43,6 +43,7 @@ import { fromAnthropicRequest, toAnthropicMessage, modelRetrieveObject } from ".
 import { readCodexAuthHeaders } from "./proxy/codex-adapter.mjs";
 import { readZaiAuthHeaders, ZAI_CREDENTIALS_PATH } from "./proxy/zai-adapter.mjs";
 import { SSEWriter, jsonToSSE } from "./proxy/stream.mjs";
+import { handleEmbeddings, handleTranscriptions, createMediaLimiter } from "./proxy/media-routes.mjs";
 import { getLifecycle } from "./discovery/model_catalog_store.mjs";
 import {
   capacityStatus,
@@ -1351,6 +1352,41 @@ const proxyConfig = buildConfig({
   siem: siemHook,
 });
 
+/**
+ * authorize() for the local-only media routes (src/proxy/media-routes.mjs).
+ *
+ * By the time a request reaches the media route branches below, it has
+ * already passed the top-of-handler client_auth/operator_auth boundary (the
+ * same one /v1/chat/completions passes through): if that boundary is enabled
+ * and the caller failed it, the handler already wrote 401/403 and returned,
+ * so this function is never reached for a rejected caller. If the boundary is
+ * disabled (client_auth.enabled: false, operator_auth.enabled: false: the
+ * default), chat completions allow any unauthenticated LAN caller through
+ * with no identity check at all, and this function allows the same for
+ * embeddings/transcriptions: same trust rules, no stricter and no looser.
+ *
+ * `consumer` reports whatever identity the boundary already resolved
+ * (req.identity.client_id / agent_id), falling back to "anonymous" when no
+ * boundary ran, so it reflects the SAME identity /v1/chat/completions logs
+ * for the same request rather than inventing one here.
+ *
+ * @param {import("node:http").IncomingMessage} req
+ * @returns {{ok: true, consumer: string}}
+ */
+function authorizeClient(req) {
+  const consumer = req.identity?.client_id || req.identity?.agent_id || "anonymous";
+  return { ok: true, consumer };
+}
+
+// One limiter instance for the process lifetime: config.media.max_concurrent_stt
+// / max_concurrent_embed bound how many /v1/audio/transcriptions and
+// /v1/embeddings requests may be in flight to the backend at once, since each
+// aliases a single local backend with real capacity (one whisper-server
+// process, one embedding server), not a pool. A shared instance here (rather
+// than one built fresh per request) is what makes the count actually count
+// concurrent requests across the whole process.
+const mediaLimiter = createMediaLimiter();
+
 // ─── Create HTTP server ───
 // Exported purely so tests can close it after a direct import of this module
 // (see tests/advertise-lifecycle.test.mjs); no production code depends on it.
@@ -1571,6 +1607,22 @@ export const server = http.createServer(async (req, res) => {
     res.writeHead(302, { location: `http://${host}:${dashboardPort}/` });
     res.end();
     return;
+  }
+
+  // ── Local-only speech-to-text and embeddings (src/proxy/media-routes.mjs) ──
+  // Aliases (sk-stt, sk-embed) come from config.media.aliases; a down backend
+  // returns an error, never a failover substitution (these aliases carry
+  // private audio/text, e.g. Nextcloud Talk recordings and document content).
+  // authorizeClient mirrors whatever the top-of-handler client_auth/
+  // operator_auth boundary already decided for this request: if that boundary
+  // is enabled and would have rejected the caller, it already did (this code
+  // is unreached); if it is disabled (the default), chat completions allow any
+  // unauthenticated LAN caller, and these routes allow the same.
+  if (req.url === "/v1/embeddings" && req.method === "POST") {
+    return handleEmbeddings(req, res, { mediaCfg: config.media || {}, fetch: globalThis.fetch, authorize: authorizeClient, limiter: mediaLimiter });
+  }
+  if (req.url === "/v1/audio/transcriptions" && req.method === "POST") {
+    return handleTranscriptions(req, res, { mediaCfg: config.media || {}, fetch: globalThis.fetch, authorize: authorizeClient, limiter: mediaLimiter });
   }
 
   // ── Aggregated model catalog: discovered + statically-configured backends ──

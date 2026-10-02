@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add `deploy/skgateway-deploy`, a deploy/rollback/status tool for running a
+  tagged release of this repo as a systemd `--user` instance, configured from
+  a private per-site config repo (`deploy/example-config-repo/`,
+  `docs/DEPLOYING.md`). It refuses an unreachable-from-`main` release tag and
+  a dirty config repo, decrypts per-instance secrets (`ansible-vault`, `sops`,
+  or `none`) to a `0600` runtime file, renders the instance's systemd unit
+  from `deploy/templates/skgateway-instance.service.tmpl`, and automatically
+  rolls back to the previous release if the new one fails its
+  `/healthz` + `/v1/models` health check. Also adds three optional,
+  instance.env-flag-gated add-on templates generalized from the
+  `deploy/chiap01`/`deploy/chiap08` site units (a secondary shadow instance,
+  tailnet ingress via systemd socket activation, and an SSH canary loopback
+  health check); all three are off by default and, even enabled, are
+  installed but never auto-started. Tests in `tests/deploy-script.test.mjs`.
+
+- Upstream five fixes that had been running live on nor's deploy checkout
+  (`fix/claude-subscription-purity-404`) but were never merged to main:
+  - `provider_purity: true` on the `anthropic` backend (the local
+    `claude --print` wrapper), so a transient wrapper cooldown fails closed
+    with `503 model_owner_backend_down` instead of spraying `claude-*` to a
+    backend (NVIDIA NIM) that structurally cannot serve it and answers a bare
+    404. Incident 2026-09-11. Tests in `tests/claude-subscription-purity.test.mjs`.
+  - Documented (comment-only) that the `anthropic` admission cap must track
+    the wrapper's real `CCAPI_MAX_CONCURRENT` ceiling, not a stale "Anthropic
+    API limit" comment left over from pointing at api.anthropic.com.
+  - `context_limit: 57344` on the `ornith` backend so the context preflight,
+    previously disabled there for lack of a declared limit, rejects oversized
+    prompts with an explicit `400` instead of letting llama-server truncate
+    them into an empty-content `502`. Tests in
+    `tests/ornith-context-ceiling.test.mjs`.
+  - `hasValidUsage()` now treats an explicit `null` `prompt_tokens_details` /
+    `completion_tokens_details` the same as an omitted key (what the qwen3.8
+    llama-server on chiap08 actually sends), instead of rejecting it and
+    rewriting a valid streaming `200` into `502 invalid_upstream_completion`.
+    Also raises `chiap08-qwen38`'s admission queue (`maxQueue` 2 to 24,
+    `queueTimeoutMs` 10s to 120s) so a burst waits instead of erroring. Tests
+    in `tests/usage-null-details.test.mjs`; the pre-existing
+    `tests/sse-tool-call-contract.test.mjs` negative control that had `null`
+    listed as malformed is corrected to match.
+  - Two pre-existing hermetic config tests (`tests/qwen-capacity-domain.test.mjs`,
+    `tests/qwen38-source-config.test.mjs`) pinned the old
+    `chiap08-qwen38` queue numbers and are updated to the values above.
+
+- Add local-only speech-to-text and embeddings routes, `POST
+  /v1/audio/transcriptions` and `POST /v1/embeddings`, OpenAI-compatible, for
+  the `sk-stt` and `sk-embed` model aliases (`src/proxy/media-routes.mjs`,
+  config `media.aliases`). These exist for the Nextcloud Talk recording and AI
+  apps integration, so a backend failure is returned to the caller as a 502
+  rather than failed over to another backend or a cloud provider: the audio
+  and text carried on these routes (call recordings, document content) is
+  private. Both routes go through the same client_auth/operator_auth boundary
+  as every other route, and carry `x-sk-model-served` on success like chat
+  completions does. Each alias also has a small concurrency cap (config
+  `media.max_concurrent_stt`, default 2; `media.max_concurrent_embed`, default
+  8): a request over the cap gets `429` with `Retry-After` and never reaches
+  the backend. The multipart `model` field is located and swapped by walking
+  the actual `--boundary` delimiters and reading only each part's own header,
+  never by searching the whole body as one string, so a sequence that merely
+  looks like the model field inside an uploaded file's bytes cannot be
+  mistaken for it. Tests in `tests/media-routes.test.mjs`.
+
 - Record a response-contract failure against model-claim quarantine instead of
   clearing it. `recordModelClaimOutcome()` was being passed `upstreamStatus`
   (the original 2xx) rather than `res.status` (the gateway 502) whenever
