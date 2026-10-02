@@ -111,12 +111,13 @@ function buildConfigRepo(instances) {
 
 function writeInstance(configRepoDir, name, opts) {
   const {
-    port, release, secretsMethod = 'none', secretsContent = 'API_KEY=fixture-secret\n', nodeOptions,
+    port, release, secretsMethod = 'none', secretsContent = 'API_KEY=fixture-secret\n', nodeOptions, extraEnv = {},
   } = opts;
   const instDir = join(configRepoDir, name);
   mkdirSync(instDir, { recursive: true });
   const envLines = [`PORT=${port}`, `RELEASE=${release}`, `SECRETS_METHOD=${secretsMethod}`];
   if (nodeOptions) envLines.push(`NODE_OPTIONS=${nodeOptions}`);
+  for (const [k, v] of Object.entries(extraEnv)) envLines.push(`${k}=${v}`);
   writeFileSync(join(instDir, 'instance.env'), `${envLines.join('\n')}\n`);
   writeFileSync(join(instDir, 'skgateway.yaml'), `server:\n  port: ${port}\n`);
   writeFileSync(join(instDir, 'policies.yaml'), 'policies: []\n');
@@ -467,5 +468,133 @@ describe('skgateway-deploy', () => {
     );
     assert.equal(forced.status, 0, forced.stderr + forced.stdout);
     assert.match(forced.stdout, /DRY-RUN/);
+  });
+
+  // ─── optional add-on templates (brief amendment): shadow / ingress / canary ──
+
+  function optionalUnitPaths(home, instance) {
+    return {
+      shadow: join(home, '.config', 'systemd', 'user', `skgateway-shadow-${instance}.service`),
+      ingressSocket: join(home, '.config', 'systemd', 'user', `skgateway-ingress-${instance}.socket`),
+      ingressService: join(home, '.config', 'systemd', 'user', `skgateway-ingress-${instance}.service`),
+      canaryService: join(home, '.config', 'systemd', 'user', `skgateway-canary-${instance}.service`),
+      canaryHealth: join(home, '.local', 'libexec', 'skgateway', `canary-${instance}-health`),
+    };
+  }
+
+  test('optional shadow/ingress/canary units are disabled by default', async () => {
+    const home = freshHome();
+    const configRepo = buildConfigRepo({ demo: { port: 19211, release: source.tagV1 } });
+    const health = await startHealthServer(19211);
+    try {
+      const r = await runDeploy(
+        ['--release', source.tagV1, '--config-repo', configRepo, '--instance', 'demo', '--execute'],
+        { home, repoRoot: source.dir, extraEnv: FAST_HEALTH },
+      );
+      assert.equal(r.status, 0, r.stderr + r.stdout);
+
+      const paths = optionalUnitPaths(home, 'demo');
+      for (const p of Object.values(paths)) {
+        assert.equal(existsSync(p), false, `expected no file at ${p}`);
+      }
+    } finally {
+      await stopServer(health);
+    }
+  });
+
+  test('renders the shadow, ingress and canary templates when enabled, from instance.env only', async () => {
+    const home = freshHome();
+    const configRepo = buildConfigRepo({
+      demo: {
+        port: 19212,
+        release: source.tagV1,
+        extraEnv: {
+          SHADOW_ENABLED: 1,
+          SHADOW_PORT: 28880,
+          INGRESS_SOCKET: 1,
+          TAILNET_INTERFACE: 'tailscale0',
+          CANARY: 1,
+          CANARY_LOCAL_PORT: 28882,
+          CANARY_REMOTE_HOST: 'chiap01',
+          CANARY_REMOTE_PORT: 28880,
+        },
+      },
+    });
+    const health = await startHealthServer(19212);
+    try {
+      const r = await runDeploy(
+        ['--release', source.tagV1, '--config-repo', configRepo, '--instance', 'demo', '--execute'],
+        { home, repoRoot: source.dir, extraEnv: FAST_HEALTH },
+      );
+      assert.equal(r.status, 0, r.stderr + r.stdout);
+
+      const paths = optionalUnitPaths(home, 'demo');
+
+      const shadow = readFileSync(paths.shadow, 'utf8');
+      assert.match(shadow, /--port 28880/);
+      assert.match(shadow, /skgateway\.shadow\.yaml/);
+      assert.match(shadow, new RegExp(secretsPath(home, 'demo').replace(/[/]/g, '\\/')));
+
+      const socket = readFileSync(paths.ingressSocket, 'utf8');
+      assert.match(socket, /BindToDevice=tailscale0/);
+      assert.match(socket, /ListenStream=19212/); // defaults to the instance PORT
+
+      const ingressService = readFileSync(paths.ingressService, 'utf8');
+      assert.match(ingressService, /127\.0\.0\.1:19212/);
+      assert.match(ingressService, /BindsTo=skgateway-ingress-demo\.socket/);
+
+      const canaryService = readFileSync(paths.canaryService, 'utf8');
+      assert.match(canaryService, /-L 127\.0\.0\.1:28882:127\.0\.0\.1:28880 chiap01/);
+      assert.match(canaryService, new RegExp(paths.canaryHealth.replace(/[/]/g, '\\/')));
+
+      const canaryHealth = readFileSync(paths.canaryHealth, 'utf8');
+      assert.match(canaryHealth, /port=28882/);
+      assert.equal(statSync(paths.canaryHealth).mode & 0o777, 0o755);
+    } finally {
+      await stopServer(health);
+    }
+  });
+
+  test('two instances with the same optional feature enabled do not collide', async () => {
+    const home = freshHome();
+    const configRepo = buildConfigRepo({
+      a: {
+        port: 19213,
+        release: source.tagV1,
+        extraEnv: { INGRESS_SOCKET: 1, TAILNET_INTERFACE: 'tailscale0' },
+      },
+      b: {
+        port: 19214,
+        release: source.tagV1,
+        extraEnv: { INGRESS_SOCKET: 1, TAILNET_INTERFACE: 'tailscale0' },
+      },
+    });
+    const healthA = await startHealthServer(19213);
+    const healthB = await startHealthServer(19214);
+    try {
+      const rA = await runDeploy(
+        ['--release', source.tagV1, '--config-repo', configRepo, '--instance', 'a', '--execute'],
+        { home, repoRoot: source.dir, extraEnv: FAST_HEALTH },
+      );
+      assert.equal(rA.status, 0, rA.stderr + rA.stdout);
+      const rB = await runDeploy(
+        ['--release', source.tagV1, '--config-repo', configRepo, '--instance', 'b', '--execute'],
+        { home, repoRoot: source.dir, extraEnv: FAST_HEALTH },
+      );
+      assert.equal(rB.status, 0, rB.stderr + rB.stdout);
+
+      const pathsA = optionalUnitPaths(home, 'a');
+      const pathsB = optionalUnitPaths(home, 'b');
+      assert.notEqual(pathsA.ingressSocket, pathsB.ingressSocket);
+
+      const socketA = readFileSync(pathsA.ingressSocket, 'utf8');
+      const socketB = readFileSync(pathsB.ingressSocket, 'utf8');
+      assert.match(socketA, /ListenStream=19213/);
+      assert.match(socketB, /ListenStream=19214/);
+      assert.notEqual(socketA, socketB);
+    } finally {
+      await stopServer(healthA);
+      await stopServer(healthB);
+    }
   });
 });
