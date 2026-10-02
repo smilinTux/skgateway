@@ -1022,7 +1022,7 @@ if (authzEnforce) {
 async function enforceAuthz(req, res, identity) {
   // Resolve trusted SKLegal scope before considering the legacy internal-peer
   // behavior. A governed route always calls the PDP, including from loopback.
-  const qualification = sklegalQualification.resolve(req.method, req.url);
+  const qualification = sklegalQualification.resolve(req.method, req.url, req.headers.authorization);
   const internal = !qualification
     && authzTrustInternal
     && isInternalRemote(req.socket?.remoteAddress);

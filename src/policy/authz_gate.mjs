@@ -51,13 +51,14 @@ function exactBoundedStringMap(value, fields) {
 
 /**
  * Build the explicit SKLegal qualification route table from trusted process
- * configuration. Request headers are never consulted for scope selectors.
+ * configuration. Opt-in request selectors are untrusted until the strict PDP
+ * verifies the unchanged credential against canonical current state.
  */
 export function createSkLegalQualificationResolver(config = {}) {
   if (config?.enabled !== true) {
     return { enabled: false, resolve: () => null };
   }
-  if (!Array.isArray(config.routes) || config.routes.length === 0) {
+  if (!Array.isArray(config.routes) || config.routes.length === 0 || config.routes.length > 64) {
     throw new Error("SKLegal qualification routes are required");
   }
 
@@ -69,23 +70,76 @@ export function createSkLegalQualificationResolver(config = {}) {
     const method = typeof entry.method === "string" ? entry.method.trim().toUpperCase() : "";
     const path = typeof entry.path === "string" ? entry.path.trim() : "";
     const subject = typeof entry.subject === "string" ? entry.subject.trim() : "";
-    const resource = exactBoundedStringMap(entry.resource, SKLEGAL_RESOURCE_FIELDS);
+    if (entry.request_capability !== undefined && typeof entry.request_capability !== 'boolean') {
+      throw new Error('SKLegal request capability mode must be boolean');
+    }
+    const dynamic = entry.request_capability === true;
+    const modelRoute = dynamic && exactBoundedStringMap({ model_route: entry.model_route }, ['model_route']);
+    if (dynamic && !modelRoute) throw new Error('SKLegal request capability requires an explicit model route');
+    const resource = exactBoundedStringMap(entry.resource, dynamic
+      ? ['tenant_id', 'matter_id', 'route_id'] : SKLEGAL_RESOURCE_FIELDS);
     const context = exactBoundedStringMap(entry.context, SKLEGAL_CONTEXT_FIELDS);
     if (!method || !path.startsWith("/") || path.includes("?") || !subject || subject.length > 256 || !resource || !context) {
       throw new Error("SKLegal qualification route lacks exact trusted scope");
     }
     const key = `${method} ${path}`;
-    if (routes.has(key)) throw new Error("SKLegal qualification route is duplicated");
-    routes.set(key, Object.freeze({ subject, resource, context }));
+    const entries = routes.get(key) || [];
+    if (entries.some(previous => !dynamic || !previous.dynamic || (
+      previous.subject === subject && previous.resource.tenant_id === resource.tenant_id
+      && previous.resource.matter_id === resource.matter_id
+      && previous.modelRoute === modelRoute.model_route && previous.context.purpose === context.purpose
+    ))) throw new Error("SKLegal qualification route is duplicated");
+    entries.push(Object.freeze({ subject, resource, context, dynamic, modelRoute: modelRoute?.model_route }));
+    routes.set(key, entries);
   }
 
   return {
     enabled: true,
-    resolve(method, url) {
+    resolve(method, url, authorization = null) {
       const pathname = (url || "").split("?")[0];
-      return routes.get(`${(method || "GET").toUpperCase()} ${pathname}`) || null;
+      const entries = routes.get(`${(method || "GET").toUpperCase()} ${pathname}`);
+      if (!entries) return null;
+      if (!entries[0].dynamic) {
+        const { subject, resource, context } = entries[0];
+        return { subject, resource, context };
+      }
+      const selectors = unverifiedCapabilitySelectors(authorization);
+      const match = selectors && entries.find(entry => entry.subject === selectors.subject
+        && entry.resource.tenant_id === selectors.resource.tenant_id
+        && entry.resource.matter_id === selectors.resource.matter_id
+        && entry.modelRoute === selectors.resource.route_id
+        && entry.context.purpose === selectors.purpose);
+      // A configured path remains governed even when its selectors are invalid.
+      if (!match) return { invalid: true };
+      return { subject: match.subject,
+        resource: Object.freeze({ ...selectors.resource, route_id: match.resource.route_id }), context: match.context };
     },
   };
+}
+
+function unverifiedCapabilitySelectors(authorization) {
+  // No signature or policy decision is made here. The PDP receives the exact
+  // original credential and rejects malformed, forged, expired or stale claims.
+  if (typeof authorization !== 'string' || authorization.length > 8192
+    || !/^Bearer [\x20-\x7e]+$/i.test(authorization)) return null;
+  try {
+    const envelope = JSON.parse(authorization.replace(/^Bearer\s+/i, ''));
+    const token = envelope?.sklegal_presented_capability === '1.0'
+      ? JSON.parse(envelope.chain.leaf) : envelope;
+    const claims = token?.payload?.metadata?.sklegal_capability;
+    const grant = claims?.grant;
+    if (grant?.audience !== 'model' || !Number.isSafeInteger(grant.resource_version)
+      || grant.resource_version < 1) return null;
+    const identity = exactBoundedStringMap({ subject: claims.principal?.subject, purpose: grant.purpose }, ['subject', 'purpose']);
+    const resource = exactBoundedStringMap({
+      tenant_id: grant.tenant_id, matter_id: grant.matter_id,
+      material_id: grant.resource_id, material_version: String(grant.resource_version),
+      route_id: grant.model_route,
+    }, SKLEGAL_RESOURCE_FIELDS);
+    return identity && resource ? { ...identity, resource } : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -148,7 +202,7 @@ export async function authorizeRequest({
   const subject = sklegalQualification?.subject || subjectFromIdentity(identity);
 
   if (sklegalQualification) {
-    if (route.capability !== "skgateway.infer" || typeof sklegalClient?.decideSkLegal !== "function") {
+    if (sklegalQualification.invalid || route.capability !== "skgateway.infer" || typeof sklegalClient?.decideSkLegal !== "function") {
       return {
         kind: "gated",
         allowed: false,

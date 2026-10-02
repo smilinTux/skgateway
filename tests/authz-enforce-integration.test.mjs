@@ -184,6 +184,61 @@ describe("authz enforce ON — allow-internal default authorizes a loopback call
 
 const SKLEGAL_PDP_PORT = 18948, SKLEGAL_PORT = 18949, SKLEGAL_DASH = 18950;
 
+test('native dynamic selectors reach the strict PDP through the actual server', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'skgw-native-'));
+  const credential = join(dir, 'service-token');
+  writeFileSync(credential, 'synthetic-service', { mode: 0o600 });
+  const calls = [];
+  const pdp = createServer(async (req, res) => {
+    let raw = '';
+    for await (const chunk of req) raw += chunk;
+    calls.push({ authorization: req.headers.authorization, body: JSON.parse(raw) });
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ allow: false, reason: 'capability_denied', obligations: [] }));
+  });
+  let handle;
+  try {
+    await new Promise(resolveListen => pdp.listen(18951, '127.0.0.1', resolveListen));
+    handle = await bootGateway({ port: 18952, dashPort: 18953,
+      env: { SKGATEWAY_AUTHZ_ENFORCE: '1' },
+      extraConfig: ['authz:', '  enforce: true', '  trust_internal: true',
+        '  sklegal_qualification:', '    enabled: true',
+        '    url: http://127.0.0.1:18951/v1/authz/decide',
+        `    service_credential_file: ${credential}`, '    routes:',
+        '      - method: POST', '        path: /v1/chat/completions',
+        '        request_capability: true', '        subject: synthetic-agent',
+        '        model_route: local_qwen',
+        '        resource: {tenant_id: tenant, matter_id: matter, route_id: governed-corpus-qwen}',
+        '        context: {purpose: legal_research, classification: public, privilege: none, ethical_wall: clear}',
+      ],
+    });
+    for (const id of ['first-material', 'second-material']) {
+      const authorization = 'Bearer ' + JSON.stringify({ skcapstone_token: '1.0',
+        signature: '-----BEGIN PGP SIGNATURE-----\nsynthetic', payload: { metadata: {
+          sklegal_capability: { principal: { subject: 'synthetic-agent' }, grant: {
+            audience: 'model', tenant_id: 'tenant', matter_id: 'matter',
+            resource_id: id, resource_version: 1, model_route: 'local_qwen', purpose: 'legal_research',
+          } },
+        } },
+      });
+      const response = await httpResponse('POST', 18952, '/v1/chat/completions',
+        { model: 'x', messages: [] }, { authorization });
+      assert.equal(response.status, 403);
+      assert.equal(calls.at(-1).body.resource.material_id, id);
+      assert.equal(calls.at(-1).body.resource.route_id, 'governed-corpus-qwen');
+      assert.equal(calls.at(-1).authorization, authorization);
+    }
+    assert.equal(calls.length, 2);
+    const missing = await httpResponse('POST', 18952, '/v1/chat/completions', { model: 'x', messages: [] });
+    assert.equal(missing.status, 403);
+    assert.equal(calls.length, 2);
+  } finally {
+    stop(handle);
+    if (pdp.listening) await new Promise(resolveClose => pdp.close(resolveClose));
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 describe("SKLegal governed qualification wire contract on the live server", () => {
   let handle;
   let pdp;

@@ -286,7 +286,7 @@ export function createSkLegalAuthzClient(opts = {}) {
     }
     if (typeof requestCapAuth !== "string"
       || requestCapAuth.length > 8192
-      || !/^Bearer\s+\S+$/i.test(requestCapAuth)) {
+      || !/^Bearer [\x20-\x7e]+$/i.test(requestCapAuth)) {
       return deny("request-local CapAuth credential is required");
     }
     if (!configured || typeof fetchImpl !== "function") {

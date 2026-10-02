@@ -72,6 +72,16 @@ function request(fetchImpl, overrides = {}) {
 }
 
 describe("SKLegal authorization client", () => {
+  test("preserves native JSON credentials with signature spaces but rejects header controls", async () => {
+    const fetchImpl = recordingFetch();
+    const token = 'Bearer ' + JSON.stringify({ signature: '-----BEGIN PGP SIGNATURE-----\nsynthetic' });
+    assert.equal((await request(fetchImpl, { requestCapAuth: token })).allow, true);
+    assert.equal(fetchImpl.calls[0].options.headers.authorization, token);
+    for (const control of ['\r', '\n', '\t', '\u007f']) {
+      assert.equal((await request(fetchImpl, { requestCapAuth: token + control })).allow, false);
+    }
+    assert.equal(fetchImpl.calls.length, 1);
+  });
   test("sends separate service and request-local credentials with the exact body", async () => {
     const fetchImpl = recordingFetch();
     const decision = await request(fetchImpl);
