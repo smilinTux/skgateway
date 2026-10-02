@@ -53,9 +53,21 @@ pooling:
   capacity_domains:
     chiap08-qwen38:
       members: [chiap08-qwen38, "reg:qwen38"]
+      # Chef, 2026-09-11: this box handles 2 concurrent, not 4. The live config
+      # had drifted up to max 4 / maxQueue 4 while the in-repo config still said
+      # 2 -- and with sk-default repointed here, a burst of agent cron jobs drove
+      # peakActive=4 peakQueue=4 (both at ceiling) and llama-server started
+      # returning completions the response contract rejected as
+      # "invalid_upstream_completion" (HTTP 502). Same failure shape as the
+      # claude-code-api outage earlier the same day: an admission cap set above
+      # what the backend can actually serve turns load into corrupt responses.
+      #
+      # max is the REAL concurrency ceiling. maxQueue is deliberately deep and
+      # the timeout generous so a burst WAITS instead of erroring -- queueing is
+      # free, a 502 costs the whole job its retries.
       max: 2
-      maxQueue: 2
-      queueTimeoutMs: 10000
+      maxQueue: 24
+      queueTimeoutMs: 120000
     chiap01-qwen38:
       members: [chiap01-qwen38]
       max: 1
@@ -71,7 +83,17 @@ pooling:
     #   ornith: { max: 4, maxQueue: 200 }
     # here (llama-server on the .100 16 GB card; keep admission small).
     anthropic:
-      max: 10                     # Anthropic API limit
+      # MUST equal CCAPI_MAX_CONCURRENT in ~/.config/claude-code-api.env.
+      # This is not "the Anthropic API limit" (that comment was stale from when
+      # this backend pointed at api.anthropic.com); the backend is the local
+      # `claude --print` wrapper, whose semaphore is the real ceiling. On
+      # 2026-09-11 this said 10 while the wrapper allowed 3, so the gateway
+      # overdrove it, requests blew the wrapper's 90s QUEUE_TIMEOUT, and the
+      # resulting 500s tripped the error-rate breaker and took claude-* down.
+      # Wrapper raised to 10 the same day to match. Each wrapper slot is a
+      # ~300MB `claude --print` plus MCP servers, so raising this pair further
+      # needs a look at free memory first.
+      max: 10
       maxQueue: 200
 
 backends:
@@ -192,6 +214,20 @@ backends:
     # enough for a real `claude --print` completion; a live stream resets it on
     # each chunk, so only a truly stalled upstream trips it.
     timeout_ms: 120000
+    # The "no failover target" above was a COMMENT, not a constraint, until
+    # 2026-09-11. Purity is opt-in per backend (card f361407c) and this flag was
+    # never set, so the design was unenforced. Live that morning: the wrapper ran
+    # out of slots (CCAPI_MAX_CONCURRENT=3) and 500'd, error_rate hit 100%, the
+    # backend was marked DOWN for a 60s cooldown, and claude-opus-5 then fell
+    # through to `primary=nvidia`. NVIDIA NIM has no such model, so its Go mux
+    # answered a bare `404 page not found`, which Hermes surfaced in Telegram as
+    # "The model provider failed after retries." A transient local cooldown
+    # became a hard 404 on a model that was never NVIDIA's to serve. With purity
+    # on, a down wrapper fails closed as 503 model_owner_backend_down naming this
+    # backend, so callers back off against the real owner instead of burning
+    # retries on doors that structurally cannot answer claude-*.
+    # Pinned by tests/claude-subscription-purity.test.mjs.
+    provider_purity: true
 
   ## ornith = Ornith 1.5 9B on the .100 RTX 5060 Ti (llama-server :8082,
   ## name-agnostic OpenAI /v1; the same box the registry `ornith` entry and
@@ -224,6 +260,23 @@ backends:
   ornith:
     enabled: false
     url: http://192.168.0.100:8082/v1
+    # Context preflight ceiling (card 9ed4a9f7). llama-server reports n_ctx 65536
+    # and the registry reserves min_output_tokens: 8192 for the visible answer,
+    # so ~57344 tokens is what the INPUT may actually occupy. Without this key
+    # the preflight is disabled for this backend and oversized requests are sent
+    # to be truncated instead of rejected.
+    #
+    # 2026-09-11: hermes agent cron jobs (daily-brief, infra-security-scan-daily)
+    # ship ~205,815-byte bodies -> ~68,605 estimated tokens. They were routed here
+    # anyway, llama-server truncated them, the model answered with reasoning and
+    # EMPTY content, and the response contract rejected that as
+    # "Upstream returned invalid completion evidence" (HTTP 502) after burning
+    # 32s per attempt. The 502 named nothing useful, so the jobs looked like an
+    # ornith fault rather than a request that never fit. With the ceiling
+    # declared, an oversized request is refused up front with an explicit 400
+    # naming the limit -- and because this backend is no_failover, it fails
+    # LOUDLY here rather than leaking Chef's traffic to a cloud provider.
+    context_limit: 57344
     auth_type: none
     models:
       - ornith-1.5-9b
