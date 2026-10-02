@@ -14,7 +14,7 @@
  * What that cost, live on 2026-09-11:
  *   07:15  claude-code-api ran out of slots (CCAPI_MAX_CONCURRENT=3) and
  *          answered 500 "queue timeout: no free claude slot within 90s"
- *   07:16  [router] backend=anthropic error_rate=100.0% — marking DOWN
+ *   07:16  [router] backend=anthropic error_rate=100.0%, marking DOWN
  *   07:16  [router] model=claude-opus-5 → primary=nvidia fallbacks=[...]
  *   ...    NVIDIA NIM has no model named claude-opus-5, so its Go mux replied
  *          with a bare `404 page not found`, which Hermes surfaced to Chef in
@@ -55,9 +55,9 @@ test("shipped config: anthropic declares provider_purity", () => {
   const backends = loadShippedBackends();
   assert.equal(
     backends.anthropic.provider_purity, true,
-    "config/skgateway.yaml backends.anthropic must set provider_purity: true — " +
-    "without it a transient claude-code-api cooldown sprays claude-* to NVIDIA, " +
-    "which answers `404 page not found`.",
+    "config/skgateway.yaml backends.anthropic must set provider_purity: true " +
+    "(without it a transient claude-code-api cooldown sprays claude-* to NVIDIA, " +
+    "which answers `404 page not found`).",
   );
 });
 
@@ -72,7 +72,7 @@ test("claude-* routes to the subscription wrapper while it is healthy", async ()
   }
 });
 
-test("claude-* fails closed when the wrapper is DOWN — never sprays to nvidia", async () => {
+test("claude-* fails closed when the wrapper is DOWN, never sprays to nvidia", async () => {
   const router = createRouter({ backends: loadShippedBackends() });
 
   // Drive the backend into the DOWN error-cooldown state exactly as the live
@@ -85,7 +85,7 @@ test("claude-* fails closed when the wrapper is DOWN — never sprays to nvidia"
     await router.route({ model }).then(
       (got) => assert.fail(
         `${model} sprayed to [${got.map((c) => c.backendId).join(", ")}] instead of ` +
-        `failing closed — this is the 2026-09-11 Telegram 404 regression`,
+        `failing closed (this is the 2026-09-11 Telegram 404 regression)`,
       ),
       (err) => {
         assert.equal(err.name, "ModelOwnerDownError");
