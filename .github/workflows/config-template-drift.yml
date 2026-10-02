@@ -1,0 +1,66 @@
+name: config-template-drift
+
+# Task G2b: the public smilinTux/skgateway-config-template repo is generated
+# from deploy/example-config-repo/ (the single source of truth) by
+# scripts/generate-config-template.sh. This workflow guards against the two
+# repos silently drifting apart:
+#
+# - `drift`: regenerates the template contents from this checkout and diffs
+#   them against a fresh clone of the published template repo. A difference
+#   means someone edited deploy/example-config-repo/ (or the template repo
+#   directly) without republishing the other side; fails until
+#   scripts/generate-config-template.sh is re-run against the template repo
+#   checkout and the result is committed and pushed there by hand (this
+#   workflow only detects drift, it does not publish).
+# - `scrub`: fails if deploy/example-config-repo/ contains what looks like a
+#   real SK* fleet hostname, domain or private IP instead of a placeholder,
+#   via scripts/scrub-check.sh. This is NOT the secrets scanner (see
+#   secret-scan.yml); it catches topology leaks a secrets scanner wouldn't.
+
+on:
+  push:
+    paths:
+      - 'deploy/example-config-repo/**'
+      - 'scripts/generate-config-template.sh'
+      - 'scripts/scrub-check.sh'
+      - '.github/workflows/config-template-drift.yml'
+  pull_request:
+    paths:
+      - 'deploy/example-config-repo/**'
+      - 'scripts/generate-config-template.sh'
+      - 'scripts/scrub-check.sh'
+      - '.github/workflows/config-template-drift.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate template contents from this checkout
+        run: scripts/generate-config-template.sh "$RUNNER_TEMP/generated"
+      - name: Clone the published template repo
+        run: |
+          set -euo pipefail
+          git clone --quiet --depth 1 \
+            https://github.com/smilinTux/skgateway-config-template.git \
+            "$RUNNER_TEMP/published"
+          rm -rf "$RUNNER_TEMP/published/.git"
+      - name: Diff generated vs. published
+        run: |
+          set -euo pipefail
+          if ! diff -rq "$RUNNER_TEMP/generated" "$RUNNER_TEMP/published"; then
+            echo "::error::skgateway-config-template has drifted from deploy/example-config-repo/." \
+                 "Regenerate with scripts/generate-config-template.sh and commit the result to" \
+                 "smilinTux/skgateway-config-template."
+            exit 1
+          fi
+
+  scrub:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scrub-check deploy/example-config-repo for real fleet identifiers
+        run: scripts/scrub-check.sh deploy/example-config-repo
