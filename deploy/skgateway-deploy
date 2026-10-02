@@ -39,6 +39,12 @@ RELEASES_DIR="$HOME/.local/share/skgateway/releases"
 UNIT_DIR="$HOME/.config/systemd/user"
 LIBEXEC_DIR="$HOME/.local/libexec/skgateway"
 
+# This release's minimum supported config-repo schema (instance.env's
+# CONFIG_SCHEMA key). Bump this only when a change in this script requires a
+# key or shape in instance.env that an older config repo won't have, and
+# document the required change in docs/DEPLOYING.md under "Config schema".
+MIN_CONFIG_SCHEMA=1
+
 log() { printf '%s\n' "$*"; }
 die() { printf 'skgateway-deploy: error: %s\n' "$*" >&2; exit 2; }
 
@@ -229,6 +235,17 @@ do_deploy() {
   NODE_OPTIONS_VAL="$(read_env_value "$INSTANCE_ENV" NODE_OPTIONS || true)"
   local secrets_method
   secrets_method="$(read_env_value "$INSTANCE_ENV" SECRETS_METHOD || echo none)"
+
+  local config_schema
+  config_schema="$(read_env_value "$INSTANCE_ENV" CONFIG_SCHEMA || echo 0)"
+  case "$config_schema" in
+    ''|*[!0-9]*)
+      die "instance.env has an invalid CONFIG_SCHEMA '$config_schema' (must be a non-negative integer): $INSTANCE_ENV"
+      ;;
+  esac
+  if [ "$config_schema" -lt "$MIN_CONFIG_SCHEMA" ]; then
+    die "instance.env CONFIG_SCHEMA=$config_schema is older than this release's minimum supported schema ($MIN_CONFIG_SCHEMA): $INSTANCE_ENV -- set CONFIG_SCHEMA=$MIN_CONFIG_SCHEMA (see docs/DEPLOYING.md#config-schema for what changed since your config repo was written)"
+  fi
 
   if [ "$RELEASE_ARG" != "$release_pin" ] && [ "$FORCE_RELEASE" -ne 1 ]; then
     die "--release $RELEASE_ARG does not match RELEASE=$release_pin in $INSTANCE_ENV (pass --force-release to override)"
