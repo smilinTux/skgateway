@@ -147,6 +147,17 @@ const DEFAULTS = {
     denial_max: 120,
   },
 
+  // Local-only speech-to-text / embeddings aliases (src/proxy/media-routes.mjs),
+  // served from POST /v1/audio/transcriptions and POST /v1/embeddings. Each
+  // alias (e.g. "sk-stt", "sk-embed") maps to exactly one backend URL; a down
+  // backend returns an error to the caller rather than failing over, since
+  // these routes exist for private audio/text (see media-routes.mjs header).
+  // Passed through from the YAML `media:` block unchanged; empty by default so
+  // both routes 400 with "unknown model" until a deployment configures aliases.
+  media: {
+    aliases: {},
+  },
+
   operator_auth: {
     enabled: false,
     credentials_file: null,
