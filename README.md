@@ -27,6 +27,33 @@ The following claims are limited to behavior present in this repository.
 | Optional local SOC dashboard with REST data endpoints and WebSocket updates | [`src/dashboard/server.mjs`](src/dashboard/server.mjs) and the static UI in [`src/dashboard/static/index.html`](src/dashboard/static/index.html) |
 | File based SKCapstone alert and service registration integration when a shared SKCapstone home exists | [`src/integration.mjs`](src/integration.mjs) and [`tests/integration.test.mjs`](tests/integration.test.mjs) |
 | Configuration reload on `SIGHUP` | [`src/config.mjs`](src/config.mjs) and live credential rotation coverage in [`tests/client-auth-integration.test.mjs`](tests/client-auth-integration.test.mjs) |
+| Local-only speech-to-text and embeddings via `sk-stt`/`sk-embed` aliases, no cloud failover | [`src/proxy/media-routes.mjs`](src/proxy/media-routes.mjs) and [`tests/media-routes.test.mjs`](tests/media-routes.test.mjs) |
+
+## Speech-to-text and embeddings
+
+`POST /v1/audio/transcriptions` (multipart, OpenAI-compatible) and
+`POST /v1/embeddings` (JSON, OpenAI-compatible) are served by
+[`src/proxy/media-routes.mjs`](src/proxy/media-routes.mjs). Both routes resolve
+the `model` the caller sent against `config.media.aliases` and forward the
+request to exactly the one backend URL configured for that alias:
+
+```yaml
+media:
+  aliases:
+    sk-stt:   { kind: stt,   url: "http://HOST:18794/v1/audio/transcriptions", model: "whisper-1", timeout_ms: 600000 }
+    sk-embed: { kind: embed, url: "http://HOST:11438/v1/embeddings",            model: "mxbai-embed-large", timeout_ms: 30000 }
+```
+
+These aliases are local-only by design: a down backend returns its error to the
+caller as a 502, never a silent substitution to another backend or a cloud
+provider, because the audio and text these routes carry (call recordings,
+document content) is private. Both routes pass through the same
+client_auth/operator_auth boundary as every other route (see
+[`src/identity/client-auth.mjs`](src/identity/client-auth.mjs)); when that
+boundary is disabled, as it is by default, these routes are reachable
+unauthenticated on the LAN, exactly like `/v1/chat/completions`. A successful
+response carries `x-sk-model-served: <alias>=<backend model>`, as chat
+completions does.
 
 ## Scope and defaults
 
@@ -123,6 +150,8 @@ The main runtime implements these public protocol surfaces in
 | --- | --- | --- |
 | `POST` | `/v1/chat/completions` | OpenAI compatible chat completion |
 | `POST` | `/v1/messages` | Anthropic Messages frontend |
+| `POST` | `/v1/embeddings` | Local-only embeddings (`sk-embed`), see [Speech-to-text and embeddings](#speech-to-text-and-embeddings) |
+| `POST` | `/v1/audio/transcriptions` | Local-only speech-to-text (`sk-stt`), see [Speech-to-text and embeddings](#speech-to-text-and-embeddings) |
 | `GET` | `/v1/models` | Reconciled public model catalog |
 | `GET` | `/v1/models/:id` | Public model metadata |
 | `GET` | `/health` and `/healthz` | Process health |

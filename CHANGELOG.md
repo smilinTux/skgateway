@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add local-only speech-to-text and embeddings routes, `POST
+  /v1/audio/transcriptions` and `POST /v1/embeddings`, OpenAI-compatible, for
+  the `sk-stt` and `sk-embed` model aliases (`src/proxy/media-routes.mjs`,
+  config `media.aliases`). These exist for the Nextcloud Talk recording and AI
+  apps integration, so a backend failure is returned to the caller as a 502
+  rather than failed over to another backend or a cloud provider: the audio
+  and text carried on these routes (call recordings, document content) is
+  private. Both routes go through the same client_auth/operator_auth boundary
+  as every other route, and carry `x-sk-model-served` on success like chat
+  completions does. Tests in `tests/media-routes.test.mjs`.
+
 - Record a response-contract failure against model-claim quarantine instead of
   clearing it. `recordModelClaimOutcome()` was being passed `upstreamStatus`
   (the original 2xx) rather than `res.status` (the gateway 502) whenever
