@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Publish the public template repo
+  [`smilinTux/skgateway-config-template`](https://github.com/smilinTux/skgateway-config-template)
+  (task G2b): a public, `is_template: true` repo every site uses via "Use
+  this template" to start its own private per-site config repo, generated
+  from `deploy/example-config-repo/` (the single source of truth) via
+  `scripts/generate-config-template.sh`. Its README is the "Use this
+  template" walkthrough: choose Private, fill `instance.env`/`skgateway.yaml`,
+  encrypt secrets, pin a release, dry-run then `--execute`, upgrade via a PR
+  bumping `RELEASE`, rollback.
+  - `.github/workflows/config-template-drift.yml` adds two CI jobs: `drift`
+    regenerates the template contents from this checkout and fails if they
+    differ from the published template repo (it only detects drift; a
+    difference is fixed by hand, regenerating and pushing to the template
+    repo); `scrub` runs `scripts/scrub-check.sh` against
+    `deploy/example-config-repo/` and fails on a real private IP (`10.x`,
+    `192.168.x`, `172.16-31.x`, excluding RFC 5737 documentation ranges and a
+    short placeholder allow-list) or a real `*.douno.it` /
+    `*.nativeassetmanagement.com` / `*.skworld.io` hostname (excluding
+    `example.*`). This is independent of `secret-scan.yml`'s gitleaks gate,
+    which catches credentials, not topology.
+  - Tests in `tests/config-template-tooling.test.mjs` for both scripts.
+
 - Add a config-repo schema version. `<instance>/instance.env` now carries
   `CONFIG_SCHEMA=<n>`, and `deploy/skgateway-deploy` refuses to deploy a
   config repo whose `CONFIG_SCHEMA` is lower than this release's minimum
