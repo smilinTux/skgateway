@@ -55,6 +55,11 @@ unauthenticated on the LAN, exactly like `/v1/chat/completions`. A successful
 response carries `x-sk-model-served: <alias>=<backend model>`, as chat
 completions does.
 
+Each alias also has a small concurrency cap, since it fronts one local backend
+process rather than a pool: `media.max_concurrent_stt` (default 2) and
+`media.max_concurrent_embed` (default 8). A request over the cap gets `429`
+with a `Retry-After` header and never reaches the backend.
+
 ## Scope and defaults
 
 The gateway is not a claim that every implemented module is enabled or enforced in
