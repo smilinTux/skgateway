@@ -1,5 +1,5 @@
 /**
- * deploy-script.test.mjs — tests for deploy/skgateway-deploy (task G2).
+ * deploy-script.test.mjs: tests for deploy/skgateway-deploy (task G2).
  *
  * Drives the real bash script in a temp HOME, with a fake `systemctl` (a
  * recording no-op on PATH) and a fake health endpoint (a tiny real HTTP
@@ -180,7 +180,9 @@ function stopServer(server) {
 // ability to accept/respond to connections) until the child exits, which
 // deadlocks the health-check loop until it times out. async spawn lets the
 // event loop keep serving the fake health endpoint while the child runs.
-function runDeploy(args, { home, repoRoot, extraEnv = {} } = {}) {
+function runDeploy(args, {
+  home, repoRoot, extraEnv = {}, parentUmask,
+} = {}) {
   const bin = makeFakeSystemctl();
   const env = {
     ...process.env,
@@ -189,8 +191,14 @@ function runDeploy(args, { home, repoRoot, extraEnv = {} } = {}) {
     SKGATEWAY_DEPLOY_REPO_ROOT: repoRoot,
     ...extraEnv,
   };
+  // parentUmask: set a permissive umask on the PARENT shell before exec'ing
+  // the script under test, to prove the script sets its own (tighter) umask
+  // rather than merely relying on whatever umask it happened to inherit.
+  const spawnArgs = parentUmask
+    ? ['-c', 'umask ' + parentUmask + '; exec "$0" "$@"', SCRIPT, ...args]
+    : [SCRIPT, ...args];
   return new Promise((resolve, reject) => {
-    const child = spawn('bash', [SCRIPT, ...args], { env });
+    const child = spawn('bash', spawnArgs, { env });
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (d) => { stdout += d; });
@@ -334,7 +342,7 @@ describe('skgateway-deploy', () => {
 
       // Second deploy to a new tag, but the health endpoint is down for it
       // (same server stays up on the port, serving the OLD release's
-      // responses — simulate "new code never comes up" by stopping it).
+      // responses, so stop it to simulate "new code never comes up").
       await stopServer(health);
       updateInstanceRelease(configRepo, 'demo', source.tagV2);
 
@@ -595,6 +603,66 @@ describe('skgateway-deploy', () => {
     } finally {
       await stopServer(healthA);
       await stopServer(healthB);
+    }
+  });
+
+  // ─── fix round 1: instance validation, umask, forced-but-unreachable ───────
+
+  test('refuses an --instance containing a path separator or ".." before any path is built', async () => {
+    const home = freshHome();
+    const configRepo = buildConfigRepo({ demo: { port: 19215, release: source.tagV1 } });
+
+    for (const bad of ['../escape', 'demo/evil', 'a/b/c', '..']) {
+      const r = await runDeploy(
+        ['--release', source.tagV1, '--config-repo', configRepo, '--instance', bad, '--execute'],
+        { home, repoRoot: source.dir },
+      );
+      assert.notEqual(r.status, 0, `expected refusal for --instance '${bad}'`);
+      assert.match(r.stderr, /invalid --instance/i);
+    }
+
+    // Nothing should have been written anywhere under home for any of them.
+    assert.equal(existsSync(join(home, '.config')), false);
+    assert.equal(existsSync(join(home, '.local')), false);
+  });
+
+  test('--force-release does not override an unreachable-from-main tag', async () => {
+    const home = freshHome();
+    const configRepo = buildConfigRepo({ demo: { port: 19216, release: source.tagUnreachable } });
+
+    const r = await runDeploy(
+      ['--release', source.tagUnreachable, '--config-repo', configRepo, '--instance', 'demo', '--execute', '--force-release'],
+      { home, repoRoot: source.dir },
+    );
+
+    assert.notEqual(r.status, 0);
+    assert.match(r.stderr, /reachable|not found/i);
+    assert.equal(existsSync(releaseDir(home, source.tagUnreachable)), false);
+    assert.equal(existsSync(unitPath(home, 'demo')), false);
+  });
+
+  test('secrets file is 0600 immediately on creation, and the script sets its own umask', async () => {
+    const home = freshHome();
+    const configRepo = buildConfigRepo({ demo: { port: 19217, release: source.tagV1 } });
+    const health = await startHealthServer(19217);
+    try {
+      // The parent shell's umask is permissive (022: world/group-readable by
+      // default). If the script did not set its own umask, the unit file
+      // (written with a plain `>` redirect, never chmod'd afterward) would
+      // come out 644. Seeing 600 anyway proves the script's own `umask 077`
+      // took effect, not just the explicit chmod on the secrets file.
+      const r = await runDeploy(
+        ['--release', source.tagV1, '--config-repo', configRepo, '--instance', 'demo', '--execute'],
+        {
+          home, repoRoot: source.dir, extraEnv: FAST_HEALTH, parentUmask: '022',
+        },
+      );
+      assert.equal(r.status, 0, r.stderr + r.stdout);
+
+      assert.equal(statSync(secretsPath(home, 'demo')).mode & 0o777, 0o600);
+      assert.equal(statSync(unitPath(home, 'demo')).mode & 0o777, 0o600);
+    } finally {
+      await stopServer(health);
     }
   });
 });

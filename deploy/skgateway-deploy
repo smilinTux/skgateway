@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# skgateway-deploy — deploy one skgateway instance from a tagged public
+# skgateway-deploy: deploy one skgateway instance from a tagged public
 # release plus a private per-site config repo.
 #
 # Usage:
@@ -78,6 +78,9 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$INSTANCE" ] || { usage >&2; die "--instance is required"; }
+case "$INSTANCE" in
+  *[!a-zA-Z0-9_-]*|'') die "invalid --instance '$INSTANCE': must match ^[a-zA-Z0-9_-]+\$ (no / . or whitespace)" ;;
+esac
 
 if [ -z "$MODE" ]; then
   [ -n "$RELEASE_ARG" ] && [ -n "$CONFIG_REPO" ] || { usage >&2; die "--release and --config-repo are required for a deploy"; }
@@ -91,7 +94,7 @@ STATE_DIR="$HOME/.local/state/skgateway/$INSTANCE"
 
 # ─── small helpers ───────────────────────────────────────────────────────────
 
-# read_env_value FILE KEY — last KEY=value line in FILE, quotes stripped.
+# read_env_value FILE KEY: last KEY=value line in FILE, quotes stripped.
 # Returns 1 (no output) if the file or the key is missing.
 read_env_value() {
   local file="$1" key="$2" line val
@@ -200,6 +203,16 @@ handle_optional_units() {
 # ─── deploy ──────────────────────────────────────────────────────────────────
 
 do_deploy() {
+  # Closes a permission race on the decrypted secrets file: without this, a
+  # tool that creates the file fresh (cp, ansible-vault --output, a `>`
+  # redirect) would briefly leave it at the inherited umask's default mode
+  # (often group/other-readable) in the window before the explicit `chmod
+  # 600` below runs. Setting the umask before anything in this function
+  # creates a file means every file created from here on (secrets, the
+  # rendered unit, optional add-on units) is group/other-inaccessible from
+  # its very first write, not just after a later chmod.
+  umask 077
+
   local instance_dir="$CONFIG_REPO/$INSTANCE"
   [ -d "$instance_dir" ] || die "no such instance in config repo: $instance_dir"
 

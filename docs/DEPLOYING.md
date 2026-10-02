@@ -96,7 +96,7 @@ Three methods are supported via `SECRETS_METHOD` in `instance.env`:
   ```
 - **`sops`**: supported for sites that already use sops/age elsewhere.
   `skgateway-deploy` runs `sops --decrypt`, which uses sops's own key
-  discovery (age key file, KMS, etc.) — nothing sops-specific is configured
+  discovery (age key file, KMS, etc.): nothing sops-specific is configured
   by this script.
 - **`none`**: no encryption; the file is read as-is. Only appropriate for a
   local/dev instance with no real credentials. CI and the test suite use this
@@ -144,7 +144,7 @@ Three methods are supported via `SECRETS_METHOD` in `instance.env`:
    don't catch.
 
 `--release` must equal the `RELEASE` already pinned in `instance.env` unless
-you pass `--force-release` — this keeps an operator from accidentally
+you pass `--force-release`, which keeps an operator from accidentally
 deploying a tag the config repo PR process never recorded. `--force-release`
 exists for recovery (e.g. hand-testing a tag before writing the PR); it does
 not rewrite `instance.env`.
@@ -165,6 +165,11 @@ A failed health check during a deploy already does this automatically (exit
 code `3`); `--rollback` is for rolling back something that passed its health
 check but is wrong for another reason.
 
+`--rollback` only restores the main instance unit and release. The optional
+add-on units (shadow/ingress/canary, below) are left exactly as the last
+deploy rendered them; roll those back by re-running a deploy with the
+instance.env flags set the way you want, or by hand.
+
 ## Status
 
 ```
@@ -182,7 +187,7 @@ Run the same command once per instance name; each gets its own unit
 is shared across instances pinned to the same tag (it's just a read-only
 Node checkout, reused rather than re-cloned when the tag matches and the
 checkout is clean). A port collision between two instances on the same host
-is a config-repo mistake — give each instance its own `PORT`.
+is a config-repo mistake: give each instance its own `PORT`.
 
 ## Optional add-ons: shadow instance, tailnet ingress, canary loopback
 
@@ -196,8 +201,8 @@ rendered. All three are parameterized only from `<instance>/instance.env`.
 ### Shadow instance (`SHADOW_ENABLED`)
 
 Runs a second gateway process for the same instance, same release checkout,
-on a different port and a different config file — e.g. a separate shared or
-restricted-profile backend served alongside the main one.
+on a different port and a different config file (e.g. a separate shared or
+restricted-profile backend served alongside the main one).
 
 | Key | Meaning |
 |---|---|
