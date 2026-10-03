@@ -24,8 +24,15 @@ import { existsSync, mkdirSync, writeFileSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { BlockList, isIP } from "node:net";
 
 export const SERVICE = "skgateway";
+
+const LOCAL_ADDRESSES = new BlockList();
+LOCAL_ADDRESSES.addSubnet("127.0.0.0", 8, "ipv4");
+LOCAL_ADDRESSES.addAddress("0.0.0.0", "ipv4");
+LOCAL_ADDRESSES.addAddress("::", "ipv6");
+LOCAL_ADDRESSES.addAddress("::1", "ipv6");
 
 /** sk-alert levels worth forwarding to the shared bus (info is dropped). */
 const NOTIFY_LEVELS = new Set(["warn", "error", "critical"]);
@@ -136,8 +143,21 @@ export function forwardSiemEvent(evt) {
  * @param {{healthUrl?:string, pidFile?:string}} [opts]
  * @returns {boolean} true if registered.
  */
-export function registerService({ healthUrl = null, pidFile = null } = {}) {
-  if (!isPresent()) return false;
+export function registerService({ healthUrl = process.env.SKGATEWAY_HEALTH_URL || null, pidFile = null } = {}) {
+  if (!isPresent() || !healthUrl) return false;
+  // This registry is shared across hosts. Never publish a local-only address
+  // or overwrite a valid deployment record from an unconfigured test process.
+  try {
+    const url = new URL(healthUrl);
+    const host = url.hostname.toLowerCase().replace(/\.$/, "");
+    const ip = host.replace(/^\[|\]$/g, "");
+    const family = isIP(ip);
+    if (!["http:", "https:"].includes(url.protocol) || url.username || url.password ||
+        host === "localhost" || host.endsWith(".localhost") ||
+        (family && LOCAL_ADDRESSES.check(ip, family === 6 ? "ipv6" : "ipv4"))) return false;
+  } catch {
+    return false;
+  }
   try {
     const entry = {
       name: SERVICE,

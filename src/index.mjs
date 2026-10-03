@@ -2844,7 +2844,7 @@ server.listen(port, bind, () => {
     }
     // Advertise to skcapstone service discovery when present (no-op otherwise).
     try {
-      if (skcapstone.registerService({ healthUrl: `http://localhost:${port}/health` })) {
+      if (skcapstone.registerService()) {
         console.log("[skgateway] registered with skcapstone service discovery");
       }
     } catch {}
