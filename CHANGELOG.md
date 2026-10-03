@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add a daily DELIVERY metric (card 3520f9e8), derived from live sources (git remote, request database, card store) rather than self-reported card status, covering PRs opened and merged, cards created and completed, rows written, deliverables verified, and the sprint denominator.
+
 ## [skgateway-v1.0.0] - 2026-10-03
 
 First tagged release of skgateway, under a new `skgateway-v*` tag namespace
