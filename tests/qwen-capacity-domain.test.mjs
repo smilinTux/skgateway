@@ -122,6 +122,41 @@ function startHoldingServer() {
   });
 }
 
+// A dedicated, always-answering fixture for the `fallback` backend. It is a
+// SEPARATE real HTTP listener from the `upstream` holding server above (not
+// a second alias for the same one), so that when the admission-failover path
+// (PR #100 / PR #94, "fail over on pool admission rejection instead of
+// returning a bare 503", card 8b64febc) actually dispatches a real request to
+// it, that request gets a genuine, immediate, verifiable response instead of
+// silently piling onto `upstream`'s manual-release queue and hanging forever
+// waiting for a release nothing in the test would ever issue.
+function startFallbackServer() {
+  const state = { totalCalls: 0 };
+  return new Promise((resolve) => {
+    const server = http.createServer((req, res) => {
+      req.resume();
+      state.totalCalls += 1;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        model: "served-qwen38",
+        choices: [{ finish_reason: "stop", message: { content: "fallback-ok" } }],
+        backend: "fallback-fixture",
+      }));
+    });
+    server.listen(0, "127.0.0.1", () => {
+      const { port } = server.address();
+      resolve({
+        state,
+        url: `http://127.0.0.1:${port}/v1`,
+        close: () => new Promise((done) => {
+          server.close(done);
+          server.closeAllConnections();
+        }),
+      });
+    });
+  });
+}
+
 async function waitFor(predicate, label) {
   const deadline = Date.now() + 2000;
   while (Date.now() < deadline) {
@@ -132,11 +167,13 @@ async function waitFor(predicate, label) {
 }
 
 let upstream;
+let fallbackUpstream;
 let router;
 
 beforeEach(async () => {
   resetPool();
   upstream = await startHoldingServer();
+  fallbackUpstream = await startFallbackServer();
   writeRegistry(upstream.url);
   router = createRouter({
     backends: {
@@ -147,7 +184,7 @@ beforeEach(async () => {
         priority: 1,
       },
       fallback: {
-        url: upstream.url,
+        url: fallbackUpstream.url,
         auth_type: "none",
         models: ["qwen3.8-27b"],
         priority: 9,
@@ -161,6 +198,10 @@ afterEach(async () => {
     upstream.releaseAll();
     await upstream.close();
     upstream = null;
+  }
+  if (fallbackUpstream) {
+    await fallbackUpstream.close();
+    fallbackUpstream = null;
   }
   resetPool();
 });
@@ -224,21 +265,37 @@ describe("chiap08 Qwen shared capacity domain", () => {
     const queued = request("sk-creative");
     await waitFor(() => getPool().getStats("reg:qwen38").queued === 1, "queued request");
 
+    // PR #100 (which supersedes PR #94, whose whole point per its title was
+    // "fail over on pool admission rejection instead of returning a bare
+    // 503") changed this exact request's outcome. `fallback` is not a member
+    // of the chiap08-qwen38 domain declared above, so it is a genuinely
+    // different capacity domain, i.e. a real different door. With
+    // chiap08-qwen38 full AND its queue full, this request now fails OVER to
+    // that door instead of returning a domain-full 503 for itself. This is
+    // the intended, documented behavior (card 8b64febc;
+    // src/proxy/router.mjs's hasDifferentDomainLater()), not a regression:
+    // candidates that SHARE a domain still queue exactly as before, which is
+    // exactly what the `queued`/`timedOut` assertions right below this one
+    // still verify, unchanged.
     const full = await request("qwen3.8-27b");
-    assert.equal(full.status, 503);
-    assert.equal(full.headers["retry-after"], "1");
-    assert.equal(full.queueWaitMs, 0);
-    assert.equal(full.inflightConcurrency, 1);
-    assert.equal(full.admissionOutcome, "denied");
-    assert.equal(full.backoffClassification, "local_admission_denial");
-    assert.equal(full.retryAfterSeconds, 1);
-    assert.deepEqual(JSON.parse(full.body).error, {
-      message: "Capacity domain chiap08-qwen38 queue is full.",
-      code: "capacity_exceeded",
-      backend: "chiap08-qwen38",
-      capacity_domain: "chiap08-qwen38",
-      retryable: true,
-      retry_after_seconds: 1,
+    assert.equal(full.status, 200);
+    assert.equal(full.backendId, "fallback");
+    assert.equal(full.failover, true);
+    assert.equal(full.admissionOutcome, "admitted");
+    assert.equal(full.backoffClassification, "nonterminal");
+    assert.equal(
+      fallbackUpstream.state.totalCalls,
+      1,
+      "the failed-over request reached the dedicated fallback fixture, not chiap08-qwen38's holder",
+    );
+    assert.deepEqual(JSON.parse(full.body), {
+      model: "served-qwen38",
+      choices: [{ finish_reason: "stop", message: { content: "fallback-ok" } }],
+      backend: "fallback-fixture",
+      // enforceResponseContract() (src/proxy/response-contract.mjs) stamps
+      // every JSON completion with the originally requested model; unrelated
+      // to this PR's admission-failover change.
+      requested_model: "qwen3.8-27b",
     });
 
     const timedOut = await queued;
@@ -250,7 +307,15 @@ describe("chiap08 Qwen shared capacity domain", () => {
     assert.equal(timedOut.inflightConcurrency, 1);
     assert.equal(timedOut.admissionOutcome, "timeout");
     assert.equal(timedOut.backoffClassification, "timeout");
-    assert.equal(getPool().getStats("chiap08-qwen38").totalDropped, 1);
+    // The chiap08-qwen38 rejection behind `full`'s failover is a deferral,
+    // not a drop: connection-pool.mjs's nonBlocking path (card 8b64febc)
+    // deliberately excludes it from totalDropped, since "a deferral that
+    // fails over successfully is a served request, and folding it into
+    // totalDropped would make the drop metric report healthy failovers as
+    // losses." totalDropped only counts a request that is denied with
+    // nowhere else to go.
+    assert.equal(getPool().getStats("chiap08-qwen38").totalDropped, 0);
+    assert.equal(getPool().getStats("chiap08-qwen38").totalDeferred, 1);
     assert.equal(getPool().getStats("chiap08-qwen38").totalTimedOut, 1);
 
     upstream.releaseAll();
@@ -260,10 +325,22 @@ describe("chiap08 Qwen shared capacity domain", () => {
   });
 
   test("queued client cancellation remains 499 and never reaches fallback or upstream", async () => {
+    // "fallback" is deliberately IN this domain's members, unlike the
+    // queue-full/queue-timeout test above. This test's whole point is to
+    // verify cancellation of a request that is genuinely QUEUED, so the
+    // second request below must actually queue rather than fail over. Per
+    // PR #100 (card 8b64febc), a full domain only queues a candidate when
+    // every remaining candidate is the SAME door; leaving fallback out (as
+    // it is in the queue-full test, on purpose, to exercise the genuinely-
+    // different-domain failover path) would make this second request fail
+    // over to fallback instead of queueing, and the `queued` wait below
+    // would never resolve. Keeping fallback as a domain member here is what
+    // makes it the same door, so it still queues, exactly as this test's
+    // name and assertions require.
     getPool({
       capacityDomains: {
         "chiap08-qwen38": {
-          members: ["chiap08-qwen38", "reg:qwen38"],
+          members: ["chiap08-qwen38", "reg:qwen38", "fallback"],
           max: 1,
           maxQueue: 1,
           queueTimeoutMs: 1000,
