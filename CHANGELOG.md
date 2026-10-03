@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Fix bucket routing (`sk-<class>-<sensitivity>`) so an addressed S, M, L or
+  XL bucket actually prefers the admitted model_class nearest its floor,
+  instead of always handing the whole pool to the single cheapest-cost-tier
+  model regardless of class. `orderMembersForClass()` was scoring a member
+  below the requested floor as "near" using a signed rank difference, so a
+  cheap under-floor model could look closer than the correctly-floored one;
+  it now treats any member below the floor as maximally far, same as an
+  unrecognized class. Separately, `selectMember()` re-ran the counter-rotated
+  cost ordering a second time on its own already-ordered output, which
+  applied the same rotation counter twice and could cancel a pool's
+  round-robin rotation entirely (observed: a two-member local pool returning
+  the same member on every request). It now reads the cheapest tier directly
+  off the single already-ordered pass. Card `617ddc13`. Tests in
+  `tests/buckets.test.mjs`.
+
 - Refresh PR96 onto current main so live-pipeline sanitizer and model-limit changes are evaluated against the latest gateway code.
 
 - Add immutable runtime bundle tooling (`scripts/runtime-bundle/`): build a

@@ -753,34 +753,85 @@ export function orderMembersByCost(members, counter = 0) {
 }
 
 /**
+ * Order an admitted bucket pool by class fit, then cost.
+ *
+ * A model_class is a floor, so larger models remain valid failover candidates.
+ * They must not, however, win every bucket merely because they share the
+ * cheapest cost tier. The nearest class AT OR ABOVE the requested floor is
+ * preferred; cost and rotation break ties within that class. This makes S, M,
+ * L and XL useful addresses while preserving upward-only capability failover.
+ *
+ * This function only reorders members already admitted by resolveBucket(). It
+ * cannot widen the sensitivity ceiling, and it must not let a member BELOW the
+ * class floor look "nearest" either: a signed rank difference lets a cheaper
+ * under-floor member outscore a correctly-floored one (a rank one notch below
+ * the floor and one notch above both have |distance| 1, but only the one above
+ * is actually admissible as a floor). Below-floor members sort last, same as
+ * an unrecognised class, so they never win the "closest class" comparison.
+ *
+ * @param {Array<object>} members members already admitted by resolveBucket
+ * @param {string|null} requestedClass bucket model_class
+ * @param {number} counter monotonically increasing per bucket
+ * @returns {Array<object>}
+ */
+export function orderMembersForClass(members, requestedClass, counter = 0) {
+  const costOrdered = orderMembersByCost(members, counter);
+  const requestedRank = classRank(requestedClass);
+  if (requestedRank === null) return costOrdered;
+
+  return costOrdered
+    .map((member, index) => ({ member, index, rank: classRank(member.model_class) }))
+    .sort((a, b) => {
+      const aDistance = a.rank === null || a.rank < requestedRank
+        ? Number.POSITIVE_INFINITY
+        : a.rank - requestedRank;
+      const bDistance = b.rank === null || b.rank < requestedRank
+        ? Number.POSITIVE_INFINITY
+        : b.rank - requestedRank;
+      return aDistance - bDistance || a.index - b.index;
+    })
+    .map(({ member }) => member);
+}
+
+/**
  * Pick which member serves THIS request.
  *
- * Selection rotates only within the cheapest available cost tier. Costlier
- * tiers remain failover candidates through `orderMembersByCost()`, but are not
- * selected while an equally eligible cheaper tier exists.
+ * Selection first chooses the closest admitted model_class, then rotates only
+ * within that class's cheapest cost tier. Larger classes and costlier tiers
+ * remain failover candidates through orderMembersForClass().
  *
- * An optional family preference is applied WITHIN the selected cost tier,
- * allowing callers to prefer a family at the same cost level. The preference
- * never widens the member set and never selects a costlier tier over a cheaper
- * one. If no member in the cheapest tier matches the preference, the normal
- * cost-tier rotation is used.
+ * An optional family preference is applied within the selected class and cost
+ * tier. It never widens the member set or crosses the sensitivity ceiling.
  *
  * @param {Array<object>} members members already admitted by resolveBucket
  * @param {number} counter monotonically increasing per bucket
  * @param {Array<string>|null} [familyPreference=null] ordered list of family names or 'free'/'sovereign'
+ * @param {string|null} [requestedClass=null] bucket model_class
  * @returns {object|null}
  */
-export function selectMember(members, counter = 0, familyPreference = null) {
-  const costOrdered = orderMembersByCost(members, counter);
-  if (costOrdered.length === 0) return null;
+export function selectMember(members, counter = 0, familyPreference = null, requestedClass = null) {
+  const ordered = orderMembersForClass(members, requestedClass, counter);
+  if (ordered.length === 0) return null;
 
-  // Find all members in the cheapest cost tier
-  const cheapestTier = costOrdered[0].cost_tier;
-  const cheapestMembers = costOrdered.filter(m => m.cost_tier === cheapestTier);
+  // Without a requested class this helper retains its historical pool
+  // semantics: all admitted members participate in cost-tier rotation. The
+  // class-specific narrowing is only meaningful for an addressed bucket.
+  const closestClass = requestedClass === null ? null : ordered[0].model_class;
+  const closestMembers = closestClass === null
+    ? ordered
+    : ordered.filter((member) => member.model_class === closestClass);
 
-  // Apply family preference only within the cheapest tier
+  // `closestMembers` is a filtered slice of `ordered`, which orderMembersForClass()
+  // already produced from a single counter-rotated orderMembersByCost() pass (the
+  // class-distance sort is stable, so it preserves that cost order within any one
+  // class). Re-running orderMembersByCost() here on the same counter would rotate
+  // a second time and could cancel the first rotation out entirely, e.g. two
+  // 'local' members would get rotated, then un-rotated, and the same member would
+  // be picked on every request regardless of counter. Read the cheapest tier
+  // straight off the already-ordered slice instead of re-deriving it.
+  const cheapestTier = closestMembers[0].cost_tier;
+  const cheapestMembers = closestMembers.filter((member) => member.cost_tier === cheapestTier);
   const preferredInCheapest = applyFamilyPreference(cheapestMembers, familyPreference);
 
-  // Return the first preferred member in the cheapest tier
   return preferredInCheapest[0] || null;
 }
