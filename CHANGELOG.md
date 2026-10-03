@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Expose provider capability metadata (`served_id`, `revision`,
+  `context_limit`, `availability`, `provider_route`, `public_eligible`) from
+  the `anthropic-wrapper` and `codex` discovery adapters, and bind the public
+  XL bucket (`sk-xl-public`) to Astra only when the catalog proves it is both
+  available and public-eligible (`src/policy/xl-public.mjs`, fails closed
+  otherwise). The anthropic-wrapper `normalize()` no longer filters on
+  `availability && public_eligible`: that gate belongs to the XL policy, and
+  in discovery it emptied the whole Claude catalog, because ordinary paid
+  Claude chat models carry neither field. Tests in
+  `tests/providers-anthropic-wrapper.test.mjs` and `tests/xl-public.test.mjs`.
+
 - Fix bucket routing (`sk-<class>-<sensitivity>`) so an addressed S, M, L or
   XL bucket actually prefers the admitted model_class nearest its floor,
   instead of always handing the whole pool to the single cheapest-cost-tier
