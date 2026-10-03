@@ -7,12 +7,19 @@ const sharedShadow = yamlLoad(readFileSync('deploy/chiap01/skgateway.shared-shad
 const sharedSystemd = readFileSync('deploy/chiap01/systemd/skgateway-shared-shadow.service', 'utf8');
 const tailnetService = readFileSync('deploy/chiap01/systemd/skgateway-shared-tailnet.service', 'utf8');
 const tailnetSocket = readFileSync('deploy/chiap01/systemd/skgateway-shared-tailnet.socket', 'utf8');
-const QWEN_IDS = [
-  'qwen3.8-27b-huihui-abliterated-q4_k_m',
-  'qwen3.8-27b-ud-q5_k_xl',
-  'qwen3.8-27b',
-  'qwen38-abliterated',
-];
+// Regression-locked per backend against the committed
+// deploy/chiap01/skgateway.shared-shadow.yaml. The two backends no longer
+// share one model list (chiap01-qwen38 and chiap08-qwen38 diverged in a
+// later, unrelated commit to that file), so each is pinned to its own
+// current list rather than one shared constant.
+const EXPECTED_MODELS = {
+  'chiap01-qwen38': ['qwen3.8-27b-huihui-abliterated-q4_k_m'],
+  'chiap08-qwen38': [
+    'qwen3.8-27b-huihui-abliterated-q4_k_m',
+    'qwen3.8-chiap08',
+    'qwen3.8-vllm',
+  ],
+};
 
 test('shared shadow config is provider-pure: Qwen-only backends, no Codex, OpenRouter disabled', () => {
   const backends = sharedShadow.backends;
@@ -21,7 +28,8 @@ test('shared shadow config is provider-pure: Qwen-only backends, no Codex, OpenR
   for (const name of backendNames) {
     const b = backends[name];
     assert.equal(b.auth_type, 'none');
-    assert.deepEqual(b.models, QWEN_IDS);
+    assert.ok(b.models.every((id) => id.toLowerCase().startsWith('qwen')), `${name} must be Qwen-only`);
+    assert.deepEqual(b.models, EXPECTED_MODELS[name]);
   }
   assert.equal('codex' in backends, false);
   assert.equal('openrouter' in backends, false);
