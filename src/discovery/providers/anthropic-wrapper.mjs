@@ -32,6 +32,5 @@ export function normalize(json) {
         public_eligible: model.public_eligible === true,
       },
       card: null,
-    }))
-    .filter((model) => model.capability.availability && model.capability.public_eligible);
+    }));
 }
