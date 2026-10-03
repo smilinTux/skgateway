@@ -789,7 +789,9 @@ ${extraRoles}defaults:
     assert.equal(error.model, 'sk-xl-secrets');
     assert.match(error.reason, /sensitivity "secrets" is not/);
     assert.ok(error.valid_buckets.includes('sk-xl-secret'), 'the caller is told the correction, not left guessing');
-    assert.equal(error.valid_buckets.length, 28);
+    // 31 total buckets now that deepseek joined the provider-focused S/M/L
+    // generation loop (buckets.test.mjs: "the taxonomy is the canonical vocabulary").
+    assert.equal(error.valid_buckets.length, 31);
     assert.equal(pool.state.count, 0, 'nothing was routed');
 
     const lines = audit.read();

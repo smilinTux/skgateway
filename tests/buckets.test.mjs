@@ -97,7 +97,11 @@ describe('C9: bucket addressing', () => {
     assert.deepEqual(v.sensitivity.values, ['public', 'internal', 'secret']);
     // risk is a SEPARATE axis and must not have been folded into the bucket id
     assert.deepEqual(v.risk.values, ['low', 'med', 'high', 'crit']);
-    assert.equal(allBuckets().length, 28, '12 scoped, 4 short public, and 12 provider-focused S/M/L buckets');
+    // 12 scoped + 4 short public + 15 provider-focused S/M/L: allBuckets()
+    // generates one bucket per class for each of zai, glm, kimi, codex,
+    // deepseek (5 names x 3 classes = 15; cursor is parsed/addressed via the
+    // regexes but is not in this generation loop, same as before this change).
+    assert.equal(allBuckets().length, 31, '12 scoped, 4 short public, and 15 provider-focused S/M/L buckets');
     assert.equal(parseBucketId('sk-kimi-xl'), null);
     assert.equal(looksLikeBucketAttempt('sk-kimi-xl').attempted, true);
     assert.equal(allBuckets().some(({ bucket }) => bucket.startsWith('sk-cursor-')), false);
