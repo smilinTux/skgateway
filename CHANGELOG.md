@@ -415,6 +415,15 @@ provider routing, bucket, and admission work recorded below.
   match the code. `tests/router-rate-limit-failover.test.mjs` is unaffected: it
   covers the router's 429 backoff in `core.mjs`, which is live and unchanged.
 
+- The unversioned sovereign-fleet Python proxy is captured as a separately
+  built, content-addressed artifact with pinned dependencies, non-secret runtime
+  and configuration manifests, deterministic build receipts, and rollback
+  instructions. The committed source is a redacted derivative of the originally
+  observed capture: the real upstream hostname and home-directory path were
+  replaced with generic, env-driven defaults before publishing (see
+  `python-proxy/README.md`). Its ambiguous pre-Git ancestry remains explicit
+  (card 2d4a7c8e).
+
 - The sanitizer and model-limit stages are now wired into the live `/v1` path.
   `trimSystemMessages()`, `trimConversationHistory()` and `sanitizeResponse()`
   existed and were unit-tested but were never invoked by `index.mjs`, so the
