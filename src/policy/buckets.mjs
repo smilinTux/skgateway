@@ -757,12 +757,17 @@ export function orderMembersByCost(members, counter = 0) {
  *
  * A model_class is a floor, so larger models remain valid failover candidates.
  * They must not, however, win every bucket merely because they share the
- * cheapest cost tier. The nearest class to the requested floor is preferred;
- * cost and rotation break ties within that class. This makes S, M, L and XL
- * useful addresses while preserving upward-only capability failover.
+ * cheapest cost tier. The nearest class AT OR ABOVE the requested floor is
+ * preferred; cost and rotation break ties within that class. This makes S, M,
+ * L and XL useful addresses while preserving upward-only capability failover.
  *
  * This function only reorders members already admitted by resolveBucket(). It
- * cannot widen the sensitivity ceiling or admit a model below the class floor.
+ * cannot widen the sensitivity ceiling, and it must not let a member BELOW the
+ * class floor look "nearest" either: a signed rank difference lets a cheaper
+ * under-floor member outscore a correctly-floored one (a rank one notch below
+ * the floor and one notch above both have |distance| 1, but only the one above
+ * is actually admissible as a floor). Below-floor members sort last, same as
+ * an unrecognised class, so they never win the "closest class" comparison.
  *
  * @param {Array<object>} members members already admitted by resolveBucket
  * @param {string|null} requestedClass bucket model_class
@@ -777,8 +782,12 @@ export function orderMembersForClass(members, requestedClass, counter = 0) {
   return costOrdered
     .map((member, index) => ({ member, index, rank: classRank(member.model_class) }))
     .sort((a, b) => {
-      const aDistance = a.rank === null ? Number.POSITIVE_INFINITY : a.rank - requestedRank;
-      const bDistance = b.rank === null ? Number.POSITIVE_INFINITY : b.rank - requestedRank;
+      const aDistance = a.rank === null || a.rank < requestedRank
+        ? Number.POSITIVE_INFINITY
+        : a.rank - requestedRank;
+      const bDistance = b.rank === null || b.rank < requestedRank
+        ? Number.POSITIVE_INFINITY
+        : b.rank - requestedRank;
       return aDistance - bDistance || a.index - b.index;
     })
     .map(({ member }) => member);
@@ -811,9 +820,17 @@ export function selectMember(members, counter = 0, familyPreference = null, requ
   const closestMembers = closestClass === null
     ? ordered
     : ordered.filter((member) => member.model_class === closestClass);
-  const costOrdered = orderMembersByCost(closestMembers, counter);
-  const cheapestTier = costOrdered[0].cost_tier;
-  const cheapestMembers = costOrdered.filter((member) => member.cost_tier === cheapestTier);
+
+  // `closestMembers` is a filtered slice of `ordered`, which orderMembersForClass()
+  // already produced from a single counter-rotated orderMembersByCost() pass (the
+  // class-distance sort is stable, so it preserves that cost order within any one
+  // class). Re-running orderMembersByCost() here on the same counter would rotate
+  // a second time and could cancel the first rotation out entirely, e.g. two
+  // 'local' members would get rotated, then un-rotated, and the same member would
+  // be picked on every request regardless of counter. Read the cheapest tier
+  // straight off the already-ordered slice instead of re-deriving it.
+  const cheapestTier = closestMembers[0].cost_tier;
+  const cheapestMembers = closestMembers.filter((member) => member.cost_tier === cheapestTier);
   const preferredInCheapest = applyFamilyPreference(cheapestMembers, familyPreference);
 
   return preferredInCheapest[0] || null;
