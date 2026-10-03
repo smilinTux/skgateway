@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add a generic bucket participation policy (`src/policy/generic-participation.mjs`):
+  an operator can favor or disable a provider or model inside the open
+  generic S/M/L buckets via `routing.generic_participation`, hot-reloadable
+  on SIGHUP, without touching direct routes or provider-focused
+  `sk-<provider>-<bucket>` routes. `routing.bucket_excluded_models` fences
+  specific model ids out of generic membership, re-applied on every resolve
+  so it survives a discovery refresh. Generic buckets now use weighted
+  provider selection (`orderMembersByGenericWeight()`); a new opt-in
+  reviewed-qualification-hash class floor
+  (`effectiveQualifiedClass`/`meetsClassFloor`) can lower (never raise) a
+  model's effective class and fails closed on malformed/expired evidence.
+  `applyGenerationDefaults()` projects only an operator's explicit
+  generation-token override, never a provider-claimed maximum;
+  `applyFocusedAliasMetadata()` exposes a focused alias under its own
+  provider identity only when its whole current pool qualifies. The
+  per-candidate-model byte-limit check (`request-limits.mjs`) now also runs
+  inside `routeAndSend`'s retry loop, skipping a candidate whose resolved
+  model has a tighter configured limit rather than attempting it.
+  `/admin/buckets` gains generic policy observability (effective per-provider
+  weights, a non-mutating next-pick preview). Also fixes `reloadConfig()`
+  always reporting `{ ok: true }` even when a SIGHUP reload failed
+  validation. Tests in `tests/generic-participation.test.mjs`,
+  `tests/qualification-class-floor.test.mjs`,
+  `tests/generic-weighted-selection.test.mjs`,
+  `tests/generation-defaults-focused-alias.test.mjs`,
+  `tests/generic-bucket-router-integration.test.mjs`.
+
 - Add explicit request byte limits (`src/proxy/request-limits.mjs`): a
   request body, or its system/developer message slice, over a configured
   byte ceiling (default 120000/40000, overridable globally or per model) is
