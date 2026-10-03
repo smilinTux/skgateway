@@ -13,13 +13,14 @@ import os
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 
-UPSTREAM = os.environ.get("SKGATEWAY_UPSTREAM", "http://chiap08:11439/v1").rstrip("/")
+UPSTREAM = os.environ.get("SKGATEWAY_UPSTREAM", "http://127.0.0.1:11439/v1").rstrip("/")
 UPSTREAM_MODEL = os.environ.get(
     "SKGATEWAY_UPSTREAM_MODEL",
     "qwen3.8-27b-huihui-abliterated-q4_k_m",
@@ -36,9 +37,10 @@ TIMEOUT_SECONDS = float(os.environ.get("SKGATEWAY_TIMEOUT_SECONDS", "1200"))
 ADVERTISE_STATE = Path(
     os.environ.get(
         "SKGATEWAY_ADVERTISE_STATE",
-        "/home/skuser01/.local/state/skgateway/advertised-models.json",
+        str(Path.home() / ".local/state/skgateway/advertised-models.json"),
     )
 )
+UPSTREAM_HOST = urlparse(UPSTREAM).hostname or "upstream"
 HOP_HEADERS = {
     "connection",
     "keep-alive",
@@ -90,7 +92,7 @@ def _admin_catalog() -> dict[str, Any]:
             {
                 "id": model_id,
                 "object": "model",
-                "provider": "skgateway" if is_alias else "chi-fleet/chiap08",
+                "provider": "skgateway" if is_alias else f"chi-fleet/{UPSTREAM_HOST}",
                 "free": True,
                 "advertised": model_id in advertised,
                 "upstream_model": UPSTREAM_MODEL,
@@ -113,7 +115,7 @@ def _admin_catalog() -> dict[str, Any]:
                     "summary": (
                         f"Stable SK role routed to {UPSTREAM_MODEL}."
                         if is_alias
-                        else "Sovereign Qwen3.8 inference hosted on chiap08."
+                        else f"Sovereign Qwen3.8 inference hosted on {UPSTREAM_HOST}."
                     ),
                 },
             }

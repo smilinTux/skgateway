@@ -15,10 +15,18 @@ proxy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(proxy)
 
 
-def test_captured_source_hash() -> None:
+def test_redacted_source_hash() -> None:
+    """Pin the committed source to a known hash so a drive-by edit is caught.
+
+    This file is a redacted derivative of the originally observed capture:
+    the real upstream hostname and home-directory path were replaced with
+    generic, env-driven defaults before this was published to a public repo
+    (see README.md "Provenance and stop condition"). It is therefore pinned
+    against a hash of the redacted bytes, not the original observed bytes.
+    """
     import hashlib
 
-    assert hashlib.sha256(MODULE_PATH.read_bytes()).hexdigest() == "5a98e8005c0615f981155ca62a6fe28920cfddb36004fbb5f5f41e8fde673f35"
+    assert hashlib.sha256(MODULE_PATH.read_bytes()).hexdigest() == "c72ecdfba0f7c78863878a5f86b087f077758942fe506b68512add037f8dffea"
 
 
 def test_alias_routing_rewrites_only_aliases() -> None:

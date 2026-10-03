@@ -1,17 +1,17 @@
 # Immutable SKGateway Python proxy
 
-This directory packages the chiap04 Python proxy separately from the Node SKGateway runtime.
+This directory packages the sovereign fleet's Python proxy separately from the Node SKGateway runtime.
 
 ## Provenance and stop condition
 
-The source is a byte-for-byte capture of `/home/skuser01/.local/share/skgateway/skgateway.py` observed on chiap04. Its SHA-256 is `5a98e8005c0615f981155ca62a6fe28920cfddb36004fbb5f5f41e8fde673f35`. The copied file had no Git metadata. A scan of all objects reachable from the canonical GitHub repository found no matching blob. Therefore this candidate deliberately makes no claim that the copy equals repository HEAD or descends from any repository revision. The reviewed candidate begins with the captured bytes as a new, explicit Git history entry.
+The source began as a byte-for-byte capture of `<home>/.local/share/skgateway/skgateway.py` observed on a fleet node. Before being published to this public repository, the captured file's infrastructure-identifying literals (the observed upstream hostname and the observed home-directory path) were replaced with generic, env-driven defaults; see `SKGATEWAY_UPSTREAM` and `SKGATEWAY_ADVERTISE_STATE` below. The SHA-256 of the committed, redacted file is `c72ecdfba0f7c78863878a5f86b087f077758942fe506b68512add037f8dffea`, pinned by `tests/test_proxy.py::test_redacted_source_hash`. The copied file had no Git metadata. A scan of all objects reachable from the canonical GitHub repository found no matching blob. Therefore this candidate deliberately makes no claim that the copy equals repository HEAD or descends from any repository revision. The reviewed candidate begins with the captured (and redacted) bytes as a new, explicit Git history entry.
 
 Observed read-only runtime state:
 
 - launcher: user unit `skgateway.service`
 - endpoint: `127.0.0.1:18780`
 - application: `uvicorn skgateway:app`
-- upstream default and observed health routing: `http://chiap08:11439/v1`
+- upstream default and observed health routing: configured via `SKGATEWAY_UPSTREAM` (example: `http://<upstream-host>:11439/v1`; the committed default is `http://127.0.0.1:11439/v1`)
 - upstream model default and observed health model: `qwen3.8-27b-huihui-abliterated-q4_k_m`
 - health paths: `/health` and `/v1/health`
 - configuration reference: `%h/.config/skgateway/skgateway.env`
@@ -19,7 +19,7 @@ Observed read-only runtime state:
 - credential references: none in the observed unit, environment key names, or source
 - captured dependencies: `requirements.lock`
 
-No environment values are committed. The configuration schema records names and types only.
+No environment values are committed. The configuration schema records names and types only. A deployment sets `SKGATEWAY_UPSTREAM` and `SKGATEWAY_ADVERTISE_STATE` to the real fleet host and home path via the (uncommitted) environment file at `%h/.config/skgateway/skgateway.env`; the defaults in source are placeholders only.
 
 ## Build
 
