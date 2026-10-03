@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [skgateway-v1.0.0] - 2026-10-03
+
+First tagged release of skgateway, under a new `skgateway-v*` tag namespace
+(no `skgateway-v*` tag existed before this one; the older `v0.x` tags below
+predate the namespace and are not part of this release line). Everything
+accumulated under Unreleased up to this point ships here. Highlights:
+local-only media routes for the Nextcloud Talk recording and AI integration
+(`/v1/audio/transcriptions`, `/v1/embeddings`); `deploy/skgateway-deploy`, a
+deploy/rollback/status tool for running a tagged release as a systemd `--user`
+instance from a private per-site config repo, plus a config-repo schema
+version it enforces on deploy; five production fixes upstreamed from nor's
+deploy checkout (Claude subscription purity, Ornith context preflight,
+qwen38 null usage details); and the Kimi, Z.ai, Codex, OpenRouter and NVIDIA
+provider routing, bucket, and admission work recorded below.
+
 - Add a config-repo schema version. `<instance>/instance.env` now carries
   `CONFIG_SCHEMA=<n>`, and `deploy/skgateway-deploy` refuses to deploy a
   config repo whose `CONFIG_SCHEMA` is lower than this release's minimum
