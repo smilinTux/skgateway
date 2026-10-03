@@ -4616,7 +4616,21 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     const modelContractFailure = upstreamStatus >= 200 && upstreamStatus < 300 &&
       res.status === 502 &&
       (recoveryFailureClass === "malformed_response" || recoveryFailureClass === "response_budget");
-    const healthy = res.status < 500 || modelContractFailure;
+    // A fast wrong answer (404/410/502, including a refused connection as
+    // normalized by sendUpstream) is exact-claim evidence: the claim machine
+    // below quarantines that one backend-model pair. Feeding the same 502 into
+    // the backend-wide machine too let a single failing alias mark the WHOLE
+    // backend down on its first failure, which starved the claim counter
+    // (routing stopped trying the backend, so it never reached its threshold)
+    // and took every sibling model on that backend out with it. When claim
+    // quarantine is active for this exact claim, the claim machine owns the
+    // signal. A backend with claim quarantine disabled, or a model it does not
+    // claim, keeps the full backend-wide 502 signal.
+    const claimOwnsFastFailure = Boolean(candidateModel) &&
+      isFastModelClaimFailure(res.status) &&
+      backend.model_claim_quarantine_threshold > 0 &&
+      backend.supportsModel(candidateModel);
+    const healthy = res.status < 500 || modelContractFailure || claimOwnsFastFailure;
     const qTransition = backend.recordOutcome(healthy, latencyMs, {
       failureClass: recoveryFailureClass,
       authoritativeRecovery: recoveryProbeSucceeded,
@@ -4674,12 +4688,23 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     const claimsHere = candidateModel && typeof backend.supportsModel === "function"
       ? backend.supportsModel(candidateModel)
       : false;
-    const anyClaimer = typeof router.getBackends === "function" && candidateModel
-      ? router.getBackends().some(
+    // A permanent error from one claimer while ANOTHER backend also claims
+    // the id is exact-claim evidence (handled by recordModelClaimOutcome
+    // above), not evidence that the model itself is gone. Counting it toward
+    // the global EOL verdict let one bad door EOL a model a valid door still
+    // serves, the outcome ModelClaimQuarantinedError is documented to avoid.
+    const claimers = typeof router.getBackends === "function" && candidateModel
+      ? router.getBackends().filter(
           (b) => typeof b.supportsModel === "function" && b.supportsModel(candidateModel)
         )
-      : false;
-    recordModelOutcome(candidateModel, { status: res.status, now: Date.now(), claiming: claimsHere || !anyClaimer });
+      : [];
+    const anyClaimer = claimers.length > 0;
+    const anotherClaimer = claimers.some((b) => b !== backend);
+    recordModelOutcome(candidateModel, {
+      status: res.status,
+      now: Date.now(),
+      claiming: (claimsHere && !anotherClaimer) || !anyClaimer,
+    });
 
     // Feed the real completion outcome back into the local-health verdict so a
     // wedged local backend that got past the probe but then hung/errored is

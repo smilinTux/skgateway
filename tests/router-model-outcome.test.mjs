@@ -134,10 +134,17 @@ describe("routeAndSend records model lifecycle outcomes", () => {
     assert.ok(lc.last_verified_at >= before_, "last_verified_at should be set to (approximately) now");
   });
 
-  for (const [label, failingUrl] of [
-    ["404", () => up404.base],
-    ["502", () => up502.base],
-    ["connection-refused", () => "http://127.0.0.1:1/v1"],
+  // Exact-claim quarantine is main's card db431f61 machine
+  // (recordModelClaimOutcome / isModelClaimAvailable / getModelClaimHealth).
+  // Per-attempt client status follows main's failover contract, pinned in
+  // tests/ornith-fast-failure.test.mjs: 502 and a refused connection fail over
+  // to the next claimer, while a 404 on an explicit (non-bucket) model is
+  // terminal and returned. Either way, after three fast failures only the
+  // failing claim is quarantined and routing goes to the live claimer.
+  for (const [label, failingUrl, attemptStatus, attemptBackend] of [
+    ["404", () => up404.base, 404, "dead"],
+    ["502", () => up502.base, 200, "live"],
+    ["connection-refused", () => "http://127.0.0.1:1/v1", 200, "live"],
   ]) {
     test(`repeated ${label} quarantines only the exact backend-model claim`, async () => {
       _resetCacheForTests();
@@ -151,14 +158,16 @@ describe("routeAndSend records model lifecycle outcomes", () => {
 
       for (let i = 0; i < 3; i++) {
         const r = await routeAndSend(router, { model: modelId }, "/chat/completions", "POST", HEADERS, bodyFor(modelId), false);
-        assert.equal(r.status, 200);
-        assert.equal(r.backendId, "live");
+        assert.equal(r.status, attemptStatus);
+        assert.equal(r.backendId, attemptBackend);
       }
 
-      assert.deepEqual(router.getHealth().dead.quarantinedModels, [modelId]);
-      assert.deepEqual(router.getHealth().live.quarantinedModels, []);
+      assert.equal(router.getBackend("dead").getModelClaimHealth(modelId).quarantined, true);
+      assert.equal(router.getBackend("dead").isModelClaimAvailable(modelId), false);
+      assert.equal(router.getBackend("live").getModelClaimHealth(modelId).quarantined, false);
+      assert.equal(router.getBackend("live").isModelClaimAvailable(modelId), true);
       assert.equal(getLifecycle(modelId).state, "active", "another valid claimer prevents global EOL");
-      assert.equal((await router.route({ model: modelId }))[0].backendId, "live");
+      assert.deepEqual((await router.route({ model: modelId })).map((c) => c.backendId), ["live"]);
     });
   }
 
@@ -177,8 +186,9 @@ describe("routeAndSend records model lifecycle outcomes", () => {
     const modelId = `slow-${Date.now()}`;
     const router = createRouter({ backends: { slow: { url: up200.base, auth_type: "none", models: [modelId] } } });
     const backend = router.getBackend("slow");
-    for (let i = 0; i < 3; i++) assert.equal(backend.recordModelStatus(modelId, 504), null);
-    assert.deepEqual(backend.getHealth().quarantinedModels, []);
+    for (let i = 0; i < 3; i++) assert.equal(backend.recordModelClaimOutcome(modelId, 504), null);
+    assert.deepEqual(backend.getModelClaimHealth(modelId), { quarantined: false, failures: 0, retryAt: null });
+    assert.equal(backend.isModelClaimAvailable(modelId), true);
   });
 
   // Store-level fail-soft behavior (a write that throws is swallowed, never
