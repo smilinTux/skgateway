@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Refresh PR96 onto current main so live-pipeline sanitizer and model-limit changes are evaluated against the latest gateway code.
+
 - Add immutable runtime bundle tooling (`scripts/runtime-bundle/`): build a
   versioned, reproducible bundle of source plus pinned runtime with a
   checksum manifest (`build-immutable-bundle.sh`), verify an existing
