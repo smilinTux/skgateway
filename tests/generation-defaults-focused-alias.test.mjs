@@ -1,5 +1,5 @@
 /**
- * generation-defaults-focused-alias.test.mjs — src/index.mjs:
+ * generation-defaults-focused-alias.test.mjs: src/index.mjs
  * applyGenerationDefaults() and applyFocusedAliasMetadata() (chi port,
  * inventory item 5).
  *

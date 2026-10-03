@@ -1,11 +1,11 @@
 /**
- * qualification-class-floor.test.mjs — src/policy/buckets.mjs:
+ * qualification-class-floor.test.mjs: src/policy/buckets.mjs,
  * effectiveQualifiedClass() and meetsClassFloor()'s reviewed-qualification
  * integration (chi port, inventory item 3).
  *
  * A reviewed qualification result can LOWER a model's effective class (it is
  * evidence against the declared prior) but never raise it, and any malformed
- * or expired evidence fails closed for generic bucket membership — a focused
+ * or expired evidence fails closed for generic bucket membership; a focused
  * provider route (`applyReviewedQualification: false`, resolveBucket's
  * default for `bucket.provider` truthy) is unaffected either way.
  *

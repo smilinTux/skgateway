@@ -1,5 +1,5 @@
 /**
- * generic-participation.mjs — strict, hot-reloadable generic bucket
+ * generic-participation.mjs: strict, hot-reloadable generic bucket
  * participation policy.
  *
  * Generic S, M and L buckets are open to every routable provider by default.
