@@ -337,6 +337,52 @@ describe("cost tracking — per-request cost from tokens × price (card 9bbcd420
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  test("OpenAI cached prompt tokens use the cache-read rate only", () => {
+    const dir = mkdtempSync(join(tmpdir(), "skgw-cache-cost-"));
+    let collector;
+    try {
+      collector = createMetricsCollector(metricsCfg(dir));
+      feedCost(collector, {
+        agentId: "lumina", model: "claude-sonnet-4-6",
+        usage: {
+          prompt_tokens: 1_000_000,
+          completion_tokens: 0,
+          prompt_tokens_details: { cached_tokens: 800_000 },
+        },
+      });
+      const row = collector.getCosts({ agentId: "lumina" })[0];
+      assert.ok(Math.abs(row.input_cost - 0.6) < 1e-9);
+      assert.ok(Math.abs(row.cache_read_cost - 0.24) < 1e-9);
+      assert.ok(Math.abs(row.total_cost - 0.84) < 1e-9);
+    } finally {
+      collector?.close?.();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("streamed OpenAI usage is retained for token and cost sensing", () => {
+    const dir = mkdtempSync(join(tmpdir(), "skgw-stream-cost-"));
+    let collector;
+    try {
+      collector = createMetricsCollector(metricsCfg(dir));
+      const reqId = collector.recordRequest({ agentId: "lumina", model: "claude-sonnet-4-6" });
+      const sse = Buffer.from([
+        'data: {"model":"served","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}',
+        'data: {"model":"served","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      collector.recordResponse({ reqId, statusCode: 200, responseBody: sse });
+      collector.flush();
+      const row = collector.db.prepare("SELECT * FROM token_usage WHERE req_id = ?").get(reqId);
+      assert.equal(row.input_tokens, 10);
+      assert.equal(row.output_tokens, 5);
+    } finally {
+      collector?.close?.();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("cost tracking — per-agent / per-model aggregation (card 9bbcd420)", () => {
