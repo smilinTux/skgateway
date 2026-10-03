@@ -17,7 +17,7 @@ import { createRouter, routeAndSend, startKimiAuthKeepalive } from "./proxy/rout
 import { normalizeSystemMessageOrder, sanitizeResponse } from "./proxy/sanitizer.mjs";
 import { applyCapacityView, availabilityState, buildModelCatalog, reconcileModeFromConfig, tagLocalModels, mergeDiscoveredCatalog, isModelAvailable, excludedModelIds, withoutExcludedModels } from "./proxy/advertise.mjs";
 import { loadAllowlist, saveAllowlist, applyAllowlist } from "./advertise.mjs";
-import { discoverCatalog, loadCache, saveCache, fetchNvidia, fetchOpenRouter, fetchOpencode, fetchAnthropicWrapper, fetchCodex, fetchZai, catalogStatus, loadCardOverrides, applyCardOverlays, buildServingCatalog } from "./discovery.mjs";
+import { discoverCatalog, loadCache, saveCache, fetchNvidia, fetchOpenRouter, fetchOpencode, fetchAnthropicWrapper, fetchCodex, fetchZai, fetchDeepSeek, catalogStatus, loadCardOverrides, applyCardOverlays, buildServingCatalog } from "./discovery.mjs";
 import { getPool, resetPool } from "./proxy/connection-pool.mjs";
 import { loadAgentRegistry, extractIdentity, normalizeAgentId, ANONYMOUS_AGENT_ID } from "./identity/capauth.mjs";
 import { ClientAuthenticator, classifyAuthenticationRoute, stripCallerCredentials, stripCredentialQuery } from "./identity/client-auth.mjs";
@@ -709,6 +709,13 @@ export async function refreshCatalog(cfg, discoverCatalogFn = discoverCatalog) {
   const codexCreds = cfg.backends?.codex?.credentials_path || cfg.backends?.codex?.credentials_file;
   const zaiEnabled = d.providers?.zai?.enabled === true && Boolean(cfg.backends?.zai);
   const zaiCreds = cfg.backends?.zai?.credentials_path || cfg.backends?.zai?.credentials_file || ZAI_CREDENTIALS_PATH;
+  // DeepSeek: same opt-in rule as zai/opencode/codex above (`=== true`, not
+  // `!== false`) and the same same-named-backend gate: a provider without
+  // backends.deepseek never makes a network call. The credential is read
+  // only through the backend's api_key_env name (default DEEPSEEK_API_KEY);
+  // it is used to build the authorization header but never logged.
+  const deepseekEnabled = d.providers?.deepseek?.enabled === true && Boolean(cfg.backends?.deepseek);
+  const deepseekKey = process.env[cfg.backends?.deepseek?.api_key_env || "DEEPSEEK_API_KEY"];
   const nvidiaKey = process.env[cfg.backends?.nvidia?.api_key_env || "NVIDIA_API_KEY"];
   const openrouterKey = process.env[cfg.backends?.openrouter?.api_key_env || "OPENROUTER_API_KEY"];
   const { models } = await discoverCatalogFn({
@@ -729,6 +736,9 @@ export async function refreshCatalog(cfg, discoverCatalogFn = discoverCatalog) {
       : async () => ({ models: [] }),
     zaiFetch: zaiEnabled
       ? () => fetchZai(readZaiAuthHeaders(zaiCreds))
+      : async () => ({ data: [] }),
+    deepseekFetch: deepseekEnabled
+      ? async () => fetchDeepSeek(deepseekKey ? { authorization: `Bearer ${deepseekKey}` } : {})
       : async () => ({ data: [] }),
     cache: _discoveryCache,
     probeSeconds: d.probe_seconds || 0,
@@ -766,6 +776,17 @@ export async function refreshCatalog(cfg, discoverCatalogFn = discoverCatalog) {
       ok: zaiProvider?.ok !== false,
       stale: zaiProvider?.ok === false,
       at: zaiProvider?.lastAttemptAt || Date.now(),
+    });
+  }
+  // Same absence-record for DeepSeek, mirroring the zai block above: a
+  // declared model list with no discovered DeepSeek models still records the
+  // attempt outcome so pending becomes attributable failed/stale.
+  const deepseekProvider = _discoveryCache.providers?.deepseek;
+  if (cfg.backends?.deepseek && !models.some((m) => m.provider === "deepseek")) {
+    router.registerDiscoveredModels?.("deepseek", [], {
+      ok: deepseekProvider?.ok !== false,
+      stale: deepseekProvider?.ok === false,
+      at: deepseekProvider?.lastAttemptAt || Date.now(),
     });
   }
   saveCache(_discoveryCache);

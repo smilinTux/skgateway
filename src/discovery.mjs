@@ -62,6 +62,7 @@ import * as opencodeAdapter from './discovery/providers/opencode.mjs';
 import * as anthropicWrapperAdapter from './discovery/providers/anthropic-wrapper.mjs';
 import * as codexAdapter from './discovery/providers/codex.mjs';
 import * as zaiAdapter from './discovery/providers/zai.mjs';
+import * as deepseekAdapter from './discovery/providers/deepseek.mjs';
 import {
   probeModels,
   DEFAULT_PROBE_BUDGET,
@@ -404,9 +405,9 @@ export function applyCardOverlays(models, overrides) {
   return models.map((m) => applyCardOverlay(m, overrides));
 }
 
-export function mergeCatalog(local, nvidia, openrouter, opencode, anthropic, codex, zai) {
+export function mergeCatalog(local, nvidia, openrouter, opencode, anthropic, codex, zai, deepseek) {
   const seen = new Map();
-  for (const group of [local || [], nvidia || [], openrouter || [], opencode || [], anthropic || [], codex || [], zai || []]) {
+  for (const group of [local || [], nvidia || [], openrouter || [], opencode || [], anthropic || [], codex || [], zai || [], deepseek || []]) {
     for (const m of group) {
       if (!seen.has(m.id)) seen.set(m.id, m);
     }
@@ -671,6 +672,13 @@ export async function fetchZai(authHeaders) {
   return zaiAdapter.fetch(authHeaders);
 }
 
+// DeepSeek (api.deepseek.com): named export matching fetchZai above; the
+// production call site (src/index.mjs) wires it when the deepseek backend is
+// enabled, same opt-in pattern as codex/opencode.
+export async function fetchDeepSeek(authHeaders) {
+  return deepseekAdapter.fetch(authHeaders);
+}
+
 /**
  * Record the outcome of one provider's fetch cycle onto the cache so the
  * freshness endpoint can report per-provider health (last success, last error,
@@ -845,6 +853,7 @@ export async function discoverCatalog(opts) {
     // "outage"; pre-existing tests must not flip stale).
     codexFetch = async () => ({ models: [] }),
     zaiFetch = async () => ({ data: [] }),
+    deepseekFetch = async () => ({ data: [] }),
     cache = {},
     now = Date.now,
     // Card P1.3: where the shared model lifecycle store (model_catalog_store.mjs)
@@ -936,12 +945,14 @@ export async function discoverCatalog(opts) {
   let anthropic = [];
   let codex = [];
   let zai = [];
+  let deepseek = [];
   let nvidiaOk = false;
   let openrouterOk = false;
   let opencodeOk = false;
   let anthropicOk = false;
   let codexOk = false;
   let zaiOk = false;
+  let deepseekOk = false;
   try {
     // Card P2.1: normalize() (not the legacy parseNvidia()) so the merged
     // catalog carries the full ModelCard, not just the id.
@@ -1011,6 +1022,16 @@ export async function discoverCatalog(opts) {
     stale = true;
     zai = (cache.models || []).filter((m) => m.provider === 'zai');
     recordProvider(cache, 'zai', { ok: false, count: zai.length, at, error: String(e?.message || e) });
+  }
+
+  try {
+    deepseek = deepseekAdapter.normalize(await deepseekFetch(), { now: () => at });
+    deepseekOk = true;
+    recordProvider(cache, 'deepseek', { ok: true, count: deepseek.length, at });
+  } catch (e) {
+    stale = true;
+    deepseek = (cache.models || []).filter((m) => m.provider === 'deepseek');
+    recordProvider(cache, 'deepseek', { ok: false, count: deepseek.length, at, error: String(e?.message || e) });
   }
 
   // Catalog-absence tracking (card P1.3): only a REAL live fetch is evidence
@@ -1083,7 +1104,17 @@ export async function discoverCatalog(opts) {
         );
         updated = { ...updated, ...reconciled };
       }
-      if (nvidiaOk || openrouterOk || opencodeOk || anthropicOk || codexOk || zaiOk) saveLifecycleStore(updated, lifecycleStorePath);
+      if (deepseekOk) {
+        const reconciled = reconcilePresence(
+          sliceByProvider(fullStore, 'deepseek', declaredModels?.deepseek ?? declaredModelsFor('deepseek')),
+          deepseek.map((m) => m.id),
+          'deepseek',
+          at,
+          thresholds,
+        );
+        updated = { ...updated, ...reconciled };
+      }
+      if (nvidiaOk || openrouterOk || opencodeOk || anthropicOk || codexOk || zaiOk || deepseekOk) saveLifecycleStore(updated, lifecycleStorePath);
     } catch {
       // fail-soft, see doc comment above.
     }
@@ -1164,7 +1195,7 @@ export async function discoverCatalog(opts) {
     ? localModels.filter((m) => m.provider !== 'anthropic' && m.provider !== 'anthropic-direct')
     : localModels;
   const models = applyCardOverlays(
-    mergeCatalog(effectiveLocal, nvidia, openrouter, opencode, anthropic, codex, zai),
+    mergeCatalog(effectiveLocal, nvidia, openrouter, opencode, anthropic, codex, zai, deepseek),
     overrides,
   ).map((m) => ({ ...m, stale }));
   cache.models = models;

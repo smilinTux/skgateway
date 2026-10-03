@@ -173,6 +173,67 @@ describe("card C3: refreshCatalog wires discovery.probe_* into discoverCatalog",
     assert.equal(typeof captured.zaiFetch, "function");
   });
 
+  // ── Same class of bug, DeepSeek: a provider without backends.deepseek (or
+  // without discovery.providers.deepseek.enabled) must never make a network
+  // call, but setting both must genuinely reach discoverCatalog.
+
+  test("deepseek stays OFF unless explicitly enabled", async () => {
+    for (const discovery of [
+      { enabled: true, providers: {} },
+      { enabled: true, providers: { deepseek: { enabled: false } } },
+    ]) {
+      let captured = null;
+      const spy = async (opts) => { captured = opts; return { models: [] }; };
+      await mod.refreshCatalog({ backends: {}, discovery }, spy);
+      assert.deepEqual(await captured.deepseekFetch(), { data: [] });
+    }
+  });
+
+  test("deepseek enabled but with no backends.deepseek entry still stays OFF", async () => {
+    let captured = null;
+    const spy = async (opts) => { captured = opts; return { models: [] }; };
+    await mod.refreshCatalog({
+      backends: {},
+      discovery: { enabled: true, providers: { deepseek: { enabled: true } } },
+    }, spy);
+    assert.deepEqual(await captured.deepseekFetch(), { data: [] });
+  });
+
+  test("deepseek enabled with a backend entry forwards a real fetch function", async () => {
+    let captured = null;
+    const spy = async (opts) => { captured = opts; return { models: [] }; };
+    await mod.refreshCatalog({
+      backends: { deepseek: { api_key_env: "DEEPSEEK_API_KEY" } },
+      discovery: { enabled: true, providers: { deepseek: { enabled: true } } },
+    }, spy);
+    assert.equal(typeof captured.deepseekFetch, "function");
+  });
+
+  test("deepseek fetch builds the bearer header from the configured api_key_env, never a hardcoded name", async () => {
+    const original = process.env.MY_DEEPSEEK_KEY;
+    process.env.MY_DEEPSEEK_KEY = "synthetic-key";
+    try {
+      let captured = null;
+      const spy = async (opts) => { captured = opts; return { models: [] }; };
+      await mod.refreshCatalog({
+        backends: { deepseek: { api_key_env: "MY_DEEPSEEK_KEY" } },
+        discovery: { enabled: true, providers: { deepseek: { enabled: true } } },
+      }, spy);
+      const originalFetch = globalThis.fetch;
+      let seenHeaders;
+      globalThis.fetch = async (_url, opts) => { seenHeaders = opts.headers; return { ok: true, json: async () => ({ data: [] }) }; };
+      try {
+        await captured.deepseekFetch();
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+      assert.equal(seenHeaders.authorization, "Bearer synthetic-key");
+    } finally {
+      if (original === undefined) delete process.env.MY_DEEPSEEK_KEY;
+      else process.env.MY_DEEPSEEK_KEY = original;
+    }
+  });
+
   test("opencode stays OFF when the config does not opt in, and OFF means an empty stub not a live call", async () => {
     for (const discovery of [
       { enabled: true, providers: {} },
