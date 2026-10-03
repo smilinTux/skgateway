@@ -225,7 +225,10 @@ CREATE TABLE IF NOT EXISTS request_log (
   backend_node     TEXT,            -- backend ID (e.g., chiap08-qwen38)
   requested_model  TEXT,            -- model the caller asked for (same as model)
   served_model     TEXT,            -- model the upstream actually served (same as model_served)
-  runtime_revision TEXT             -- readiness:discovery revision tuple
+  runtime_revision TEXT,            -- readiness:discovery revision tuple
+  queue_wait_ms INTEGER,            -- NULL means queue wait was not observed
+  inflight_concurrency INTEGER,      -- NULL means admission concurrency was not observed
+  admission_outcome TEXT            -- admitted | queue_full | queue_timeout | cancelled | denied
 );
 
 CREATE TABLE IF NOT EXISTS token_usage (
@@ -369,6 +372,11 @@ function migrate(db) {
   ensureColumn(db, 'request_log', 'requested_model', 'TEXT');
   ensureColumn(db, 'request_log', 'served_model', 'TEXT');
   ensureColumn(db, 'request_log', 'runtime_revision', 'TEXT');
+  ensureColumn(db, 'request_log', 'queue_wait_ms', 'INTEGER');
+  ensureColumn(db, 'request_log', 'inflight_concurrency', 'INTEGER');
+  ensureColumn(db, 'request_log', 'admission_outcome', 'TEXT');
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_request_queue_aggregate
+    ON request_log (admission_outcome, started_at)`);
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -559,6 +567,9 @@ export function createMetricsCollector(config) {
             requested_model = COALESCE(@requested_model, requested_model),
             served_model = COALESCE(@served_model, served_model),
             runtime_revision = COALESCE(@runtime_revision, runtime_revision),
+            queue_wait_ms = @queue_wait_ms,
+            inflight_concurrency = @inflight_concurrency,
+            admission_outcome = @admission_outcome,
             error_msg = @error_msg,
             backend = COALESCE(@backend, backend),
             model_served = COALESCE(@model_served, model_served)
@@ -837,6 +848,38 @@ export function createMetricsCollector(config) {
    * signal (empty means quiesced). ponytail: linear scan of the pending map,
    * bounded by concurrent requests; index it if fleets exceed hundreds.
    */
+  /** Reconstruct durable queue totals without inventing pre-telemetry zeros. */
+  function durableQueueStats() {
+    if (!db) return { available: false, reason: 'metrics_database_unavailable' };
+    try {
+      maybeFlush(true);
+      const row = db.prepare(`
+        SELECT MIN(started_at) AS observed_from, COUNT(*) AS observed_requests,
+          SUM(admission_outcome = 'admitted') AS processed,
+          SUM(admission_outcome IN ('queue_full', 'denied', 'local_admission_denial')) AS rejected,
+          SUM(admission_outcome = 'queue_timeout') AS timed_out,
+          SUM(admission_outcome = 'cancelled' OR terminal_state = 'cancelled') AS cancelled,
+          SUM(queue_wait_ms) AS queue_wait_ms, COUNT(queue_wait_ms) AS queue_wait_samples,
+          MAX(inflight_concurrency) AS peak_concurrency
+        FROM request_log INDEXED BY idx_request_queue_aggregate
+        WHERE admission_outcome IS NOT NULL
+      `).get();
+      if (!row || row.observed_requests === 0) return {
+        available: true, observedFrom: null, observedRequests: 0,
+        processed: null, rejected: null, timedOut: null, cancelled: null,
+        queueWaitMs: null, queueWaitSamples: 0, peakConcurrency: null,
+      };
+      return {
+        available: true, observedFrom: row.observed_from, observedRequests: row.observed_requests,
+        processed: row.processed, rejected: row.rejected, timedOut: row.timed_out,
+        cancelled: row.cancelled, queueWaitMs: row.queue_wait_ms,
+        queueWaitSamples: row.queue_wait_samples, peakConcurrency: row.peak_concurrency,
+      };
+    } catch (error) {
+      return { available: false, reason: 'metrics_database_query_failed', error: error.message };
+    }
+  }
+
   function inFlightRequests() {
     const now = Date.now();
     return [...pending.entries()].map(([id, p]) => ({
@@ -898,6 +941,9 @@ export function createMetricsCollector(config) {
     backend: backendOverride,
     sessionId: sessionOverride,
     attribution,
+    queueWaitMs,
+    inflightConcurrency,
+    admissionOutcome,
   } = {}) {
     const orig = pending.get(reqId) ?? {};
     pending.delete(reqId);
@@ -1037,6 +1083,11 @@ export function createMetricsCollector(config) {
         requested_model:  (typeof model === 'string' && model) ? model : null,
         served_model:     (typeof modelServed === 'string' && modelServed) ? modelServed : null,
         runtime_revision: (typeof attribution?.runtimeRevision === 'string' && attribution.runtimeRevision) ? attribution.runtimeRevision : null,
+        queue_wait_ms: Number.isFinite(queueWaitMs) && queueWaitMs >= 0 ? Math.round(queueWaitMs) : null,
+        inflight_concurrency: Number.isInteger(inflightConcurrency) && inflightConcurrency >= 0
+          ? inflightConcurrency : null,
+        admission_outcome: typeof admissionOutcome === 'string' && admissionOutcome
+          ? admissionOutcome : null,
         error_msg: errorMsg ?? null,
         // The serving backend, which is only knowable AFTER dispatch. The
         // insert above runs before routing resolves and can only write NULL
@@ -1365,6 +1416,7 @@ export function createMetricsCollector(config) {
     recordRequest,
     recordResponse,
     recordEnergy,
+    durableQueueStats,
     inFlightRequests,
     getStats,
     getAnomalies,
