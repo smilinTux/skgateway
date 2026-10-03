@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add immutable runtime bundle tooling (`scripts/runtime-bundle/`): build a
+  versioned, reproducible bundle of source plus pinned runtime with a
+  checksum manifest (`build-immutable-bundle.sh`), verify an existing
+  bundle's integrity (`verify-bundle.sh`), prove two builds from the same
+  commit are byte-identical (`test-reproducibility.sh`), generate a
+  multi-instance deployment manifest (`generate-deployment-manifest.sh`),
+  and bundle the Python SKCounter service the same way
+  (`build-skcounter-bundle.sh`). Addresses gateway instances running from a
+  single mutable shared directory, which carries drift risk and no
+  rollback path. See `docs/runtime-bundle-architecture.md` and
+  `scripts/runtime-bundle/README.md`. Card `8f2d6a10`.
+
 ### Fixed
 
 - Gateway config activation now validates and hashes one immutable config
