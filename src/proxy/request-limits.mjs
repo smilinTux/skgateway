@@ -1,5 +1,5 @@
 /**
- * request-limits.mjs — explicit transport byte bounds for proxied requests.
+ * request-limits.mjs: explicit transport byte bounds for proxied requests.
  *
  * Unlike the trim-based model limits applied earlier in the request path
  * (src/index.mjs, "model limits"), these bounds never edit the client's

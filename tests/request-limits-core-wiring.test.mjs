@@ -1,18 +1,18 @@
 /**
- * request-limits-core-wiring.test.mjs — handleRequest()'s explicit byte-limit
+ * request-limits-core-wiring.test.mjs: handleRequest()'s explicit byte-limit
  * gate (src/proxy/core.mjs), wired on top of request-limits.mjs.
  *
  * Covers:
- *   1. happy path  — a small request within every configured limit passes
+ *   1. happy path: a small request within every configured limit passes
  *      through to the upstream untouched.
- *   2. edge case   — a tool-heavy request that is over the system-byte limit
- *      only because of its tool definitions is NOT rejected outright: the
+ *   2. edge case: a tool-heavy request that is over the system-byte limit
+ *      only because of its tool definitions is NOT rejected outright. The
  *      gateway reduces to the proactive tool budget and re-checks, the
  *      "reduced-tools retry" described in the chi port brief.
- *   3. failure case — a request still over limit after the reduction retry
+ *   3. failure case: a request still over limit after the reduction retry
  *      (because its conversation history itself is oversized, not its
  *      tools) gets a 413 with the original history intact (no upstream call).
- *   4. failure case — ingress-level rejection: a body that exceeds every
+ *   4. failure case: ingress-level rejection. A body that exceeds every
  *      configured model's ceiling is rejected while still streaming in,
  *      before it is ever parsed.
  *

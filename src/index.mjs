@@ -2151,7 +2151,7 @@ export const server = http.createServer(async (req, res) => {
     // The model isn't known yet, so ingressRequestLimit() admits the largest
     // body any configured model is allowed to send; the explicit per-model
     // byte limits (request-limits.mjs, same transport ceiling used by
-    // core.mjs/handleRequest) are not re-applied here once parsed — the
+    // core.mjs/handleRequest) are not re-applied here once parsed: the
     // existing model-limits trim below (card 080e032e) already bounds the
     // conversation that reaches a backend. This is a DoS-style backstop
     // against a body too large for any model to admit at all.

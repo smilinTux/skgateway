@@ -1,5 +1,5 @@
 /**
- * request-limits.test.mjs — Unit tests for src/proxy/request-limits.mjs
+ * request-limits.test.mjs: unit tests for src/proxy/request-limits.mjs
  *
  * Explicit transport byte bounds on the request body and the system/developer
  * message slice of it. Unlike the existing trim-based model limits (card

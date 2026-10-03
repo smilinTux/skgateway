@@ -1,5 +1,5 @@
 /**
- * request-limits-ingress-live.test.mjs — explicit ingress byte limit on the
+ * request-limits-ingress-live.test.mjs: explicit ingress byte limit on the
  * LIVE request path (src/index.mjs, the production entrypoint).
  *
  * src/proxy/core.mjs's handleRequest() is NOT the live path (see
@@ -10,10 +10,10 @@
  * real effect in production rather than only existing in an unused module.
  *
  * Coverage:
- *   1. happy path  — a small request passes through to the upstream.
- *   2. failure case — a body larger than every configured model's ceiling is
+ *   1. happy path: a small request passes through to the upstream.
+ *   2. failure case: a body larger than every configured model's ceiling is
  *      rejected (413, request_too_large) while still streaming in.
- *   3. failure case — a per-model sanitizer override still rejects an
+ *   3. failure case: a per-model sanitizer override still rejects an
  *      oversized body (the ingress ceiling tracks config, not a hardcoded
  *      constant).
  *
