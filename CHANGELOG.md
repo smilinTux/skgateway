@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add a governed, versioned realtime observation contract (`skgateway.observation.v1`) for SKDashboard, with bounded field sizes, a forbidden-field guard against raw prompts, responses, credentials, and other sensitive data, and an explicit `gateway_observed`/`harness_reported` lane distinction.
+
 - Preserve usage-derived cost accounting for streamed (SSE) responses by parsing a buffered or string response body for the trailing usage event, and account for OpenAI-style cached prompt tokens (`prompt_tokens_details.cached_tokens`) as cache-read tokens instead of double-counting them as fresh input.
 - The npm publish workflow now also runs for `skgateway-v*` release tags (the tag namespace since
   skgateway-v1.0.0) and can be dispatched by hand for an existing release tag, which must be reachable
