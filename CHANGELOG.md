@@ -44,6 +44,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reduce to the proactive tool budget and recheck before rejecting. Tests in
   `tests/request-limits.test.mjs`, `tests/request-limits-core-wiring.test.mjs`,
   `tests/request-limits-ingress-live.test.mjs`.
+- Add DeepSeek provider discovery (`src/discovery/providers/deepseek.mjs`,
+  same adapter shape as zai/opencode), opt-in via
+  `discovery.providers.deepseek.enabled: true` and a `backends.deepseek`
+  entry. `hasValidUsage()` accepts DeepSeek's `prompt_cache_hit_tokens`/
+  `prompt_cache_miss_tokens` usage keys, and a non-final SSE chunk's
+  top-level `usage: null` now validates like an omitted key, same tolerance
+  already given to the nested `prompt_tokens_details`/
+  `completion_tokens_details` blocks. Tests in
+  `tests/providers-deepseek.test.mjs`, `tests/discovery.test.mjs`,
+  `tests/refresh-catalog-probe-wiring.test.mjs`,
+  `tests/deepseek-usage-contract.test.mjs`.
 
 ### Fixed
 
