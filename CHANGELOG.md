@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 - Preserve usage-derived cost accounting for streamed (SSE) responses by parsing a buffered or string response body for the trailing usage event, and account for OpenAI-style cached prompt tokens (`prompt_tokens_details.cached_tokens`) as cache-read tokens instead of double-counting them as fresh input.
+- The npm publish workflow now also runs for `skgateway-v*` release tags (the tag namespace since
+  skgateway-v1.0.0) and can be dispatched by hand for an existing release tag, which must be reachable
+  from `main`. Before this, `skgateway-v1.0.0` was tagged but never published.
 
 - Add a daily DELIVERY metric (card 3520f9e8), derived from live sources (git remote, request database, card store) rather than self-reported card status, covering PRs opened and merged, cards created and completed, rows written, deliverables verified, and the sprint denominator.
 
