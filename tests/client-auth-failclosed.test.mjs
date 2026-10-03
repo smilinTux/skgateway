@@ -33,7 +33,7 @@ test('client_auth enabled is fail-closed before routing', async (t) => {
   const credPath = join(dir, 'credentials.json');
   const auditPath = join(dir, 'audit.jsonl');
   writeRegistry(credPath, [
-    { agent_id: 'jarvis', client_id: 'chiap02-pi', hash: tokenHash, revision: 'r1' },
+    { agent_id: 'jarvis', client_id: 'site-b-pi', hash: tokenHash, revision: 'r1' },
   ], 'estate-r1');
 
   const configPath = join(dir, 'gateway.yaml');
@@ -90,7 +90,7 @@ test('client_auth enabled is fail-closed before routing', async (t) => {
     const h = {
       'content-type': 'application/json',
       'x-agent-id': 'jarvis',
-      'x-sk-client-id': 'chiap02-pi',
+      'x-sk-client-id': 'site-b-pi',
       'x-sk-credential-revision': rev,
     };
     if (tok) h.authorization = BEARER + tok;
@@ -103,7 +103,7 @@ test('client_auth enabled is fail-closed before routing', async (t) => {
   assert.equal((await fetch(`${base}/health`)).status, 200, 'health must be public');
   assert.equal((await post({ 'content-type': 'application/json' })).status, 401, 'anonymous must be denied');
   assert.equal((await post({
-    'content-type': 'application/json', 'x-agent-id': 'jarvis', 'x-sk-client-id': 'chiap02-pi',
+    'content-type': 'application/json', 'x-agent-id': 'jarvis', 'x-sk-client-id': 'site-b-pi',
     authorization: BEARER + token,
   })).status, 401, 'missing revision must be denied');
   assert.equal((await post({ ...headersFor(token, 'r1'), 'x-agent-id': 'other-agent' })).status, 401, 'wrong agent must be denied');
@@ -111,14 +111,14 @@ test('client_auth enabled is fail-closed before routing', async (t) => {
   assert.equal((await post(headersFor(token, 'r1'))).status, 200, 'valid credentials must pass');
 
   writeRegistry(credPath, [
-    { agent_id: 'jarvis', client_id: 'chiap02-pi', hash: tokenHash, revision: 'r2', revoked: true },
+    { agent_id: 'jarvis', client_id: 'site-b-pi', hash: tokenHash, revision: 'r2', revoked: true },
   ], 'estate-r2');
   child.kill('SIGHUP');
   await new Promise((r) => setTimeout(r, 300));
   assert.equal((await post(headersFor(token, 'r2'))).status, 401, 'revoked credential must be denied');
 
   writeRegistry(credPath, [
-    { agent_id: 'jarvis', client_id: 'chiap02-pi', hash: tokenHash, revision: 'r2', expires_at: '2020-01-01T00:00:00.000Z' },
+    { agent_id: 'jarvis', client_id: 'site-b-pi', hash: tokenHash, revision: 'r2', expires_at: '2020-01-01T00:00:00.000Z' },
   ], 'estate-r3');
   child.kill('SIGHUP');
   await new Promise((r) => setTimeout(r, 300));
