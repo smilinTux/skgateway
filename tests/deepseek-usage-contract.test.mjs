@@ -1,5 +1,5 @@
 /**
- * deepseek-usage-contract.test.mjs — response-contract.mjs reconciliation for
+ * deepseek-usage-contract.test.mjs: response-contract.mjs reconciliation for
  * chi's unmerged DeepSeek usage support (inventory item 7), rebased onto
  * main's already-merged explicit-null tolerance (6e684df/d094be9) instead of
  * copying chi's older response-contract.mjs/stream.mjs, which predate that
@@ -8,7 +8,7 @@
  * Covers the two behaviors actually added here:
  *   1. DeepSeek's prompt_cache_hit_tokens/prompt_cache_miss_tokens usage keys
  *      are accepted (happy path), while an unrelated unknown key is still
- *      rejected (failure case) — the allowlist grew, it did not open up.
+ *      rejected (failure case): the allowlist grew, it did not open up.
  *   2. An explicit top-level `usage: null` on a non-final SSE chunk is
  *      treated as "no usage yet", not malformed evidence (edge case),
  *      extending the same null==absent tolerance the G1 fix already gives
