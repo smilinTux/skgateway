@@ -1,5 +1,5 @@
 /**
- * generic-participation.test.mjs — src/policy/generic-participation.mjs
+ * generic-participation.test.mjs: src/policy/generic-participation.mjs
  *
  * Port of chi's unmerged generic bucket participation policy (ab1608f9).
  * Covers the pure value layer: normalizeGenericParticipation() (schema

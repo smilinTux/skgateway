@@ -1,5 +1,5 @@
 /**
- * generic-weighted-selection.test.mjs — src/policy/buckets.mjs:
+ * generic-weighted-selection.test.mjs: src/policy/buckets.mjs,
  * orderMembersByGenericWeight() (chi port, inventory item 3).
  *
  * Weighted ticket selection across providers inside an open generic S/M/L

@@ -1,11 +1,11 @@
 /**
- * generic-bucket-router-integration.test.mjs — router.mjs integration for
+ * generic-bucket-router-integration.test.mjs: router.mjs integration for
  * chi's unmerged generic bucket policy wiring (inventory item 6):
  *
  *   1. `routing.bucket_excluded_models` removes a model from GENERIC bucket
  *      membership, and the exclusion survives a simulated discovery refresh
- *      (the catalog cache is rewritten with the excluded model still present
- *      — it must stay excluded because the config fence is re-applied on
+ *      (the catalog cache is rewritten with the excluded model still present;
+ *      it must stay excluded because the config fence is re-applied on
  *      every resolve, not baked into a one-time lifecycle flag).
  *   2. A generic bucket's member ordering actually uses
  *      `routing.generic_participation`'s weights end to end through
