@@ -374,18 +374,29 @@ const _FRESH_PROVIDER_SOURCES = new Set(["openrouter", "models.dev"]);
 
 export function applyCardOverlay(model, overrides) {
   const override = overrides && overrides[model.id];
+  const existingCard = model.card || {};
+  // Cost is derived from the card tier, never from provider names. Preserve
+  // every other classification field, including trust and data handling.
+  // This correction also applies to fresh provider cards: their metadata is
+  // authoritative, but a stale free flag must not contradict their tier.
+  if (existingCard.tier === 'paid-cloud' && model.free !== false) {
+    model = { ...model, free: false };
+  }
   if (!override) return model;
   const src = model.card && model.card.source;
   // Never clobber a live provider's authoritative card.
   if (src && _FRESH_PROVIDER_SOURCES.has(src)) return model;
-  return {
-    ...model,
-    card: {
-      ...(model.card || {}),
-      ...override,
-      source: 'manual',
-    },
+  const card = {
+    ...(model.card || {}),
+    ...override,
+    source: 'manual',
   };
+  // Cost is a card fact, not a provider-name heuristic.  Configured models
+  // start as free when their backend is otherwise unknown; a curated
+  // paid-cloud tier must correct that declaration while leaving trust-zone,
+  // data-handling, and provider-purity fields untouched.
+  const free = card.tier === 'paid-cloud' ? false : model.free;
+  return { ...model, free, card };
 }
 
 /** Apply the manual overlay across a whole merged catalog (card P2.2). */

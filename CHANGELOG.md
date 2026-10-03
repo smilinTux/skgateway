@@ -177,6 +177,7 @@ provider routing, bucket, and admission work recorded below.
 - Add public provider-focused S, M, and L routing aliases for Z.ai, Kimi,
   and Codex while preserving health-gated generic bucket failover. Cursor
   aliases remain unadvertised until its transport adapter is qualified.
+- Derive the catalog `free` flag from curated paid-cloud card metadata, so a model carded as `paid-cloud` is always classified as paid even when a stale or default `free` value would otherwise contradict its tier (fixes Kimi showing as free).
 - Persist provider-neutral request attribution with explicit unknown values for client, application, route, rail, provider, backend node, requested model, served model, and runtime revision.
 
 ### Added
