@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Gateway config activation now validates and hashes one immutable config
+  snapshot before binding, drains the prior listener with a bounded
+  fail-closed rollback, and records listener PID and revision continuity
+  evidence.
+
 - Add a governed, versioned realtime observation contract (`skgateway.observation.v1`) for SKDashboard, with bounded field sizes, a forbidden-field guard against raw prompts, responses, credentials, and other sensitive data, and an explicit `gateway_observed`/`harness_reported` lane distinction.
 
 - Preserve usage-derived cost accounting for streamed (SSE) responses by parsing a buffered or string response body for the trailing usage event, and account for OpenAI-style cached prompt tokens (`prompt_tokens_details.cached_tokens`) as cache-read tokens instead of double-counting them as fresh input.
@@ -305,11 +312,6 @@ provider routing, bucket, and admission work recorded below.
 
 - Bucket diagnostics now distinguish lifecycle exclusions from temporary
   capacity exclusions and report a sanitized capacity reason and retry time.
-
-- Gateway config activation now validates and hashes one immutable config
-  snapshot before binding, drains the prior listener with a bounded
-  fail-closed rollback, and records listener PID and revision continuity
-  evidence.
 
 - Request classifier input is bounded (8K head + 2K tail per message).
   A single 420KB message drove catastrophic regex behavior in the heuristic
