@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Preserve usage-derived cost accounting for streamed (SSE) responses by parsing a buffered or string response body for the trailing usage event, and account for OpenAI-style cached prompt tokens (`prompt_tokens_details.cached_tokens`) as cache-read tokens instead of double-counting them as fresh input.
+
 - Add a daily DELIVERY metric (card 3520f9e8), derived from live sources (git remote, request database, card store) rather than self-reported card status, covering PRs opened and merged, cards created and completed, rows written, deliverables verified, and the sprint denominator.
 
 ## [skgateway-v1.0.0] - 2026-10-03
