@@ -884,7 +884,7 @@ export class Backend {
     this.model_claim_quarantine_cooldown_ms = typeof config.model_claim_quarantine_cooldown_ms === "number"
       ? config.model_claim_quarantine_cooldown_ms
       : DEFAULT_MODEL_CLAIM_QUARANTINE_COOLDOWN_MS;
-    /** @type {Map<string,{failures:number,quarantinedAt:number,lastStatus:number,lastReason:?string,probing:boolean}>} */
+    /** @type {Map<string,{failures:number,quarantinedAt:number,lastStatus:number,lastReason:?string,probing:boolean,probingSince?:number}>} */
     this._modelClaimFailures = new Map();
 
     // Auth credentials. credentials_path (the key the YAML schema and
@@ -1004,19 +1004,33 @@ export class Backend {
     return !state?.quarantinedAt;
   }
 
-  /** Admit one half-open recovery probe after cooldown, never ordinary traffic. */
+  /**
+   * Admit one half-open recovery probe after cooldown, never ordinary traffic.
+   * The lease is bounded to one cooldown window: route() can take it for a
+   * candidate that is never sent (the lifecycle-gate check discards route()
+   * results, and @match/bucket chains stop at the first success), and an
+   * unbounded lease would then pin the claim quarantined forever. An expired
+   * lease may be re-acquired, so at most one probe runs per window.
+   */
   tryAcquireModelClaimProbe(model) {
     const state = this._modelClaimFailures.get(model);
-    if (!state?.quarantinedAt || state.probing) return false;
-    if (Date.now() - state.quarantinedAt < this.model_claim_quarantine_cooldown_ms) return false;
+    if (!state?.quarantinedAt) return false;
+    const now = Date.now();
+    const window = this.model_claim_quarantine_cooldown_ms;
+    if (now - state.quarantinedAt < window) return false;
+    if (state.probing && now - (state.probingSince || 0) < window) return false;
     state.probing = true;
+    state.probingSince = now;
     return true;
   }
 
   /** Release a half-open lease when no upstream attempt was made. */
   releaseModelClaimProbe(model) {
     const state = this._modelClaimFailures.get(model);
-    if (state?.probing) state.probing = false;
+    if (state?.probing) {
+      state.probing = false;
+      state.probingSince = 0;
+    }
   }
 
   /**

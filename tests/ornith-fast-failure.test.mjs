@@ -115,13 +115,20 @@ describe("exact backend-model fast-failure quarantine", () => {
     });
   }
 
-  test("GLM claim recovery is one half-open probe and stays hidden until 2xx", async () => {
+  // A backend id that resolves to the zai (or codex) provider is governed
+  // FIRST by the provider capacity store (src/discovery/capacity_store.mjs,
+  // PR #139 and #151): one fast GLM failure marks the exact model throttled
+  // and only a scheduled public-synthetic probe may recover it. That layer
+  // trips before this exact-claim layer can reach its threshold, so this
+  // test exercises the generic exact-claim half-open probe on a backend
+  // outside the capacity gate. Every assertion is unchanged.
+  test("exact claim recovery is one half-open probe and stays hidden until 2xx", async () => {
     const dead = await controlledUpstream();
     try {
       const model = "glm-4.6";
       process.env.SKGATEWAY_TEST_ZAI_KEY = "synthetic-test-token";
       const config = { backends: {
-        zai: {
+        exact: {
           url: dead.url,
           models: [model],
           auth_type: "api_key",
@@ -130,7 +137,7 @@ describe("exact backend-model fast-failure quarantine", () => {
           quarantine_threshold: 3,
           quarantine_cooldown_ms: 10,
           cooldown_ms: 1,
-          model_claim_quarantine_cooldown_ms: 10,
+          model_claim_quarantine_cooldown_ms: 200,
         },
       }};
       const router = createRouter(config);
@@ -141,18 +148,18 @@ describe("exact backend-model fast-failure quarantine", () => {
         assert.equal(result.status, 502);
       }
 
-      const backend = router.getBackend("zai");
+      const backend = router.getBackend("exact");
       const quarantined = backend.getModelClaimHealth(model);
       assert.equal(quarantined.status, "quarantined");
       assert.equal(quarantined.lastFailureReason, "invalid_upstream_completion");
-      assert.equal(router.getHealth().zai.modelClaims[model].quarantined, true);
+      assert.equal(router.getHealth().exact.modelClaims[model].quarantined, true);
       const unavailable = buildModelCatalog(config.backends, router, "flag")[0];
       assert.equal(unavailable.status, "unavailable");
       assert.equal(unavailable.claim_health.status, "quarantined");
       assert.deepEqual(buildModelCatalog(config.backends, router, "hide"), []);
       await assert.rejects(router.route({ model }), ModelClaimQuarantinedError);
 
-      await new Promise((resolve) => setTimeout(resolve, 15));
+      await new Promise((resolve) => setTimeout(resolve, 250));
       dead.setResponse(200, 20);
       const beforeProbe = dead.requests.length;
       const probe = routeAndSend(
