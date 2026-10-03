@@ -5,7 +5,7 @@ After=default.target
 [Service]
 Environment=PATH=/home/OPERATOR/.local/bin:/usr/local/cuda-12.8/bin:/usr/bin:/bin
 Environment=CUDA_VISIBLE_DEVICES=0
-ExecStart=/home/OPERATOR/clawd/skcapstone-repos/skgateway/scripts/nodes/node100/run-ornith-1.5.sh
+ExecStart=/home/YOUR_USER/skcapstone-repos/skgateway/scripts/nodes/node100/run-ornith-1.5.sh
 Restart=on-failure
 RestartSec=5
 RestartSteps=8

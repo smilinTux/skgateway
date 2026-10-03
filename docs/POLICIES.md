@@ -1,4 +1,19 @@
-# SKGateway — Policy Writing Guide
+# SKGateway - Policy Writing Guide
+
+> **Current implementation and qualification status:** The shipped
+> `src/index.mjs` request path invokes model-limit system and conversation
+> trimming before `routeAndSend`, and invokes response sanitization for buffered
+> responses after routing. Streaming responses skip that buffered sanitizer
+> path. Repository source inspection and `tests/live-pipeline-wiring.test.mjs`
+> verify this wiring, but the proposed bounded production runtime check was
+> denied for now. These stages are therefore not claimed as live-runtime
+> qualified. `config/policies.yaml` and `src/policy/engine.mjs` are consumed by
+> the embeddable `handleRequest` path in `src/proxy/core.mjs`; the main
+> `src/index.mjs` gateway path does not invoke that policy engine, proactive tool
+> reduction, or the core retry rate-limit handling. Treat those as available
+> library or observational behavior, not live enforcement. Prompt classification
+> is passive by default (`classification.enabled: false`,
+> `classification.side_effects: false`).
 
 ## Contents
 

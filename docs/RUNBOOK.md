@@ -254,7 +254,7 @@ the error and keeps the previous good config.
 ## Restart and upgrade
 
 ```bash
-cd ~/clawd/skcapstone-repos/skgateway
+cd /home/YOUR_USER/skcapstone-repos/skgateway
 git pull
 npm ci                                      # reproducible install
 systemctl --user restart skgateway.service
