@@ -59,7 +59,13 @@ import { REGISTRY_PATH } from "./proxy/registry.mjs";
 import { energyRowsFrom, energyHeaders } from "./metrics/energy.mjs";
 import { attributionHeaders } from "./metrics/attribution.mjs";
 import { sampleTokenRatio } from "./metrics/token-ratio.mjs";
-import { allBuckets, capacityRoutabilityRejection, resolveBucket } from "./policy/buckets.mjs";
+import {
+  allBuckets,
+  capacityRoutabilityRejection,
+  orderMembersByGenericWeight,
+  resolveBucket,
+} from "./policy/buckets.mjs";
+import { genericPolicyRevision } from "./policy/generic-participation.mjs";
 import { loadRegistry, REGISTRY_PATH as _REGISTRY_PATH } from "./proxy/registry.mjs";
 import { policyFromRegistry } from "./policy/sensitivity.mjs";
 import { readFileSync } from "node:fs";
@@ -518,6 +524,80 @@ export function deriveModelBadges(card) {
  */
 export function applyPickerBadges(data) {
   return data.map((m) => ({ ...m, ...deriveModelBadges(m.card) }));
+}
+
+/**
+ * Project the operator's explicit generation-token cap onto each catalog
+ * entry, replacing whatever a provider claims (or a stale cached default
+ * already carries). A provider-advertised maximum is a marketing ceiling, not
+ * an operator policy; this makes `generation_default_tokens` reflect only an
+ * override explicitly set in model-cards.overrides.yaml.
+ *
+ * @param {Array<object>} data
+ * @param {object} [overrides] result of loadCardOverrides(), injectable for tests
+ * @returns {Array<object>}
+ */
+export function applyGenerationDefaults(data, overrides = loadCardOverrides()) {
+  return data.map((model) => {
+    const value = Object.hasOwn(overrides || {}, model.id)
+      ? overrides[model.id]?.generation_default_tokens : undefined;
+    const valid = Number.isSafeInteger(value) && value > 0;
+    if (!valid && !Object.hasOwn(model.card || {}, 'generation_default_tokens')) return model;
+    const card = { ...model.card };
+    // Provider maxima and stale cached defaults do not establish operator policy.
+    delete card.generation_default_tokens;
+    if (valid) card.generation_default_tokens = value;
+    return { ...model, card };
+  });
+}
+
+/**
+ * Project a provider-focused `sk-<provider>-<bucket>` alias (e.g.
+ * `sk-deepseek-l`) under its OWN provider identity in the public catalog,
+ * but only when every member of its current generic-bucket pool actually
+ * qualifies: advertised, not stale, reasoning-capable, and supports both
+ * `tools` and `tool_choice`. Any entry that fails this (an empty pool, a
+ * disabled/missing backend, a non-qualifying member) is projected as an
+ * unavailable `skgateway`-owned stub instead of silently exposing a
+ * provider identity the pool cannot actually back end-to-end.
+ *
+ * @param {Array<object>} data catalog entries, including bucket-kind aliases
+ * @param {object} cfg live gateway config (for backend enabled/disabled state)
+ * @param {{sensitivityPolicy?: object, lifecycle?: Function, membership?: Array<object>}} [opts]
+ * @returns {Array<object>}
+ */
+export function applyFocusedAliasMetadata(data, cfg, { sensitivityPolicy, lifecycle = getLifecycle, membership = data } = {}) {
+  const concrete = data.filter((entry) => !entry.kind);
+  const catalog = buildCapabilityCatalog(membership.filter((entry) => !entry.kind), { getLifecycleFn: lifecycle });
+  const buckets = new Map(allBuckets().filter((bucket) => bucket.provider)
+    .map((bucket) => [bucket.bucket, bucket]));
+  const policy = sensitivityPolicy ?? policyFromRegistry(loadRegistry());
+  return data.map((entry) => {
+    const bucket = entry.kind === 'bucket' ? buckets.get(entry.id) : null;
+    if (!bucket) return entry;
+    const unavailable = { ...entry, provider: 'skgateway', owned_by: 'skgateway',
+      advertised: false, stale: true };
+    const backend = cfg?.backends?.[bucket.provider];
+    if (!backend || backend.enabled === false) return unavailable;
+    const { members } = resolveBucket({ bucket, catalog, sensitivityPolicy: policy });
+    if (!members.length) return unavailable;
+    const rows = members.map((member) => concrete.filter((row) =>
+      row.id === member.id && row.provider === bucket.provider));
+    if (rows.some((matches) => matches.length !== 1)) return unavailable;
+    const selected = rows.map(([row]) => row);
+    if (selected.some((row) => row.advertised !== true || row.stale !== false
+      || row.status === 'unavailable' || row.capacity?.state === 'unavailable'
+      || row.card?.reasoning !== true
+      || !Array.isArray(row.card?.supported_parameters)
+      || !row.card?.supported_parameters?.includes('tools')
+      || !row.card?.supported_parameters?.includes('tool_choice'))) return unavailable;
+    return { ...entry, provider: bucket.provider, owned_by: bucket.provider,
+      advertised: true, stale: false,
+      card: { ...entry.card, size_class: bucket.model_class, reasoning: true,
+        supported_parameters: ['tools', 'tool_choice', 'reasoning'],
+        ...(selected.every((row) => row.card?.tier === selected[0].card?.tier)
+          ? { tier: selected[0].card.tier } : {}) } };
+  });
 }
 
 /**
@@ -1674,7 +1754,20 @@ export const server = http.createServer(async (req, res) => {
       // Claimer-aware lifecycle view (incident inc-2026-08-18-qwen38-eol):
       // the advertised set honors the same claim-over-verdict rule as the
       // router's gate, so /v1/models and routability stay consistent.
-      const data = stripInternalCardFields(applyPickerBadges(applyLifecycleView(enriched, getLifecycle, modelClaimersFor(advertiseBackends))));
+      // Focused-alias projection (generic bucket policy, operator-fenced
+      // `sk-<provider>-<bucket>` aliases): a focused alias is only advertised
+      // under its own provider identity once its whole current pool actually
+      // qualifies (reasoning + tool support, not stale/unavailable). applyCardOverlays
+      // re-applies curated card fields lost by applyLifecycleView above, since
+      // applyFocusedAliasMetadata needs the full card (reasoning, supported_parameters)
+      // to judge qualification. applyGenerationDefaults then projects the
+      // operator's explicit generation-token cap (never a provider-claimed max).
+      const visible = applyCardOverlays(applyLifecycleView(enriched, getLifecycle,
+        modelClaimersFor(advertiseBackends)), loadCardOverrides());
+      const focused = applyFocusedAliasMetadata(visible, getConfig(), {
+        membership: applyCardOverlays(merged, loadCardOverrides()),
+      });
+      const data = stripInternalCardFields(applyPickerBadges(applyGenerationDefaults(focused)));
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ object: "list", data }));
     } catch (e) {
@@ -1688,7 +1781,12 @@ export const server = http.createServer(async (req, res) => {
       const seenIds = new Set(allowed.map((m) => m.id));
       let data = [...allowed, ...aliases.filter((e) => !seenIds.has(e.id))];
       try {
-        data = stripInternalCardFields(applyPickerBadges(applyLifecycleView(data, getLifecycle, modelClaimersFor(advertiseBackends))));
+        const visible = applyCardOverlays(applyLifecycleView(data, getLifecycle,
+          modelClaimersFor(advertiseBackends)), loadCardOverrides());
+        const focused = applyFocusedAliasMetadata(visible, getConfig(), {
+          membership: applyCardOverlays(fallback, loadCardOverrides()),
+        });
+        data = stripInternalCardFields(applyPickerBadges(applyGenerationDefaults(focused)));
       } catch (e2) {
         console.warn("[skgateway] /v1/models static catalog fallback also failed, serving empty list:", e2.message);
         data = [];
@@ -2000,6 +2098,8 @@ export const server = http.createServer(async (req, res) => {
         return capacityRoutabilityRejection(capacityStatus(e.provider, e.id));
       };
       const bucketsEnabled = cfg?.routing?.buckets_enabled === true;
+      const genericPolicy = cfg?.routing?.generic_participation;
+      const genericRevision = genericPolicyRevision(genericPolicy);
       const all = allBuckets();
       const out = [];
       for (const b of all) {
@@ -2011,6 +2111,29 @@ export const server = http.createServer(async (req, res) => {
             getRoutabilityRejection,
           });
           const physicalResources = new Set(members.map((m) => m.physical_resource_id));
+          // Generic S/M/L buckets only (never a focused sk-<provider>-<bucket>
+          // route): project the policy's per-provider weight as it would
+          // actually apply right now (0 when disabled OR when no member of
+          // this specific bucket belongs to that provider), plus a
+          // non-mutating preview of which provider the NEXT request would
+          // pick, so an operator can see the policy's live effect without
+          // guessing at the rotation counter.
+          const isGeneric = !b.provider && ["S", "M", "L"].includes(b.model_class);
+          const effectiveWeights = isGeneric
+            ? Object.entries(genericPolicy?.providers || {}).sort(([a], [z]) => a.localeCompare(z))
+              .map(([provider, override]) => {
+                const hasEligibleMember = members.some((member) => member.provider === provider);
+                return {
+                  provider,
+                  weight: override.enabled && hasEligibleMember ? override.weight : 0,
+                  reason: !override.enabled ? "disabled"
+                    : hasEligibleMember ? "enabled" : "no-eligible-member",
+                };
+              })
+            : [];
+          const preview = isGeneric
+            ? orderMembersByGenericWeight(members, 0, b, genericPolicy)[0]
+            : null;
           out.push({
             bucket: b.bucket,
             model_class: b.model_class,
@@ -2020,6 +2143,9 @@ export const server = http.createServer(async (req, res) => {
             member_alias_count: members.length,
             physical_server_count: physicalResources.size,
             physical_resources: [...physicalResources],
+            generic_policy_revision: isGeneric ? genericRevision : null,
+            generic_effective_weights: effectiveWeights,
+            generic_next_provider: preview?.provider || null,
             rejected,
           });
         } catch (e) {
@@ -2036,7 +2162,11 @@ export const server = http.createServer(async (req, res) => {
         }
       }
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ buckets_enabled: bucketsEnabled, buckets: out }));
+      res.end(JSON.stringify({
+        buckets_enabled: bucketsEnabled,
+        generic_policy_revision: genericRevision,
+        buckets: out,
+      }));
     } catch (e) {
       console.warn("[skgateway] /admin/buckets failed:", e.message);
       res.writeHead(500, { "content-type": "application/json" });
