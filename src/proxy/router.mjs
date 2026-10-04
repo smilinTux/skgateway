@@ -22,6 +22,7 @@ import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
 import { sendUpstream } from "./upstream.mjs";
+import { modelRequestLimits, requestLimitError, requestLimitResponse } from "./request-limits.mjs";
 import { createEvent, EventType } from "../siem/events.mjs";
 import { isAnthropicBackend, toAnthropicRequest, toOpenAIResponse } from "./anthropic-adapter.mjs";
 import {
@@ -71,6 +72,8 @@ import {
   parseBucketId,
   resolveBucket,
   orderMembersForClass,
+  orderMembersByCost,
+  orderMembersByGenericWeight,
   validateFamilyPreference,
   applyFamilyPreference,
   selectMember,
@@ -3062,12 +3065,16 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
     wantsTools = false;
   }
 
+  // Operator fences survive discovery refresh without fabricating lifecycle state.
+  // They affect bucket selection only; explicit diagnostic model requests remain available.
+  const excluded = new Set(getConfig().routing?.bucket_excluded_models || []);
   const { members, rejected, ceiling } = resolveBucket({
     bucket: addr,
     catalog,
     sensitivityPolicy: policy,
     requireToolUse: wantsTools,
     isRoutable: (e) => {
+      if (excluded.has(e.id)) return false;
       const claimers = typeof router.getBackends === "function"
         ? router.getBackends()
           .filter((backend) => backend.supportsModel(e.id))
@@ -3121,8 +3128,8 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
     };
   }
 
-  const n = (_bucketCounters.get(addr.bucket) || 0) + 1;
-  _bucketCounters.set(addr.bucket, n);
+  const n = _bucketCounters.get(addr.bucket) || 0;
+  _bucketCounters.set(addr.bucket, n + 1);
   
   // Read and validate family preference from x-sk-prefer header (card 1e26943e)
   const prefHeader = request.headers?.['x-sk-prefer'];
@@ -3159,8 +3166,26 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
     }
   }
 
-  // Apply family preference within cheapest cost tier
-  const picked = selectMember(members, n, familyPreference, addr.model_class);
+  const isWeightedGeneric = !addr.provider && ['S', 'M', 'L'].includes(addr.model_class);
+  const genericPolicy = isWeightedGeneric
+    ? getConfig()?.routing?.generic_participation
+    : null;
+  let orderedMembers = isWeightedGeneric
+    ? orderMembersByGenericWeight(members, n, addr, genericPolicy)
+    : orderMembersByCost(members, n);
+  if (familyPreference && orderedMembers.length > 0) {
+    const selectedProvider = orderedMembers[0].provider;
+    const sameProvider = orderedMembers.filter((member) => member.provider === selectedProvider);
+    const rest = orderedMembers.filter((member) => member.provider !== selectedProvider);
+    orderedMembers = [...applyFamilyPreference(sameProvider, familyPreference), ...rest];
+  }
+  // Non-generic buckets keep card 617ddc13's class-floor-aware selection:
+  // selectMember's 4th argument prefers the admitted class nearest the
+  // bucket's floor rather than plain cheapest-cost. Weighted generic buckets
+  // (S/M/L with no explicit provider) use the ticket-weighted pick above
+  // instead, which already encodes its own provider/weight policy.
+  const picked = isWeightedGeneric ? (orderedMembers[0] || null)
+    : selectMember(members, n, familyPreference, addr.model_class);
   
   if (!picked) {
     console.warn(`[router] bucket ${addr.bucket} no member selected after preference`);
@@ -3170,9 +3195,9 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
         headers: { "content-type": "application/json" },
         body: Buffer.from(JSON.stringify({
           error: {
-            message: `No model available for bucket ${addr.bucket}`,
+            message: `No enabled provider is eligible for bucket ${addr.bucket}`,
             code: 503,
-            type: "bucket_no_member",
+            type: "bucket_no_eligible_provider",
           },
         }), "utf-8"),
       },
@@ -3203,14 +3228,22 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
   // path does await the same call; this one was simply missed, and no test ever
   // reached it. The normalization is kept for the resolved value, which really
   // can be a single object or an array.
-  // selectMember() returns the ONE closest class fit, with cost and preference
-  // breaking ties. The candidate loop below still needs the full member list
-  // so failover, quarantine and pooling keep working when that member's backend
-  // is down. Larger classes remain upward-only capability failover candidates.
-  const orderedMembers = [
-    picked,
-    ...orderMembersForClass(members, addr.model_class, n).filter((m) => m.id !== picked.id),
-  ];
+  // selectMember() returns the ONE best member: for weighted generic buckets
+  // that is the ticket-weighted pick computed above (orderedMembers already
+  // holds its full failover chain); for everything else it is card
+  // 617ddc13's class-floor-aware pick (nearest admitted class, then cost).
+  // The candidate loop below still needs the full member list so failover,
+  // quarantine and pooling keep working when the chosen member's backend is
+  // down. Rebuild it with the picked member first, then the rest in
+  // class-floor order: the preference decides who serves, it does not remove
+  // anyone from the failover chain. Larger classes remain upward-only
+  // capability failover candidates.
+  if (!isWeightedGeneric) {
+    orderedMembers = [
+      picked,
+      ...orderMembersForClass(members, addr.model_class, n).filter((m) => m.id !== picked.id),
+    ];
+  }
 
   const candidates = [];
   const seen = new Set();
@@ -3297,6 +3330,10 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
             model: member.id,
             bucket: addr.bucket,
             bucketMember: member.id,
+            genericPolicyRevision: member.generic_policy_revision,
+            genericProviderWeight: member.generic_provider_weight,
+            genericParticipationReason: member.generic_participation_reason,
+            genericRotationCounter: member.generic_rotation_counter,
           });
         }
         continue;
@@ -3316,6 +3353,10 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
         model: member.id,
         bucket: addr.bucket,
         bucketMember: member.id,
+        genericPolicyRevision: member.generic_policy_revision,
+        genericProviderWeight: member.generic_provider_weight,
+        genericParticipationReason: member.generic_participation_reason,
+        genericRotationCounter: member.generic_rotation_counter,
       });
     }
   }
@@ -3346,6 +3387,14 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
     phase: "candidate_chain",
     outcome: "candidate_chain_built",
     bucket: addr.bucket,
+    logical_route: addr.bucket,
+    selected_provider: picked.provider || null,
+    selected_model: picked.id,
+    generic_policy_revision: picked.generic_policy_revision || null,
+    generic_provider_weight: picked.generic_provider_weight ?? null,
+    generic_participation_reason: picked.generic_participation_reason || null,
+    generic_exclusion_reason: null,
+    generic_rotation_counter: picked.generic_rotation_counter ?? null,
     chain_length: candidates.length,
     skipped,
   }, {});
@@ -3387,20 +3436,19 @@ export function createRouteSiemEmitter(siem, requestSource = {}, requestId = ran
 
 /**
  * Preserve logical routing for synthetic traffic unless the concrete model has
- * an exact admission-gated owner whose initial health this request can prove.
+ * an exact configured owner that this request is intended to probe.
  */
 export function shouldUseRegistryRouting(router, request, bootstrapProbe = false) {
   if (!isRegistryRouted(request)) return false;
   if (!bootstrapProbe) return true;
   const model = request?.model;
   if (typeof model !== "string") return true;
-  const exactAdmissionOwner = (typeof router.getBackends === "function"
+  const exactOwner = (typeof router.getBackends === "function"
     ? [...router.getBackends().values()]
     : []
-  ).some((backend) => backend?.require_observed_health === true &&
-    backend.models?.some((pattern) =>
+  ).some((backend) => backend?.models?.some((pattern) =>
       typeof pattern === "string" && pattern.toLowerCase() === model.toLowerCase()));
-  return !exactAdmissionOwner;
+  return !exactOwner;
 }
 
 export function configuredModelAlias(model, config = null) {
@@ -3420,6 +3468,8 @@ export function configuredModelAlias(model, config = null) {
 export async function routeAndSend(router, request, upstreamPath, method, clientHeaders, body, usePool = true, siem = null, abortSignal = null, exactBackendId = null) {
   const pool = usePool ? getPool() : null;
   const requestedModel = request?.model;
+  let requestLimitsConfig;
+  try { requestLimitsConfig = getConfig(); } catch { /* Direct callers may not load configuration. */ }
   const aliasTarget = configuredModelAlias(requestedModel);
   if (!exactBackendId && aliasTarget) {
     request = { ...request, model: aliasTarget };
@@ -4041,6 +4091,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
   // synthesis at the bottom of the loop, and is the attribution payload
   // itself: {backendId, model, status, cooldownMs, skipped?}.
   const throttledAttempts = [];
+  const transportRejections = [];
 
   for (let i = 0; i < candidates.length; i++) {
     const { backendId, backendUrl, authHeaders, backend, modelClaimProbe } = candidates[i];
@@ -4048,6 +4099,15 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // candidate rewrites the model to a cloud-served id). Default to the shared
     // body when no override is present.
     let attemptBody = candidates[i].bodyOverride || attemptBodyBase;
+    const candidateModel = candidates[i].model || request.model;
+    if (requestLimitsConfig) {
+      const rejection = requestLimitError(attemptBody,
+        modelRequestLimits(requestLimitsConfig, candidateModel, requestedModel));
+      if (rejection) {
+        transportRejections.push({ ...rejection, backend: backendId, model: candidateModel });
+        continue;
+      }
+    }
 
     // Context preflight (card 9ed4a9f7): a backend may declare context_limit,
     // the true serving-engine token ceiling (e.g. llama.cpp --ctx-size 32768
@@ -4088,7 +4148,6 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // every other candidate serves the same model as every other candidate
     // in the list (candidatesFor() only ever matches on model id), so
     // request.model is the correct default.
-    const candidateModel = candidates[i].model || request.model;
     attemptBody = applyBodyFloor(
       attemptBody,
       candidateModel,
@@ -5229,6 +5288,11 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       retryAfterSeconds: retryAfterSec,
       failover: didFailover,
     };
+  }
+
+  if (!lastResult && transportRejections.length > 0) {
+    await emitSiem("response", { status: 413, failover: false, request_too_large: true }, {});
+    return requestLimitResponse({ ...transportRejections[0], candidates: transportRejections });
   }
 
   // Context preflight rejected every door (card 9ed4a9f7): the request can
