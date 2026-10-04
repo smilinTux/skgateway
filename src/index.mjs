@@ -12,6 +12,7 @@
 import http from "node:http";
 import { loadConfig, getConfig } from "./config.mjs";
 import { createProxyServer, handleRequest, buildConfig, trimSystemMessages, trimConversationHistory } from "./proxy/core.mjs";
+import { ingressRequestLimit, requestLimitResponse } from "./proxy/request-limits.mjs";
 import { createRouter, routeAndSend, startKimiAuthKeepalive } from "./proxy/router.mjs";
 import { normalizeSystemMessageOrder, sanitizeResponse } from "./proxy/sanitizer.mjs";
 import { applyCapacityView, availabilityState, buildModelCatalog, reconcileModeFromConfig, tagLocalModels, mergeDiscoveredCatalog, isModelAvailable, excludedModelIds, withoutExcludedModels } from "./proxy/advertise.mjs";
@@ -2147,14 +2148,33 @@ export const server = http.createServer(async (req, res) => {
     }
 
     // Buffer the request body so we can read the model for routing.
+    // The model isn't known yet, so ingressRequestLimit() admits the largest
+    // body any configured model is allowed to send; the explicit per-model
+    // byte limits (request-limits.mjs, same transport ceiling used by
+    // core.mjs/handleRequest) are not re-applied here once parsed: the
+    // existing model-limits trim below (card 080e032e) already bounds the
+    // conversation that reaches a backend. This is a DoS-style backstop
+    // against a body too large for any model to admit at all.
     const chunks = [];
     let receivedBytes = 0;
+    const ingressLimit = ingressRequestLimit(getConfig());
     for await (const chunk of req) {
       receivedBytes += chunk.length;
       if (clientAuthenticator && receivedBytes > config.client_auth.max_request_body_bytes) {
         siemHook({ ts: new Date().toISOString(), event: 'client_auth.denied', reason: 'request_too_large', status: 413, agent_id: identity.agent_id, path: req.url });
         res.writeHead(413, { 'content-type': 'application/json', 'cache-control': 'no-store' });
         res.end(JSON.stringify({ error: { message: 'Request body exceeds configured limit', code: 'request_too_large', status: 413 } }));
+        return;
+      }
+      if (receivedBytes > ingressLimit) {
+        const rejected = requestLimitResponse({
+          message: 'Request body exceeds the configured transport limit; history was not modified',
+          code: 'request_too_large', type: 'invalid_request_error', param: 'body',
+          actual_bytes: receivedBytes, limit_bytes: ingressLimit, retryable: false,
+        });
+        siemHook({ ts: new Date().toISOString(), event: 'request_limit.denied', reason: 'request_too_large', status: 413, agent_id: identity.agent_id, path: req.url });
+        res.writeHead(rejected.status, rejected.headers);
+        res.end(rejected.body);
         return;
       }
       chunks.push(chunk);

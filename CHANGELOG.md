@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add explicit request byte limits (`src/proxy/request-limits.mjs`): a
+  request body, or its system/developer message slice, over a configured
+  byte ceiling (default 120000/40000, overridable globally or per model) is
+  rejected with `413 request_too_large` and the conversation left untouched,
+  instead of being silently trimmed to fit. Wired into the ingress buffering
+  loop in both `src/proxy/core.mjs` and the live `src/index.mjs` request
+  path. A rejection caused only by an oversized tool list gets one retry:
+  reduce to the proactive tool budget and recheck before rejecting. Tests in
+  `tests/request-limits.test.mjs`, `tests/request-limits-core-wiring.test.mjs`,
+  `tests/request-limits-ingress-live.test.mjs`.
+
 ### Fixed
 
 - **Admission failover is reachable.** `pool.acquire()` takes `nonBlocking`; only the

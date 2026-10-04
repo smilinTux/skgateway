@@ -56,6 +56,7 @@ import http from "node:http";
 import { URL } from "node:url";
 
 import { sendUpstream } from "./upstream.mjs";
+import { ingressRequestLimit, requestLimitError, requestLimitResponse } from "./request-limits.mjs";
 import { reduceTools, stripToolCallHistory } from "./tools.mjs";
 import {
   normalizeSystemMessageOrder,
@@ -721,8 +722,34 @@ export async function handleRequest(clientReq, clientRes, cfg) {
   const error = cfg.logger.error.bind(cfg.logger);
 
   // --- Buffer the full request body ---
+  // The model isn't known yet (routing happens after the body is read), so
+  // the ingress ceiling admits the largest body any configured model may
+  // send; a tighter per-model bound is enforced below once parsed.
+  const transportConfig = {
+    sanitizer: { max_body_bytes: cfg.maxBodyBytes, max_system_bytes: cfg.maxSystemBytes },
+    model_limits: Object.fromEntries(Object.entries(cfg.modelLimits || {}).map(([model, limits]) =>
+      [model, { max_body_bytes: limits.maxBodyBytes, max_system_bytes: limits.maxSystemBytes }])),
+  };
+  const ingressLimit = ingressRequestLimit(transportConfig);
+  const reject = (rejection) => {
+    const result = requestLimitResponse(rejection);
+    clientRes.writeHead(result.status, result.headers);
+    clientRes.end(result.body);
+  };
   const chunks = [];
-  for await (const chunk of clientReq) chunks.push(chunk);
+  let receivedBytes = 0;
+  for await (const chunk of clientReq) {
+    receivedBytes += chunk.length;
+    if (receivedBytes > ingressLimit) {
+      reject({
+        message: "Request body exceeds the configured transport limit; history was not modified",
+        code: "request_too_large", type: "invalid_request_error", param: "body",
+        actual_bytes: receivedBytes, limit_bytes: ingressLimit, retryable: false,
+      });
+      return;
+    }
+    chunks.push(chunk);
+  }
   let body = Buffer.concat(chunks);
 
   const contentType = clientReq.headers["content-type"] || "";
@@ -741,6 +768,32 @@ export async function handleRequest(clientReq, clientRes, cfg) {
     } catch {
       // Parse failure — fall through to transparent relay
     }
+  }
+
+  // --- Explicit byte-limit rejection, once the concrete model is known ---
+  // A request whose size is dominated by its tool definitions gets one
+  // retry: reduce to the same proactive tool budget the tool-processing path
+  // below would apply anyway, and re-check before rejecting. This lets a
+  // caller that shipped its full toolset (instead of declaring
+  // enabled_toolsets) succeed on the first request rather than being bounced
+  // to retry smaller itself.
+  if (parsed) {
+    const perModelCfg = { ...cfg, ...cfg.modelLimits?.[parsed.model || ""] };
+    let rejection = requestLimitError(body, perModelCfg);
+    if (rejection && Array.isArray(parsed.tools) && parsed.tools.length > cfg.proactiveToolLimit) {
+      const reducedTools = cfg.toolReducer(parsed.tools, parsed.messages, cfg.proactiveToolLimit);
+      const reducedBody = Buffer.from(JSON.stringify({ ...parsed, tools: reducedTools }), "utf-8");
+      const retryRejection = requestLimitError(reducedBody, perModelCfg);
+      if (retryRejection) {
+        rejection = retryRejection;
+      } else {
+        log(`request limit retry: reduced ${parsed.tools.length}->${reducedTools.length} tools, now within limit`);
+        parsed.tools = reducedTools;
+        body = reducedBody;
+        rejection = null;
+      }
+    }
+    if (rejection) { reject(rejection); return; }
   }
 
   // --- Transparent relay for non-tool or non-chat requests ---
