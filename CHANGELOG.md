@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Shared service discovery now requires an explicit `SKGATEWAY_HEALTH_URL`.
+  Unconfigured startups preserve existing records; loopback, wildcard, and
+  credential-bearing URLs are refused. The endpoint represents liveness only.
+
 - Expose provider capability metadata (`served_id`, `revision`,
   `context_limit`, `availability`, `provider_route`, `public_eligible`) from
   the `anthropic-wrapper` and `codex` discovery adapters, and bind the public

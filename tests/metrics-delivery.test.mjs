@@ -525,7 +525,8 @@ describe("DeliveryAdapter - emitDelivery", () => {
     assert.ok(existsSync(join(deliveryDir, `${date}.json`)));
   });
   
-  test("AC4: daily-idempotency - re-running produces same result", () => {
+  test("AC4: daily-idempotency - re-running produces same result", (t) => {
+    t.mock.timers.enable({ apis: ["Date"], now: new Date("2026-01-02T12:00:00Z") });
     const date = '2026-01-02';
     
     // First emit
