@@ -206,8 +206,12 @@ function collectChoiceEvidence(chunk, states, ids, stream) {
 function hasValidUsage(usage) {
   if (!usage || typeof usage !== "object" || Array.isArray(usage)) return false;
   const keys = Object.keys(usage);
+  // prompt_cache_hit_tokens/prompt_cache_miss_tokens are DeepSeek's own usage
+  // keys (api.deepseek.com's context-caching breakdown of prompt_tokens, no
+  // nested details object). Allow them through like any other provider field;
+  // they carry no further structural validation of their own.
   if (!keys.includes("prompt_tokens") || !keys.includes("completion_tokens")
-      || keys.some((key) => !["prompt_tokens", "completion_tokens", "total_tokens", "prompt_tokens_details", "completion_tokens_details"].includes(key))) return false;
+      || keys.some((key) => !["prompt_tokens", "completion_tokens", "total_tokens", "prompt_tokens_details", "completion_tokens_details", "prompt_cache_hit_tokens", "prompt_cache_miss_tokens"].includes(key))) return false;
   const values = [usage.prompt_tokens, usage.completion_tokens, usage.total_tokens]
     .filter((value) => value !== undefined);
   if (values.some((value) => !Number.isSafeInteger(value) || value < 0 || value > MAX_USAGE_TOKENS)) return false;
@@ -336,7 +340,11 @@ export function enforceResponseContract(response, requestedModel) {
       try {
         const parsed = JSON.parse(payload);
         if (!servedModel && typeof parsed.model === "string" && parsed.model) servedModel = parsed.model;
-        if (Object.hasOwn(parsed, "usage")) {
+        // An explicit top-level `usage: null` on a non-final chunk means "no
+        // usage in this frame yet", same tolerance as the nested detail
+        // blocks above, not malformed evidence. Omitting the key entirely
+        // already skipped this block; a present-but-null value must too.
+        if (Object.hasOwn(parsed, "usage") && parsed.usage !== null) {
           const choices = Array.isArray(parsed.choices) ? parsed.choices : null;
           const attachedTerminalUsage = choices?.length > 0 && choices.every((choice) => {
             const output = choice?.delta || {};

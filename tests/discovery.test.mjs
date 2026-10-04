@@ -71,6 +71,58 @@ test('mergeCatalog dedups by id, local wins', () => {
   assert.equal(byId['g/y:free'], 'openrouter');
 });
 
+test('mergeCatalog accepts an 8th deepseek group, local still wins on a dup id', () => {
+  const out = mergeCatalog(
+    [{ id: 'ornith-tiny', provider: 'local', free: true }],
+    [], [], [], [], [], [],
+    [{ id: 'deepseek-chat', provider: 'deepseek', free: false }, { id: 'ornith-tiny', provider: 'deepseek', free: false }],
+  );
+  const byId = Object.fromEntries(out.map((m) => [m.id, m.provider]));
+  assert.equal(byId['deepseek-chat'], 'deepseek');
+  assert.equal(byId['ornith-tiny'], 'local', 'an earlier group must still win the dedup on a collision');
+});
+
+test('mergeCatalog with no deepseek arg behaves exactly as before (backward compatible)', () => {
+  const out = mergeCatalog(
+    [{ id: 'a', provider: 'local', free: true }],
+    [{ id: 'b', provider: 'nvidia', free: true }],
+  );
+  assert.deepEqual(out.map((m) => m.id), ['a', 'b']);
+});
+
+test('discoverCatalog: a successful deepseekFetch is normalized into the merged catalog', async () => {
+  const cache = {};
+  const res = await discoverCatalog({
+    localModels: [],
+    nvidiaFetch: async () => ({ data: [] }),
+    openrouterFetch: async () => ({ data: [] }),
+    deepseekFetch: async () => ({ data: [{ id: 'deepseek-chat' }, { id: 'deepseek-reasoner' }] }),
+    cache,
+  });
+  const ids = res.models.map((m) => m.id);
+  assert.ok(ids.includes('deepseek-chat'));
+  assert.ok(ids.includes('deepseek-reasoner'));
+  assert.equal(res.models.find((m) => m.id === 'deepseek-chat').provider, 'deepseek');
+  assert.equal(cache.providers?.deepseek?.ok, true);
+  assert.equal(cache.providers?.deepseek?.count, 2);
+});
+
+test('discoverCatalog: a throwing deepseekFetch falls back to cached deepseek models and marks stale', async () => {
+  const cache = { models: [{ id: 'deepseek-cached', provider: 'deepseek', free: false }] };
+  const res = await discoverCatalog({
+    localModels: [],
+    nvidiaFetch: async () => ({ data: [] }),
+    openrouterFetch: async () => ({ data: [] }),
+    deepseekFetch: async () => { throw new Error('deepseek 503'); },
+    cache,
+  });
+  assert.equal(res.stale, true);
+  const ids = res.models.map((m) => m.id);
+  assert.ok(ids.includes('deepseek-cached'));
+  assert.equal(cache.providers?.deepseek?.ok, false);
+  assert.match(cache.providers?.deepseek?.lastError || '', /deepseek 503/);
+});
+
 test('discoverCatalog serves cache + marks stale when a provider throws', async () => {
   const cache = { models: [{ id: 'cached', provider: 'nvidia', free: true }] };
   const res = await discoverCatalog({
