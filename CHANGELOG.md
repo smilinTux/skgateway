@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [skgateway-v1.1.0] - 2026-10-05
+
+Second tagged release. Adds the chi-fleet capability set alongside this
+release's own fixes: a generic bucket participation policy, explicit
+request byte limits, DeepSeek provider discovery and usage-contract
+reconciliation, admission-failover reachability and truthful admission
+telemetry, shared-service-discovery hardening, bucket-routing and
+anthropic-wrapper/XL-public catalog fixes, immutable runtime bundle
+tooling, and the daily DELIVERY metric. Everything accumulated under
+Unreleased up to this point ships here.
+
 - Remove the `deploy/chiap01/` and `deploy/chiap08/` site-specific deploy
   files from this public repo. They are a real site's units, hostnames and
   model lists, and now live in that site's own private config repo
@@ -19,7 +30,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which pinned the removed site files' exact content, are removed with them;
   the generic templates already have their own coverage in
   `tests/deploy-script.test.mjs`.
-
 - Add a generic bucket participation policy (`src/policy/generic-participation.mjs`):
   an operator can favor or disable a provider or model inside the open
   generic S/M/L buckets via `routing.generic_participation`, hot-reloadable
