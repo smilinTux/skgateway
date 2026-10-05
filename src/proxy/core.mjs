@@ -509,6 +509,10 @@ function truncateLargeToolResults(parsed) {
  * @param {ProxyConfig} cfg
  */
 export function trimConversationHistory(parsed, cfg) {
+  // Logical GLM limits are resolved at dispatch. Silently trimming here hides
+  // the real context size from native workers and prevents their compaction.
+  // Ingress and per-candidate transport limits still reject oversized bodies.
+  if (/^sk-(?:glm|zai)-(?:s|m|l)$/.test(parsed.model)) return;
   if (!Array.isArray(parsed.messages) || parsed.messages.length < 6) return;
 
   // Pass 1: truncate large tool results - ONLY over budget. This used to run

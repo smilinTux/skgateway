@@ -142,3 +142,45 @@ test('live gateway: a per-model limit widens the ingress ceiling past the global
   assert.equal(res.status, 200, 'ingress must admit the largest configured model ceiling, not just the default');
   assert.equal(gw.upstreamRequests.length, 1);
 });
+
+test('live gateway: logical GLM retains evidence and obeys the concrete byte ceiling', async (t) => {
+  const gw = await startGatewayFixture([
+    'sanitizer:', '  max_body_bytes: 120000', '  max_system_bytes: 40000',
+    'model_aliases:', '  sk-glm-m: fixture-model',
+    'model_limits:', '  fixture-model:', '    max_body_bytes: 640000',
+    '  large-fixture:', '    max_body_bytes: 2000000',
+  ]);
+  t.after(() => gw.close());
+
+  const messages = [{ role: 'system', content: 'bounded synthetic worker' }];
+  for (let i = 0; i < 10; i++) {
+    messages.push({ role: 'assistant', content: null, tool_calls: [{
+      id: `read-${i}`, type: 'function', function: { name: 'read', arguments: '{}' },
+    }] });
+    messages.push({ role: 'tool', tool_call_id: `read-${i}`,
+      content: `evidence-${i}:` + 'x'.repeat(15000) });
+  }
+  messages.push({ role: 'user', content: 'implement using the exact evidence' });
+  const body = { model: 'sk-glm-m', messages };
+  const res = await post(gw.gatewayPort, JSON.stringify(body));
+  assert.equal(res.status, 200);
+  assert.deepEqual(JSON.parse(gw.upstreamRequests[0].body).messages, messages);
+
+  // Under ingress's 2 MB ceiling, but over this resolved model's 640 KB.
+  const oversized = JSON.stringify({ ...body,
+    messages: [...messages, { role: 'user', content: 'x'.repeat(640000) }] });
+  const rejected = await post(gw.gatewayPort, oversized);
+  assert.equal(rejected.status, 413);
+  assert.equal((await rejected.json()).error.limit_bytes, 640000);
+  assert.equal(gw.upstreamRequests.length, 1, 'oversized history must not reach upstream');
+
+  const systemRejected = await post(gw.gatewayPort, JSON.stringify({
+    model: 'sk-glm-m', messages: [
+      { role: 'developer', content: 's'.repeat(45000) },
+      { role: 'user', content: 'hello' },
+    ],
+  }));
+  assert.equal(systemRejected.status, 413);
+  assert.equal((await systemRejected.json()).error.param, 'system');
+  assert.equal(gw.upstreamRequests.length, 1, 'system guard must still reject before upstream');
+});
