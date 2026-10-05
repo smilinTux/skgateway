@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Remove the `deploy/chiap01/` and `deploy/chiap08/` site-specific deploy
+  files from this public repo. They are a real site's units, hostnames and
+  model lists, and now live in that site's own private config repo
+  (`skgateway-config-chi`) instead. The patterns they encoded (a secondary
+  shared-shadow instance, tailnet ingress via systemd socket activation, a
+  canary loopback health check) are already available to any site as the
+  generic, instance.env-flag-gated add-on templates under `deploy/templates/`
+  (see `docs/DEPLOYING.md#optional-add-ons-shadow-instance-tailnet-ingress-canary-loopback`).
+  `tests/shared-shadow-profile.test.mjs` and `tests/canary-loopback-transport.test.mjs`,
+  which pinned the removed site files' exact content, are removed with them;
+  the generic templates already have their own coverage in
+  `tests/deploy-script.test.mjs`.
+
 - Add a generic bucket participation policy (`src/policy/generic-participation.mjs`):
   an operator can favor or disable a provider or model inside the open
   generic S/M/L buckets via `routing.generic_participation`, hot-reloadable
