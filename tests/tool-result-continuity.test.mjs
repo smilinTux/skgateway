@@ -26,6 +26,20 @@ function overBudgetFixture() {
 const noOrphans = (msgs) => !msgs.some((m, i) =>
   m.tool_calls?.length && !msgs.slice(i + 1).some(n => n.tool_call_id === m.tool_calls[0].id));
 
+test("logical GLM history stays intact above the legacy alias budget", () => {
+  for (const provider of ["glm", "zai"]) {
+    for (const size of ["s", "m", "l"]) {
+      const body = overBudgetFixture();
+      body.model = `sk-${provider}-${size}`;
+      body.messages[3].content = "immutable tool evidence ".repeat(7000);
+      const original = structuredClone(body);
+      trimConversationHistory(body, { maxBodyBytes: 120000,
+        logger: { log: () => {} } });
+      assert.deepEqual(body, original, body.model);
+    }
+  }
+});
+
 test("head-slice tool_call whose reply dropped in the middle never orphans", () => {
   const out = trimHistoryToBudget(overBudgetFixture(),
     { maxBodyBytes: 500, keepStart: 2, keepEnd: 12, label: "t", log: () => {}, aggressiveNotice: "[t]" });
