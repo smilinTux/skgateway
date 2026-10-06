@@ -157,6 +157,12 @@ export const DEFAULT_CONFIG = {
   },
 
   /**
+   * Maximum characters retained per tool-result content item after the request
+   * is already over `maxBodyBytes`. Not applied to bodies that fit.
+   */
+  toolResultMaxChars: 1500,
+
+  /**
    * Per-model body/system byte limits.  Keys are exact model IDs.
    * When a request matches, maxBodyBytes and maxSystemBytes are overridden
    * for that request only — global defaults apply to everything else.
@@ -447,20 +453,21 @@ export function sendOk(clientRes, resBody, headers, asSSE, cfg) {
 /**
  * Trim tool-result message content that is excessively large.
  * Modifies `parsed.messages` in place.
- * Truncates string content at 1500 chars; array content items at 1500 chars each.
+ * Used only after a request already exceeds its body budget.
  *
  * @param {object} parsed  Parsed request body (mutated in place).
+ * @param {number} maxChars Maximum characters retained per tool-result item.
  */
-function truncateLargeToolResults(parsed) {
+function truncateLargeToolResults(parsed, maxChars = 1500) {
   if (!Array.isArray(parsed.messages)) return;
   for (const m of parsed.messages) {
     if (m.role === "tool" || m.role === "toolResult") {
-      if (typeof m.content === "string" && m.content.length > 1500) {
-        m.content = m.content.slice(0, 1500) + "\n...[truncated]";
+      if (typeof m.content === "string" && m.content.length > maxChars) {
+        m.content = m.content.slice(0, maxChars) + "\n...[truncated]";
       } else if (Array.isArray(m.content)) {
         for (const c of m.content) {
-          if (c.type === "text" && typeof c.text === "string" && c.text.length > 1500) {
-            c.text = c.text.slice(0, 1500) + "\n...[truncated]";
+          if (c.type === "text" && typeof c.text === "string" && c.text.length > maxChars) {
+            c.text = c.text.slice(0, maxChars) + "\n...[truncated]";
           }
         }
       }
@@ -473,7 +480,8 @@ function truncateLargeToolResults(parsed) {
  * `cfg.maxBodyBytes`.
  *
  * Strategy (in order):
- *  1. Truncate large tool result messages (1500 char cap per result).
+ *  1. If serialized request bytes exceed `cfg.maxBodyBytes`, truncate large
+ *     tool result messages (`cfg.toolResultMaxChars`, default 1500 chars).
  *  2. Drop middle messages (keep first 2 + last N non-system messages).
  *     N starts at min(12, len-2) and decreases until size is under budget.
  *  3. Aggressive fallback: system + first user + last 4 non-system.
@@ -489,8 +497,11 @@ function truncateLargeToolResults(parsed) {
 export function trimConversationHistory(parsed, cfg) {
   if (!Array.isArray(parsed.messages) || parsed.messages.length < 6) return;
 
-  // Pass 1: truncate large tool results
-  truncateLargeToolResults(parsed);
+  // Pass 1: truncate large tool results only when the request is already over budget.
+  // Preserve full tool output while it fits; this is not a blanket display limit.
+  if (Buffer.byteLength(JSON.stringify(parsed), "utf-8") > cfg.maxBodyBytes) {
+    truncateLargeToolResults(parsed, cfg.toolResultMaxChars ?? 1500);
+  }
 
   // Passes 2-5: delegate to the canonical history-trim algorithm in
   // sanitizer.mjs. Single source of truth — fixes to the trim/repair logic

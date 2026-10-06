@@ -247,6 +247,47 @@ describe("sanitizeRequest tail repair integration", () => {
       }
     }
   });
+
+  test("preserves large tool results while the request is under body budget", () => {
+    const fullResult = "z".repeat(4_000);
+    const body = {
+      model: "kimi",
+      messages: [
+        { role: "system", content: "sys" },
+        { role: "user", content: "u0" },
+        { role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "f", arguments: "{}" } }] },
+        { role: "tool", tool_call_id: "c1", content: fullResult },
+        { role: "assistant", content: "done" },
+        { role: "user", content: "next" },
+      ],
+    };
+
+    sanitizeRequest(body, { label: "test", maxBodyBytes: 20_000, toolResultMaxChars: 1_500 });
+
+    const tool = body.messages.find((m) => m.role === "tool");
+    assert.equal(tool.content, fullResult);
+    assert.ok(!tool.content.includes("...[truncated]"));
+  });
+
+  test("truncates large tool results only when the request exceeds body budget", () => {
+    const body = {
+      model: "kimi",
+      messages: [
+        { role: "system", content: "sys" },
+        { role: "user", content: "u0" },
+        { role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "f", arguments: "{}" } }] },
+        { role: "tool", tool_call_id: "c1", content: "z".repeat(4_000) },
+        { role: "assistant", content: "done" },
+        { role: "user", content: "next" },
+      ],
+    };
+
+    sanitizeRequest(body, { label: "test", maxBodyBytes: 2_000, toolResultMaxChars: 1_500 });
+
+    const tool = body.messages.find((m) => m.role === "tool");
+    assert.equal(tool.content.length, 1_515);
+    assert.ok(tool.content.endsWith("\n...[truncated]"));
+  });
 });
 
 // ---------------------------------------------------------------------------

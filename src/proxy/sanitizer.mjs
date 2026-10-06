@@ -633,6 +633,22 @@ export function trimHistoryToBudget(body, options = {}) {
   return body;
 }
 
+function truncateLargeToolResults(body, toolResultMaxChars) {
+  if (!body || !Array.isArray(body.messages)) return;
+  for (const m of body.messages) {
+    if (m.role !== "tool" && m.role !== "toolResult") continue;
+    if (typeof m.content === "string" && m.content.length > toolResultMaxChars) {
+      m.content = m.content.slice(0, toolResultMaxChars) + "\n...[truncated]";
+    } else if (Array.isArray(m.content)) {
+      for (const block of m.content) {
+        if (block.type === "text" && typeof block.text === "string" && block.text.length > toolResultMaxChars) {
+          block.text = block.text.slice(0, toolResultMaxChars) + "\n...[truncated]";
+        }
+      }
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Public API: sanitizeRequest
 // ---------------------------------------------------------------------------
@@ -645,7 +661,8 @@ export function trimHistoryToBudget(body, options = {}) {
  * trimmed result automatically).
  *
  * Operations performed (in order):
- *  1. Truncate large tool-result messages (kept to `config.toolResultMaxChars`).
+ *  1. If serialized request bytes exceed `config.maxBodyBytes`, truncate large
+ *     tool-result messages (kept to `config.toolResultMaxChars`).
  *  2. Trim system messages if total system bytes exceed `config.maxSystemBytes`.
  *  3. Trim conversation history if total body bytes exceed `config.maxBodyBytes`.
  *     Strategy:
@@ -684,18 +701,11 @@ export function sanitizeRequest(body, config = {}) {
   const keepEndMax         = config.keepEnd            ?? DEFAULT_KEEP_END;
   const toolResultMaxChars = config.toolResultMaxChars ?? 1500;
 
-  // --- Step 1: Truncate oversized tool-result messages ---
-  for (const m of body.messages) {
-    if (m.role !== "tool" && m.role !== "toolResult") continue;
-    if (typeof m.content === "string" && m.content.length > toolResultMaxChars) {
-      m.content = m.content.slice(0, toolResultMaxChars) + "\n...[truncated]";
-    } else if (Array.isArray(m.content)) {
-      for (const block of m.content) {
-        if (block.type === "text" && typeof block.text === "string" && block.text.length > toolResultMaxChars) {
-          block.text = block.text.slice(0, toolResultMaxChars) + "\n...[truncated]";
-        }
-      }
-    }
+  // --- Step 1: Truncate oversized tool-result messages only when needed ---
+  // Preserve full tool output while the request fits. The tool-result cap is a
+  // pressure-release valve for over-budget bodies, not a blanket display limit.
+  if (Buffer.byteLength(JSON.stringify(body), "utf-8") > maxBodyBytes) {
+    truncateLargeToolResults(body, toolResultMaxChars);
   }
 
   // --- Step 2: Trim system messages ---
