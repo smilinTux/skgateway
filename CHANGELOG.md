@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `sk-glm-m` and `sk-glm-l` had a single eligible member (`glm-5.3`), so
+  every M or L GLM request on chiap01 queued behind one model and fleet
+  workers hit 504s after 180 s. `glm-4.5` is now declared `size_class: M`
+  (the same published 355B / 32B-active MoE architecture as `glm-4.6`) and
+  `glm-5` `size_class: L` (Z.ai's published size, between `glm-4.7` and
+  `glm-5.3`). `glm-5-turbo` stays unsized until its size is published.
+
 ## [skgateway-v1.1.0] - 2026-10-05
 
 Second tagged release. Adds the chi-fleet capability set alongside this
