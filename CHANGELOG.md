@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The skfleet route snapshot only accepts models whose card declares tools
+  and reasoning, so `glm-5.3` was the fleet's only GLM route and one
+  rate-limit on it zeroed GLM capacity. `glm-4.5` (128k context) and `glm-5`
+  now declare `tools`, `tool_choice` and `reasoning`, per Z.ai's published
+  function-calling and thinking-mode support for both models.
+
+### Fixed
+
 - `sk-glm-m` and `sk-glm-l` had a single eligible member (`glm-5.3`), so
   every M or L GLM request on chiap01 queued behind one model and fleet
   workers hit 504s after 180 s. `glm-4.5` is now declared `size_class: M`
