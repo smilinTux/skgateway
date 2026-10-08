@@ -10,7 +10,7 @@ const scheduledProbes = new Map();
 const TRANSIENT_RETRY_MS = 5 * 60 * 1000;
 const TERMINAL_RETRY_MS = 30 * 60 * 1000;
 const MODEL_RECOVERY_RETRY_MS = 60 * 1000;
-const ZAI_RECOVERY_MODELS = Object.freeze(["glm-4.6", "glm-4.7", "glm-5.3"]);
+const ZAI_RECOVERY_MODELS = Object.freeze(["glm-4.5", "glm-4.6", "glm-4.7", "glm-5", "glm-5.3"]);
 
 /** Keep shared provider recovery on the exact claims qualified for fleet use. */
 export function selectProviderRecoveryModels(provider, models) {

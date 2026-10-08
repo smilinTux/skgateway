@@ -269,8 +269,8 @@ test("Z.ai recovery selects only canonical fleet claims from discovery", () => {
   assert.deepEqual(selectProviderRecoveryModels("zai", [
     "glm-4.5", "glm-4.5-air", "glm-4.6", "glm-4.7", "glm-5",
     "glm-5.1", "glm-5.2", "glm-5.3", "glm-5.3-flash",
-  ]), ["glm-4.6", "glm-4.7", "glm-5.3"]);
-  assert.deepEqual(selectProviderRecoveryModels("zai", ["glm-4.5", "glm-5.3-flash"]), []);
+  ]), ["glm-4.5", "glm-4.6", "glm-4.7", "glm-5", "glm-5.3"]);
+  assert.deepEqual(selectProviderRecoveryModels("zai", ["glm-4.5", "glm-5"]), ["glm-4.5", "glm-5"]);
 });
 
 test("canonical GLM recovery claims keep their authoritative class floors", () => {
@@ -278,8 +278,8 @@ test("canonical GLM recovery claims keep their authoritative class floors", () =
     new URL("../config/model-cards.overrides.yaml", import.meta.url), "utf8",
   )).overrides;
   assert.deepEqual(
-    ["glm-4.6", "glm-4.7", "glm-5.3"].map((model) => cards[model].size_class),
-    ["M", "L", "XL"],
+    ["glm-4.5", "glm-4.6", "glm-4.7", "glm-5", "glm-5.3"].map((model) => cards[model].size_class),
+    ["M", "M", "L", "L", "XL"],
   );
 });
 
