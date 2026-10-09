@@ -279,7 +279,8 @@ test("canonical GLM recovery claims keep their authoritative class floors", () =
   )).overrides;
   assert.deepEqual(
     ["glm-4.5", "glm-4.6", "glm-4.7", "glm-5", "glm-5.3"].map((model) => cards[model].size_class),
-    ["M", "M", "L", "L", "XL"],
+    // glm-4.5 is S: Z.ai serves it as glm-5.3-flash (observed 2026-10-09).
+    ["S", "M", "L", "L", "XL"],
   );
 });
 
