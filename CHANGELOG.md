@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `glm-4.5` no longer declares tools/reasoning, which removes it from skfleet
+  routing. Z.ai serves it as `glm-5.3-flash`, and skfleet's route preflight
+  requires the served model to equal the requested one, so every fleet
+  admission to it was a cached preflight failure (11 in four cycles after
+  v1.1.5). The gateway still serves it to other callers.
+
+### Fixed
+
 - `glm-4.5` is now `size_class: S`. Z.ai serves `glm-4.5` requests as
   `glm-5.3-flash` (an S model), so declaring it M (#184) put a small model in
   `sk-glm-m`, and skfleet route preflight cached it as a failure for M work

@@ -345,7 +345,7 @@ overrides:
   # does not publish context, parameter count, or tool capability facts, so
   # those fields remain absent until independently verified. This prevents an
   # attractive but unsupported size claim from placing a model in an XL bucket.
-  glm-4.5:       { display_name: "GLM-4.5",       org: Z.ai, tier: paid-cloud, size_class: S, context_length: 128000, supported_parameters: [tools, tool_choice, reasoning], reasoning: true, notes: "S, not M: Z.ai serves glm-4.5 requests as glm-5.3-flash (x-sk-model-served, observed 2026-10-09), an S-class model, so fleet route preflight rejected it for M work. Do not size this by the published GLM-4.5 architecture." }
+  glm-4.5:       { display_name: "GLM-4.5",       org: Z.ai, tier: paid-cloud, size_class: S, context_length: 128000, notes: "Z.ai serves glm-4.5 requests as glm-5.3-flash (x-sk-model-served, 2026-10-09). No tools/reasoning declared on purpose: skfleet routes only cards that declare them, and its route preflight requires served == requested, which can never hold here, so declaring them made every fleet admission to glm-4.5 a cached preflight failure." }
   glm-4.5-air:   { display_name: "GLM-4.5 Air",   org: Z.ai, tier: paid-cloud, size_class: S, notes: "light/fast z.ai lane" }
   glm-4.6:       { display_name: "GLM-4.6",       org: Z.ai, tier: paid-cloud, size_class: M, context_length: 200000, supported_parameters: [tools, tool_choice, reasoning], reasoning: true, notes: "fleet GLM S/M workhorse; account ceiling 10 concurrent" }
   glm-4.7:       { display_name: "GLM-4.7",       org: Z.ai, tier: paid-cloud, size_class: L, context_length: 200000, supported_parameters: [tools, tool_choice, reasoning], reasoning: true, notes: "fleet GLM L level" }
