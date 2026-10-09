@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `glm-4.5` is now `size_class: S`. Z.ai serves `glm-4.5` requests as
+  `glm-5.3-flash` (an S model), so declaring it M (#184) put a small model in
+  `sk-glm-m`, and skfleet route preflight cached it as a failure for M work
+  (24 blocked admissions in one cycle on 2026-10-09). `sk-glm-m` and
+  `sk-glm-l` keep `glm-5` and `glm-5.3`, which Z.ai serves as `glm-5.3`.
+
+### Fixed
+
 - The skfleet route snapshot only accepts models whose card declares tools
   and reasoning, so `glm-5.3` was the fleet's only GLM route and one
   rate-limit on it zeroed GLM capacity. `glm-4.5` (128k context) and `glm-5`
