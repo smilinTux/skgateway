@@ -355,6 +355,14 @@ overrides:
   glm-5.2:       { display_name: "GLM-5.2",       org: Z.ai, tier: paid-cloud }
   glm-5.3:       { display_name: "GLM-5.3",       org: Z.ai, tier: paid-cloud, size_class: XL, context_length: 200000, supported_parameters: [tools, tool_choice, reasoning], reasoning: true, notes: "fleet GLM XL level" }
   glm-5.3-flash: { display_name: "GLM-5.3 Flash", org: Z.ai, tier: paid-cloud, size_class: S, notes: "fast z.ai lane; size left S pending measurement" }
+  # DeepSeek Platform API ids served by the chi gateway's `deepseek` backend.
+  # Measured through chiap01:18790 on 2026-10-10: HTTP 200, x-sk-model-served
+  # equal to the requested id, a correct tool call, and reasoning tokens on a
+  # reasoning_effort request (94 flash, 125 pro). Without cards the skfleet
+  # router could not use DeepSeek at all, and sk-deepseek-* never qualified.
+  # Size classes are an operator assignment pending latency/quality telemetry.
+  deepseek-flash:  { display_name: "DeepSeek V4 Flash", org: DeepSeek, tier: paid-cloud, size_class: M, supported_parameters: [tools, tool_choice, reasoning], reasoning: true, notes: "DeepSeek Platform API; fleet M level (2026-10-10 measured: tools + reasoning)" }
+  deepseek-v4-pro: { display_name: "DeepSeek V4 Pro",   org: DeepSeek, tier: paid-cloud, size_class: L, supported_parameters: [tools, tool_choice, reasoning], reasoning: true, notes: "DeepSeek Platform API; fleet L level (2026-10-10 measured: tools + reasoning)" }
 
   # ───────────── KIMI CODE SUBSCRIPTION (kimi_oauth backend, 2026-09-03) ──────
   # Ranked by capability and account family structure. Concurrency ceilings
@@ -992,3 +1000,11 @@ providers:
     cost_tier: paid-cloud
     verified: "2026-08-22"
     ref: "ZCode subscription entitlement observed locally; provider retention terms still require human review"
+
+  # DeepSeek Platform API (paid key). Retention/training posture not verified;
+  # mirror the zai fail-safe zone-2 boundary until the terms are reviewed.
+  deepseek:
+    data_retention: unknown
+    cost_tier: paid-cloud
+    verified: "2026-10-10"
+    ref: "DeepSeek Platform API key observed in the chi gateway; provider retention terms still require human review"
