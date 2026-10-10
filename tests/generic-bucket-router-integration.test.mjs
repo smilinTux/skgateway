@@ -312,4 +312,71 @@ describe('generic bucket policy wired into routeAndSend', () => {
     }
     assert.equal(deepseek.state.count, 0, 'the tool-less member must never receive a tools request');
   });
+  // Session affinity (policy/bucket-affinity.mjs). chi 2026-10-10: one fleet
+  // builder session went deepseek-flash -> glm-5.3 -> deepseek-flash and
+  // DeepSeek 400'd on the missing reasoning_content of its own prior turn.
+  const conversation = (opening, turns) => {
+    const messages = [{ role: 'system', content: 'fleet builder' }, { role: 'user', content: opening }];
+    for (let i = 0; i < turns; i++) {
+      messages.push({ role: 'assistant', content: `step ${i}` });
+      messages.push({ role: 'user', content: `tool result ${i}` });
+    }
+    return Buffer.from(JSON.stringify({ model: 'sk-m', messages }));
+  };
+
+  test('a continuing conversation stays on its first member while first turns still rotate', async () => {
+    writeFileSync(CATALOG_CACHE_PATH, JSON.stringify({ models: CATALOG }), 'utf8');
+    applyConfig({});
+    const router = makeRouter();
+
+    const firsts = new Set();
+    for (let session = 0; session < 6; session++) {
+      const r = await routeAndSend(router, { model: 'sk-m', agentId: `first-${session}` },
+        '/chat/completions', 'POST', HEADERS, conversation(`card ${session}`, 0), false);
+      assert.equal(r.status, 200);
+      firsts.add(r.bucketMember);
+    }
+    assert.equal(firsts.size, 2, 'first turns of different sessions must still spread across members');
+
+    const opening = await routeAndSend(router, { model: 'sk-m', agentId: 'sticky' },
+      '/chat/completions', 'POST', HEADERS, conversation('card sticky', 0), false);
+    for (let turn = 1; turn <= 6; turn++) {
+      const r = await routeAndSend(router, { model: 'sk-m', agentId: 'sticky' },
+        '/chat/completions', 'POST', HEADERS, conversation('card sticky', turn), false);
+      assert.equal(r.status, 200);
+      assert.equal(r.bucketMember, opening.bucketMember, `turn ${turn} must stay on the session's member`);
+    }
+  });
+
+  test('affinity never forces a member that left the pool', async () => {
+    writeFileSync(CATALOG_CACHE_PATH, JSON.stringify({ models: CATALOG }), 'utf8');
+    applyConfig({});
+    const router = makeRouter();
+    let first;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      first = await routeAndSend(router, { model: 'sk-m', agentId: 'fenced' },
+        '/chat/completions', 'POST', HEADERS, conversation('card fenced', 0), false);
+      if (first.bucketMember === 'deepseek-model') break;
+    }
+    assert.equal(first.bucketMember, 'deepseek-model');
+    applyConfig({ generic_bucket_providers: ['zai'] });
+    const r = await routeAndSend(router, { model: 'sk-m', agentId: 'fenced' },
+      '/chat/completions', 'POST', HEADERS, conversation('card fenced', 1), false);
+    assert.equal(r.status, 200);
+    assert.equal(r.bucketMember, 'zai-model', 'a fenced-out remembered member must not be forced');
+  });
+
+  test('an explicit x-session-id keys affinity even when openings differ', async () => {
+    writeFileSync(CATALOG_CACHE_PATH, JSON.stringify({ models: CATALOG }), 'utf8');
+    applyConfig({});
+    const router = makeRouter();
+    const headers = { ...HEADERS, 'x-session-id': 'sess-42' };
+    const first = await routeAndSend(router, { model: 'sk-m', agentId: 'sid', headers },
+      '/chat/completions', 'POST', headers, conversation('opening a', 0), false);
+    for (let turn = 1; turn <= 4; turn++) {
+      const r = await routeAndSend(router, { model: 'sk-m', agentId: 'sid', headers },
+        '/chat/completions', 'POST', headers, conversation(`opening ${turn}`, turn), false);
+      assert.equal(r.bucketMember, first.bucketMember);
+    }
+  });
 });

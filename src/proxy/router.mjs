@@ -51,6 +51,7 @@ import { enforceResponseContract } from "./response-contract.mjs";
 import { shouldForceNonStream } from "../classifiers/classifier.mjs";
 import { openAIJsonToSSEBuffer } from "./stream.mjs";
 import { createDecisionCache, decisionKey } from "./decision-cache.mjs";
+import { bucketAffinityKey, isContinuation, preferRemembered } from "../policy/bucket-affinity.mjs";
 // card P4.2 (@match routing): reuse the existing ranker + capability deriver
 // + discovery cache reader + allowlist/availability checks as-is, no
 // reimplementation. getConfig() gates the whole branch behind
@@ -115,6 +116,9 @@ function writeJsonAtomic(filePath, value) {
 
 // sk-auto routing decision cache (TTL+LRU); keyed by request fingerprint + config epoch.
 const _autoDecisionCache = createDecisionCache({ ttlMs: 60_000, maxEntries: 500 });
+// One agent session stays on one bucket member (see policy/bucket-affinity.mjs).
+// Two hours covers a long builder session; 5000 entries bounds memory.
+const _bucketAffinity = createDecisionCache({ ttlMs: 2 * 60 * 60 * 1000, maxEntries: 5000 });
 // @match ranked-pick decision cache (card P4.2). Separate from the sk-auto
 // cache above so entries never collide; same TTL/LRU discipline.
 const _matchDecisionCache = createDecisionCache({ ttlMs: 60_000, maxEntries: 500 });
@@ -3191,8 +3195,24 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
   // bucket's floor rather than plain cheapest-cost. Weighted generic buckets
   // (S/M/L with no explicit provider) use the ticket-weighted pick above
   // instead, which already encodes its own provider/weight policy.
-  const picked = isWeightedGeneric ? (orderedMembers[0] || null)
+  const affinityMessages = extractMessages(request, body);
+  const affinityKey = bucketAffinityKey(
+    addr.bucket,
+    affinityMessages,
+    request.headers?.["x-session-id"],
+  );
+  const remembered = affinityKey && isContinuation(affinityMessages)
+    ? _bucketAffinity.get(affinityKey)
+    : null;
+  if (isWeightedGeneric) orderedMembers = preferRemembered(orderedMembers, remembered);
+  let picked = isWeightedGeneric ? (orderedMembers[0] || null)
     : selectMember(members, n, familyPreference, addr.model_class);
+  if (!isWeightedGeneric && picked && remembered) {
+    picked = preferRemembered(
+      [picked, ...members.filter((member) => member.id !== picked.id)],
+      remembered,
+    )[0];
+  }
   
   if (!picked) {
     console.warn(`[router] bucket ${addr.bucket} no member selected after preference`);
@@ -3211,12 +3231,16 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
     };
   }
 
+  if (affinityKey) _bucketAffinity.set(affinityKey, { id: picked.id, family: picked.family });
+  const sticky = Boolean(remembered && remembered.id === picked.id);
+
   console.log(
     `[router] bucket ${addr.bucket} -> ${picked.id} ` +
       `(class ${picked.model_class || "?"} via ${picked.class_basis}, zone ${picked.trust_zone ?? "?"}, ` +
       `family ${picked.family || "?"}, ` +
       `${members.length} eligible)` +
-      (familyPreference ? ` [preference: ${familyPreference.join(',')}]` : ''),
+      (familyPreference ? ` [preference: ${familyPreference.join(',')}]` : '') +
+      (sticky ? " [session affinity]" : ""),
   );
 
   // Resolve the chosen id through the router's own model matching, so
