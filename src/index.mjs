@@ -64,10 +64,13 @@ import {
   capacityRoutabilityRejection,
   orderMembersByGenericWeight,
   resolveBucket,
+  isGenericBucket,
+  genericBucketFence,
 } from "./policy/buckets.mjs";
 import { genericPolicyRevision } from "./policy/generic-participation.mjs";
 import { loadRegistry, REGISTRY_PATH as _REGISTRY_PATH } from "./proxy/registry.mjs";
 import { policyFromRegistry } from "./policy/sensitivity.mjs";
+import { genericBucketQualification, applyGenericBucketMetadata, genericBucketQueueRows, genericBucketHealthRows } from "./policy/generic-bucket-status.mjs";
 import { readFileSync } from "node:fs";
 import { load as yamlLoad } from "js-yaml";
 import { createShadowRecorder } from "./proxy/semantic-cache-shadow.mjs";
@@ -598,6 +601,88 @@ export function applyFocusedAliasMetadata(data, cfg, { sensitivityPolicy, lifecy
         ...(selected.every((row) => row.card?.tier === selected[0].card?.tier)
           ? { tier: selected[0].card.tier } : {}) } };
   });
+}
+
+/**
+ * The /v1/models pipeline up to (not including) alias projection, shared with
+ * the /queue and /health generic-bucket rows so all three judge bucket
+ * qualification from the same catalog view.
+ *
+ * @returns {Promise<{visible: Array<object>, membership: Array<object>}>}
+ */
+async function buildCatalogStages() {
+  const discovered = await getDiscoveredCatalog();
+  const advertiseBackends = effectiveAdvertiseBackends(config.backends || {}, router);
+  const excluded = excludedModelIds(config);
+  const reconciled = buildModelCatalog(advertiseBackends, router, advertiseReconcileMode, excluded);
+  // mergeDiscoveredCatalog() layers the discovered provider/free/stale tags
+  // onto the reconciled health/status entries and GUARANTEES every model
+  // carries a non-empty provider (see src/proxy/advertise.mjs). The
+  // allowlist is applied last, exactly as on /admin/models.
+  const merged = withoutExcludedModels(
+    mergeDiscoveredCatalog(reconciled, discovered, advertiseBackends), excluded);
+  const allowlist = loadAllowlist();
+  const allowed = applyCapacityView(applyAllowlist(merged, allowlist));
+  // Aliases (buckets + registry roles): additive, allowlist-aware,
+  // dedupe concrete-first. Buckets only when buckets_enabled is true.
+  const aliases = allowAliases(aliasCatalogEntries(getConfig()), allowlist);
+  const seenIds = new Set(allowed.map((m) => m.id));
+  const enriched = [...allowed, ...aliases.filter((e) => !seenIds.has(e.id))];
+  // Lifecycle view (card P1.4): hide eol/dead ids, flag suspect ones.
+  // Composes with (does not replace) the allowlist filter above.
+  // Picker badges (card P2.4): additive ctx_tokens/tools/vision derived
+  // from each surviving entry's card, if it has one. Superset-only.
+  // Public-safe: strip internal card fields (notes) before the funnel.
+  // Claimer-aware lifecycle view (incident inc-2026-08-18-qwen38-eol):
+  // the advertised set honors the same claim-over-verdict rule as the
+  // router's gate, so /v1/models and routability stay consistent.
+  // Focused-alias projection (generic bucket policy, operator-fenced
+  // `sk-<provider>-<bucket>` aliases): a focused alias is only advertised
+  // under its own provider identity once its whole current pool actually
+  // qualifies (reasoning + tool support, not stale/unavailable). applyCardOverlays
+  // re-applies curated card fields lost by applyLifecycleView above, since
+  // applyFocusedAliasMetadata needs the full card (reasoning, supported_parameters)
+  // to judge qualification. applyGenerationDefaults then projects the
+  // operator's explicit generation-token cap (never a provider-claimed max).
+  const visible = applyCardOverlays(applyLifecycleView(enriched, getLifecycle,
+    modelClaimersFor(advertiseBackends)), loadCardOverrides());
+  return { visible, membership: applyCardOverlays(merged, loadCardOverrides()) };
+}
+
+// Short-lived memo of the generic-bucket qualification so a fleet polling
+// /queue and /health does not rebuild the whole catalog view every hit.
+const GENERIC_QUALIFICATION_TTL_MS = 5000;
+let _genericQualification = { at: 0, value: null };
+
+function rememberGenericQualification(visible, membership) {
+  const value = genericBucketQualification(visible, getConfig(), {
+    membership, lifecycle: getLifecycle, sensitivityPolicy: policyFromRegistry(loadRegistry()) });
+  _genericQualification = { at: Date.now(), value };
+  return value;
+}
+
+/**
+ * Current generic-bucket qualification for /queue and /health, or null when
+ * buckets are disabled or the catalog view cannot be built (fail-soft: those
+ * endpoints must never fail because of bucket rows).
+ */
+async function currentGenericQualification() {
+  if (getConfig()?.routing?.buckets_enabled !== true) return null;
+  if (_genericQualification.value && Date.now() - _genericQualification.at < GENERIC_QUALIFICATION_TTL_MS) {
+    return _genericQualification.value;
+  }
+  // Never make a health/queue poll wait on a cold network discovery refresh:
+  // until the first catalog lands, serve the last known rows (or none).
+  if (getConfig()?.discovery?.enabled !== false && _catalog.length === 0) {
+    return _genericQualification.value;
+  }
+  try {
+    const { visible, membership } = await buildCatalogStages();
+    return rememberGenericQualification(visible, membership);
+  } catch (e) {
+    console.warn("[skgateway] generic bucket qualification failed (rows omitted):", e.message);
+    return null;
+  }
 }
 
 /**
@@ -1635,11 +1720,21 @@ export const server = http.createServer(async (req, res) => {
 
   // ── Health check endpoint ──
   if (req.url === "/health" || req.url === "/healthz") {
+    // Generic buckets (sk-s/sk-m/sk-l/sk-xl) join the backends map as
+    // aggregate rows so the fleet can health-gate a bucket like a backend.
+    const health = router.getHealth();
+    let bucketRows = {};
+    try {
+      const qualification = await currentGenericQualification();
+      if (qualification) bucketRows = genericBucketHealthRows(qualification, health);
+    } catch (e) {
+      console.warn("[skgateway] /health generic bucket rows failed (omitted):", e.message);
+    }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
       status: "ok",
       uptime: process.uptime(),
-      backends: router.getHealth(),
+      backends: { ...bucketRows, ...health },
     }));
     return;
   }
@@ -1674,6 +1769,16 @@ export const server = http.createServer(async (req, res) => {
   if (req.url === "/queue") {
     const allStats = pool.getAllStats();
     const total = pool.getTotalStats();
+    // Generic buckets as capacity domains: one row per bucket with >=1
+    // qualified member, summing member pool stats (each pool domain once).
+    // Added after `total` so bucket rows never double count pool capacity.
+    let bucketRows = {};
+    try {
+      const qualification = await currentGenericQualification();
+      if (qualification) bucketRows = genericBucketQueueRows(qualification, (id) => pool.getStats(id));
+    } catch (e) {
+      console.warn("[skgateway] /queue generic bucket rows failed (omitted):", e.message);
+    }
     // In-flight requests with age: the discriminator between a WORKING
     // worker (fresh open request, ages cycling) and a HUNG one (a request
     // open for many minutes). Two fleet workers were mistaken for hung on
@@ -1691,7 +1796,7 @@ export const server = http.createServer(async (req, res) => {
         utilization: total.totalCapacity > 0 ? (total.totalActive / total.totalCapacity) : 0,
       },
       inFlight,
-      backends: allStats,
+      backends: { ...bucketRows, ...allStats },
       timestamp: new Date().toISOString(),
     }));
     return;
@@ -1750,45 +1855,14 @@ export const server = http.createServer(async (req, res) => {
     // the process down. /v1/models must always answer 200 with whatever
     // catalog it can assemble, never 500, never crash.
     try {
-      const discovered = await getDiscoveredCatalog();
-      const advertiseBackends = effectiveAdvertiseBackends(config.backends || {}, router);
-      const excluded = excludedModelIds(config);
-      const reconciled = buildModelCatalog(advertiseBackends, router, advertiseReconcileMode, excluded);
-      // mergeDiscoveredCatalog() layers the discovered provider/free/stale tags
-      // onto the reconciled health/status entries and GUARANTEES every model
-      // carries a non-empty provider (see src/proxy/advertise.mjs). The
-      // allowlist is applied last, exactly as on /admin/models.
-      const merged = withoutExcludedModels(
-        mergeDiscoveredCatalog(reconciled, discovered, advertiseBackends), excluded);
-      const allowlist = loadAllowlist();
-      const allowed = applyCapacityView(applyAllowlist(merged, allowlist));
-      // Aliases (buckets + registry roles): additive, allowlist-aware,
-      // dedupe concrete-first. Buckets only when buckets_enabled is true.
-      const aliases = allowAliases(aliasCatalogEntries(getConfig()), allowlist);
-      const seenIds = new Set(allowed.map((m) => m.id));
-      const enriched = [...allowed, ...aliases.filter((e) => !seenIds.has(e.id))];
-      // Lifecycle view (card P1.4): hide eol/dead ids, flag suspect ones.
-      // Composes with (does not replace) the allowlist filter above.
-      // Picker badges (card P2.4): additive ctx_tokens/tools/vision derived
-      // from each surviving entry's card, if it has one. Superset-only.
-      // Public-safe: strip internal card fields (notes) before the funnel.
-      // Claimer-aware lifecycle view (incident inc-2026-08-18-qwen38-eol):
-      // the advertised set honors the same claim-over-verdict rule as the
-      // router's gate, so /v1/models and routability stay consistent.
-      // Focused-alias projection (generic bucket policy, operator-fenced
-      // `sk-<provider>-<bucket>` aliases): a focused alias is only advertised
-      // under its own provider identity once its whole current pool actually
-      // qualifies (reasoning + tool support, not stale/unavailable). applyCardOverlays
-      // re-applies curated card fields lost by applyLifecycleView above, since
-      // applyFocusedAliasMetadata needs the full card (reasoning, supported_parameters)
-      // to judge qualification. applyGenerationDefaults then projects the
-      // operator's explicit generation-token cap (never a provider-claimed max).
-      const visible = applyCardOverlays(applyLifecycleView(enriched, getLifecycle,
-        modelClaimersFor(advertiseBackends)), loadCardOverrides());
-      const focused = applyFocusedAliasMetadata(visible, getConfig(), {
-        membership: applyCardOverlays(merged, loadCardOverrides()),
-      });
-      const data = stripInternalCardFields(applyPickerBadges(applyGenerationDefaults(focused)));
+      const { visible, membership } = await buildCatalogStages();
+      const focused = applyFocusedAliasMetadata(visible, getConfig(), { membership });
+      // Generic buckets (sk-s/sk-m/sk-l/sk-xl): advertised when at least one
+      // fenced, tool-capable reasoning member qualifies. Same qualification the
+      // /queue and /health bucket rows use (see policy/generic-bucket-status.mjs).
+      const generic = applyGenericBucketMetadata(focused,
+        rememberGenericQualification(visible, membership));
+      const data = stripInternalCardFields(applyPickerBadges(applyGenerationDefaults(generic)));
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ object: "list", data }));
     } catch (e) {
@@ -1804,10 +1878,12 @@ export const server = http.createServer(async (req, res) => {
       try {
         const visible = applyCardOverlays(applyLifecycleView(data, getLifecycle,
           modelClaimersFor(advertiseBackends)), loadCardOverrides());
-        const focused = applyFocusedAliasMetadata(visible, getConfig(), {
-          membership: applyCardOverlays(fallback, loadCardOverrides()),
-        });
-        data = stripInternalCardFields(applyPickerBadges(applyGenerationDefaults(focused)));
+        const membership = applyCardOverlays(fallback, loadCardOverrides());
+        const focused = applyFocusedAliasMetadata(visible, getConfig(), { membership });
+        const generic = applyGenericBucketMetadata(focused,
+          genericBucketQualification(visible, getConfig(), {
+    membership, lifecycle: getLifecycle, sensitivityPolicy: policyFromRegistry(loadRegistry()) }));
+        data = stripInternalCardFields(applyPickerBadges(applyGenerationDefaults(generic)));
       } catch (e2) {
         console.warn("[skgateway] /v1/models static catalog fallback also failed, serving empty list:", e2.message);
         data = [];
@@ -2125,11 +2201,20 @@ export const server = http.createServer(async (req, res) => {
       const out = [];
       for (const b of all) {
         try {
+          // Mirror the request path's operator fences so this view agrees
+          // with routing: bucket_excluded_models for every bucket, plus the
+          // generic-only provider/model fences for provider-less buckets.
+          const fence = isGenericBucket(b) ? genericBucketFence(cfg?.routing) : null;
+          const bucketExcluded = new Set(cfg?.routing?.bucket_excluded_models || []);
           const { members, rejected, ceiling } = resolveBucket({
             bucket: b,
             catalog,
             sensitivityPolicy: policy,
-            getRoutabilityRejection,
+            getRoutabilityRejection: (e) => {
+              if (bucketExcluded.has(e.id)) return { reason: "bucket_excluded_models" };
+              if (fence && !fence(e)) return { reason: "generic bucket fence" };
+              return getRoutabilityRejection(e);
+            },
           });
           const physicalResources = new Set(members.map((m) => m.physical_resource_id));
           // Generic S/M/L buckets only (never a focused sk-<provider>-<bucket>

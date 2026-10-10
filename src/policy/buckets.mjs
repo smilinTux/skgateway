@@ -141,6 +141,49 @@ export function publicLSubscriptionOwns(entry, bucket) {
     || provider === 'kimi' || provider.startsWith('kimi-');
 }
 
+/** True for a provider-less bucket (sk-m, sk-m-public, ...), never a focused alias. */
+export function isGenericBucket(bucket) {
+  return Boolean(bucket) && !bucket.provider;
+}
+
+/**
+ * Operator fence for GENERIC bucket membership only, read from gateway config:
+ *
+ *   routing.generic_bucket_providers        provider/backend names allowed as
+ *                                           generic members; empty = all
+ *   routing.generic_bucket_excluded_models  exact ids kept out of generic buckets
+ *
+ * Focused `sk-<provider>-<bucket>` aliases and explicit model requests never
+ * consult this, which is the point: the fleet can turn a model on or off for
+ * sk-s/sk-m/sk-l/sk-xl without touching the provider-focused routes other
+ * consumers depend on. A provider name matches the entry's provider (with the
+ * glm->zai alias and the kimi-* family) or the serving backend id (owned_by).
+ *
+ * @param {object} [routing] config.routing
+ * @returns {(entry: object) => boolean} true when the entry may be a generic member
+ */
+export function genericBucketFence(routing = {}) {
+  const norm = (v) => {
+    const s = String(v || '').toLowerCase();
+    return PROVIDER_ALIASES[s] || s;
+  };
+  const providers = new Set((Array.isArray(routing?.generic_bucket_providers)
+    ? routing.generic_bucket_providers : []).map(norm).filter(Boolean));
+  const excluded = new Set(Array.isArray(routing?.generic_bucket_excluded_models)
+    ? routing.generic_bucket_excluded_models : []);
+  return (entry) => {
+    if (excluded.has(entry?.id)) return false;
+    if (providers.size === 0) return true;
+    for (const candidate of [entry?.provider, entry?.owned_by]) {
+      const name = norm(candidate);
+      if (!name) continue;
+      if (providers.has(name)) return true;
+      if (providers.has('kimi') && name.startsWith('kimi-')) return true;
+    }
+    return false;
+  };
+}
+
 /**
  * Parse a model id as a bucket address, or null when it is an ordinary id.
  *

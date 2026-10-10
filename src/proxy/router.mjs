@@ -81,6 +81,8 @@ import {
   looksLikeBucketAttempt,
   allBuckets,
   publicLSubscriptionOwns,
+  isGenericBucket,
+  genericBucketFence,
 } from "../policy/buckets.mjs";
 import { codexPurityProblems } from "../policy/codex-purity.mjs";
 
@@ -3068,6 +3070,10 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
   // Operator fences survive discovery refresh without fabricating lifecycle state.
   // They affect bucket selection only; explicit diagnostic model requests remain available.
   const excluded = new Set(getConfig().routing?.bucket_excluded_models || []);
+  // Generic-only fence (routing.generic_bucket_providers /
+  // generic_bucket_excluded_models): narrows provider-less buckets only, so a
+  // focused sk-<provider>-<bucket> alias is never affected by it.
+  const genericFence = isGenericBucket(addr) ? genericBucketFence(getConfig().routing) : null;
   const { members, rejected, ceiling } = resolveBucket({
     bucket: addr,
     catalog,
@@ -3075,6 +3081,7 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
     requireToolUse: wantsTools,
     isRoutable: (e) => {
       if (excluded.has(e.id)) return false;
+      if (genericFence && !genericFence(e)) return false;
       const claimers = typeof router.getBackends === "function"
         ? router.getBackends()
           .filter((backend) => backend.supportsModel(e.id))
