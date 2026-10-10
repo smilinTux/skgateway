@@ -46,6 +46,7 @@ process.env.SKGATEWAY_CAPACITY_STORE_PATH = CAPACITY_PATH;
 const { createRouter, routeAndSend } = await import('../src/proxy/router.mjs');
 const { loadConfig } = await import('../src/config.mjs');
 const { _resetCacheForTests } = await import('../src/discovery/model_catalog_store.mjs');
+const { attributionHeaders } = await import('../src/metrics/attribution.mjs');
 
 const HEADERS = { 'content-type': 'application/json' };
 const bodyFor = (model, extra = {}) => Buffer.from(JSON.stringify({
@@ -53,7 +54,8 @@ const bodyFor = (model, extra = {}) => Buffer.from(JSON.stringify({
 }));
 
 let _cfgSeq = 0;
-function applyConfig({ buckets_enabled = true, generic_participation, bucket_excluded_models, model_limits } = {}) {
+function applyConfig({ buckets_enabled = true, generic_participation, bucket_excluded_models, model_limits,
+  generic_bucket_providers, generic_bucket_excluded_models } = {}) {
   const p = join(FIX_DIR, `gw-${_cfgSeq++}.yaml`);
   const lines = ['routing:', `  buckets_enabled: ${buckets_enabled}`];
   if (generic_participation) {
@@ -62,6 +64,12 @@ function applyConfig({ buckets_enabled = true, generic_participation, bucket_exc
   }
   if (bucket_excluded_models) {
     lines.push(`  bucket_excluded_models: ${JSON.stringify(bucket_excluded_models)}`);
+  }
+  if (generic_bucket_providers) {
+    lines.push(`  generic_bucket_providers: ${JSON.stringify(generic_bucket_providers)}`);
+  }
+  if (generic_bucket_excluded_models) {
+    lines.push(`  generic_bucket_excluded_models: ${JSON.stringify(generic_bucket_excluded_models)}`);
   }
   if (model_limits) {
     lines.push('model_limits:');
@@ -230,5 +238,78 @@ describe('generic bucket policy wired into routeAndSend', () => {
     assert.match(error.message, /history was not modified/);
     assert.equal(zai.state.count, 0);
     assert.equal(deepseek.state.count, 0);
+  });
+  test('generic_bucket_providers fences generic buckets only: focused alias for a fenced-out provider still serves', async () => {
+    writeFileSync(CATALOG_CACHE_PATH, JSON.stringify({ models: CATALOG }), 'utf8');
+    applyConfig({ generic_bucket_providers: ['zai'] });
+    const router = makeRouter();
+    for (let counter = 0; counter < 6; counter++) {
+      const r = await routeAndSend(router, { model: 'sk-m', agentId: `gp-${counter}` },
+        '/chat/completions', 'POST', HEADERS, bodyFor('sk-m'), false);
+      assert.equal(r.status, 200);
+      assert.equal(r.bucketMember, 'zai-model');
+      assert.equal(r.backendId, 'zaiBackend');
+    }
+    assert.equal(deepseek.state.count, 0);
+    const focused = await routeAndSend(router, { model: 'sk-deepseek-m', agentId: 'gp-focused' },
+      '/chat/completions', 'POST', HEADERS, bodyFor('sk-deepseek-m'), false);
+    assert.equal(focused.status, 200, 'the generic-only fence must not touch a focused alias');
+    assert.equal(focused.bucketMember, 'deepseek-model');
+    const direct = await routeAndSend(router, { model: 'deepseek-model', agentId: 'gp-direct' },
+      '/chat/completions', 'POST', HEADERS, bodyFor('deepseek-model'), false);
+    assert.equal(direct.status, 200, 'an explicit model request must not be fenced');
+  });
+
+  test('generic_bucket_excluded_models fences generic buckets only', async () => {
+    writeFileSync(CATALOG_CACHE_PATH, JSON.stringify({ models: CATALOG }), 'utf8');
+    applyConfig({ generic_bucket_excluded_models: ['zai-model'] });
+    const router = makeRouter();
+    for (let counter = 0; counter < 6; counter++) {
+      const r = await routeAndSend(router, { model: 'sk-m', agentId: `ge-${counter}` },
+        '/chat/completions', 'POST', HEADERS, bodyFor('sk-m'), false);
+      assert.equal(r.status, 200);
+      assert.equal(r.bucketMember, 'deepseek-model');
+    }
+    assert.equal(zai.state.count, 0);
+    const focused = await routeAndSend(router, { model: 'sk-zai-m', agentId: 'ge-focused' },
+      '/chat/completions', 'POST', HEADERS, bodyFor('sk-zai-m'), false);
+    assert.equal(focused.status, 200);
+    assert.equal(focused.bucketMember, 'zai-model');
+  });
+
+  test('a generic bucket fenced to nothing fails closed with 503', async () => {
+    writeFileSync(CATALOG_CACHE_PATH, JSON.stringify({ models: CATALOG }), 'utf8');
+    applyConfig({ generic_bucket_providers: ['openrouter'] });
+    const router = makeRouter();
+    const r = await routeAndSend(router, { model: 'sk-m', agentId: 'ge-none' },
+      '/chat/completions', 'POST', HEADERS, bodyFor('sk-m'), false);
+    assert.equal(r.status, 503);
+    assert.equal(zai.state.count + deepseek.state.count, 0);
+  });
+
+  test('a tools request to sk-m never lands on a tool-less member; attribution names the serving member', async () => {
+    const toolCatalog = [
+      { id: 'zai-model', provider: 'zai', free: false,
+        card: { tier: 'paid-cloud', size_class: 'M', supported_parameters: ['tools', 'tool_choice'] } },
+      { id: 'deepseek-model', provider: 'deepseek', free: false,
+        card: { tier: 'paid-cloud', size_class: 'M', supported_parameters: [] } },
+    ];
+    writeFileSync(CATALOG_CACHE_PATH, JSON.stringify({ models: toolCatalog }), 'utf8');
+    applyConfig({});
+    const router = makeRouter();
+    const tools = [{ type: 'function', function: { name: 'f', parameters: { type: 'object' } } }];
+    for (let counter = 0; counter < 6; counter++) {
+      const r = await routeAndSend(router, { model: 'sk-m', agentId: `tools-${counter}` },
+        '/chat/completions', 'POST', HEADERS, bodyFor('sk-m', { tools }), false);
+      assert.equal(r.status, 200);
+      assert.equal(r.bucketMember, 'zai-model');
+      assert.equal(r.backendId, 'zaiBackend', 'x-sk-backend source must be the serving member backend');
+      const attribution = attributionHeaders('req-1', r);
+      assert.equal(attribution['x-sk-backend'], 'zaiBackend');
+      if (r.servedModel !== undefined) assert.equal(attribution['x-sk-model-served'], r.servedModel);
+      assert.equal(zai.state.lastModel, 'zai-model', 'the upstream must be asked for the member id, not the bucket alias');
+      assert.equal(attribution['x-sk-bucket-member'], 'zai-model');
+    }
+    assert.equal(deepseek.state.count, 0, 'the tool-less member must never receive a tools request');
   });
 });

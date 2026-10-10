@@ -297,6 +297,14 @@ const DEFAULTS = {
     // a model cannot silently reappear in rotation just because discovery
     // re-fetched it.
     bucket_excluded_models: [],
+    // GENERIC-bucket-only fences (sk-s/sk-m/sk-l/sk-xl and the other
+    // provider-less buckets). bucket_excluded_models above applies to every
+    // bucket including focused sk-<provider>-<bucket> aliases, so it cannot be
+    // a fleet on/off switch. These two never touch focused or direct routes.
+    //   generic_bucket_providers        allowed provider/backend names; [] = all
+    //   generic_bucket_excluded_models  exact model ids kept out of generic buckets
+    generic_bucket_providers: [],
+    generic_bucket_excluded_models: [],
   },
 
   // CapAuth agent-identity (SKGateway P2.1). Every /v1/* request is resolved to
@@ -982,6 +990,16 @@ function validate(cfg, removedBackendIds = new Set()) {
   if (!Array.isArray(bucketExcluded) || bucketExcluded.some((id) =>
     typeof id !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9._:/-]*$/.test(id))) {
     errs.push('routing.bucket_excluded_models must be an array of exact model IDs');
+  }
+  const genericProviders = cfg.routing?.generic_bucket_providers;
+  if (genericProviders !== undefined && (!Array.isArray(genericProviders) || genericProviders.some((id) =>
+    typeof id !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9._:-]*$/.test(id)))) {
+    errs.push('routing.generic_bucket_providers must be an array of provider/backend names');
+  }
+  const genericExcluded = cfg.routing?.generic_bucket_excluded_models;
+  if (genericExcluded !== undefined && (!Array.isArray(genericExcluded) || genericExcluded.some((id) =>
+    typeof id !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9._:/-]*$/.test(id)))) {
+    errs.push('routing.generic_bucket_excluded_models must be an array of exact model IDs');
   }
 
   // server
