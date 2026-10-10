@@ -175,7 +175,7 @@ export function genericBucketHealthRows(qualification, health = {}) {
     const rows = qualification.get(id).rows;
     out[id] = {
       status,
-      observed: true,
+      observed: snaps.some((s) => s.observed === true),
       quarantined: snaps.length > 0 && snaps.every((s) => s.quarantined === true),
       lastCheck: Math.max(0, ...snaps.map((s) => Number(s.lastCheck) || 0)),
       members: backends,
