@@ -123,6 +123,11 @@ backends:
   ## the canonical id across both replicas.
   chiap01-qwen38:
     url: http://chiap01:18810/v1
+    # 2026-10-11: sovereignty guard (the 2026-08-16 inversion class). This
+    # backend serves content no substitute may answer; with no_failover
+    # absent, a dead upstream let the router substitute the CLOUD fallback
+    # (nvidia) for requests naming this model. Fail loudly instead.
+    no_failover: true
     auth_type: none
     models:
       - qwen3.8-27b-huihui-abliterated-q4_k_m
@@ -135,6 +140,11 @@ backends:
   ## GET http://chiap08:11439/v1/models answers (owned_by vllm, 131072 ctx).
   chiap08-qwen38:
     url: http://chiap08:11439/v1
+    # 2026-10-11: sovereignty guard (the 2026-08-16 inversion class). This
+    # backend serves content no substitute may answer; with no_failover
+    # absent, a dead upstream let the router substitute the CLOUD fallback
+    # (nvidia) for requests naming this model. Fail loudly instead.
+    no_failover: true
     # Context preflight ceiling (card 9ed4a9f7). Matches the in-repo value from
     # commit 37e599a: chiap08's vLLM reports max_model_len 131072 on
     # GET /v1/models. The LIVE config carried no ceiling at all, so the preflight
@@ -315,6 +325,11 @@ backends:
   ornith:
     enabled: true
     url: http://192.168.0.100:8082/v1
+    # 2026-10-11: sovereignty guard (the 2026-08-16 inversion class). This
+    # backend serves content no substitute may answer; with no_failover
+    # absent, a dead upstream let the router substitute the CLOUD fallback
+    # (nvidia) for requests naming this model. Fail loudly instead.
+    no_failover: true
     # Context preflight ceiling (card 9ed4a9f7). llama-server reports n_ctx 65536
     # and the registry reserves min_output_tokens: 8192 for the visible answer,
     # so ~57344 tokens is what the INPUT may actually occupy. Without this key
@@ -397,6 +412,24 @@ sanitizer:
 # Per-model context limits.  Formula: max_body_bytes = context_tokens * 4 bytes * 0.80
 # max_system_bytes = max_body_bytes * 0.40.  Values from NVIDIA NIM model cards (2026-05-12).
 model_limits:
+  # claude-* via the ccapi subscription path (2026-10-11). These had NO entry,
+  # so Hermes' main model inherited the global sanitizer.max_body_bytes of
+  # 120000 while every local model carried a generous override (qwen3.8-27b
+  # 800000, deepseek 2000000). Hermes sends 118k-174k byte turns: 118078 slipped
+  # under and worked, 148219/162329/173911 were rejected with
+  # "Request body exceeds the configured transport limit", which Hermes
+  # surfaced as "413 payload too large. Cannot compress further." and then
+  # auto-reset the session. Claude's context is ~200k tokens, far more than
+  # 120000 bytes of text, so the cap was the gateway's, not the model's.
+  # Matched to qwen3.8-27b's proven values rather than guessed higher.
+  claude-opus-5-5:              { max_body_bytes: 800000, max_system_bytes: 320000 }
+  claude-opus-5:                { max_body_bytes: 800000, max_system_bytes: 320000 }
+  claude-opus-4-8:              { max_body_bytes: 800000, max_system_bytes: 320000 }
+  claude-opus-4-7:              { max_body_bytes: 800000, max_system_bytes: 320000 }
+  claude-opus-4-6:              { max_body_bytes: 800000, max_system_bytes: 320000 }
+  claude-sonnet-5:              { max_body_bytes: 800000, max_system_bytes: 320000 }
+  claude-sonnet-4-6:            { max_body_bytes: 800000, max_system_bytes: 320000 }
+  claude-fable-5:               { max_body_bytes: 800000, max_system_bytes: 320000 }
   ## Ornith 1.5 Q6_K is deliberately served at 32K on the .100 16GB GPU.
   ornith-1.5-9b:                              { max_body_bytes: 104750,   max_system_bytes: 42000   }
   ornith-1.0-9b:                              { max_body_bytes: 104750,   max_system_bytes: 42000   }  # compatibility alias on the 1.5 server
