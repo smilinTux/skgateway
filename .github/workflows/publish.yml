@@ -4,6 +4,15 @@ on:
   push:
     tags:
       - "v*"
+      - "skgateway-v*"
+  # Publish an existing release tag after the fact (a tag-triggered run uses the
+  # workflow file AT the tagged commit, so re-pushing an old tag cannot pick up a
+  # fixed workflow). The tag must be reachable from main.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to publish (vX.Y.Z or skgateway-vX.Y.Z)"
+        required: true
 
 permissions:
   contents: read
@@ -13,6 +22,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+      - name: Refuse a tag that is not a release tag reachable from main
+        env:
+          REL_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          case "$REL_TAG" in
+            v[0-9]*.[0-9]*.[0-9]*|skgateway-v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::not a release tag: $REL_TAG"; exit 1 ;;
+          esac
+          git rev-parse -q --verify "refs/tags/$REL_TAG" >/dev/null || { echo "::error::tag not found: $REL_TAG"; exit 1; }
+          git fetch -q origin main
+          git merge-base --is-ancestor "refs/tags/$REL_TAG" origin/main || { echo "::error::$REL_TAG is not reachable from main"; exit 1; }
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -29,13 +52,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
       - name: Sync version from tag
+        env:
+          REL_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
-          TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+          TAG_VERSION="${REL_TAG#skgateway-v}"
+          TAG_VERSION="${TAG_VERSION#v}"
           npm version "$TAG_VERSION" --no-git-tag-version --allow-same-version
           echo "npm version set to $TAG_VERSION"
       - name: Install dependencies
@@ -46,7 +74,7 @@ jobs:
         run: |
           OUTPUT=$(npm publish --access public 2>&1) && exit 0
           if echo "$OUTPUT" | grep -q "cannot publish over the previously published"; then
-            echo "::warning::Version already exists on npm — skipping"
+            echo "::warning::Version already exists on npm: skipping"
           else
             echo "$OUTPUT"
             exit 1

@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "SKGATEWAY_ADVERTISE_STATE": {
+      "type": "string"
+    },
+    "SKGATEWAY_ALIASES": {
+      "type": "string"
+    },
+    "SKGATEWAY_TIMEOUT_SECONDS": {
+      "minimum": 0.1,
+      "type": "number"
+    },
+    "SKGATEWAY_UPSTREAM": {
+      "pattern": "^https?://",
+      "type": "string"
+    },
+    "SKGATEWAY_UPSTREAM_MODEL": {
+      "minLength": 1,
+      "type": "string"
+    }
+  },
+  "required": [
+    "SKGATEWAY_UPSTREAM",
+    "SKGATEWAY_UPSTREAM_MODEL",
+    "SKGATEWAY_ALIASES",
+    "SKGATEWAY_TIMEOUT_SECONDS",
+    "SKGATEWAY_ADVERTISE_STATE"
+  ],
+  "title": "SKGateway Python proxy non-secret configuration",
+  "type": "object"
+}

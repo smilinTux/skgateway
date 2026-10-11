@@ -431,6 +431,12 @@ node --test --reporter=tap tests/
 The test runner is Node.js's built-in `node:test` module (Node 20+). No external
 test framework is required.
 
+`npm test` runs each `tests/*.test.mjs` file in sorted order with a 120 second
+per-file timeout. It emits one JSON result naming the exact file and
+classification. The suite stops on the first test failure, runner error, or
+timeout. Set `SKGATEWAY_TEST_FILE_TIMEOUT_MS` to a positive millisecond value
+for a different bounded CI budget.
+
 ### Writing a new test file
 
 Create `tests/<module>.test.mjs`. Follow this scaffold:

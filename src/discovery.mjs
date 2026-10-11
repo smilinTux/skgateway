@@ -62,6 +62,7 @@ import * as opencodeAdapter from './discovery/providers/opencode.mjs';
 import * as anthropicWrapperAdapter from './discovery/providers/anthropic-wrapper.mjs';
 import * as codexAdapter from './discovery/providers/codex.mjs';
 import * as zaiAdapter from './discovery/providers/zai.mjs';
+import * as deepseekAdapter from './discovery/providers/deepseek.mjs';
 import {
   probeModels,
   DEFAULT_PROBE_BUDGET,
@@ -374,18 +375,29 @@ const _FRESH_PROVIDER_SOURCES = new Set(["openrouter", "models.dev"]);
 
 export function applyCardOverlay(model, overrides) {
   const override = overrides && overrides[model.id];
+  const existingCard = model.card || {};
+  // Cost is derived from the card tier, never from provider names. Preserve
+  // every other classification field, including trust and data handling.
+  // This correction also applies to fresh provider cards: their metadata is
+  // authoritative, but a stale free flag must not contradict their tier.
+  if (existingCard.tier === 'paid-cloud' && model.free !== false) {
+    model = { ...model, free: false };
+  }
   if (!override) return model;
   const src = model.card && model.card.source;
   // Never clobber a live provider's authoritative card.
   if (src && _FRESH_PROVIDER_SOURCES.has(src)) return model;
-  return {
-    ...model,
-    card: {
-      ...(model.card || {}),
-      ...override,
-      source: 'manual',
-    },
+  const card = {
+    ...(model.card || {}),
+    ...override,
+    source: 'manual',
   };
+  // Cost is a card fact, not a provider-name heuristic.  Configured models
+  // start as free when their backend is otherwise unknown; a curated
+  // paid-cloud tier must correct that declaration while leaving trust-zone,
+  // data-handling, and provider-purity fields untouched.
+  const free = card.tier === 'paid-cloud' ? false : model.free;
+  return { ...model, free, card };
 }
 
 /** Apply the manual overlay across a whole merged catalog (card P2.2). */
@@ -393,9 +405,9 @@ export function applyCardOverlays(models, overrides) {
   return models.map((m) => applyCardOverlay(m, overrides));
 }
 
-export function mergeCatalog(local, nvidia, openrouter, opencode, anthropic, codex, zai) {
+export function mergeCatalog(local, nvidia, openrouter, opencode, anthropic, codex, zai, deepseek) {
   const seen = new Map();
-  for (const group of [local || [], nvidia || [], openrouter || [], opencode || [], anthropic || [], codex || [], zai || []]) {
+  for (const group of [local || [], nvidia || [], openrouter || [], opencode || [], anthropic || [], codex || [], zai || [], deepseek || []]) {
     for (const m of group) {
       if (!seen.has(m.id)) seen.set(m.id, m);
     }
@@ -660,6 +672,13 @@ export async function fetchZai(authHeaders) {
   return zaiAdapter.fetch(authHeaders);
 }
 
+// DeepSeek (api.deepseek.com): named export matching fetchZai above; the
+// production call site (src/index.mjs) wires it when the deepseek backend is
+// enabled, same opt-in pattern as codex/opencode.
+export async function fetchDeepSeek(authHeaders) {
+  return deepseekAdapter.fetch(authHeaders);
+}
+
 /**
  * Record the outcome of one provider's fetch cycle onto the cache so the
  * freshness endpoint can report per-provider health (last success, last error,
@@ -834,6 +853,7 @@ export async function discoverCatalog(opts) {
     // "outage"; pre-existing tests must not flip stale).
     codexFetch = async () => ({ models: [] }),
     zaiFetch = async () => ({ data: [] }),
+    deepseekFetch = async () => ({ data: [] }),
     cache = {},
     now = Date.now,
     // Card P1.3: where the shared model lifecycle store (model_catalog_store.mjs)
@@ -925,12 +945,14 @@ export async function discoverCatalog(opts) {
   let anthropic = [];
   let codex = [];
   let zai = [];
+  let deepseek = [];
   let nvidiaOk = false;
   let openrouterOk = false;
   let opencodeOk = false;
   let anthropicOk = false;
   let codexOk = false;
   let zaiOk = false;
+  let deepseekOk = false;
   try {
     // Card P2.1: normalize() (not the legacy parseNvidia()) so the merged
     // catalog carries the full ModelCard, not just the id.
@@ -1000,6 +1022,16 @@ export async function discoverCatalog(opts) {
     stale = true;
     zai = (cache.models || []).filter((m) => m.provider === 'zai');
     recordProvider(cache, 'zai', { ok: false, count: zai.length, at, error: String(e?.message || e) });
+  }
+
+  try {
+    deepseek = deepseekAdapter.normalize(await deepseekFetch(), { now: () => at });
+    deepseekOk = true;
+    recordProvider(cache, 'deepseek', { ok: true, count: deepseek.length, at });
+  } catch (e) {
+    stale = true;
+    deepseek = (cache.models || []).filter((m) => m.provider === 'deepseek');
+    recordProvider(cache, 'deepseek', { ok: false, count: deepseek.length, at, error: String(e?.message || e) });
   }
 
   // Catalog-absence tracking (card P1.3): only a REAL live fetch is evidence
@@ -1072,7 +1104,17 @@ export async function discoverCatalog(opts) {
         );
         updated = { ...updated, ...reconciled };
       }
-      if (nvidiaOk || openrouterOk || opencodeOk || anthropicOk || codexOk || zaiOk) saveLifecycleStore(updated, lifecycleStorePath);
+      if (deepseekOk) {
+        const reconciled = reconcilePresence(
+          sliceByProvider(fullStore, 'deepseek', declaredModels?.deepseek ?? declaredModelsFor('deepseek')),
+          deepseek.map((m) => m.id),
+          'deepseek',
+          at,
+          thresholds,
+        );
+        updated = { ...updated, ...reconciled };
+      }
+      if (nvidiaOk || openrouterOk || opencodeOk || anthropicOk || codexOk || zaiOk || deepseekOk) saveLifecycleStore(updated, lifecycleStorePath);
     } catch {
       // fail-soft, see doc comment above.
     }
@@ -1153,7 +1195,7 @@ export async function discoverCatalog(opts) {
     ? localModels.filter((m) => m.provider !== 'anthropic' && m.provider !== 'anthropic-direct')
     : localModels;
   const models = applyCardOverlays(
-    mergeCatalog(effectiveLocal, nvidia, openrouter, opencode, anthropic, codex, zai),
+    mergeCatalog(effectiveLocal, nvidia, openrouter, opencode, anthropic, codex, zai, deepseek),
     overrides,
   ).map((m) => ({ ...m, stale }));
   cache.models = models;

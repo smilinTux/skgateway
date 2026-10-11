@@ -13,11 +13,112 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 import {
+  normalizeSystemMessageOrder,
   repairToolPairing,
   recoverKimiToolCalls,
   sanitizeRequest,
   sanitizeResponse,
+  trimHistoryToBudget,
 } from "../src/proxy/sanitizer.mjs";
+
+describe("normalizeSystemMessageOrder", () => {
+  test("consolidates all system messages ahead of multi-turn tool history without changing history order", () => {
+    const messages = [
+      { role: "system", content: "base" },
+      { role: "user", content: "find it" },
+      { role: "assistant", tool_calls: [{ id: "c1" }] },
+      { role: "tool", tool_call_id: "c1", content: "found" },
+      { role: "system", content: "trim notice" },
+      { role: "assistant", content: "done" },
+    ];
+
+    assert.equal(normalizeSystemMessageOrder(messages), true);
+    assert.deepEqual(messages, [
+      { role: "system", content: "base\n\ntrim notice" },
+      { role: "user", content: "find it" },
+      { role: "assistant", tool_calls: [{ id: "c1" }] },
+      { role: "tool", tool_call_id: "c1", content: "found" },
+      { role: "assistant", content: "done" },
+    ]);
+  });
+
+  test("moves an appended tool-limit STOP message to the system prefix", () => {
+    const messages = [
+      { role: "system", content: "base" },
+      { role: "user", content: "continue" },
+      { role: "tool", tool_call_id: "c20", content: "result" },
+      { role: "system", content: "STOP calling tools" },
+    ];
+
+    assert.equal(normalizeSystemMessageOrder(messages), true);
+    assert.deepEqual(messages.map((message) => message.content), [
+      "base\n\nSTOP calling tools", "continue", "result",
+    ]);
+  });
+
+  test("moves a generated trimming notice into the system prefix", () => {
+    const body = {
+      messages: [
+        { role: "system", content: "base" },
+        ...Array.from({ length: 8 }, (_, i) => ({
+          role: i % 2 ? "assistant" : "user",
+          content: `${i}:`.padEnd(500, "x"),
+        })),
+      ],
+    };
+
+    trimHistoryToBudget(body, { maxBodyBytes: 2_500, keepStart: 2, keepEnd: 3, log: () => {} });
+    assert.ok(body.messages.some((message) => message.role === "system" && /trimmed/.test(message.content)));
+    assert.equal(normalizeSystemMessageOrder(body.messages), true);
+    assert.equal(body.messages[0].role, "system");
+    assert.match(body.messages[0].content, /^base\n\n/);
+    assert.ok(body.messages.slice(1).every((message) => message.role !== "system"));
+  });
+
+  test("consolidates an already-leading system prefix for strict single-system templates", () => {
+    const messages = [
+      { role: "system", content: "base" },
+      { role: "system", content: "policy" },
+      { role: "user", content: "hello" },
+    ];
+
+    assert.equal(normalizeSystemMessageOrder(messages), true);
+    assert.deepEqual(messages, [
+      { role: "system", content: "base\n\npolicy" },
+      { role: "user", content: "hello" },
+    ]);
+  });
+
+  test("preserves ordered text blocks when consolidating structured system content", () => {
+    const messages = [
+      { role: "system", content: "base" },
+      { role: "user", content: "hello" },
+      { role: "system", content: [{ type: "text", text: "policy" }] },
+    ];
+
+    assert.equal(normalizeSystemMessageOrder(messages), true);
+    assert.deepEqual(messages, [
+      { role: "system", content: [
+        { type: "text", text: "base" },
+        { type: "text", text: "\n\n" },
+        { type: "text", text: "policy" },
+      ] },
+      { role: "user", content: "hello" },
+    ]);
+  });
+
+  test("leaves an ordinary request unchanged", () => {
+    const messages = [
+      { role: "system", content: "base" },
+      { role: "user", content: "hello" },
+      { role: "assistant", content: "hi" },
+    ];
+    const before = JSON.stringify(messages);
+
+    assert.equal(normalizeSystemMessageOrder(messages), false);
+    assert.equal(JSON.stringify(messages), before);
+  });
+});
 
 describe("repairToolPairing", () => {
   test("returns input unchanged when no tool messages present", () => {

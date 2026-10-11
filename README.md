@@ -11,7 +11,17 @@ by the repository's [`tests`](tests).
 
 ## Shipped capabilities
 
-The following claims are limited to behavior present in this repository.
+The following claims are limited to behavior present in this repository. They
+do not claim that every component is enabled in a deployed gateway.
+
+> **Pipeline qualification:** The shipped `src/index.mjs` request path invokes
+> model-limit trimming before `routeAndSend` and response sanitization before
+> returning buffered responses. Repository tests exercise that source wiring.
+> The proposed bounded production runtime check was not authorized, so these
+> statements are source and synthetic-test evidence, not a live-runtime
+> qualification. The YAML policy engine, proactive tool reducer, and core retry
+> rate-limit handling remain library or observational components unless a caller
+> explicitly composes them. See [the policy guide](docs/POLICIES.md).
 
 | Capability | Shipped evidence |
 | --- | --- |
@@ -27,6 +37,38 @@ The following claims are limited to behavior present in this repository.
 | Optional local SOC dashboard with REST data endpoints and WebSocket updates | [`src/dashboard/server.mjs`](src/dashboard/server.mjs) and the static UI in [`src/dashboard/static/index.html`](src/dashboard/static/index.html) |
 | File based SKCapstone alert and service registration integration when a shared SKCapstone home exists | [`src/integration.mjs`](src/integration.mjs) and [`tests/integration.test.mjs`](tests/integration.test.mjs) |
 | Configuration reload on `SIGHUP` | [`src/config.mjs`](src/config.mjs) and live credential rotation coverage in [`tests/client-auth-integration.test.mjs`](tests/client-auth-integration.test.mjs) |
+| Local-only speech-to-text and embeddings via `sk-stt`/`sk-embed` aliases, no cloud failover | [`src/proxy/media-routes.mjs`](src/proxy/media-routes.mjs) and [`tests/media-routes.test.mjs`](tests/media-routes.test.mjs) |
+
+## Speech-to-text and embeddings
+
+`POST /v1/audio/transcriptions` (multipart, OpenAI-compatible) and
+`POST /v1/embeddings` (JSON, OpenAI-compatible) are served by
+[`src/proxy/media-routes.mjs`](src/proxy/media-routes.mjs). Both routes resolve
+the `model` the caller sent against `config.media.aliases` and forward the
+request to exactly the one backend URL configured for that alias:
+
+```yaml
+media:
+  aliases:
+    sk-stt:   { kind: stt,   url: "http://HOST:18794/v1/audio/transcriptions", model: "whisper-1", timeout_ms: 600000 }
+    sk-embed: { kind: embed, url: "http://HOST:11438/v1/embeddings",            model: "mxbai-embed-large", timeout_ms: 30000 }
+```
+
+These aliases are local-only by design: a down backend returns its error to the
+caller as a 502, never a silent substitution to another backend or a cloud
+provider, because the audio and text these routes carry (call recordings,
+document content) is private. Both routes pass through the same
+client_auth/operator_auth boundary as every other route (see
+[`src/identity/client-auth.mjs`](src/identity/client-auth.mjs)); when that
+boundary is disabled, as it is by default, these routes are reachable
+unauthenticated on the LAN, exactly like `/v1/chat/completions`. A successful
+response carries `x-sk-model-served: <alias>=<backend model>`, as chat
+completions does.
+
+Each alias also has a small concurrency cap, since it fronts one local backend
+process rather than a pool: `media.max_concurrent_stt` (default 2) and
+`media.max_concurrent_embed` (default 8). A request over the cap gets `429`
+with a `Retry-After` header and never reaches the backend.
 
 ## Scope and defaults
 
@@ -40,9 +82,16 @@ every deployment.
   reroute requests. See the `classification` defaults in
   [`src/config.mjs`](src/config.mjs) and the side effect guard in
   [`tests/classification-engine.test.mjs`](tests/classification-engine.test.mjs).
-* The YAML policy engine, tool reducer, sanitizer, and rate limiter are used by the
-  embeddable `handleRequest` path in [`src/proxy/core.mjs`](src/proxy/core.mjs).
-  They are not presented here as unconditional enforcement by the main runtime.
+* Model-limit system and conversation trimming are wired into the main
+  `src/index.mjs` request path before `routeAndSend`. Buffered response
+  sanitization is wired after `routeAndSend`; streaming responses skip that
+  sanitizer path. [`tests/live-pipeline-wiring.test.mjs`](tests/live-pipeline-wiring.test.mjs)
+  provides repository test evidence only. The bounded production runtime check
+  was denied for now, so neither stage is claimed as live-runtime qualified.
+* The YAML policy engine, proactive tool reducer, and core retry rate-limit
+  handling are used by the embeddable `handleRequest` path in
+  [`src/proxy/core.mjs`](src/proxy/core.mjs), but are not composed by the default
+  `src/index.mjs` request path. They are not claimed as live enforcement.
 * Syslog and Elasticsearch are optional sinks. The default SIEM output is a local
   JSONL file. See [`src/config.mjs`](src/config.mjs),
   [`tests/siem-syslog.test.mjs`](tests/siem-syslog.test.mjs), and
@@ -123,6 +172,8 @@ The main runtime implements these public protocol surfaces in
 | --- | --- | --- |
 | `POST` | `/v1/chat/completions` | OpenAI compatible chat completion |
 | `POST` | `/v1/messages` | Anthropic Messages frontend |
+| `POST` | `/v1/embeddings` | Local-only embeddings (`sk-embed`), see [Speech-to-text and embeddings](#speech-to-text-and-embeddings) |
+| `POST` | `/v1/audio/transcriptions` | Local-only speech-to-text (`sk-stt`), see [Speech-to-text and embeddings](#speech-to-text-and-embeddings) |
 | `GET` | `/v1/models` | Reconciled public model catalog |
 | `GET` | `/v1/models/:id` | Public model metadata |
 | `GET` | `/health` and `/healthz` | Process health |

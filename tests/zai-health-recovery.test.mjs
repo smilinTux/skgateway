@@ -193,7 +193,20 @@ test("malformed GLM output does not poison shared backend lifecycle", async (t) 
     })), false);
   assert.equal(result.status, 502);
   assert.equal(router.getBackend("zai").getHealth().status, "up");
-  assert.equal(router.getBackend("zai").getModelClaimHealth("glm-4.7").quarantined, false);
+  // Was asserted `quarantined, false` before this fix. A bug at the
+  // router.mjs claimTransition call site fed the upstream's original 2xx
+  // into recordModelClaimOutcome() instead of the gateway's 502 whenever a
+  // contract failure occurred, so recordModelClaimOutcome() always took its
+  // success branch and deleted the failure entry, meaning a malformed
+  // completion could never quarantine the model claim, even here with
+  // threshold 1 where it should trip on the very first failure. That is the
+  // bug this test was unknowingly enshrining (see
+  // model-claim-contract-failure.test.mjs for the direct regression
+  // coverage). The invariant this test's name is about is the line above:
+  // the SHARED backend health stays "up" even though the exact model claim
+  // correctly quarantines.
+  assert.equal(router.getBackend("zai").getModelClaimHealth("glm-4.7").quarantined, true);
+  assert.equal(router.getBackend("zai").getModelClaimHealth("glm-4.7").failures, 1);
   const status = capacityStatus("zai", "glm-4.7", { path: CAPACITY_STORE_PATH });
   assert.equal(status.scope, "model");
   assert.equal(status.reason, "malformed_response");
@@ -256,8 +269,8 @@ test("Z.ai recovery selects only canonical fleet claims from discovery", () => {
   assert.deepEqual(selectProviderRecoveryModels("zai", [
     "glm-4.5", "glm-4.5-air", "glm-4.6", "glm-4.7", "glm-5",
     "glm-5.1", "glm-5.2", "glm-5.3", "glm-5.3-flash",
-  ]), ["glm-4.6", "glm-4.7", "glm-5.3"]);
-  assert.deepEqual(selectProviderRecoveryModels("zai", ["glm-4.5", "glm-5.3-flash"]), []);
+  ]), ["glm-4.5", "glm-4.6", "glm-4.7", "glm-5", "glm-5.3"]);
+  assert.deepEqual(selectProviderRecoveryModels("zai", ["glm-4.5", "glm-5"]), ["glm-4.5", "glm-5"]);
 });
 
 test("canonical GLM recovery claims keep their authoritative class floors", () => {
@@ -265,8 +278,9 @@ test("canonical GLM recovery claims keep their authoritative class floors", () =
     new URL("../config/model-cards.overrides.yaml", import.meta.url), "utf8",
   )).overrides;
   assert.deepEqual(
-    ["glm-4.6", "glm-4.7", "glm-5.3"].map((model) => cards[model].size_class),
-    ["M", "L", "XL"],
+    ["glm-4.5", "glm-4.6", "glm-4.7", "glm-5", "glm-5.3"].map((model) => cards[model].size_class),
+    // glm-4.5 is S: Z.ai serves it as glm-5.3-flash (observed 2026-10-09).
+    ["S", "M", "L", "L", "XL"],
   );
 });
 

@@ -262,6 +262,9 @@ describe("disabled qualification startup", () => {
       queueTimeoutMs: 12_000,
       totalProcessed: 0,
       totalDropped: 0,
+      // Additive admission counter: deferrals to the next candidate are
+      // counted separately from drops (see connection-pool-admission tests).
+      totalDeferred: 0,
       totalTimedOut: 0,
       totalCancelled: 0,
       peakActive: 0,

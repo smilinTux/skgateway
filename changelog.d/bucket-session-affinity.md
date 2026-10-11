@@ -1,0 +1,1 @@
+- Keep one agent session on one bucket member: continuation turns (a prior assistant message) prefer the member that served the session's first turn, keyed by `x-session-id` or the conversation opening, so a session no longer alternates model families mid-conversation.

@@ -87,6 +87,34 @@ function startUpstream(statusRef = 200) {
   });
 }
 
+function startStreamingUpstream() {
+  return new Promise((resolve) => {
+    const state = { body: null };
+    const server = http.createServer((req, res) => {
+      const chunks = [];
+      req.on("data", (chunk) => chunks.push(chunk));
+      req.on("end", () => {
+        state.body = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+        const model = state.body.model;
+        const frames = [
+          { model, choices: [{ index: 0, delta: { content: "ok" }, finish_reason: "stop" }] },
+          { model, choices: [], usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } },
+        ];
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.end(`${frames.map((frame) => `data: ${JSON.stringify(frame)}`).join("\n\n")}\n\ndata: [DONE]\n\n`);
+      });
+    });
+    server.listen(0, "127.0.0.1", () => {
+      const { port } = server.address();
+      resolve({
+        base: `http://127.0.0.1:${port}/v1`,
+        close: () => new Promise((done) => server.close(done)),
+        state,
+      });
+    });
+  });
+}
+
 const HEADERS = { "content-type": "application/json" };
 const bodyFor = (model) => Buffer.from(JSON.stringify({ model, messages: [] }));
 
@@ -255,4 +283,38 @@ describe("per-agent routing via routeAndSend", () => {
     );
     assert.equal(r.backendId, "b", "explicit role signal suppressed the agent pin");
   });
+});
+
+test("stream_options and the upstream usage frame survive routed streaming", async () => {
+  const upstream = await startStreamingUpstream();
+  try {
+    const router = createRouter({
+      backends: {
+        qwen: { url: upstream.base, auth_type: "none", models: ["qwen-test"], priority: 1 },
+      },
+      registry_path: writeRegistry({ "agent:lumina": "qwen-test" }),
+      failover: false,
+    });
+    const request = {
+      model: "sk-default",
+      messages: [{ role: "user", content: "synthetic" }],
+      stream: true,
+      stream_options: { include_usage: true },
+    };
+
+    const result = await routeAndSend(
+      router,
+      { model: request.model, agentId: "lumina" },
+      "/v1/chat/completions",
+      "POST",
+      HEADERS,
+      Buffer.from(JSON.stringify(request)),
+      false,
+    );
+
+    assert.deepEqual(upstream.state.body.stream_options, { include_usage: true });
+    assert.match(result.body.toString("utf-8"), /"usage":\{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15\}/);
+  } finally {
+    await upstream.close();
+  }
 });

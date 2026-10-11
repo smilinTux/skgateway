@@ -1,0 +1,19 @@
+[Unit]
+Description=SKGateway tailnet ingress socket: __INSTANCE__
+Documentation=https://github.com/smilinTux/skgateway
+After=network-online.target
+Wants=network-online.target
+
+[Socket]
+## Binds the named interface only (SO_BINDTODEVICE), never a wildcard, LAN or
+## public address. Portable across hosts: the interface name does not change
+## even if the tailnet address does. May require elevated network
+## capabilities on some hosts; see docs/DEPLOYING.md.
+BindToDevice=__TAILNET_INTERFACE__
+ListenStream=__INGRESS_PORT__
+Accept=no
+KeepAlive=true
+NoDelay=true
+
+[Install]
+WantedBy=sockets.target

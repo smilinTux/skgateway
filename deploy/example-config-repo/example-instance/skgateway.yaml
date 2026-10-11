@@ -1,0 +1,19 @@
+## Placeholder SKGateway config for this instance. See docs/CONFIGURATION.md
+## in the main skgateway repo for the full field reference. All fields have
+## code-level defaults; this file only needs entries that differ.
+
+server:
+  port: 18780
+  dashboard_port: 18781
+  bind: 0.0.0.0
+
+backends:
+  example-local:
+    url: http://example-backend-host:11434/v1
+    auth_type: none
+    models:
+      - example-model-id
+    priority: 1
+
+advertise:
+  reconcile: hide

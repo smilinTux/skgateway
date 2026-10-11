@@ -12,11 +12,12 @@
 import http from "node:http";
 import { loadConfig, getConfig } from "./config.mjs";
 import { createProxyServer, handleRequest, buildConfig, trimSystemMessages, trimConversationHistory } from "./proxy/core.mjs";
-import { createRouter, routeAndSend } from "./proxy/router.mjs";
-import { sanitizeResponse } from "./proxy/sanitizer.mjs";
+import { ingressRequestLimit, requestLimitResponse } from "./proxy/request-limits.mjs";
+import { createRouter, routeAndSend, startKimiAuthKeepalive } from "./proxy/router.mjs";
+import { normalizeSystemMessageOrder, sanitizeResponse } from "./proxy/sanitizer.mjs";
 import { applyCapacityView, availabilityState, buildModelCatalog, reconcileModeFromConfig, tagLocalModels, mergeDiscoveredCatalog, isModelAvailable, excludedModelIds, withoutExcludedModels } from "./proxy/advertise.mjs";
 import { loadAllowlist, saveAllowlist, applyAllowlist } from "./advertise.mjs";
-import { discoverCatalog, loadCache, saveCache, fetchNvidia, fetchOpenRouter, fetchOpencode, fetchAnthropicWrapper, fetchCodex, fetchZai, catalogStatus, loadCardOverrides, applyCardOverlays, buildServingCatalog } from "./discovery.mjs";
+import { discoverCatalog, loadCache, saveCache, fetchNvidia, fetchOpenRouter, fetchOpencode, fetchAnthropicWrapper, fetchCodex, fetchZai, fetchDeepSeek, catalogStatus, loadCardOverrides, applyCardOverlays, buildServingCatalog } from "./discovery.mjs";
 import { getPool, resetPool } from "./proxy/connection-pool.mjs";
 import { loadAgentRegistry, extractIdentity, normalizeAgentId, ANONYMOUS_AGENT_ID } from "./identity/capauth.mjs";
 import { ClientAuthenticator, classifyAuthenticationRoute, stripCallerCredentials, stripCredentialQuery } from "./identity/client-auth.mjs";
@@ -43,6 +44,7 @@ import { fromAnthropicRequest, toAnthropicMessage, modelRetrieveObject } from ".
 import { readCodexAuthHeaders } from "./proxy/codex-adapter.mjs";
 import { readZaiAuthHeaders, ZAI_CREDENTIALS_PATH } from "./proxy/zai-adapter.mjs";
 import { SSEWriter, jsonToSSE } from "./proxy/stream.mjs";
+import { handleEmbeddings, handleTranscriptions, createMediaLimiter } from "./proxy/media-routes.mjs";
 import { getLifecycle } from "./discovery/model_catalog_store.mjs";
 import {
   capacityStatus,
@@ -57,9 +59,18 @@ import { REGISTRY_PATH } from "./proxy/registry.mjs";
 import { energyRowsFrom, energyHeaders } from "./metrics/energy.mjs";
 import { attributionHeaders } from "./metrics/attribution.mjs";
 import { sampleTokenRatio } from "./metrics/token-ratio.mjs";
-import { allBuckets, capacityRoutabilityRejection, resolveBucket } from "./policy/buckets.mjs";
+import {
+  allBuckets,
+  capacityRoutabilityRejection,
+  orderMembersByGenericWeight,
+  resolveBucket,
+  isGenericBucket,
+  genericBucketFence,
+} from "./policy/buckets.mjs";
+import { genericPolicyRevision } from "./policy/generic-participation.mjs";
 import { loadRegistry, REGISTRY_PATH as _REGISTRY_PATH } from "./proxy/registry.mjs";
 import { policyFromRegistry } from "./policy/sensitivity.mjs";
+import { genericBucketQualification, applyGenericBucketMetadata, genericBucketQueueRows, genericBucketHealthRows } from "./policy/generic-bucket-status.mjs";
 import { readFileSync } from "node:fs";
 import { load as yamlLoad } from "js-yaml";
 import { createShadowRecorder } from "./proxy/semantic-cache-shadow.mjs";
@@ -519,6 +530,162 @@ export function applyPickerBadges(data) {
 }
 
 /**
+ * Project the operator's explicit generation-token cap onto each catalog
+ * entry, replacing whatever a provider claims (or a stale cached default
+ * already carries). A provider-advertised maximum is a marketing ceiling, not
+ * an operator policy; this makes `generation_default_tokens` reflect only an
+ * override explicitly set in model-cards.overrides.yaml.
+ *
+ * @param {Array<object>} data
+ * @param {object} [overrides] result of loadCardOverrides(), injectable for tests
+ * @returns {Array<object>}
+ */
+export function applyGenerationDefaults(data, overrides = loadCardOverrides()) {
+  return data.map((model) => {
+    const value = Object.hasOwn(overrides || {}, model.id)
+      ? overrides[model.id]?.generation_default_tokens : undefined;
+    const valid = Number.isSafeInteger(value) && value > 0;
+    if (!valid && !Object.hasOwn(model.card || {}, 'generation_default_tokens')) return model;
+    const card = { ...model.card };
+    // Provider maxima and stale cached defaults do not establish operator policy.
+    delete card.generation_default_tokens;
+    if (valid) card.generation_default_tokens = value;
+    return { ...model, card };
+  });
+}
+
+/**
+ * Project a provider-focused `sk-<provider>-<bucket>` alias (e.g.
+ * `sk-deepseek-l`) under its OWN provider identity in the public catalog,
+ * but only when every member of its current generic-bucket pool actually
+ * qualifies: advertised, not stale, reasoning-capable, and supports both
+ * `tools` and `tool_choice`. Any entry that fails this (an empty pool, a
+ * disabled/missing backend, a non-qualifying member) is projected as an
+ * unavailable `skgateway`-owned stub instead of silently exposing a
+ * provider identity the pool cannot actually back end-to-end.
+ *
+ * @param {Array<object>} data catalog entries, including bucket-kind aliases
+ * @param {object} cfg live gateway config (for backend enabled/disabled state)
+ * @param {{sensitivityPolicy?: object, lifecycle?: Function, membership?: Array<object>}} [opts]
+ * @returns {Array<object>}
+ */
+export function applyFocusedAliasMetadata(data, cfg, { sensitivityPolicy, lifecycle = getLifecycle, membership = data } = {}) {
+  const concrete = data.filter((entry) => !entry.kind);
+  const catalog = buildCapabilityCatalog(membership.filter((entry) => !entry.kind), { getLifecycleFn: lifecycle });
+  const buckets = new Map(allBuckets().filter((bucket) => bucket.provider)
+    .map((bucket) => [bucket.bucket, bucket]));
+  const policy = sensitivityPolicy ?? policyFromRegistry(loadRegistry());
+  return data.map((entry) => {
+    const bucket = entry.kind === 'bucket' ? buckets.get(entry.id) : null;
+    if (!bucket) return entry;
+    const unavailable = { ...entry, provider: 'skgateway', owned_by: 'skgateway',
+      advertised: false, stale: true };
+    const backend = cfg?.backends?.[bucket.provider];
+    if (!backend || backend.enabled === false) return unavailable;
+    const { members } = resolveBucket({ bucket, catalog, sensitivityPolicy: policy });
+    if (!members.length) return unavailable;
+    const rows = members.map((member) => concrete.filter((row) =>
+      row.id === member.id && row.provider === bucket.provider));
+    if (rows.some((matches) => matches.length !== 1)) return unavailable;
+    const selected = rows.map(([row]) => row);
+    if (selected.some((row) => row.advertised !== true || row.stale !== false
+      || row.status === 'unavailable' || row.capacity?.state === 'unavailable'
+      || row.card?.reasoning !== true
+      || !Array.isArray(row.card?.supported_parameters)
+      || !row.card?.supported_parameters?.includes('tools')
+      || !row.card?.supported_parameters?.includes('tool_choice'))) return unavailable;
+    return { ...entry, provider: bucket.provider, owned_by: bucket.provider,
+      advertised: true, stale: false,
+      card: { ...entry.card, size_class: bucket.model_class, reasoning: true,
+        supported_parameters: ['tools', 'tool_choice', 'reasoning'],
+        ...(selected.every((row) => row.card?.tier === selected[0].card?.tier)
+          ? { tier: selected[0].card.tier } : {}) } };
+  });
+}
+
+/**
+ * The /v1/models pipeline up to (not including) alias projection, shared with
+ * the /queue and /health generic-bucket rows so all three judge bucket
+ * qualification from the same catalog view.
+ *
+ * @returns {Promise<{visible: Array<object>, membership: Array<object>}>}
+ */
+async function buildCatalogStages() {
+  const discovered = await getDiscoveredCatalog();
+  const advertiseBackends = effectiveAdvertiseBackends(config.backends || {}, router);
+  const excluded = excludedModelIds(config);
+  const reconciled = buildModelCatalog(advertiseBackends, router, advertiseReconcileMode, excluded);
+  // mergeDiscoveredCatalog() layers the discovered provider/free/stale tags
+  // onto the reconciled health/status entries and GUARANTEES every model
+  // carries a non-empty provider (see src/proxy/advertise.mjs). The
+  // allowlist is applied last, exactly as on /admin/models.
+  const merged = withoutExcludedModels(
+    mergeDiscoveredCatalog(reconciled, discovered, advertiseBackends), excluded);
+  const allowlist = loadAllowlist();
+  const allowed = applyCapacityView(applyAllowlist(merged, allowlist));
+  // Aliases (buckets + registry roles): additive, allowlist-aware,
+  // dedupe concrete-first. Buckets only when buckets_enabled is true.
+  const aliases = allowAliases(aliasCatalogEntries(getConfig()), allowlist);
+  const seenIds = new Set(allowed.map((m) => m.id));
+  const enriched = [...allowed, ...aliases.filter((e) => !seenIds.has(e.id))];
+  // Lifecycle view (card P1.4): hide eol/dead ids, flag suspect ones.
+  // Composes with (does not replace) the allowlist filter above.
+  // Picker badges (card P2.4): additive ctx_tokens/tools/vision derived
+  // from each surviving entry's card, if it has one. Superset-only.
+  // Public-safe: strip internal card fields (notes) before the funnel.
+  // Claimer-aware lifecycle view (incident inc-2026-08-18-qwen38-eol):
+  // the advertised set honors the same claim-over-verdict rule as the
+  // router's gate, so /v1/models and routability stay consistent.
+  // Focused-alias projection (generic bucket policy, operator-fenced
+  // `sk-<provider>-<bucket>` aliases): a focused alias is only advertised
+  // under its own provider identity once its whole current pool actually
+  // qualifies (reasoning + tool support, not stale/unavailable). applyCardOverlays
+  // re-applies curated card fields lost by applyLifecycleView above, since
+  // applyFocusedAliasMetadata needs the full card (reasoning, supported_parameters)
+  // to judge qualification. applyGenerationDefaults then projects the
+  // operator's explicit generation-token cap (never a provider-claimed max).
+  const visible = applyCardOverlays(applyLifecycleView(enriched, getLifecycle,
+    modelClaimersFor(advertiseBackends)), loadCardOverrides());
+  return { visible, membership: applyCardOverlays(merged, loadCardOverrides()) };
+}
+
+// Short-lived memo of the generic-bucket qualification so a fleet polling
+// /queue and /health does not rebuild the whole catalog view every hit.
+const GENERIC_QUALIFICATION_TTL_MS = 5000;
+let _genericQualification = { at: 0, value: null };
+
+function rememberGenericQualification(visible, membership) {
+  const value = genericBucketQualification(visible, getConfig(), {
+    membership, lifecycle: getLifecycle, sensitivityPolicy: policyFromRegistry(loadRegistry()) });
+  _genericQualification = { at: Date.now(), value };
+  return value;
+}
+
+/**
+ * Current generic-bucket qualification for /queue and /health, or null when
+ * buckets are disabled or the catalog view cannot be built (fail-soft: those
+ * endpoints must never fail because of bucket rows).
+ */
+async function currentGenericQualification() {
+  if (getConfig()?.routing?.buckets_enabled !== true) return null;
+  if (_genericQualification.value && Date.now() - _genericQualification.at < GENERIC_QUALIFICATION_TTL_MS) {
+    return _genericQualification.value;
+  }
+  // Never make a health/queue poll wait on a cold network discovery refresh:
+  // until the first catalog lands, serve the last known rows (or none).
+  if (getConfig()?.discovery?.enabled !== false && _catalog.length === 0) {
+    return _genericQualification.value;
+  }
+  try {
+    const { visible, membership } = await buildCatalogStages();
+    return rememberGenericQualification(visible, membership);
+  } catch (e) {
+    console.warn("[skgateway] generic bucket qualification failed (rows omitted):", e.message);
+    return null;
+  }
+}
+
+/**
  * Public-safe card projection for `/v1/models` (the funnel-exposed catalog +
  * the model dex). Strips operator-internal card fields (currently `notes`,
  * which carries ops commentary like "costs real money, keep the tier ladder
@@ -627,6 +794,13 @@ export async function refreshCatalog(cfg, discoverCatalogFn = discoverCatalog) {
   const codexCreds = cfg.backends?.codex?.credentials_path || cfg.backends?.codex?.credentials_file;
   const zaiEnabled = d.providers?.zai?.enabled === true && Boolean(cfg.backends?.zai);
   const zaiCreds = cfg.backends?.zai?.credentials_path || cfg.backends?.zai?.credentials_file || ZAI_CREDENTIALS_PATH;
+  // DeepSeek: same opt-in rule as zai/opencode/codex above (`=== true`, not
+  // `!== false`) and the same same-named-backend gate: a provider without
+  // backends.deepseek never makes a network call. The credential is read
+  // only through the backend's api_key_env name (default DEEPSEEK_API_KEY);
+  // it is used to build the authorization header but never logged.
+  const deepseekEnabled = d.providers?.deepseek?.enabled === true && Boolean(cfg.backends?.deepseek);
+  const deepseekKey = process.env[cfg.backends?.deepseek?.api_key_env || "DEEPSEEK_API_KEY"];
   const nvidiaKey = process.env[cfg.backends?.nvidia?.api_key_env || "NVIDIA_API_KEY"];
   const openrouterKey = process.env[cfg.backends?.openrouter?.api_key_env || "OPENROUTER_API_KEY"];
   const { models } = await discoverCatalogFn({
@@ -647,6 +821,9 @@ export async function refreshCatalog(cfg, discoverCatalogFn = discoverCatalog) {
       : async () => ({ models: [] }),
     zaiFetch: zaiEnabled
       ? () => fetchZai(readZaiAuthHeaders(zaiCreds))
+      : async () => ({ data: [] }),
+    deepseekFetch: deepseekEnabled
+      ? async () => fetchDeepSeek(deepseekKey ? { authorization: `Bearer ${deepseekKey}` } : {})
       : async () => ({ data: [] }),
     cache: _discoveryCache,
     probeSeconds: d.probe_seconds || 0,
@@ -684,6 +861,17 @@ export async function refreshCatalog(cfg, discoverCatalogFn = discoverCatalog) {
       ok: zaiProvider?.ok !== false,
       stale: zaiProvider?.ok === false,
       at: zaiProvider?.lastAttemptAt || Date.now(),
+    });
+  }
+  // Same absence-record for DeepSeek, mirroring the zai block above: a
+  // declared model list with no discovered DeepSeek models still records the
+  // attempt outcome so pending becomes attributable failed/stale.
+  const deepseekProvider = _discoveryCache.providers?.deepseek;
+  if (cfg.backends?.deepseek && !models.some((m) => m.provider === "deepseek")) {
+    router.registerDiscoveredModels?.("deepseek", [], {
+      ok: deepseekProvider?.ok !== false,
+      stale: deepseekProvider?.ok === false,
+      at: deepseekProvider?.lastAttemptAt || Date.now(),
     });
   }
   saveCache(_discoveryCache);
@@ -784,6 +972,13 @@ const recoveryProbeTargets = () => Object.entries(config.backends || {})
     });
   })
   .filter((target) => target.model);
+
+// Kimi OAuth tokens (900s TTL) used to only refresh as a side effect of a
+// request reaching buildAuthHeaders(). A quiet backend, or one the router
+// failed over away from after an earlier error, stopped calling that path
+// and its token went stale until a restart. This polls it independently of
+// traffic; see startKimiAuthKeepalive in proxy/router.mjs for the full story.
+startKimiAuthKeepalive({ getBackends: router.getBackends });
 
 startCapacityProbeScheduler({
   targets: recoveryProbeTargets,
@@ -1344,6 +1539,41 @@ const proxyConfig = buildConfig({
   siem: siemHook,
 });
 
+/**
+ * authorize() for the local-only media routes (src/proxy/media-routes.mjs).
+ *
+ * By the time a request reaches the media route branches below, it has
+ * already passed the top-of-handler client_auth/operator_auth boundary (the
+ * same one /v1/chat/completions passes through): if that boundary is enabled
+ * and the caller failed it, the handler already wrote 401/403 and returned,
+ * so this function is never reached for a rejected caller. If the boundary is
+ * disabled (client_auth.enabled: false, operator_auth.enabled: false: the
+ * default), chat completions allow any unauthenticated LAN caller through
+ * with no identity check at all, and this function allows the same for
+ * embeddings/transcriptions: same trust rules, no stricter and no looser.
+ *
+ * `consumer` reports whatever identity the boundary already resolved
+ * (req.identity.client_id / agent_id), falling back to "anonymous" when no
+ * boundary ran, so it reflects the SAME identity /v1/chat/completions logs
+ * for the same request rather than inventing one here.
+ *
+ * @param {import("node:http").IncomingMessage} req
+ * @returns {{ok: true, consumer: string}}
+ */
+function authorizeClient(req) {
+  const consumer = req.identity?.client_id || req.identity?.agent_id || "anonymous";
+  return { ok: true, consumer };
+}
+
+// One limiter instance for the process lifetime: config.media.max_concurrent_stt
+// / max_concurrent_embed bound how many /v1/audio/transcriptions and
+// /v1/embeddings requests may be in flight to the backend at once, since each
+// aliases a single local backend with real capacity (one whisper-server
+// process, one embedding server), not a pool. A shared instance here (rather
+// than one built fresh per request) is what makes the count actually count
+// concurrent requests across the whole process.
+const mediaLimiter = createMediaLimiter();
+
 // ─── Create HTTP server ───
 // Exported purely so tests can close it after a direct import of this module
 // (see tests/advertise-lifecycle.test.mjs); no production code depends on it.
@@ -1490,11 +1720,21 @@ export const server = http.createServer(async (req, res) => {
 
   // ── Health check endpoint ──
   if (req.url === "/health" || req.url === "/healthz") {
+    // Generic buckets (sk-s/sk-m/sk-l/sk-xl) join the backends map as
+    // aggregate rows so the fleet can health-gate a bucket like a backend.
+    const health = router.getHealth();
+    let bucketRows = {};
+    try {
+      const qualification = await currentGenericQualification();
+      if (qualification) bucketRows = genericBucketHealthRows(qualification, health);
+    } catch (e) {
+      console.warn("[skgateway] /health generic bucket rows failed (omitted):", e.message);
+    }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
       status: "ok",
       uptime: process.uptime(),
-      backends: router.getHealth(),
+      backends: { ...bucketRows, ...health },
     }));
     return;
   }
@@ -1529,6 +1769,16 @@ export const server = http.createServer(async (req, res) => {
   if (req.url === "/queue") {
     const allStats = pool.getAllStats();
     const total = pool.getTotalStats();
+    // Generic buckets as capacity domains: one row per bucket with >=1
+    // qualified member, summing member pool stats (each pool domain once).
+    // Added after `total` so bucket rows never double count pool capacity.
+    let bucketRows = {};
+    try {
+      const qualification = await currentGenericQualification();
+      if (qualification) bucketRows = genericBucketQueueRows(qualification, (id) => pool.getStats(id));
+    } catch (e) {
+      console.warn("[skgateway] /queue generic bucket rows failed (omitted):", e.message);
+    }
     // In-flight requests with age: the discriminator between a WORKING
     // worker (fresh open request, ages cycling) and a HUNG one (a request
     // open for many minutes). Two fleet workers were mistaken for hung on
@@ -1546,7 +1796,7 @@ export const server = http.createServer(async (req, res) => {
         utilization: total.totalCapacity > 0 ? (total.totalActive / total.totalCapacity) : 0,
       },
       inFlight,
-      backends: allStats,
+      backends: { ...bucketRows, ...allStats },
       timestamp: new Date().toISOString(),
     }));
     return;
@@ -1564,6 +1814,22 @@ export const server = http.createServer(async (req, res) => {
     res.writeHead(302, { location: `http://${host}:${dashboardPort}/` });
     res.end();
     return;
+  }
+
+  // ── Local-only speech-to-text and embeddings (src/proxy/media-routes.mjs) ──
+  // Aliases (sk-stt, sk-embed) come from config.media.aliases; a down backend
+  // returns an error, never a failover substitution (these aliases carry
+  // private audio/text, e.g. Nextcloud Talk recordings and document content).
+  // authorizeClient mirrors whatever the top-of-handler client_auth/
+  // operator_auth boundary already decided for this request: if that boundary
+  // is enabled and would have rejected the caller, it already did (this code
+  // is unreached); if it is disabled (the default), chat completions allow any
+  // unauthenticated LAN caller, and these routes allow the same.
+  if (req.url === "/v1/embeddings" && req.method === "POST") {
+    return handleEmbeddings(req, res, { mediaCfg: config.media || {}, fetch: globalThis.fetch, authorize: authorizeClient, limiter: mediaLimiter });
+  }
+  if (req.url === "/v1/audio/transcriptions" && req.method === "POST") {
+    return handleTranscriptions(req, res, { mediaCfg: config.media || {}, fetch: globalThis.fetch, authorize: authorizeClient, limiter: mediaLimiter });
   }
 
   // ── Aggregated model catalog: discovered + statically-configured backends ──
@@ -1589,32 +1855,14 @@ export const server = http.createServer(async (req, res) => {
     // the process down. /v1/models must always answer 200 with whatever
     // catalog it can assemble, never 500, never crash.
     try {
-      const discovered = await getDiscoveredCatalog();
-      const advertiseBackends = effectiveAdvertiseBackends(config.backends || {}, router);
-      const excluded = excludedModelIds(config);
-      const reconciled = buildModelCatalog(advertiseBackends, router, advertiseReconcileMode, excluded);
-      // mergeDiscoveredCatalog() layers the discovered provider/free/stale tags
-      // onto the reconciled health/status entries and GUARANTEES every model
-      // carries a non-empty provider (see src/proxy/advertise.mjs). The
-      // allowlist is applied last, exactly as on /admin/models.
-      const merged = withoutExcludedModels(
-        mergeDiscoveredCatalog(reconciled, discovered, advertiseBackends), excluded);
-      const allowlist = loadAllowlist();
-      const allowed = applyCapacityView(applyAllowlist(merged, allowlist));
-      // Aliases (buckets + registry roles): additive, allowlist-aware,
-      // dedupe concrete-first. Buckets only when buckets_enabled is true.
-      const aliases = allowAliases(aliasCatalogEntries(getConfig()), allowlist);
-      const seenIds = new Set(allowed.map((m) => m.id));
-      const enriched = [...allowed, ...aliases.filter((e) => !seenIds.has(e.id))];
-      // Lifecycle view (card P1.4): hide eol/dead ids, flag suspect ones.
-      // Composes with (does not replace) the allowlist filter above.
-      // Picker badges (card P2.4): additive ctx_tokens/tools/vision derived
-      // from each surviving entry's card, if it has one. Superset-only.
-      // Public-safe: strip internal card fields (notes) before the funnel.
-      // Claimer-aware lifecycle view (incident inc-2026-08-18-qwen38-eol):
-      // the advertised set honors the same claim-over-verdict rule as the
-      // router's gate, so /v1/models and routability stay consistent.
-      const data = stripInternalCardFields(applyPickerBadges(applyLifecycleView(enriched, getLifecycle, modelClaimersFor(advertiseBackends))));
+      const { visible, membership } = await buildCatalogStages();
+      const focused = applyFocusedAliasMetadata(visible, getConfig(), { membership });
+      // Generic buckets (sk-s/sk-m/sk-l/sk-xl): advertised when at least one
+      // fenced, tool-capable reasoning member qualifies. Same qualification the
+      // /queue and /health bucket rows use (see policy/generic-bucket-status.mjs).
+      const generic = applyGenericBucketMetadata(focused,
+        rememberGenericQualification(visible, membership));
+      const data = stripInternalCardFields(applyPickerBadges(applyGenerationDefaults(generic)));
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ object: "list", data }));
     } catch (e) {
@@ -1628,7 +1876,14 @@ export const server = http.createServer(async (req, res) => {
       const seenIds = new Set(allowed.map((m) => m.id));
       let data = [...allowed, ...aliases.filter((e) => !seenIds.has(e.id))];
       try {
-        data = stripInternalCardFields(applyPickerBadges(applyLifecycleView(data, getLifecycle, modelClaimersFor(advertiseBackends))));
+        const visible = applyCardOverlays(applyLifecycleView(data, getLifecycle,
+          modelClaimersFor(advertiseBackends)), loadCardOverrides());
+        const membership = applyCardOverlays(fallback, loadCardOverrides());
+        const focused = applyFocusedAliasMetadata(visible, getConfig(), { membership });
+        const generic = applyGenericBucketMetadata(focused,
+          genericBucketQualification(visible, getConfig(), {
+    membership, lifecycle: getLifecycle, sensitivityPolicy: policyFromRegistry(loadRegistry()) }));
+        data = stripInternalCardFields(applyPickerBadges(applyGenerationDefaults(generic)));
       } catch (e2) {
         console.warn("[skgateway] /v1/models static catalog fallback also failed, serving empty list:", e2.message);
         data = [];
@@ -1940,17 +2195,51 @@ export const server = http.createServer(async (req, res) => {
         return capacityRoutabilityRejection(capacityStatus(e.provider, e.id));
       };
       const bucketsEnabled = cfg?.routing?.buckets_enabled === true;
+      const genericPolicy = cfg?.routing?.generic_participation;
+      const genericRevision = genericPolicyRevision(genericPolicy);
       const all = allBuckets();
       const out = [];
       for (const b of all) {
         try {
+          // Mirror the request path's operator fences so this view agrees
+          // with routing: bucket_excluded_models for every bucket, plus the
+          // generic-only provider/model fences for provider-less buckets.
+          const fence = isGenericBucket(b) ? genericBucketFence(cfg?.routing) : null;
+          const bucketExcluded = new Set(cfg?.routing?.bucket_excluded_models || []);
           const { members, rejected, ceiling } = resolveBucket({
             bucket: b,
             catalog,
             sensitivityPolicy: policy,
-            getRoutabilityRejection,
+            getRoutabilityRejection: (e) => {
+              if (bucketExcluded.has(e.id)) return { reason: "bucket_excluded_models" };
+              if (fence && !fence(e)) return { reason: "generic bucket fence" };
+              return getRoutabilityRejection(e);
+            },
           });
           const physicalResources = new Set(members.map((m) => m.physical_resource_id));
+          // Generic S/M/L buckets only (never a focused sk-<provider>-<bucket>
+          // route): project the policy's per-provider weight as it would
+          // actually apply right now (0 when disabled OR when no member of
+          // this specific bucket belongs to that provider), plus a
+          // non-mutating preview of which provider the NEXT request would
+          // pick, so an operator can see the policy's live effect without
+          // guessing at the rotation counter.
+          const isGeneric = !b.provider && ["S", "M", "L"].includes(b.model_class);
+          const effectiveWeights = isGeneric
+            ? Object.entries(genericPolicy?.providers || {}).sort(([a], [z]) => a.localeCompare(z))
+              .map(([provider, override]) => {
+                const hasEligibleMember = members.some((member) => member.provider === provider);
+                return {
+                  provider,
+                  weight: override.enabled && hasEligibleMember ? override.weight : 0,
+                  reason: !override.enabled ? "disabled"
+                    : hasEligibleMember ? "enabled" : "no-eligible-member",
+                };
+              })
+            : [];
+          const preview = isGeneric
+            ? orderMembersByGenericWeight(members, 0, b, genericPolicy)[0]
+            : null;
           out.push({
             bucket: b.bucket,
             model_class: b.model_class,
@@ -1960,6 +2249,9 @@ export const server = http.createServer(async (req, res) => {
             member_alias_count: members.length,
             physical_server_count: physicalResources.size,
             physical_resources: [...physicalResources],
+            generic_policy_revision: isGeneric ? genericRevision : null,
+            generic_effective_weights: effectiveWeights,
+            generic_next_provider: preview?.provider || null,
             rejected,
           });
         } catch (e) {
@@ -1976,7 +2268,11 @@ export const server = http.createServer(async (req, res) => {
         }
       }
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ buckets_enabled: bucketsEnabled, buckets: out }));
+      res.end(JSON.stringify({
+        buckets_enabled: bucketsEnabled,
+        generic_policy_revision: genericRevision,
+        buckets: out,
+      }));
     } catch (e) {
       console.warn("[skgateway] /admin/buckets failed:", e.message);
       res.writeHead(500, { "content-type": "application/json" });
@@ -2088,14 +2384,33 @@ export const server = http.createServer(async (req, res) => {
     }
 
     // Buffer the request body so we can read the model for routing.
+    // The model isn't known yet, so ingressRequestLimit() admits the largest
+    // body any configured model is allowed to send; the explicit per-model
+    // byte limits (request-limits.mjs, same transport ceiling used by
+    // core.mjs/handleRequest) are not re-applied here once parsed: the
+    // existing model-limits trim below (card 080e032e) already bounds the
+    // conversation that reaches a backend. This is a DoS-style backstop
+    // against a body too large for any model to admit at all.
     const chunks = [];
     let receivedBytes = 0;
+    const ingressLimit = ingressRequestLimit(getConfig());
     for await (const chunk of req) {
       receivedBytes += chunk.length;
       if (clientAuthenticator && receivedBytes > config.client_auth.max_request_body_bytes) {
         siemHook({ ts: new Date().toISOString(), event: 'client_auth.denied', reason: 'request_too_large', status: 413, agent_id: identity.agent_id, path: req.url });
         res.writeHead(413, { 'content-type': 'application/json', 'cache-control': 'no-store' });
         res.end(JSON.stringify({ error: { message: 'Request body exceeds configured limit', code: 'request_too_large', status: 413 } }));
+        return;
+      }
+      if (receivedBytes > ingressLimit) {
+        const rejected = requestLimitResponse({
+          message: 'Request body exceeds the configured transport limit; history was not modified',
+          code: 'request_too_large', type: 'invalid_request_error', param: 'body',
+          actual_bytes: receivedBytes, limit_bytes: ingressLimit, retryable: false,
+        });
+        siemHook({ ts: new Date().toISOString(), event: 'request_limit.denied', reason: 'request_too_large', status: 413, agent_id: identity.agent_id, path: req.url });
+        res.writeHead(rejected.status, rejected.headers);
+        res.end(rejected.body);
         return;
       }
       chunks.push(chunk);
@@ -2332,6 +2647,8 @@ export const server = http.createServer(async (req, res) => {
 
         // Trim conversation history
         trimConversationHistory(parsedBody, cfg);
+
+        normalizeSystemMessageOrder(parsedBody.messages);
 
         // Update the transformed messages for dispatch
         transformedMessages = parsedBody.messages;
@@ -2676,7 +2993,10 @@ export const server = http.createServer(async (req, res) => {
         try {
           parsedBody = result?.body ? JSON.parse(result.body.toString("utf8")) : null;
         } catch {
-          parsedBody = null;           // SSE or non-JSON; usage extraction skipped
+          // The collector accepts buffered SSE and extracts only its usage frame.
+          // Keeping the bytes here preserves streamed accounting without logging
+          // request content or credentials.
+          parsedBody = result?.body ?? null;
         }
         closeMetrics({
           statusCode: result?.status ?? res.statusCode,
@@ -2780,7 +3100,7 @@ server.listen(port, bind, () => {
     }
     // Advertise to skcapstone service discovery when present (no-op otherwise).
     try {
-      if (skcapstone.registerService({ healthUrl: `http://localhost:${port}/health` })) {
+      if (skcapstone.registerService()) {
         console.log("[skgateway] registered with skcapstone service discovery");
       }
     } catch {}

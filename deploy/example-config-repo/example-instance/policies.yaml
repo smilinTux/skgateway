@@ -1,0 +1,3 @@
+## Placeholder authz policies for this instance. See docs/POLICIES.md in the
+## main skgateway repo.
+policies: []

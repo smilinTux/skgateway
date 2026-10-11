@@ -7,6 +7,327 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `glm-4.5` no longer declares tools/reasoning, which removes it from skfleet
+  routing. Z.ai serves it as `glm-5.3-flash`, and skfleet's route preflight
+  requires the served model to equal the requested one, so every fleet
+  admission to it was a cached preflight failure (11 in four cycles after
+  v1.1.5). The gateway still serves it to other callers.
+
+### Fixed
+
+- `glm-4.5` is now `size_class: S`. Z.ai serves `glm-4.5` requests as
+  `glm-5.3-flash` (an S model), so declaring it M (#184) put a small model in
+  `sk-glm-m`, and skfleet route preflight cached it as a failure for M work
+  (24 blocked admissions in one cycle on 2026-10-09). `sk-glm-m` and
+  `sk-glm-l` keep `glm-5` and `glm-5.3`, which Z.ai serves as `glm-5.3`.
+
+### Fixed
+
+- The skfleet route snapshot only accepts models whose card declares tools
+  and reasoning, so `glm-5.3` was the fleet's only GLM route and one
+  rate-limit on it zeroed GLM capacity. `glm-4.5` (128k context) and `glm-5`
+  now declare `tools`, `tool_choice` and `reasoning`, per Z.ai's published
+  function-calling and thinking-mode support for both models.
+
+### Fixed
+
+- `sk-glm-m` and `sk-glm-l` had a single eligible member (`glm-5.3`), so
+  every M or L GLM request on chiap01 queued behind one model and fleet
+  workers hit 504s after 180 s. `glm-4.5` is now declared `size_class: M`
+  (the same published 355B / 32B-active MoE architecture as `glm-4.6`) and
+  `glm-5` `size_class: L` (Z.ai's published size, between `glm-4.7` and
+  `glm-5.3`). `glm-5-turbo` stays unsized until its size is published.
+
+## [skgateway-v1.1.0] - 2026-10-05
+
+Second tagged release. Adds the chi-fleet capability set alongside this
+release's own fixes: a generic bucket participation policy, explicit
+request byte limits, DeepSeek provider discovery and usage-contract
+reconciliation, admission-failover reachability and truthful admission
+telemetry, shared-service-discovery hardening, bucket-routing and
+anthropic-wrapper/XL-public catalog fixes, immutable runtime bundle
+tooling, and the daily DELIVERY metric. Everything accumulated under
+Unreleased up to this point ships here.
+
+- Remove the `deploy/chiap01/` and `deploy/chiap08/` site-specific deploy
+  files from this public repo. They are a real site's units, hostnames and
+  model lists, and now live in that site's own private config repo
+  (`skgateway-config-chi`) instead. The patterns they encoded (a secondary
+  shared-shadow instance, tailnet ingress via systemd socket activation, a
+  canary loopback health check) are already available to any site as the
+  generic, instance.env-flag-gated add-on templates under `deploy/templates/`
+  (see `docs/DEPLOYING.md#optional-add-ons-shadow-instance-tailnet-ingress-canary-loopback`).
+  `tests/shared-shadow-profile.test.mjs` and `tests/canary-loopback-transport.test.mjs`,
+  which pinned the removed site files' exact content, are removed with them;
+  the generic templates already have their own coverage in
+  `tests/deploy-script.test.mjs`.
+- Add a generic bucket participation policy (`src/policy/generic-participation.mjs`):
+  an operator can favor or disable a provider or model inside the open
+  generic S/M/L buckets via `routing.generic_participation`, hot-reloadable
+  on SIGHUP, without touching direct routes or provider-focused
+  `sk-<provider>-<bucket>` routes. `routing.bucket_excluded_models` fences
+  specific model ids out of generic membership, re-applied on every resolve
+  so it survives a discovery refresh. Generic buckets now use weighted
+  provider selection (`orderMembersByGenericWeight()`); a new opt-in
+  reviewed-qualification-hash class floor
+  (`effectiveQualifiedClass`/`meetsClassFloor`) can lower (never raise) a
+  model's effective class and fails closed on malformed/expired evidence.
+  `applyGenerationDefaults()` projects only an operator's explicit
+  generation-token override, never a provider-claimed maximum;
+  `applyFocusedAliasMetadata()` exposes a focused alias under its own
+  provider identity only when its whole current pool qualifies. The
+  per-candidate-model byte-limit check (`request-limits.mjs`) now also runs
+  inside `routeAndSend`'s retry loop, skipping a candidate whose resolved
+  model has a tighter configured limit rather than attempting it.
+  `/admin/buckets` gains generic policy observability (effective per-provider
+  weights, a non-mutating next-pick preview). Also fixes `reloadConfig()`
+  always reporting `{ ok: true }` even when a SIGHUP reload failed
+  validation. Tests in `tests/generic-participation.test.mjs`,
+  `tests/qualification-class-floor.test.mjs`,
+  `tests/generic-weighted-selection.test.mjs`,
+  `tests/generation-defaults-focused-alias.test.mjs`,
+  `tests/generic-bucket-router-integration.test.mjs`.
+
+- Add explicit request byte limits (`src/proxy/request-limits.mjs`): a
+  request body, or its system/developer message slice, over a configured
+  byte ceiling (default 120000/40000, overridable globally or per model) is
+  rejected with `413 request_too_large` and the conversation left untouched,
+  instead of being silently trimmed to fit. Wired into the ingress buffering
+  loop in both `src/proxy/core.mjs` and the live `src/index.mjs` request
+  path. A rejection caused only by an oversized tool list gets one retry:
+  reduce to the proactive tool budget and recheck before rejecting. Tests in
+  `tests/request-limits.test.mjs`, `tests/request-limits-core-wiring.test.mjs`,
+  `tests/request-limits-ingress-live.test.mjs`.
+- Add DeepSeek provider discovery (`src/discovery/providers/deepseek.mjs`,
+  same adapter shape as zai/opencode), opt-in via
+  `discovery.providers.deepseek.enabled: true` and a `backends.deepseek`
+  entry. `hasValidUsage()` accepts DeepSeek's `prompt_cache_hit_tokens`/
+  `prompt_cache_miss_tokens` usage keys, and a non-final SSE chunk's
+  top-level `usage: null` now validates like an omitted key, same tolerance
+  already given to the nested `prompt_tokens_details`/
+  `completion_tokens_details` blocks. Tests in
+  `tests/providers-deepseek.test.mjs`, `tests/discovery.test.mjs`,
+  `tests/refresh-catalog-probe-wiring.test.mjs`,
+  `tests/deepseek-usage-contract.test.mjs`.
+
+### Fixed
+
+- **Admission failover is reachable.** `pool.acquire()` takes `nonBlocking`; only the
+  FINAL routing candidate may queue, so a full door defers to the next candidate
+  instead of waiting out `queueTimeoutMs` on a saturated backend. The previous
+  change made an admission 503 failover-eligible but left it unreachable whenever
+  `maxQueue > 0`, which is every production capacity domain.
+- **Truthful admission telemetry.** The rejection event hardcoded `failover:false`
+  and was emitted before the failover decision, so a request that failed over
+  successfully still wrote a 503 `response` claiming it had not, followed by a 200.
+  It now states failover truthfully and carries an explicit `terminal` flag.
+- **Bounded attempt attribution.** Refused doors are recorded on the rejection with
+  an explicit cap, so capacity failover is visible in attribution.
+- `getStats()` gains `totalDeferred`, deliberately separate from `totalDropped`: a
+  deferral that fails over successfully is a served request, not a loss.
+
+- Shared service discovery now requires an explicit `SKGATEWAY_HEALTH_URL`.
+  Unconfigured startups preserve existing records; loopback, wildcard, and
+  credential-bearing URLs are refused. The endpoint represents liveness only.
+
+- Expose provider capability metadata (`served_id`, `revision`,
+  `context_limit`, `availability`, `provider_route`, `public_eligible`) from
+  the `anthropic-wrapper` and `codex` discovery adapters, and bind the public
+  XL bucket (`sk-xl-public`) to Astra only when the catalog proves it is both
+  available and public-eligible (`src/policy/xl-public.mjs`, fails closed
+  otherwise). The anthropic-wrapper `normalize()` no longer filters on
+  `availability && public_eligible`: that gate belongs to the XL policy, and
+  in discovery it emptied the whole Claude catalog, because ordinary paid
+  Claude chat models carry neither field. Tests in
+  `tests/providers-anthropic-wrapper.test.mjs` and `tests/xl-public.test.mjs`.
+
+- Fix bucket routing (`sk-<class>-<sensitivity>`) so an addressed S, M, L or
+  XL bucket actually prefers the admitted model_class nearest its floor,
+  instead of always handing the whole pool to the single cheapest-cost-tier
+  model regardless of class. `orderMembersForClass()` was scoring a member
+  below the requested floor as "near" using a signed rank difference, so a
+  cheap under-floor model could look closer than the correctly-floored one;
+  it now treats any member below the floor as maximally far, same as an
+  unrecognized class. Separately, `selectMember()` re-ran the counter-rotated
+  cost ordering a second time on its own already-ordered output, which
+  applied the same rotation counter twice and could cancel a pool's
+  round-robin rotation entirely (observed: a two-member local pool returning
+  the same member on every request). It now reads the cheapest tier directly
+  off the single already-ordered pass. Card `617ddc13`. Tests in
+  `tests/buckets.test.mjs`.
+
+- Refresh PR96 onto current main so live-pipeline sanitizer and model-limit changes are evaluated against the latest gateway code.
+
+- Add immutable runtime bundle tooling (`scripts/runtime-bundle/`): build a
+  versioned, reproducible bundle of source plus pinned runtime with a
+  checksum manifest (`build-immutable-bundle.sh`), verify an existing
+  bundle's integrity (`verify-bundle.sh`), prove two builds from the same
+  commit are byte-identical (`test-reproducibility.sh`), generate a
+  multi-instance deployment manifest (`generate-deployment-manifest.sh`),
+  and bundle the Python SKCounter service the same way
+  (`build-skcounter-bundle.sh`). Addresses gateway instances running from a
+  single mutable shared directory, which carries drift risk and no
+  rollback path. See `docs/runtime-bundle-architecture.md` and
+  `scripts/runtime-bundle/README.md`. Card `8f2d6a10`.
+
+### Fixed
+
+- Gateway config activation now validates and hashes one immutable config
+  snapshot before binding, drains the prior listener with a bounded
+  fail-closed rollback, and records listener PID and revision continuity
+  evidence.
+
+- Add a governed, versioned realtime observation contract (`skgateway.observation.v1`) for SKDashboard, with bounded field sizes, a forbidden-field guard against raw prompts, responses, credentials, and other sensitive data, and an explicit `gateway_observed`/`harness_reported` lane distinction.
+
+- Preserve usage-derived cost accounting for streamed (SSE) responses by parsing a buffered or string response body for the trailing usage event, and account for OpenAI-style cached prompt tokens (`prompt_tokens_details.cached_tokens`) as cache-read tokens instead of double-counting them as fresh input.
+- The npm publish workflow now also runs for `skgateway-v*` release tags (the tag namespace since
+  skgateway-v1.0.0) and can be dispatched by hand for an existing release tag, which must be reachable
+  from `main`. Before this, `skgateway-v1.0.0` was tagged but never published.
+
+- Add a daily DELIVERY metric (card 3520f9e8), derived from live sources (git remote, request database, card store) rather than self-reported card status, covering PRs opened and merged, cards created and completed, rows written, deliverables verified, and the sprint denominator.
+
+## [skgateway-v1.0.0] - 2026-10-03
+
+First tagged release of skgateway, under a new `skgateway-v*` tag namespace
+(no `skgateway-v*` tag existed before this one; the older `v0.x` tags below
+predate the namespace and are not part of this release line). Everything
+accumulated under Unreleased up to this point ships here. Highlights:
+local-only media routes for the Nextcloud Talk recording and AI integration
+(`/v1/audio/transcriptions`, `/v1/embeddings`); `deploy/skgateway-deploy`, a
+deploy/rollback/status tool for running a tagged release as a systemd `--user`
+instance from a private per-site config repo, plus a config-repo schema
+version it enforces on deploy; five production fixes upstreamed from nor's
+deploy checkout (Claude subscription purity, Ornith context preflight,
+qwen38 null usage details); and the Kimi, Z.ai, Codex, OpenRouter and NVIDIA
+provider routing, bucket, and admission work recorded below.
+
+- Add a config-repo schema version. `<instance>/instance.env` now carries
+  `CONFIG_SCHEMA=<n>`, and `deploy/skgateway-deploy` refuses to deploy a
+  config repo whose `CONFIG_SCHEMA` is lower than this release's minimum
+  supported schema (`MIN_CONFIG_SCHEMA` in the script, currently `1`),
+  naming the value to set in the error rather than failing on a missing key
+  or an assumption the old config repo doesn't meet. A config repo written
+  before this key existed is treated as schema `0` and refused the same way.
+  See `docs/DEPLOYING.md#config-schema`. Tests in
+  `tests/deploy-script.test.mjs`.
+
+- Add `deploy/skgateway-deploy`, a deploy/rollback/status tool for running a
+  tagged release of this repo as a systemd `--user` instance, configured from
+  a private per-site config repo (`deploy/example-config-repo/`,
+  `docs/DEPLOYING.md`). It refuses an unreachable-from-`main` release tag and
+  a dirty config repo, decrypts per-instance secrets (`ansible-vault`, `sops`,
+  or `none`) to a `0600` runtime file, renders the instance's systemd unit
+  from `deploy/templates/skgateway-instance.service.tmpl`, and automatically
+  rolls back to the previous release if the new one fails its
+  `/healthz` + `/v1/models` health check. Also adds three optional,
+  instance.env-flag-gated add-on templates generalized from the
+  `deploy/chiap01`/`deploy/chiap08` site units (a secondary shadow instance,
+  tailnet ingress via systemd socket activation, and an SSH canary loopback
+  health check); all three are off by default and, even enabled, are
+  installed but never auto-started. Tests in `tests/deploy-script.test.mjs`.
+
+- Upstream five fixes that had been running live on nor's deploy checkout
+  (`fix/claude-subscription-purity-404`) but were never merged to main:
+  - `provider_purity: true` on the `anthropic` backend (the local
+    `claude --print` wrapper), so a transient wrapper cooldown fails closed
+    with `503 model_owner_backend_down` instead of spraying `claude-*` to a
+    backend (NVIDIA NIM) that structurally cannot serve it and answers a bare
+    404. Incident 2026-09-11. Tests in `tests/claude-subscription-purity.test.mjs`.
+  - Documented (comment-only) that the `anthropic` admission cap must track
+    the wrapper's real `CCAPI_MAX_CONCURRENT` ceiling, not a stale "Anthropic
+    API limit" comment left over from pointing at api.anthropic.com.
+  - `context_limit: 57344` on the `ornith` backend so the context preflight,
+    previously disabled there for lack of a declared limit, rejects oversized
+    prompts with an explicit `400` instead of letting llama-server truncate
+    them into an empty-content `502`. Tests in
+    `tests/ornith-context-ceiling.test.mjs`.
+  - `hasValidUsage()` now treats an explicit `null` `prompt_tokens_details` /
+    `completion_tokens_details` the same as an omitted key (what the qwen3.8
+    llama-server on chiap08 actually sends), instead of rejecting it and
+    rewriting a valid streaming `200` into `502 invalid_upstream_completion`.
+    Also raises `chiap08-qwen38`'s admission queue (`maxQueue` 2 to 24,
+    `queueTimeoutMs` 10s to 120s) so a burst waits instead of erroring. Tests
+    in `tests/usage-null-details.test.mjs`; the pre-existing
+    `tests/sse-tool-call-contract.test.mjs` negative control that had `null`
+    listed as malformed is corrected to match.
+  - Two pre-existing hermetic config tests (`tests/qwen-capacity-domain.test.mjs`,
+    `tests/qwen38-source-config.test.mjs`) pinned the old
+    `chiap08-qwen38` queue numbers and are updated to the values above.
+
+- Add local-only speech-to-text and embeddings routes, `POST
+  /v1/audio/transcriptions` and `POST /v1/embeddings`, OpenAI-compatible, for
+  the `sk-stt` and `sk-embed` model aliases (`src/proxy/media-routes.mjs`,
+  config `media.aliases`). These exist for the Nextcloud Talk recording and AI
+  apps integration, so a backend failure is returned to the caller as a 502
+  rather than failed over to another backend or a cloud provider: the audio
+  and text carried on these routes (call recordings, document content) is
+  private. Both routes go through the same client_auth/operator_auth boundary
+  as every other route, and carry `x-sk-model-served` on success like chat
+  completions does. Each alias also has a small concurrency cap (config
+  `media.max_concurrent_stt`, default 2; `media.max_concurrent_embed`, default
+  8): a request over the cap gets `429` with `Retry-After` and never reaches
+  the backend. The multipart `model` field is located and swapped by walking
+  the actual `--boundary` delimiters and reading only each part's own header,
+  never by searching the whole body as one string, so a sequence that merely
+  looks like the model field inside an uploaded file's bytes cannot be
+  mistaken for it. Tests in `tests/media-routes.test.mjs`.
+
+- Record a response-contract failure against model-claim quarantine instead of
+  clearing it. `recordModelClaimOutcome()` was being passed `upstreamStatus`
+  (the original 2xx) rather than `res.status` (the gateway 502) whenever
+  `modelContractFailure` was true, and since any 2xx is treated as success and
+  DELETES the failure entry, every `invalid_upstream_completion`,
+  `invalid_upstream_tool_calls` and non-budget `empty_upstream_response` was
+  counted as a clean success. The counter that should detect "this exact model
+  keeps returning garbage" could therefore never accumulate, which is the
+  opposite of what the adjacent comment already stated. Measured live:
+  `chiap08-qwen38` showed 80 errors of 3,941 requests, about 8 percent lifetime,
+  while still reporting `quarantined: false, consecutiveFailures: 0`. Shared
+  transport health is deliberately unchanged, since the transport genuinely
+  worked; only the model-claim argument is corrected.
+
+- Poll `kimi_oauth` backends so their tokens refresh without traffic. The
+  existing refresh ran only as a side effect of a request reaching
+  `buildAuthHeaders()`, so once a backend went quiet, from a lull or because the
+  router failed it over after an earlier error, nothing called that path again
+  and both the in-memory token and the on-disk file went stale with nothing to
+  wake them. An expired kimi token fails by HANGING rather than returning a
+  clean 401, so no error ever arrived to trigger the reactive check either, and
+  only a gateway restart recovered it. A `setInterval` keepalive, following the
+  existing `startCapacityProbeScheduler` pattern, polls every `kimi_oauth`
+  backend independent of traffic, persists refreshed tokens through the existing
+  write path, is unref'd so it cannot hold the process open, guards against
+  overlapping ticks, and logs and continues on a failed refresh.
+
+- Bound an upstream attempt by wall clock so a wedged backend becomes visible to
+  health. `timeout_ms` is applied as a Node socket IDLE timer, which resets on
+  any socket activity, so an upstream that dribbles bytes never trips it and
+  hangs indefinitely. Because backend health is recorded only from a COMPLETED
+  attempt, a request that never resolves never reaches `recordOutcome()`.
+  Measured 2026-09-19: `kimi-for-coding` carried `timeout_ms: 30000`, hung past
+  45s, and `/health` reported `status=up errorRate=0 totalRequests=486
+  totalErrors=0` while every request to it was dead. The new ceiling is armed
+  once at send time and never reset by activity, derived as `timeout_ms * 3` so
+  a slow completion is never cut off while a wedge still terminates and reaches
+  `recordOutcome(false)`. A backend with no `timeout_ms` keeps the previous
+  unbounded behaviour, because giving it a ceiling is a config decision.
+
+- `sk-l-public` and `sk-l` now admit the OpenRouter and NVIDIA NIM free tiers
+  alongside the Z.ai, Kimi and Codex subscriptions. The narrow allowlist landed
+  with a46b53e to keep public L work off sovereign-local hardware; free REMOTE
+  pools never conflicted with that intent, and on a fleet with no Z.ai/Kimi/Codex
+  credentials the bucket fail-closed 503 with all 20 catalog members rejected for
+  the same reason while `sk-m-public` and `sk-xl-public` served normally. Both
+  added pools are discovered `free_only` and sit in trust zone 2, which `public`
+  already admits, so the exposure ceiling is unchanged and `sk-l-internal` /
+  `sk-l-secret` still refuse them. Local models remain excluded.
+
+- Validate every logical bucket member against the selected backend's exact
+  model claim before handoff, skipping stale catalog aliases with attributable
+  evidence while preserving the requested bucket and served-model identity.
+
 - Continue a provider-neutral bucket chain when one member has all exact
   backend claims quarantined, while concrete-model requests remain fail closed.
 
@@ -28,7 +349,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add public provider-focused S, M, and L routing aliases for Z.ai, Kimi,
   and Codex while preserving health-gated generic bucket failover. Cursor
   aliases remain unadvertised until its transport adapter is qualified.
+- Keep quarantined per-model claims out of routing, health, and catalog availability until one authenticated half-open recovery request succeeds; repeated upstream 502 or invalid completion responses re-quarantine the exact model claim.
+
+- Derive the catalog `free` flag from curated paid-cloud card metadata, so a model carded as `paid-cloud` is always classified as paid even when a stale or default `free` value would otherwise contradict its tier (fixes Kimi showing as free).
 - Persist provider-neutral request attribution with explicit unknown values for client, application, route, rail, provider, backend node, requested model, served model, and runtime revision.
+- Persist aggregate queue counters (admitted, rejected, timed out, cancelled, queue wait, peak concurrency) in the metrics database so they survive a gateway restart instead of resetting to zero.
 
 ### Added
 
@@ -53,6 +378,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 ### Fixed
+
+- Card `2e817c54`: consolidate ordered system instructions into one leading
+  message so strict single-system Jinja templates accept multi-turn requests.
+
+- Card `4f23a634`: normalize system-message order in the production entry
+  dispatch path after request trimming and before upstream serialization.
+
+- Card `e240fe09`: outbound chat requests now keep every system message ahead
+  of conversation history after tool-limit and history-trimming notices.
 
 - Normalize only legacy model-local Z.ai malformed-response and transport
   recovery deadlines at read time without rewriting persisted capacity state.
@@ -258,6 +592,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to answer "are we rate limited?" got yes; the answer was no. The docs now
   match the code. `tests/router-rate-limit-failover.test.mjs` is unaffected: it
   covers the router's 429 backoff in `core.mjs`, which is live and unchanged.
+
+- The unversioned sovereign-fleet Python proxy is captured as a separately
+  built, content-addressed artifact with pinned dependencies, non-secret runtime
+  and configuration manifests, deterministic build receipts, and rollback
+  instructions. The committed source is a redacted derivative of the originally
+  observed capture: the real upstream hostname and home-directory path were
+  replaced with generic, env-driven defaults before publishing (see
+  `python-proxy/README.md`). Its ambiguous pre-Git ancestry remains explicit
+  (card 2d4a7c8e).
 
 - The sanitizer and model-limit stages are now wired into the live `/v1` path.
   `trimSystemMessages()`, `trimConversationHistory()` and `sanitizeResponse()`
@@ -945,7 +1288,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   clears `ExecStart=` and re-declares it without `--config`, so the service loads the
   Syncthing-synced `~/.skcapstone/gateway/skgateway.yaml`, not the in-repo config. Also
   recorded that `ExecStart` runs source directly out of the shared working checkout
-  `~/clawd/skcapstone-repos/skgateway`, so an uncommitted edit there is live behaviour.
+  `/home/YOUR_USER/skcapstone-repos/skgateway`, so an uncommitted edit there is live behaviour.
 - **SOP §9: stopped quoting a stale version.** `package.json` and the hardcoded
   `src/index.mjs:962` `/status` string both still say `0.1.0` while the newest release tag
   is far past it, and `publish-npm` overwrites `package.json` from the tag anyway. The SOP

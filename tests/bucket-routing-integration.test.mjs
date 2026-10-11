@@ -335,6 +335,41 @@ ${extraRoles}defaults:
     }
   });
 
+  test('receipt-derived backend-invalid aliases are skipped before backend handoff', async () => {
+    const invalidAliases = [
+      'qwen38-abliterated',
+      'qwen3.8-27b-ud-q5_k_xl',
+    ];
+    const audit = auditSink('backend-invalid-receipts');
+    writeFileSync(CATALOG_CACHE_PATH, JSON.stringify({ models: [
+      { id: 'pool-l-local', provider: 'local', free: true, card: { tier: 'local', size_class: 'L' } },
+      ...invalidAliases.map((id) => ({
+        id, provider: 'local', free: true, card: { tier: 'local', size_class: 'L' },
+      })),
+    ] }), 'utf8');
+    _resetCacheForTests();
+    await applyConfig({ buckets_enabled: true });
+
+    const result = await routeAndSend(
+      router,
+      { model: 'sk-s', agentId: 'receipt-reproduction' },
+      '/chat/completions', 'POST', HEADERS, bodyFor('sk-s'), false, audit.write,
+    );
+
+    assert.equal(result.status, 200);
+    assert.equal(result.bucket, 'sk-s');
+    assert.equal(result.bucketMember, 'pool-l-local');
+    assert.equal(pool.state.lastModel, 'pool-l-local');
+    const skipped = audit.read().filter(
+      (event) => event.details.type === 'bucket_member_skipped'
+        && invalidAliases.includes(event.details.member),
+    );
+    assert.deepEqual(
+      skipped.map((event) => [event.details.member, event.details.reason]).sort(),
+      invalidAliases.map((id) => [id, 'missing_backend_binding']).sort(),
+    );
+  });
+
   test('a backend output floor protects bucket-routed reasoning responses', async () => {
     await applyConfig({ buckets_enabled: true });
     const floorRouter = createRouter({
@@ -672,8 +707,12 @@ ${extraRoles}defaults:
         '/chat/completions', 'POST', HEADERS, bodyFor('sk-s-public'), false,
       );
       assert.equal(r3.status, 200);
-      assert.equal(r3.bucketMember, 'hung-local', 'request three rotates selection back toward the failed member');
-      assert.equal(r3.backendId, 'healthy', 'the preserved local URL lets health-aware expansion serve healthy');
+      assert.equal(
+        r3.bucketMember,
+        'healthy-local',
+        'a healthy backend cannot be attributed to the different member it does not claim',
+      );
+      assert.equal(r3.backendId, 'healthy');
       assert.equal(
         hanging.state.count,
         hungAttempts,
@@ -750,7 +789,9 @@ ${extraRoles}defaults:
     assert.equal(error.model, 'sk-xl-secrets');
     assert.match(error.reason, /sensitivity "secrets" is not/);
     assert.ok(error.valid_buckets.includes('sk-xl-secret'), 'the caller is told the correction, not left guessing');
-    assert.equal(error.valid_buckets.length, 28);
+    // 31 total buckets now that deepseek joined the provider-focused S/M/L
+    // generation loop (buckets.test.mjs: "the taxonomy is the canonical vocabulary").
+    assert.equal(error.valid_buckets.length, 31);
     assert.equal(pool.state.count, 0, 'nothing was routed');
 
     const lines = audit.read();

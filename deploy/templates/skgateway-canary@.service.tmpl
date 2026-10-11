@@ -1,0 +1,25 @@
+[Unit]
+Description=SKGateway canary loopback transport: __INSTANCE__
+Documentation=https://github.com/smilinTux/skgateway
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60s
+StartLimitBurst=3
+
+[Service]
+Type=simple
+## Supervised SSH port-forward: exposes only 127.0.0.1:CANARY_LOCAL_PORT here,
+## forwarded only to 127.0.0.1:CANARY_REMOTE_PORT as seen by the remote host.
+## No inline credential; the SSH config/known_hosts supplies the identity.
+ExecStart=/usr/bin/ssh -N -T -F __CANARY_SSH_CONFIG__ -o BatchMode=yes -o StrictHostKeyChecking=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ConnectTimeout=10 -o ConnectionAttempts=1 -o ClearAllForwardings=yes -L 127.0.0.1:__CANARY_LOCAL_PORT__:127.0.0.1:__CANARY_REMOTE_PORT__ __CANARY_REMOTE_HOST__
+ExecStartPost=__CANARY_HEALTH_SCRIPT__
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=20s
+TimeoutStopSec=10s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=skgateway-canary-__INSTANCE__
+
+[Install]
+WantedBy=default.target

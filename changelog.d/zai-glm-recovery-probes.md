@@ -1,0 +1,1 @@
+- Include the approved GLM-4.5 and GLM-5 routes in autonomous Z.ai recovery probes so expired model cooldowns can be requalified.

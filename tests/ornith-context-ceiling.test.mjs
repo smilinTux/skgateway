@@ -38,8 +38,9 @@ test("ornith declares a context_limit so the preflight is armed", () => {
   assert.ok(ornith, "ornith backend must exist");
   assert.equal(
     typeof ornith.context_limit, "number",
-    "ornith must declare context_limit — without it the context preflight is " +
-    "disabled and oversized prompts are truncated into empty-content 502s.",
+    "ornith must declare context_limit " +
+    "(without it the context preflight is disabled and oversized prompts " +
+    "are truncated into empty-content 502s).",
   );
   assert.ok(ornith.context_limit > 0, "context_limit must be positive to arm the preflight");
 });

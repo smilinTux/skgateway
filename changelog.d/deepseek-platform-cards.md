@@ -1,0 +1,1 @@
+- Card the DeepSeek Platform models (`deepseek-flash`, `deepseek-v4-pro`) with measured tools and reasoning, plus a zone-2 provider posture matching zai, so skfleet can route to DeepSeek and `sk-deepseek-*` can qualify.

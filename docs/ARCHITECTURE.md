@@ -264,8 +264,12 @@ flowchart LR
   `/queue` exposes configured domains even while idle plus timeout, drop, and
   cancellation counters. Each admitted slot has a pool-owned, single-use
   object ticket; release by string, copy, duplicate, or foreign pool is inert.
-- Generic `sk-l-public` and its short alias `sk-l` admit only eligible Z.ai,
-  Kimi, and Codex subscription models. Provider-focused aliases remain exact:
+- Generic `sk-l-public` and its short alias `sk-l` admit only REMOTE pools:
+  eligible Z.ai, Kimi, and Codex subscription models, plus the OpenRouter and
+  NVIDIA NIM free tiers (both discovered `free_only`, both trust zone 2, which
+  `public` already admits). Sovereign-local models stay excluded — that is the
+  rule's purpose — and `sk-l-internal` / `sk-l-secret` still refuse zone 2
+  entirely. Provider-focused aliases remain exact:
   `sk-glm-l` and `sk-zai-l` cannot cross into Kimi, Codex, or local backends.
   The provider check is repeated on final and owner-down expansion candidates,
   so a permitted model name cannot escape through an unrelated backend.

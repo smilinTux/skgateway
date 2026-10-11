@@ -47,8 +47,11 @@ test('the replicas retain separate bounded capacity domains', () => {
   assert.deepEqual(config.pooling.capacity_domains['chiap08-qwen38'], {
     members: ['chiap08-qwen38', 'reg:qwen38'],
     max: 2,
-    maxQueue: 2,
-    queueTimeoutMs: 10_000,
+    // 2026-09-11 (6e684df): max is the real concurrency ceiling; maxQueue is
+    // deliberately deep (and the timeout generous) so a burst waits instead of
+    // erroring into invalid_upstream_completion, as it did live that day.
+    maxQueue: 24,
+    queueTimeoutMs: 120_000,
   });
   assert.deepEqual(config.pooling.capacity_domains['chiap01-qwen38'], {
     members: ['chiap01-qwen38'],
