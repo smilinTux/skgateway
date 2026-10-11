@@ -109,6 +109,11 @@ backends:
   ## a real chat completion returned 200 with that model id.
   chiap01-qwen38:
     url: http://chiap01:18810/v1
+    # 2026-10-11: sovereignty guard (the 2026-08-16 inversion class). This
+    # backend serves content no substitute may answer; with no_failover
+    # absent, a dead upstream let the router substitute the CLOUD fallback
+    # (nvidia) for requests naming this model. Fail loudly instead.
+    no_failover: true
     auth_type: none
     models:
       - qwen3.8-27b-huihui-abliterated-q4_k_m
@@ -139,6 +144,11 @@ backends:
   ## qwen3.8-27b-huihui-abliterated-q4_k_m (owned_by vllm, max_model_len 131072).
   chiap08-qwen38:
     url: http://chiap08:11439/v1
+    # 2026-10-11: sovereignty guard (the 2026-08-16 inversion class). This
+    # backend serves content no substitute may answer; with no_failover
+    # absent, a dead upstream let the router substitute the CLOUD fallback
+    # (nvidia) for requests naming this model. Fail loudly instead.
+    no_failover: true
     auth_type: none
     models:
       - qwen3.8-27b-huihui-abliterated-q4_k_m
@@ -260,6 +270,11 @@ backends:
   ornith:
     enabled: false
     url: http://192.168.0.100:8082/v1
+    # 2026-10-11: sovereignty guard (the 2026-08-16 inversion class). This
+    # backend serves content no substitute may answer; with no_failover
+    # absent, a dead upstream let the router substitute the CLOUD fallback
+    # (nvidia) for requests naming this model. Fail loudly instead.
+    no_failover: true
     # Context preflight ceiling (card 9ed4a9f7). llama-server reports n_ctx 65536
     # and the registry reserves min_output_tokens: 8192 for the visible answer,
     # so ~57344 tokens is what the INPUT may actually occupy. Without this key
