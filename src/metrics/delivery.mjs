@@ -476,7 +476,13 @@ export function createDeliveryAdapter() {
   
   return new DeliveryAdapter({
     gitRepo: process.env.SKCAPSTONE_GIT_REPO,
-    metricsDb: join(skcapstoneHome, '..', 'skgateway-codex', 'data', 'metrics.db'),
+    // One `main` serves estates with different layouts, so the metrics DB
+    // location cannot be a hardcoded sibling named after chi's codex checkout.
+    // $SKGATEWAY_METRICS_DB overrides it; the old path stays the default so
+    // chi keeps working untouched.
+    metricsDb:
+      process.env.SKGATEWAY_METRICS_DB ||
+      join(skcapstoneHome, '..', 'skgateway-codex', 'data', 'metrics.db'),
     cardStore: join(skcapstoneHome, 'cards'),
     evidenceDir: join(skcapstoneHome, 'evidence', 'work'),
     sprintDenominator: SPRINT_DENOMINATOR
