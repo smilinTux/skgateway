@@ -1,0 +1,626 @@
+## SKGateway configuration
+## All fields have code-level defaults; this file only needs entries that differ.
+## Reload at runtime: kill -HUP <pid>  or  pkill -HUP skgateway
+
+server:
+  port: 18780
+  dashboard_port: 18781
+  bind: 0.0.0.0
+
+## Advertised-vs-working reconciliation (card 5c680ee9)
+## The GET /v1/models catalog is reconciled against live backend health so
+## callers are not offered models whose only backend(s) are down or quarantined.
+## Composes with the quarantine layer via Backend.isAvailable(); recovery
+## re-admits a model automatically. Runtime view only, config is never mutated.
+##   reconcile: flag  (default) advertise all, annotate status available/unavailable
+##              hide           omit models with no available serving backend
+##              off            legacy behavior, advertise everything, no status
+## 2026-08-14: ENABLED as `hide`. It shipped commented out, so the default was
+## `flag` and the catalog still advertised models whose only backend was down.
+## `ornith-1.0-35b` is the live example: chiap08:11436 is connection-refused
+## (ornith-aeon.service inactive), yet the model was still being offered.
+##
+## SCOPE, so the next reader is not misled: this reconciles against BACKEND
+## health/quarantine via Backend.isAvailable(). It does NOT know about per-model
+## lifecycle, so a RETIRED model on a HEALTHY backend is still advertised. That
+## is most of the current rot: 11 of 12 NVIDIA ids answer 410 Gone or 404 while
+## the nvidia backend itself is perfectly up. Card 767adc4e covers folding
+## lifecycle into the catalog; this flag is the half that already existed.
+advertise:
+  reconcile: hide
+
+## Connection Pooling — enforces per-backend concurrency limits
+## NVIDIA NIM allows 20 concurrent requests max. We enforce this here
+## so the gateway never exceeds the upstream limit.
+pooling:
+  default_max_concurrent: 20    # Max concurrent requests per backend
+  default_max_queue: 1000        # Max queue depth per backend
+  queue_timeout_ms: 300000        # Max time a request waits in queue (5 min)
+  # Direct aliases and registry role routes reach the same four-slot
+  # llama.cpp service on chiap08. Keep their admission shared and bounded.
+  capacity_domains:
+    chiap08-qwen38:
+      members: [chiap08-qwen38, "reg:qwen38"]
+      # Chef, 2026-09-11: this box handles 2 concurrent, not 4. The live config
+      # had drifted up to max 4 / maxQueue 4 while the in-repo config still said
+      # 2 -- and with sk-default repointed here, a burst of agent cron jobs drove
+      # peakActive=4 peakQueue=4 (both at ceiling) and llama-server started
+      # returning completions the response contract rejected as
+      # "invalid_upstream_completion" (HTTP 502). Same failure shape as the
+      # claude-code-api outage earlier the same day: an admission cap set above
+      # what the backend can actually serve turns load into corrupt responses.
+      #
+      # max is the REAL concurrency ceiling. maxQueue is deliberately deep and
+      # the timeout generous so a burst WAITS instead of erroring -- queueing is
+      # free, a 502 costs the whole job its retries.
+      max: 2
+      maxQueue: 24
+      queueTimeoutMs: 120000
+    # chiap01 B70 replica of the same model, independent admission domain
+    # (added 2026-09-04, card 0e010200; mirrors the repo config).
+    chiap01-qwen38:
+      members: [chiap01-qwen38]
+      max: 1
+      maxQueue: 1
+      queueTimeoutMs: 10000
+  per_backend:                   # Per-backend overrides
+    nvidia:
+      max: 20                     # NVIDIA NIM: 20 concurrent
+      maxQueue: 500               # Queue up to 500 requests for NVIDIA
+    # The old `ollama` override (max 50) was removed 2026-09-04 with the
+    # backend rename to `ornith`. Config validation rejects a per_backend key
+    # for a disabled backend, so when `ornith` is re-enabled add
+    #   ornith: { max: 4, maxQueue: 200 }
+    # here (llama-server on the .100 16 GB card; keep admission small).
+    anthropic:
+      max: 10                     # Anthropic API limit
+      maxQueue: 200
+
+backends:
+  ## 2026-09-04 (card 0e010200): the `local` block that used to sit here
+  ## (.100:8082, priority 1, ornith-tiny / ornith-1.5-9b / ornith-1.0-9b /
+  ## qwen3.6-27b-abliterated) was the SAME endpoint as the `ornith` block
+  ## further down and has been down and quarantined; it is folded into that
+  ## single, disabled `ornith` backend so the file has one truth for .100.
+  ## `ornith-tiny` is a registry ROLE (roles.ornith-tiny -> ornith), not a
+  ## backend model claim, and keeps resolving through the registry.
+
+  ## ornith-1.0-35b (Q4_K_M) — llama.cpp (llama-server :11436, sm120) on chiap08,
+  ## 256K ctx, reasoning model. High priority NUMBER keeps this OUT of the
+  ## unmatched-model fallback pool (fronted by priority 1); it remains the SOLE
+  ## match for the exact id `ornith-1.0-35b`, so it never shadows other routing.
+  ##
+  ## 2026-07-21: chiap08 added as PRIMARY. chiap08:11436 serves
+  ## deepreinforce-ai_Ornith-1.0-35B-Q4_K_M.gguf at n_ctx=262144, so the existing
+  ## model_limits (800000/320000) apply unchanged.
+  ##
+  ## 2026-08-05: REMOVED the two Tyler failover backends (tyler-ornith .150:8087,
+  ## tyler-ornith-b .153:8087). Both have been EHOSTUNREACH since 2026-07-21 and
+  ## were the ONLY failover targets, so a transient chiap08 5xx failed over to two
+  ## dead boxes -> a hard request failure, and the router marked chiap08 DEGRADED
+  ## on the resulting error-rate blip (the observed "flakiness"). chiap08 is
+  ## verified healthy (plain + concurrent + 39KB tool-laden payloads all 200), so
+  ## it is now the SOLE ornith-1.0-35b backend and a blip retries it instead of
+  ## cascading to nothing. Re-add the Tyler boxes (priority 5/6) if they return.
+   ## REMOVED 2026-08-16 on Chef's instruction: "remove ornith-big, consider it
+  ## gone". The chiap08-ornith backend (100.81.238.58:11436, ornith-aeon.service)
+  ## has been connection-REFUSED since at least 2026-08-14, and `ornith-big` was
+  ## the only model it still advertised. It answered 502 on every catalog
+  ## verification run. Advertising a model nothing can serve is exactly the
+  ## defect card 767adc4e exists to eliminate, so it is deleted rather than left
+  ## defined-but-dead.
+  ##
+  ## To restore: start `ornith-aeon.service` on chiap08, then re-add a backend
+  ## block pointing at http://100.81.238.58:11436/v1 with priority 4. The old
+  ## block also carried ornith-1.0-35b and noted Tyler boxes at priority 5/6.
+
+  ## Qwen3.8 27B Huihui abliterated Q4_K_M, chiap01 B70 card 1, an independent
+  ## replica at :18810 (llama-server, n_ctx 32768). Added to the RUNTIME config
+  ## 2026-09-04 (card 0e010200); it had only ever existed in the repo config.
+  ## Confirmed live before adding: GET /v1/models reports exactly
+  ## qwen3.8-27b-huihui-abliterated-q4_k_m and a real chat completion returned
+  ## 200 with that model id. Same priority as chiap08 so the router round-robins
+  ## the canonical id across both replicas.
+  chiap01-qwen38:
+    url: http://chiap01:18810/v1
+    auth_type: none
+    models:
+      - qwen3.8-27b-huihui-abliterated-q4_k_m
+    context_limit: 32768
+    priority: 3
+
+  ## 2026-09-04 (card 0e010200): url moved from the tailnet address to the bare
+  ## MagicDNS host name so runtime and repo agree (the repo carried the dead
+  ## placeholder TAILNET_HOST). Verified `chiap08` resolves here and
+  ## GET http://chiap08:11439/v1/models answers (owned_by vllm, 131072 ctx).
+  chiap08-qwen38:
+    url: http://chiap08:11439/v1
+    # Context preflight ceiling (card 9ed4a9f7). Matches the in-repo value from
+    # commit 37e599a: chiap08's vLLM reports max_model_len 131072 on
+    # GET /v1/models. The LIVE config carried no ceiling at all, so the preflight
+    # was disabled for this backend and oversized prompts overflowed at the
+    # engine instead of being refused with a limit-naming 400. The registry
+    # separately claimed ctx 262144 here, 2x the real window; corrected the same
+    # day. Keep this equal to the in-repo value: live/repo drift on an admission
+    # number is what turned a burst into 502s earlier today.
+    context_limit: 131072
+    auth_type: none
+    models:
+      # 2026-08-16 CUTOVER: chiap08 :11439 now serves the ABLITERATED build.
+      # VERIFIED live: GET /v1/models reports qwen3.8-27b-huihui-abliterated-q4_k_m
+      # and a real completion returns that same id. The canonical id is listed
+      # FIRST so a request by the model's real name routes; before this it 404'd
+      # while the stale aliases still worked, which meant the catalog described a
+      # model that was not running.
+      - qwen3.8-27b-huihui-abliterated-q4_k_m   # what llama-server actually reports
+      - qwen3.8-27b-ud-q5_k_xl   # RETAINED alias: the pre-cutover id, still routed
+      - qwen3.8-27b              # short alias -> same backend (llama.cpp is name-agnostic)
+      # 2026-08-18 (incident inc-2026-08-18-qwen38-eol): custom alias re-added
+      # after the discovery fix. Declaring it here is what the discovery fix
+      # trusts: a claimer's declaration beats an unattributed EOL verdict
+      # (router gate + advertised catalog) and 404/410s from non-claiming
+      # backends no longer count toward its lifecycle (recordModelOutcome
+      # claimer-awareness). llama.cpp serves name-agnostically, so the alias
+      # is as good as the canonical id on this backend.
+      - qwen38-abliterated       # custom alias -> same backend (llama.cpp is name-agnostic)
+    priority: 3
+  nvidia:
+    url: https://integrate.api.nvidia.com/v1
+    auth_type: api_key
+    api_key_env: NVIDIA_API_KEY
+    models:
+      ## Validated live 2026-07-15 via one-word completion probe. Dead and
+      ## decommissioned models pruned (see note at end of list).
+      ## Qwen
+      - qwen/qwen3.5-122b-a10b
+      - qwen/qwen3.5-397b-a17b
+      ## OpenAI OSS
+      - openai/gpt-oss-20b
+      ## DeepSeek
+      - deepseek-ai/deepseek-v4-flash
+      - deepseek-ai/deepseek-v4-pro                    # slow (~46s), batch/cron use
+      ## Mistral
+      - mistralai/mistral-medium-3.5-128b
+      - mistralai/mistral-large-3-675b-instruct-2512
+      ## NVIDIA
+      - nvidia/llama-3.3-nemotron-super-49b-v1.5
+      ## MiniMax
+      - minimaxai/minimax-m2.7                         # slow (~40s), batch/cron use
+      ## PRUNED 2026-07-15 (validated dead, all failed a warm one-word probe):
+      ##   moonshotai/kimi-k2.6                    404 Function not found (account)
+      ##   qwen/qwen3-next-80b-a3b-instruct        hang > 60s
+      ##   qwen/qwen3-next-80b-a3b-thinking        410 Gone (decommissioned)
+      ##   qwen/qwen3-coder-480b-a35b-instruct     410 Gone (decommissioned)
+      ##   openai/gpt-oss-120b                     hang > 60s
+      ##   meta/llama-3.3-70b-instruct             hang > 60s
+      ##   google/gemma-4-31b-it                   hang > 90s
+      ##   bytedance/seed-oss-36b-instruct         hang > 90s
+      ##   mistralai/ministral-14b-instruct-2512   hang > 60s
+    priority: 1
+
+  ## OpenCode Zen (card 6cc8aac3 / C8). Discovery-only, NO static models list:
+  ## the free tier turns over fast (27 zero-cost ids in models.dev, 7 live on
+  ## Zen), and a hand-maintained list is exactly what rotted on nvidia. Free is
+  ## decided by cost from models.dev, never by an id suffix, because big-pickle
+  ## is free and carries no -free suffix. Trust zone 2 (free-remote,
+  ## unauthenticated third-party inference): never route sensitivity secret here.
+  opencode:
+    url: https://opencode.ai/zen/v1
+    auth_type: api_key
+    api_key_env: OPENCODE_API_KEY
+    auth_optional: true          # card C15: this provider genuinely serves keyless traffic
+    discovery: free
+    max_concurrent: 10
+
+  anthropic:
+    # Route Claude models through the LOCAL Claude Code client wrapper
+    # (claude-code-api :18782 = `claude --print`) so they bill as genuine
+    # FIRST-PARTY subscription usage. Hitting api.anthropic.com directly with the
+    # raw OAuth token is treated by Anthropic as a third-party app that draws from
+    # extra-usage (not the plan), which starves the subscription and 400s under
+    # load. The wrapper IS Claude Code, so it uses the plan correctly.
+    # OpenAI-compatible → auth_type none (no Messages-API translation, no oauth).
+    url: http://127.0.0.1:18782/v1
+    # 2026-08-16: was `auth_type: none`. The wrapper began requiring a shared
+    # secret on every route but /health (claude-code-api PR #4), and that landed
+    # without its consumer being updated, so the ENTIRE Claude path 401ed:
+    # sk-heavy, sk-auto's hard tier, and every internal/XL bucket, all of which
+    # resolve here. auth_type api_key sends `Authorization: Bearer <key>`, which
+    # is one of the two forms the wrapper accepts.
+    #
+    # The value is referenced by ENV, never inlined: this file syncs to four
+    # machines with versioning=NONE, so a secret written here would replicate
+    # fleet-wide with no undo. It lives in ~/.config/skgateway/secrets.env, which
+    # is outside the synced tree and is already this service's EnvironmentFile.
+    auth_type: api_key
+    api_key_env: CCAPI_TOKEN
+    discovery: anthropic
+    models: &claude_cold_start_models
+      - claude-fable-5
+      - claude-haiku-4-5
+      - claude-haiku-4-5-20251001
+      - claude-opus-4-5-20251101
+      - claude-opus-4-6
+      - claude-opus-4-7
+      - claude-opus-4-8
+      - claude-opus-5
+      - claude-sonnet-4-5-20250929
+      - claude-sonnet-4-6
+      - claude-sonnet-5
+    priority: 2
+    # SPOF fail-fast: the wrapper is a single local service outside this repo.
+    # If it wedges (accepts the socket but never replies) the request would hang
+    # forever with no failover. This idle timeout aborts a stalled wrapper call
+    # with a 504. There is no direct-to-Anthropic failover by design: the
+    # subscription path is the only claude-* route. Generous
+    # enough for a real `claude --print` completion; a live stream resets it on
+    # each chunk, so only a truly stalled upstream trips it.
+    #
+    # 2026-09-17: raised 120000 -> 300000. The "a live stream resets it" caveat
+    # is exactly why 120s was wrong in practice: hermes-gateway posts
+    # stream=False to this backend, so there are NO chunks to reset the idle
+    # timer and the value acted as a hard wall-clock cap on every Claude call.
+    # Measured that morning: one 3686-char health-check prompt took 238s of
+    # honest work at claude-code-api, tripped the 120s cap four times, and each
+    # 504 drove a hermes retry -- the SAME prompt ran to completion four times
+    # (2355/1994/2977/2837 output chars) and billed four subscription runs for
+    # one logical request, while the caller saw only failures. 300000 matches
+    # pooling.queue_timeout_ms (300000) so the two ceilings agree, and still
+    # fails a genuinely wedged wrapper closed rather than hanging forever.
+    timeout_ms: 300000
+    # The "no failover target" above was a COMMENT, not a constraint, until
+    # 2026-09-11. Purity is opt-in per backend (card f361407c) and this flag was
+    # never set, so the design was unenforced. Live that morning: the wrapper ran
+    # out of slots (CCAPI_MAX_CONCURRENT was 3) and 500'd, error_rate hit 100%,
+    # the backend was marked DOWN for a 60s cooldown, and claude-opus-5 then fell
+    # through to `primary=nvidia`. NVIDIA NIM has no such model, so its Go mux
+    # answered a bare `404 page not found`, which Hermes surfaced in Telegram as
+    # "The model provider failed after retries." A transient local cooldown
+    # became a hard 404 on a model that was never NVIDIA's to serve. With purity
+    # on, a down wrapper fails closed as 503 model_owner_backend_down naming this
+    # backend, so callers back off against the real owner instead of burning
+    # retries on doors that structurally cannot answer claude-*.
+    # Pinned by tests/claude-subscription-purity.test.mjs in the skgateway repo.
+    provider_purity: true
+
+  ## ornith = Ornith 1.5 9B on the .100 RTX 5060 Ti (llama-server :8082,
+  ## name-agnostic OpenAI /v1; the same box the registry `ornith` entry and
+  ## the `reg:ornith` synthetic route point at). This block REPLACES the old
+  ## `ollama` backend (.100:11434, glob `dolphin-*`): that listener had been
+  ## dead for about two days, no dolphin model has ever been requested through
+  ## this gateway (audit log: zero hits), and .100 is the ornith host, so the
+  ## backend is now named for what it serves. The old `local` block (same
+  ## :8082 endpoint) is folded in here too.
+  ##
+  ## DISABLED 2026-09-04 (card 0e010200) because the host did not answer.
+  ## Probed live from the gateway node before this edit:
+  ##   ping 192.168.0.100                         2/2 replies
+  ##   tcp 22 and 11434                           open, but the SSH banner
+  ##                                              exchange times out and an HTTP
+  ##                                              GET on :11434 returns 0 bytes
+  ##                                              in 15 s
+  ##   GET http://192.168.0.100:8082/v1/models    connect timed out after 15 s
+  ##   GET http://192.168.0.100:11438/v1/models   no answer
+  ##   tailscale status (skworld-100)             offline, last seen 2 days ago
+  ## The kernel answers and every service on it is wedged. This gateway's own
+  ## journal shows :8082 (as backend=local) 502ing after 132 s and being
+  ## QUARANTINED at 04:37 the same morning. A declared-but-dead backend is
+  ## exactly the defect this card removes (a retired NVIDIA id left in config
+  ## broke the operator every run), so the block is kept complete and OFF.
+  ## To re-enable: verify GET /v1/models AND a real completion on :8082, then
+  ## flip `enabled: true`. There is no discovery provider for this backend, so
+  ## `enabled` here is the only flag; `models` stays non-empty on purpose so
+  ## Backend.matches() can never fall into its empty-list accept-everything
+  ## behaviour.
+  ornith:
+    enabled: true
+    url: http://192.168.0.100:8082/v1
+    # Context preflight ceiling (card 9ed4a9f7). llama-server reports n_ctx 65536
+    # and the registry reserves min_output_tokens: 8192 for the visible answer,
+    # so ~57344 tokens is what the INPUT may actually occupy. Without this key
+    # the preflight is disabled for this backend and oversized requests are sent
+    # to be truncated instead of rejected.
+    #
+    # 2026-09-11: hermes agent cron jobs (daily-brief, infra-security-scan-daily)
+    # ship ~205,815-byte bodies -> ~68,605 estimated tokens. They were routed here
+    # anyway, llama-server truncated them, the model answered with reasoning and
+    # EMPTY content, and the response contract rejected that as
+    # "Upstream returned invalid completion evidence" (HTTP 502) after burning
+    # 32s per attempt. The 502 named nothing useful, so the jobs looked like an
+    # ornith fault rather than a request that never fit. With the ceiling
+    # declared, an oversized request is refused up front with an explicit 400
+    # naming the limit -- and because this backend is no_failover, it fails
+    # LOUDLY here rather than leaking Chef's traffic to a cloud provider.
+    context_limit: 57344
+    auth_type: none
+    models:
+      - ornith-1.5-9b
+    priority: 4  # below the two qwen3.8-27b replicas (priority 3), which are the
+                 # preferred sk-m members. ornith stays a sovereign fallback.
+    # Thinking model: the <think> pass can spike ~3k tokens, so a small client
+    # max_tokens starves visible content and the reply returns EMPTY. Measured
+    # 2026-09-11: max_tokens=8 -> empty_upstream_response; max_tokens=64 -> 'ok'.
+    # router.mjs raises a sub-floor from THIS backend field. The identical value
+    # in ~/.skcapstone/models/registry.yaml is the skos registry and does NOT
+    # feed the gateway, which is why the floor was never applied.
+    min_output_tokens: 8192
+
+  openrouter:
+    enabled: true
+    url: https://openrouter.ai/api/v1
+    auth_type: api_key
+    api_key_env: OPENROUTER_API_KEY
+    discovery: free
+    priority: 4
+    max_concurrent: 10
+
+tools:
+  guaranteed:
+    - exec
+    - read
+    - write
+    - edit
+    - message
+  max_budget: 16
+  fallback_budget: 8
+  call_limit: 10
+
+# Streaming → non-streaming auto-flip.  Tool-heavy or large-context turns
+# hit NVIDIA NIM streaming instability (connection drops mid-stream at ~10k
+# tokens).  When any trigger below matches, the proxy forces `stream:false`
+# upstream, buffers the complete JSON, and re-emits SSE to the client so
+# the streaming contract is preserved without the mid-stream-drop failure
+# mode.  Tool requests already non-stream upstream (see core.mjs); this
+# covers non-tool traffic and explicit opt-in.
+streaming:
+  default: true
+  force_header: x-skgateway-nonstream        # value 'force' or '1'
+  auto_nonstream:
+    enabled: true
+    trigger_if_body_bytes_ge: 40000          # ~10k tokens
+    trigger_if_messages_ge: 6
+    trigger_if_tool_call_history_ge: 3
+    aggressive_models:
+      - moonshotai/kimi-k2.6
+      - qwen/qwen3-next-80b-a3b-instruct
+      - qwen/qwen3-next-80b-a3b-thinking
+      - deepseek-ai/deepseek-v4-flash
+      - deepseek-ai/deepseek-v4-pro
+
+sanitizer:
+  max_system_bytes: 40000       # global default — ~10K tokens
+  max_body_bytes: 120000        # global default — ~30K tokens
+  keep_start: 2
+  keep_end: 12
+  strip_thinking: true
+
+# Per-model context limits.  Formula: max_body_bytes = context_tokens * 4 bytes * 0.80
+# max_system_bytes = max_body_bytes * 0.40.  Values from NVIDIA NIM model cards (2026-05-12).
+model_limits:
+  ## Ornith 1.5 Q6_K is deliberately served at 32K on the .100 16GB GPU.
+  ornith-1.5-9b:                              { max_body_bytes: 104750,   max_system_bytes: 42000   }
+  ornith-1.0-9b:                              { max_body_bytes: 104750,   max_system_bytes: 42000   }  # compatibility alias on the 1.5 server
+  ornith-tiny:                                { max_body_bytes: 104750,   max_system_bytes: 42000   }  # alias of Ornith 1.5 9B
+  qwen3.6-27b-abliterated:                    { max_body_bytes: 419000,   max_system_bytes: 168000  }
+  ## 256K context (ornith-1.0-35b on Tyler's .150/.153:8087 — verified n_ctx=256000)
+  ## RETIRED 2026-08-16 (Chef: "there is no model of that any more"). ornith-big
+  ## and ornith-1.0-35b both lived on chiap08 :11436 via ornith-aeon.service,
+  ## which is retired and STAYS retired: a 35B beside llama-qwen38 contends for
+  ## the same GPU. Probed live on the day of removal: both return 404. chiap08
+  ## :11439 now serves qwen3.8-27b-huihui-abliterated-q4_k_m instead, which has
+  ## its own limits entry above. Kept as commented history rather than deleted so
+  ## the next reader does not re-add them from the old docs.
+  ##   ornith-1.0-35b: { max_body_bytes: 800000, max_system_bytes: 320000 }
+  ##   ornith-big:     { max_body_bytes: 800000, max_system_bytes: 320000 }
+  ## 256K context (qwen3.8-27b on chiap08 :11439, CTX_SIZE=262144) — same window
+  ## as ornith-1.0-35b, so it carries the same limits.
+  qwen3.8-27b-huihui-abliterated-q4_k_m:      { max_body_bytes: 800000,   max_system_bytes: 320000  }  # 2026-08-16 cutover: the id chiap08 :11439 now reports
+  qwen3.8-27b-ud-q5_k_xl:                     { max_body_bytes: 800000,   max_system_bytes: 320000  }
+  qwen3.8-27b:                                { max_body_bytes: 800000,   max_system_bytes: 320000  }  # alias of qwen3.8-27b-ud-q5_k_xl
+  qwen38-abliterated:                         { max_body_bytes: 800000,   max_system_bytes: 320000  }  # 2026-08-18: custom alias of the same chiap08 :11439 model (incident inc-2026-08-18-qwen38-eol)
+  ## 256K context (kimi-k2.6)
+  moonshotai/kimi-k2.6:                       { max_body_bytes: 800000,   max_system_bytes: 320000  }
+  ## 262K context (Qwen3 family, Mistral family, Gemma 4)
+  qwen/qwen3-next-80b-a3b-instruct:           { max_body_bytes: 838000,   max_system_bytes: 335000  }
+  qwen/qwen3-next-80b-a3b-thinking:           { max_body_bytes: 838000,   max_system_bytes: 335000  }
+  qwen/qwen3-coder-480b-a35b-instruct:        { max_body_bytes: 838000,   max_system_bytes: 335000  }
+  qwen/qwen3.5-122b-a10b:                     { max_body_bytes: 838000,   max_system_bytes: 335000  }
+  qwen/qwen3.5-397b-a17b:                     { max_body_bytes: 838000,   max_system_bytes: 335000  }
+  mistralai/mistral-medium-3.5-128b:          { max_body_bytes: 838000,   max_system_bytes: 335000  }
+  mistralai/mistral-large-3-675b-instruct-2512: { max_body_bytes: 838000, max_system_bytes: 335000  }
+  mistralai/ministral-14b-instruct-2512:      { max_body_bytes: 838000,   max_system_bytes: 335000  }
+  google/gemma-4-31b-it:                      { max_body_bytes: 838000,   max_system_bytes: 335000  }
+  ## 1M context (DeepSeek V4 — cap at 2M bytes practical limit)
+  deepseek-ai/deepseek-v4-flash:              { max_body_bytes: 2000000,  max_system_bytes: 800000  }
+  deepseek-ai/deepseek-v4-pro:               { max_body_bytes: 2000000,  max_system_bytes: 800000  }
+  ## 512K context (ByteDance Seed OSS)
+  bytedance/seed-oss-36b-instruct:            { max_body_bytes: 1638000,  max_system_bytes: 655000  }
+  ## 204K context (MiniMax M2.7)
+  minimaxai/minimax-m2.7:                     { max_body_bytes: 655000,   max_system_bytes: 262000  }
+  ## 128K context (GPT-OSS, Llama 3.3)
+  openai/gpt-oss-120b:                        { max_body_bytes: 409000,   max_system_bytes: 164000  }
+  openai/gpt-oss-20b:                         { max_body_bytes: 409000,   max_system_bytes: 164000  }
+  meta/llama-3.3-70b-instruct:               { max_body_bytes: 409000,   max_system_bytes: 164000  }
+  ## 131K context (Nemotron Super 49B)
+  nvidia/llama-3.3-nemotron-super-49b-v1.5:  { max_body_bytes: 419000,   max_system_bytes: 168000  }
+
+metrics:
+  enabled: true
+  db_path: ./data/metrics.db
+  retention_days: 90
+  token_tracking: true
+  cost_tracking: true
+
+  ## Per-model pricing (USD per 1 000 000 tokens)
+  pricing:
+    claude-opus-4-7:
+      input: 15.00
+      output: 75.00
+      cache_read: 1.50
+      cache_write: 3.75
+    claude-sonnet-4-6:
+      input: 3.00
+      output: 15.00
+      cache_read: 0.30
+      cache_write: 0.375
+    claude-haiku-4-5:
+      input: 0.80
+      output: 4.00
+      cache_read: 0.08
+      cache_write: 0.10
+    ## NVIDIA hosted models — free tier
+    moonshotai/kimi-k2.6:
+      input: 0
+      output: 0
+    qwen/qwen3-next-80b-a3b-instruct:
+      input: 0
+      output: 0
+    qwen/qwen3-coder-480b-a35b-instruct:
+      input: 0
+      output: 0
+    openai/gpt-oss-120b:
+      input: 0
+      output: 0
+    deepseek-ai/deepseek-v4-flash:
+      input: 0
+      output: 0
+    deepseek-ai/deepseek-v4-pro:
+      input: 0
+      output: 0
+    minimaxai/minimax-m2.7:
+      input: 0
+      output: 0
+    ## Ollama local
+    default_local:
+      input: 0
+      output: 0
+
+siem:
+  enabled: true
+  outputs:
+    - type: file
+      path: ./logs/audit.jsonl
+      rotate_mb: 100
+
+dashboard:
+  enabled: true
+  refresh_ms: 5000
+
+## Dynamic provider model discovery: periodically polls each declared
+## backend's model-list endpoint and folds newly seen models into the
+## effective model set, instead of relying solely on the static `models`
+## arrays above.
+discovery:
+  enabled: true
+  refresh_seconds: 3600
+  # Card 1f65cf45 (C3) wired these; card fix/probe-failure-escalation made the
+  # sweep actually able to retire a model that never answers (before it, a
+  # timeout demoted to suspect and stopped, leaving it advertised forever).
+  # Daily cadence, 20 models per sweep, so full coverage of ~67 advertised ids
+  # takes a few days. Each probe is a REAL upstream completion: this is a
+  # cost ceiling, not a display limit.
+  probe_seconds: 86400
+  probe_budget: 20
+  probe_timeout_ms: 15000
+  # Card 0e010400 (2026-09-04): one sweep per provider listed here, each on
+  # its own backend endpoint and pool bucket. The capability battery
+  # (tool_call / structured_output / instruction_following /
+  # min_output_tokens, src/discovery/capability-assessment.mjs) rides the
+  # sweep for every provider with capability_battery: true. Capability is
+  # MEASURED by a real completion, never inferred from the model name; a
+  # 429/timeout/5xx records unmeasured, never fail. scope `provider` means
+  # actively-used models are eligible too, not only the 7-day long tail.
+  probe_providers: [nvidia, openrouter]
+  capability_budget: 8
+  capability_interval_seconds: 2592000
+  capability_timeout_ms: 30000
+  capability_scope: provider
+  providers:
+    anthropic:  { enabled: true, free_only: false, chat_only: true }
+    nvidia:     { enabled: true, free_only: true, chat_only: true, capability_battery: true }
+    openrouter: { enabled: true, free_only: true, chat_only: true, capability_battery: true }
+
+    # Disabled 2026-08-29: OPENCODE_API_KEY is not set anywhere and Chef has no
+    # key, so every one of its 9 advertised models returns 403. auth_optional
+    # let it try keyless and fail. Re-enable if a key ever lands.
+    opencode:   { enabled: false, free_only: true, chat_only: true }
+## Joule-economy P0 metering (energy_log). Reads a skmeter energy counter
+## around each upstream attempt. Shadow mode ships OFF: no meter reads, no
+## behavior change, until this node's meter config has been validated.
+energy:
+  enabled: true
+  read_timeout_ms: 250
+  meters:
+    # A meter measures a NODE, not a backend, so key it by HOST. Backend NAMES
+    # cannot cover every alias: the same .100 GPU is reached as `local`,
+    # `ornith`, `ollama`, and as the registry-routed synthetic id `reg:ornith`,
+    # which is what actually lands in energy_log. Host keys catch all of them.
+    "192.168.0.100": "http://100.127.233.81:9420/energy"
+    "192.168.0.100:8082": "http://100.127.233.81:9420/energy"
+    local: "http://100.127.233.81:9420/energy"
+  # Locality wins over the URL heuristic. The anthropic backend is a loopback
+  # WRAPPER on 127.0.0.1:18782, so a URL test would call it local and file
+  # Anthropic's datacenter energy as imputed_local.
+  locality:
+    anthropic: remote
+  coefficients:
+    # CURATED ENTRIES WIN over id-derivation, so a wrong entry here is worse
+    # than no entry. Anything NOT listed is derived from the parameter count
+    # encoded in the model id (MoE ids use ACTIVE params) at 0.106 J per token
+    # per billion. Derivation and its uncertainty: src/metrics/energy.mjs.
+    #
+    # ornith: MEASURED, not derived. 600 output tokens cost 1713 J marginal on
+    # .100's RTX 5060 Ti (2026-08-15) = 2.85 J/token. Derivation would apply
+    # the datacenter discount and return 0.95, understating our OWN energy
+    # threefold and making local look artificially cheap against cloud.
+    # Input tokens: prefill is roughly a tenth of decode per token, and the
+    # anchor already folded a short 51-token prompt into the output figure.
+    ornith:      { j_per_input_token: 0.285, j_per_output_token: 2.85 }
+    # Frontier models publish no parameter count, so the id cannot be parsed
+    # and derivation correctly returns null. This ESTIMATE stands in for that,
+    # assuming roughly 400B active-equivalent. Lowest-confidence number here.
+    claude-:     { j_per_input_token: 4.2, j_per_output_token: 42.0 }
+    # NOTE: there is deliberately NO `openai/` entry. It used to be 0, and a
+    # curated 0 beats derivation, so every openai/* model recorded as costing
+    # nothing. Free in DOLLARS is not free in JOULES: somebody's datacenter
+    # burns real power. Zeroing cloud energy would make the cheapest strategy
+    # "send everything off-box" and the joule economy would reward shipping
+    # work off your own hardware, inverting the whole point. Let it derive.
+# Graded model selection, card 6dff5c17. Enabled 2026-08-16 by Chef's decision,
+# AFTER skgateway PRs #34 and #35 merged and deployed. Before those, every bucket
+# resolution threw ReferenceError, so enabling this flag earlier would have armed
+# a path that could not run.
+#
+# buckets_enabled ONLY, deliberately. sensitivity_enforced is inert without
+# match_enabled (only match_enabled populates request.requirements, which
+# requestZoneCeiling reads), so enabling it alone would produce a gate that looks
+# enforced and enforces nothing. And the shadow soak for sensitivity happens while
+# sensitivity_enforced is OFF: that is when it logs "would block". Turning it on
+# ends the soak rather than starting it.
+routing:
+  buckets_enabled: true
+
+# Task 2 (2026-10-02 nextcloud-recording-local-ai): local-only STT + embeddings
+# for Nextcloud Talk recording transcription and semantic search. sk-stt is
+# whisper.cpp large-v3-turbo on .100 (model id whisper-1), sk-embed is the
+# mxbai-embed-large embedding server also on .100. No Tailscale fallback: a
+# down backend returns an error, never a cloud substitution (see README
+# "Speech-to-text and embeddings").
+media:
+  aliases:
+    sk-stt:   { kind: stt,   url: "http://192.168.0.100:18794/v1/audio/transcriptions", model: "whisper-1",         timeout_ms: 600000 }
+    sk-embed: { kind: embed, url: "http://192.168.0.100:11438/v1/embeddings",            model: "mxbai-embed-large", timeout_ms: 30000 }
+  max_concurrent_stt: 2
+  max_concurrent_embed: 8
+
+# Task 2: nextcloud-skhub consumer credential, created ready for use. NOT
+# enforced yet: enabled stays false so this does not turn on authentication
+# for every other LAN caller of this gateway (chat completions included).
+# When client_auth is flipped on fleet-wide, this registry already has the
+# nextcloud-skhub entry (agent_id nextcloud / client_id nextcloud-skhub).
+# Credential token lives at
+# ~/skstacks-sdd/secrets/skgateway-nor-nextcloud-skhub.key on the laptop (0600).
+client_auth:
+  enabled: false
+  credentials_file: "/home/cbrd21/.skcapstone/gateway/nor-client-auth-credentials.json"
+  expected_owner_uid: 1000

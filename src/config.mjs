@@ -56,21 +56,58 @@ function expandHome(p) {
 export const SYNCED_CONFIG_PATH = resolve(homedir(), '.skcapstone', 'gateway', 'skgateway.yaml');
 
 /**
+ * Per-estate runtime config path. One skgateway `main` serves estates that run
+ * entirely different provider sets (nor: ccapi + local/free models; chi: glm,
+ * kimi, codex, deepseek), so the estate name belongs in the FILENAME rather
+ * than in a branch or a checkout. Set `$SKWORLD_ESTATE=nor` and this host reads
+ * `~/.skcapstone/gateway/skgateway.nor.yaml`, which cannot collide with chi's
+ * file even if the directory is synced to both.
+ *
+ * @param {string} estate
+ * @returns {string}
+ */
+export function estateConfigPath(estate) {
+  return resolve(homedir(), '.skcapstone', 'gateway', `skgateway.${estate}.yaml`);
+}
+
+/**
  * Resolve which skgateway.yaml to load, in precedence order:
  *   1. `explicit` (a function-arg / --config override) if provided
  *   2. `$SKGATEWAY_CONFIG` if set
- *   3. the Syncthing-synced path (SYNCED_CONFIG_PATH) if it exists on disk
- *   4. the in-repo `config/skgateway.yaml` (pre-migration fallback)
+ *   3. the per-estate synced path, when `$SKWORLD_ESTATE` is set and the file exists
+ *   4. the Syncthing-synced path (SYNCED_CONFIG_PATH) if it exists on disk
+ *   5. nothing -- throw
  * `~/` is expanded in 1 and 2 (systemd Environment= does not expand it).
+ *
+ * There is deliberately no in-repo fallback. `config/skgateway.yaml` is a real
+ * 499-line estate config and `config/skgateway-codex.yaml` is chi's, so falling
+ * through to either meant a host with a missing or misnamed runtime config
+ * silently booted ANOTHER estate's provider set, endpoints and admission caps
+ * instead of refusing to start. For a router that is worse than downtime: it
+ * looks healthy while sending traffic to backends this estate does not own.
+ * Those files stay in the tree because the test suite loads them as fixtures;
+ * they are no longer a runtime fallback. Fail closed and say what to set.
  *
  * @param {string} [explicit]  Optional explicit override.
  * @returns {string} Absolute path to the config file to load.
+ * @throws {Error} When no config can be resolved.
  */
 export function resolveConfigPath(explicit) {
   if (explicit) return expandHome(explicit);
   if (process.env.SKGATEWAY_CONFIG) return expandHome(process.env.SKGATEWAY_CONFIG);
+  const estate = (process.env.SKWORLD_ESTATE || '').trim();
+  if (estate) {
+    const perEstate = estateConfigPath(estate);
+    if (existsSync(perEstate)) return perEstate;
+  }
   if (existsSync(SYNCED_CONFIG_PATH)) return SYNCED_CONFIG_PATH;
-  return resolve(REPO_ROOT, 'config', 'skgateway.yaml');
+  throw new Error(
+    'skgateway: no runtime config found. Set $SKGATEWAY_CONFIG to an absolute ' +
+      'path, or set $SKWORLD_ESTATE=<estate> and create ' +
+      `${estateConfigPath(estate || '<estate>')}, or create ${SYNCED_CONFIG_PATH}. ` +
+      'The in-repo config/ files are per-estate fixtures, not a fallback: booting ' +
+      "another estate's provider set silently is worse than refusing to start.",
+  );
 }
 
 // ─── defaults ─────────────────────────────────────────────────────────────────
