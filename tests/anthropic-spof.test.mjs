@@ -22,8 +22,23 @@ import { test, describe, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { URL } from "node:url";
+import { resolve, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { loadConfig } from "../src/config.mjs";
+
+// This suite asserts a property of the committed in-repo config, so it must
+// name that fixture. resolveConfigPath() deliberately has no in-repo fallback
+// (a host that fell through to it served another estate's providers), so an
+// implicit loadConfig() here resolved to this developer's ~/.skcapstone config
+// locally and threw on a CI runner that has none. Every other test in the
+// suite already passes configPath explicitly.
+const IN_REPO_CONFIG = resolve(
+  dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "config",
+  "skgateway.yaml",
+);
 import { createRouter, routeAndSend } from "../src/proxy/router.mjs";
 import { sendUpstream } from "../src/proxy/upstream.mjs";
 
@@ -60,7 +75,7 @@ const HEADERS = { "content-type": "application/json" };
 
 describe("config: claude-* is subscription-only (no direct Anthropic)", () => {
   test("claude-* resolves to the wrapper alone, with a fail-fast timeout", async () => {
-    const cfg = (await loadConfig({ silent: true })).current();
+    const cfg = (await loadConfig({ configPath: IN_REPO_CONFIG, silent: true })).current();
     const rb = {};
     for (const [id, b] of Object.entries(cfg.backends || {})) {
       rb[id] = { ...b };
