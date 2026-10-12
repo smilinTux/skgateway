@@ -3361,6 +3361,7 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
             model: member.id,
             bucket: addr.bucket,
             bucketMember: member.id,
+            bucketFamily: member.family,
             genericPolicyRevision: member.generic_policy_revision,
             genericProviderWeight: member.generic_provider_weight,
             genericParticipationReason: member.generic_participation_reason,
@@ -3384,6 +3385,7 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
         model: member.id,
         bucket: addr.bucket,
         bucketMember: member.id,
+        bucketFamily: member.family,
         genericPolicyRevision: member.generic_policy_revision,
         genericProviderWeight: member.generic_provider_weight,
         genericParticipationReason: member.generic_participation_reason,
@@ -5170,6 +5172,38 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         if (larger) {
           contextOverflows.push({ backendId, model: candidateModel });
           continue;  // no health write: the door is fine, the prompt is just big
+        }
+      }
+    }
+
+    // DeepSeek thinking mode rejects a continuation whose earlier assistant
+    // turns carry no reasoning_content. In a bucket chain that is a property
+    // of this member family versus this history, not a payload defect: pi
+    // compaction rewrites the first user message, so bucket affinity loses the
+    // session's family and a later turn lands on DeepSeek with another
+    // family's history. Every fleet builder hitting it died on a terminal 400
+    // (chi, 2026-10-12: cb5213d9 looped claim/release four times). Advance to
+    // the next candidate of a different family, with no health penalty; with
+    // no such candidate the 400 stays terminal.
+    if (res.status === 400 && isBucketChain) {
+      let reasoningHistory = false;
+      try {
+        const parsedErr = JSON.parse(res.body?.toString("utf-8") || "{}");
+        const message = String((parsedErr?.error || parsedErr)?.message || "");
+        reasoningHistory = /reasoning_content[\s\S]*must be passed back/i.test(message);
+      } catch { /* not JSON: terminal 400 */ }
+      if (reasoningHistory) {
+        const family = candidates[i]?.bucketFamily;
+        const next = candidates.findIndex(
+          (c, j) => j > i && (c.bucketFamily ?? null) !== (family ?? null),
+        );
+        console.warn(
+          `[router] 400 reasoning-history backend=${backendId} model=${candidateModel} family=${family || "?"}; ` +
+          `${next > i ? `advancing to ${candidates[next].bucketMember} (family ${candidates[next].bucketFamily})` : "no other family, terminal"}`,
+        );
+        if (next > i) {
+          i = next - 1;  // the loop's i++ lands on the other-family candidate
+          continue;
         }
       }
     }
