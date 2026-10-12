@@ -1,0 +1,1 @@
+- router: a DeepSeek "reasoning_content must be passed back" 400 inside a bucket chain fails over to the next candidate of another family (no health penalty) instead of ending the request.

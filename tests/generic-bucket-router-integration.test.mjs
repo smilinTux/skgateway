@@ -100,7 +100,7 @@ function startUpstream(name) {
         try { state.lastModel = JSON.parse(raw.toString('utf-8')).model ?? null; }
         catch { state.lastModel = null; }
         res.writeHead(state.status, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ served: name, model: state.lastModel }));
+        res.end(state.body ?? JSON.stringify({ served: name, model: state.lastModel }));
       });
     });
     server.listen(0, '127.0.0.1', () => {
@@ -131,7 +131,7 @@ describe('generic bucket policy wired into routeAndSend', () => {
     _resetCacheForTests();
     writeFileSync(STORE_PATH, JSON.stringify({}), 'utf8');
     writeFileSync(REGISTRY_PATH, 'roles:\ndefaults:\n  role: sk-default\n', 'utf8');
-    for (const up of [zai, deepseek, kimi]) { up.state.count = 0; up.state.lastModel = null; up.state.lastBodyLen = 0; }
+    for (const up of [zai, deepseek, kimi]) { up.state.count = 0; up.state.lastModel = null; up.state.lastBodyLen = 0; up.state.status = 200; up.state.body = undefined; }
   });
 
   const CATALOG = [
@@ -147,6 +147,50 @@ describe('generic bucket policy wired into routeAndSend', () => {
       },
     });
   }
+
+  const REASONING_400 = JSON.stringify({ error: {
+    message: 'The `reasoning_content` in the thinking mode must be passed back to the API. (request_id: x)',
+    type: 'invalid_request_error', param: null, code: 'invalid_request_error',
+  } });
+  // Unique opening per call: bucket affinity is module-global and keyed on it.
+  let _turn = 0;
+  const continuation = () => Buffer.from(JSON.stringify({ model: 'sk-m', messages: [
+    { role: 'system', content: 'reasoning-history builder' },
+    { role: 'user', content: `compaction summary ${_turn++}` },
+    { role: 'assistant', content: 'done' },
+    { role: 'user', content: 'next' },
+  ] }));
+
+  test('DeepSeek reasoning-history 400 fails over to another family in the bucket', async () => {
+    writeFileSync(CATALOG_CACHE_PATH, JSON.stringify({ models: CATALOG }), 'utf8');
+    applyConfig({ generic_participation: { providers: { zai: { enabled: true, weight: 1 }, deepseek: { enabled: true, weight: 1 } } } });
+    deepseek.state.status = 400;
+    deepseek.state.body = REASONING_400;
+    const router = makeRouter();
+    for (let counter = 0; counter < 8; counter++) {
+      const r = await routeAndSend(router, { model: 'sk-m', agentId: `reason-${counter}` },
+        '/chat/completions', 'POST', HEADERS, continuation(), false);
+      assert.equal(r.status, 200, 'a reasoning-history 400 must not end the request');
+      assert.equal(r.bucketMember, 'zai-model');
+    }
+    assert.ok(deepseek.state.count > 0, 'rotation must have tried deepseek at least once');
+    assert.equal(router.getBackend('deepseekBackend').isAvailable(), true, 'no health penalty');
+  });
+
+  test('any other DeepSeek 400 in a bucket stays terminal', async () => {
+    writeFileSync(CATALOG_CACHE_PATH, JSON.stringify({ models: CATALOG }), 'utf8');
+    applyConfig({ generic_participation: { providers: { zai: { enabled: true, weight: 1 }, deepseek: { enabled: true, weight: 1 } } } });
+    deepseek.state.status = 400;
+    deepseek.state.body = JSON.stringify({ error: { message: 'bad param', type: 'invalid_request_error' } });
+    const router = makeRouter();
+    let saw400 = false;
+    for (let counter = 0; counter < 8 && !saw400; counter++) {
+      const r = await routeAndSend(router, { model: 'sk-m', agentId: `other-${counter}` },
+        '/chat/completions', 'POST', HEADERS, continuation(), false);
+      if (r.status === 400) saw400 = true;
+    }
+    assert.ok(saw400, 'a non-reasoning 400 must still reach the caller');
+  });
 
   test('bucket_excluded_models removes a model from generic membership and survives a simulated discovery refresh', async () => {
     writeFileSync(CATALOG_CACHE_PATH, JSON.stringify({ models: CATALOG }), 'utf8');
