@@ -193,7 +193,7 @@ export function applyCompletionOutcome(lc, { status, now, provider, thresholds =
     };
   }
 
-  if (status === 404 || status === 410) {
+  if (status === 404 || status === 410 || status === 502) {
     const consecutive_permanent_errors = lc.consecutive_permanent_errors + 1;
     if (consecutive_permanent_errors >= thresholds.eolErrorThreshold) {
       return {
@@ -201,7 +201,7 @@ export function applyCompletionOutcome(lc, { status, now, provider, thresholds =
         state: LIFECYCLE_STATES.EOL,
         consecutive_permanent_errors,
         consecutive_successes: 0,
-        eol_reason: 'provider_410',
+        eol_reason: status === 502 ? 'backend_unreachable' : 'provider_410',
         eol_at: now,
       };
     }
