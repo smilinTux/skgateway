@@ -1,0 +1,1 @@
+- codex: report Codex CLI version 0.163.0 (was 0.148.0) so the ChatGPT Codex backend serves the GPT-6 family (gpt-6.1-sol etc.); override with SKGATEWAY_CODEX_CLI_VERSION.

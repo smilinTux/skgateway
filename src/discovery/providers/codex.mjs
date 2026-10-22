@@ -32,7 +32,7 @@
  * @module discovery/providers/codex
  */
 
-import { CODEX_BASE_URL, CODEX_CLI_VERSION } from '../../proxy/codex-adapter.mjs';
+import { CODEX_BASE_URL, codexCliVersion } from '../../proxy/codex-adapter.mjs';
 
 /**
  * GET the Codex /models catalog. `authHeaders` is the header set built from
@@ -56,7 +56,7 @@ export async function fetch(authHeaders) {
   if (authHeaders?.["chatgpt-account-id"]) headers["chatgpt-account-id"] = authHeaders["chatgpt-account-id"];
   if (!headers.authorization) throw new Error('codex no-credentials');
   const r = await globalThis.fetch(
-    `${CODEX_BASE_URL}/models?client_version=${CODEX_CLI_VERSION}`,
+    `${CODEX_BASE_URL}/models?client_version=${codexCliVersion()}`,
     { headers },
   );
   if (!r.ok) throw new Error(`codex ${r.status}`);
