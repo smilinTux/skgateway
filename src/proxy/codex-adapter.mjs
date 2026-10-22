@@ -64,7 +64,18 @@ import { readFileSync } from "node:fs";
  * headers on a plausible CLI version, so this is functional, not cosmetic.
  * Bump together with the fleet's codex CLI.
  */
-export const CODEX_CLI_VERSION = "0.148.0";
+export const CODEX_CLI_VERSION = "0.163.0";
+
+/**
+ * Effective Codex CLI version. SKGATEWAY_CODEX_CLI_VERSION overrides the
+ * default so a new model gated on client version can be unlocked without a
+ * code release (the backend gates models by this value, e.g. gpt-6.1-sol
+ * needs >= 0.163.0).
+ */
+export function codexCliVersion() {
+  const v = (process.env.SKGATEWAY_CODEX_CLI_VERSION || "").trim();
+  return /^\d+\.\d+\.\d+/.test(v) ? v : CODEX_CLI_VERSION;
+}
 
 /** Codex client identity sent on every /responses call (measured from the CLI). */
 export const CODEX_ORIGINATOR = "codex_cli_rs";
@@ -265,7 +276,7 @@ export function toCodexRequest(openaiBody) {
       "content-type": "application/json",
       accept: "text/event-stream",
       originator: CODEX_ORIGINATOR,
-      version: CODEX_CLI_VERSION,
+      version: codexCliVersion(),
     },
     body: Buffer.from(JSON.stringify(out), "utf-8"),
     clientStream: req.stream === true,

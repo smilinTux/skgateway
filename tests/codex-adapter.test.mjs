@@ -325,3 +325,31 @@ test("readCodexAuthHeaders: codex CLI auth.json shape, flat shape, and failures"
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ── client version header ─────────────────────────────────────────────────────
+
+test("toCodexRequest: version header defaults to the pinned CLI version", () => {
+  const prev = process.env.SKGATEWAY_CODEX_CLI_VERSION;
+  delete process.env.SKGATEWAY_CODEX_CLI_VERSION;
+  try {
+    const r = toCodexRequest(openaiBody({ model: "gpt-6.1-sol", messages: [{ role: "user", content: "hi" }] }));
+    assert.equal(r.headers.version, "0.163.0");
+    assert.equal(r.headers.originator, "codex_cli_rs");
+  } finally {
+    if (prev !== undefined) process.env.SKGATEWAY_CODEX_CLI_VERSION = prev;
+  }
+});
+
+test("toCodexRequest: SKGATEWAY_CODEX_CLI_VERSION overrides the version header; junk is ignored", () => {
+  const prev = process.env.SKGATEWAY_CODEX_CLI_VERSION;
+  const body = openaiBody({ model: "gpt-6.1-sol", messages: [{ role: "user", content: "hi" }] });
+  try {
+    process.env.SKGATEWAY_CODEX_CLI_VERSION = "0.170.2";
+    assert.equal(toCodexRequest(body).headers.version, "0.170.2");
+    process.env.SKGATEWAY_CODEX_CLI_VERSION = "latest";
+    assert.equal(toCodexRequest(body).headers.version, "0.163.0");
+  } finally {
+    if (prev === undefined) delete process.env.SKGATEWAY_CODEX_CLI_VERSION;
+    else process.env.SKGATEWAY_CODEX_CLI_VERSION = prev;
+  }
+});
