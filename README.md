@@ -1,859 +1,266 @@
 # SKGateway
 
-```
-  ███████╗██╗  ██╗ ██████╗  █████╗ ████████╗███████╗██╗    ██╗ █████╗ ██╗   ██╗
-  ██╔════╝██║ ██╔╝██╔════╝ ██╔══██╗╚══██╔══╝██╔════╝██║    ██║██╔══██╗╚██╗ ██╔╝
-  ███████╗█████╔╝ ██║  ███╗███████║   ██║   █████╗  ██║ █╗ ██║███████║ ╚████╔╝
-  ╚════██║██╔═██╗ ██║   ██║██╔══██║   ██║   ██╔══╝  ██║███╗██║██╔══██║  ╚██╔╝
-  ███████║██║  ██╗╚██████╔╝██║  ██║   ██║   ███████╗╚███╔███╔╝██║  ██║   ██║
-  ╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝  ╚═╝   ╚══════╝ ╚══╝╚══╝ ╚═╝  ╚═╝   ╚═╝
-```
+SKGateway is a Node.js inference gateway that exposes OpenAI-compatible and Anthropic-compatible HTTP frontends and routes requests to configured model backends.
 
-**Enterprise AI Inference Proxy - BlueCoat for AI**
+**Maturity-tier:** T0 - N/A (no key material; see [SOP.md](./SOP.md#9-maturity-tier--version-reference)).
 
-![Version](https://img.shields.io/badge/version-0.1.0-blue)
-![Node](https://img.shields.io/badge/node-%3E%3D20.0.0-green)
-![License](https://img.shields.io/badge/license-MIT-lightgrey)
+**Version:** 0.1.0. **Runtime:** Node.js 20 or later. **License:** MIT.
 
----
+> **Current-surface note:** This README describes behavior shipped in this repository. It does not claim that a particular deployment, provider credential, backend, or public route is active. Runtime availability depends on local configuration and backend health.
 
-## What is SKGateway?
+## What ships
 
-SKGateway is a transparent, auditing proxy that sits between any AI client and any LLM backend - the same idea as BlueCoat/Zscaler for web traffic, applied to AI inference. Every prompt entering and every token leaving your infrastructure passes through SKGateway's identity verification, policy engine, prompt classifier, and SIEM event bus before reaching the model.
+The production entrypoint is [`src/index.mjs`](./src/index.mjs). The main request path buffers an incoming request, resolves routing context, and calls `routeAndSend()` in [`src/proxy/router.mjs`](./src/proxy/router.mjs).
 
-Beyond raw proxying, SKGateway delivers enterprise SOC/SIEM capabilities that most AI deployments bolt on as an afterthought: per-agent rate limiting, cost accounting, DLP/PII scanning, jailbreak detection, and a real-time SOC dashboard styled for an OLED command center. It is sovereign infrastructure - no third-party telemetry, no cloud dependency, your data stays in your logs.
+| Surface | Shipped behavior | Evidence |
+|---|---|---|
+| Client protocols | OpenAI-style `/v1/chat/completions` and model listing, plus translation of Anthropic `/v1/messages` requests and responses | [`src/index.mjs`](./src/index.mjs), [`src/proxy/anthropic-frontend.mjs`](./src/proxy/anthropic-frontend.mjs), [`tests/anthropic-frontend.test.mjs`](./tests/anthropic-frontend.test.mjs), [`tests/stream-anthropic.test.mjs`](./tests/stream-anthropic.test.mjs) |
+| Backend routing | Model and registry-role routing, priority ordering, backend health tracking, connection-pool admission, and bounded failover | [`src/proxy/router.mjs`](./src/proxy/router.mjs), [`tests/registry-failover.test.mjs`](./tests/registry-failover.test.mjs), [`tests/connection-pool-admission.test.mjs`](./tests/connection-pool-admission.test.mjs), [`tests/router-rate-limit-failover.test.mjs`](./tests/router-rate-limit-failover.test.mjs) |
+| Model catalog | Static and discovered models are merged for `/v1/models`; lifecycle and configured availability can remove or flag entries | [`src/index.mjs`](./src/index.mjs), [`src/proxy/advertise.mjs`](./src/proxy/advertise.mjs), [`tests/advertise-lifecycle.test.mjs`](./tests/advertise-lifecycle.test.mjs), [`tests/discovery.test.mjs`](./tests/discovery.test.mjs) |
+| Identity and authentication | Optional client and operator credential boundaries; agent identity can resolve from a CapAuth signature, a registered bearer, or `X-Agent-Id` | [`src/identity/client-auth.mjs`](./src/identity/client-auth.mjs), [`src/identity/capauth.mjs`](./src/identity/capauth.mjs), [`tests/client-auth-integration.test.mjs`](./tests/client-auth-integration.test.mjs), [`tests/capauth-identity.test.mjs`](./tests/capauth-identity.test.mjs) |
+| Authorization | Optional delegation to a CapAuth policy decision point. Enforcement is disabled by default and fails closed when explicitly enabled | [`src/policy/authz_gate.mjs`](./src/policy/authz_gate.mjs), [`src/policy/authz_decide.mjs`](./src/policy/authz_decide.mjs), [`tests/authz-enforce-integration.test.mjs`](./tests/authz-enforce-integration.test.mjs) |
+| Prompt classification | Passive intent, risk, jailbreak, and injection labels are emitted to SIEM when classification is enabled. These labels do not block or reroute requests | [`src/index.mjs`](./src/index.mjs), [`src/classifiers/engine.mjs`](./src/classifiers/engine.mjs), [`tests/classification-engine.test.mjs`](./tests/classification-engine.test.mjs) |
+| Metrics | Optional SQLite request, token, cost, and latency recording, including per-backend/model P50, P95, and P99 estimates | [`src/metrics/collector.mjs`](./src/metrics/collector.mjs), [`tests/metrics-collector.test.mjs`](./tests/metrics-collector.test.mjs), [`tests/metrics-wiring-e2e.test.mjs`](./tests/metrics-wiring-e2e.test.mjs) |
+| SIEM | The live entrypoint can append JSONL audit records and optionally forward events to syslog, Elasticsearch/OpenSearch, and the local SKCapstone file bus | [`src/index.mjs`](./src/index.mjs), [`src/siem/syslog.mjs`](./src/siem/syslog.mjs), [`src/siem/elasticsearch.mjs`](./src/siem/elasticsearch.mjs), [`src/integration.mjs`](./src/integration.mjs), [`tests/siem-live-hook.test.mjs`](./tests/siem-live-hook.test.mjs) |
+| Dashboard | Optional HTTP and WebSocket server for stats, health, tokens, and costs | [`src/dashboard/server.mjs`](./src/dashboard/server.mjs), [`src/dashboard/static/index.html`](./src/dashboard/static/index.html), [`tests/startup-disablement.test.mjs`](./tests/startup-disablement.test.mjs) |
+| Config reload | `SIGHUP` re-reads and validates YAML. A restart is still required for secrets and structural subsystem changes such as backend topology | [`src/config.mjs`](./src/config.mjs), [`src/index.mjs`](./src/index.mjs), [`config/skgateway.yaml.example`](./config/skgateway.yaml.example), [`docs/RUNBOOK.md`](./docs/RUNBOOK.md) |
 
-SKGateway is a first-class pillar of the [SKCapstone](https://github.com/smilinTux/skcapstone) sovereign agent framework, serving as the network chokepoint for Lumina and the full agent swarm.
+### Important scope boundaries
 
----
+The repository also contains implemented modules that are **not invoked by the production `src/index.mjs` request path**:
 
-## Architecture Overview
+- The alternate embeddable proxy core in [`src/proxy/core.mjs`](./src/proxy/core.mjs) performs tool reduction, history trimming, response sanitization, and its own retry sequence. Its behavior is covered by [`tests/sanitizer.test.mjs`](./tests/sanitizer.test.mjs) and [`tests/retry.test.mjs`](./tests/retry.test.mjs).
+- The YAML policy engine and rate limiter in [`src/policy/engine.mjs`](./src/policy/engine.mjs) and [`src/policy/ratelimit.mjs`](./src/policy/ratelimit.mjs) are library modules. They are not the optional CapAuth authorization gate described above.
+- DLP/PII scanning helpers in [`src/proxy/sanitizer.mjs`](./src/proxy/sanitizer.mjs) are not a blocking DLP boundary on the production route.
+- The reusable rotating file adapter and generic event bus in [`src/siem/file.mjs`](./src/siem/file.mjs) and [`src/siem/events.mjs`](./src/siem/events.mjs) are not used for the live JSONL append in `src/index.mjs`. The live append therefore must not be described as rotated merely because `rotate_mb` appears in YAML.
+- The dashboard's server-side event and activity rings are not fed by the live gateway SIEM hook. When no activity is available, the current browser UI inserts demo activity and security events and starts with sample classification values. Treat those panels as demonstration UI, not an operational audit source. See [`src/dashboard/server.mjs`](./src/dashboard/server.mjs) and [`src/dashboard/static/index.html`](./src/dashboard/static/index.html).
+
+## Architecture
 
 ```mermaid
 graph LR
-    subgraph Clients
-        OC[OpenClaw]
-        SV[skvoice]
-        CC[Claude Code]
-        CA[Custom Apps]
-    end
-
-    subgraph SKGateway["SKGateway :18780 / :18781"]
-        direction TB
-        ID["Identity<br/>CapAuth · Session · Reputation"]
-        PE["Policy Engine<br/>Rules · DLP · Rate Limit"]
-        CL["Classifiers<br/>Intent · Risk · Jailbreak · PII"]
-        PC["Proxy Core<br/>Router · Tools · Sanitizer · Stream · Retry"]
-        ME["Metrics<br/>Tokens · Cost · Latency P50/P95/P99"]
-        SI["SIEM Event Bus<br/>CEF · JSONL · Syslog · Elastic"]
-        DA["SOC Dashboard<br/>Real-time · WebSocket · Canvas"]
-
-        ID --> PE --> CL --> PC --> ME --> SI
-        SI --> DA
-    end
-
-    subgraph Backends
-        AN["Anthropic<br/>claude-opus/sonnet"]
-        NV["NVIDIA NIM<br/>kimi-k2 · minimax-m2"]
-        OL["Ollama<br/>Local Models"]
-        OA["OpenAI<br/>Compatible"]
-        CU["Custom<br/>vLLM / LMStudio"]
-    end
-
-    OC & SV & CC & CA -->|HTTP / SSE| SKGateway
-    PC -->|upstream| AN & NV & OL & OA & CU
+    C[OpenAI or Anthropic client] -->|HTTP| I[src/index.mjs]
+    I --> A[optional client authentication]
+    A --> Z[optional CapAuth authorization]
+    Z --> P[passive classification]
+    P --> R[proxy/router.mjs]
+    R --> B1[configured local backend]
+    R --> B2[configured remote backend]
+    R --> M[metrics collector]
+    R --> S[SIEM hook]
+    M --> D[(SQLite)]
+    S --> J[JSONL]
+    S -. optional .-> X[syslog or Elasticsearch/OpenSearch]
+    I -. optional .-> UI[dashboard :18781]
 ```
 
----
+The gateway does not make a backend sovereign by itself. Prompts leave the host whenever routing selects a remote provider. A local-only inference path requires local backend URLs, suitable trust-zone policy, and network controls configured by the operator. Routing and sensitivity behavior is implemented in [`src/proxy/router.mjs`](./src/proxy/router.mjs) and [`src/policy/sensitivity.mjs`](./src/policy/sensitivity.mjs), with coverage in [`tests/sensitivity-trust-zone.test.mjs`](./tests/sensitivity-trust-zone.test.mjs) and [`tests/trust-zone-provider-wiring.test.mjs`](./tests/trust-zone-provider-wiring.test.mjs).
 
-## Features
+## Quick start
 
-### Core Proxy
+### Prerequisites
 
-- [x] Multi-backend routing - Anthropic, NVIDIA NIM, Ollama, OpenAI-compatible, custom vLLM clusters
-- [x] SSE streaming and JSON response handling with chunked transfer
-- [x] Intelligent tool reduction - semantic keyword routing trims 94 tools to a scored budget of 16
-- [x] Guaranteed tools - configurable set (exec, read, write, edit, message) always survive reduction
-- [x] Content sanitization - strips leaked model markup (e.g. Kimi `<|tool_calls_section_begin|>`)
-- [x] Multi-layer retry with backend fallback and circuit breaker logic
-- [x] Hot-reload config - `kill -HUP <pid>` reloads without dropping connections
-- [x] CLI flags - `--port`, `--config` for flexible deployment
+- Node.js 20 or later, as declared in [`package.json`](./package.json).
+- npm.
+- At least one reachable backend configured for the model you request.
+- Any provider credential required by that backend, supplied outside the repository.
 
-### Identity and Access
-
-- [x] CapAuth PGP-based identity verification for every request
-- [x] Agent registry - named agents with individual profiles and trust levels
-- [x] Session tracking and agent fingerprinting across requests
-- [x] Reputation scoring - real-time behavioral baseline per agent
-
-### Security
-
-- [x] Prompt intent classification - code gen, data query, creative, admin
-- [x] Risk scoring on a 0-10 scale with configurable thresholds
-- [x] Jailbreak detection - 13 pattern families, hard block at score >= 9
-- [x] Prompt injection detection - 7 injection type signatures
-- [x] DLP/PII scanning with configurable redaction transforms
-- [x] Secret detection - blocks `password=`, `api_key=`, `secret=` patterns outbound
-- [x] Safety prompt injection for elevated-risk requests
-
-### Policy Engine
-
-- [x] YAML-driven rule files - human-readable, git-diffable, hot-reloadable
-- [x] Five actions: allow, deny, transform, rate_limit, alert
-- [x] Four transforms: redact_pii, downgrade_model, strip_tools, add_safety_prompt
-- [x] Model routing per agent - restrict `sentinel` to kimi, restrict `jarvis` to local
-- [x] Budget enforcement - auto-downgrade to free-tier model when budget exceeded
-- [x] Time-of-day rules - configurable after-hours model downgrade
-- [x] Token quota controls - downgrade + alert at configurable daily limits
-
-### Observability
-
-- [x] SIEM event bus - structured events on every request lifecycle stage
-- [x] ArcSight CEF format output
-- [x] JSONL audit logs with configurable rotation (default 100 MB)
-- [x] Syslog output (RFC 5424) for integration with Splunk, Elastic, Graylog
-- [x] Token tracking - input, output, cache read/write per agent per model
-- [x] Cost accounting - per-model USD pricing, budget alerts
-- [x] Latency tracking - P50, P95, P99 percentiles stored in SQLite
-- [x] 90-day metrics retention with configurable rollup
-
-### Dashboard
-
-- [x] Real-time SOC UI at `:18781` - OLED black, glass morphism design
-- [x] Canvas-based token usage graphs with live WebSocket updates
-- [x] Per-agent activity feed with soul color coding
-- [x] Cost tracking panels with budget alert indicators
-- [x] Prompt classification breakdown charts
-- [x] Security events and alert stream
-- [x] Backend health status at a glance
-- [x] Fully responsive - works on ultrawide command center displays
-
----
-
-## Quick Start
+### Install and validate
 
 ```bash
 git clone https://github.com/smilinTux/skgateway.git
 cd skgateway
-npm install
-
-# The defaults in config/skgateway.yaml work out of the box for NVIDIA NIM.
-# Set your API key if using NVIDIA:
-export NVIDIA_API_KEY=your_key_here
-
-# Start the gateway
-node src/index.mjs
-
-# Or with dev watch mode (auto-restarts on file changes):
-npm run dev
-
-# Proxy endpoint:    http://localhost:18780
-# SOC Dashboard:     http://localhost:18781
+npm ci
+node --check src/index.mjs
+npm test
 ```
 
-Point any OpenAI-compatible client at `http://localhost:18780/v1` - it speaks the same API.
+`npm test` runs all `tests/*.test.mjs` through Node's built-in test runner, as defined in [`package.json`](./package.json). CI runs the locked install and test suite on Node 20 and 22; see [`.github/workflows/ci.yml`](./.github/workflows/ci.yml).
 
-### Systemd (production)
+### Configure
+
+Start from the public template and replace placeholder backend addresses with endpoints reachable from your host:
 
 ```bash
-# Copy and enable the user service
-cp scripts/skgateway.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now skgateway
-
-# Reload config without restart
-systemctl --user kill -s HUP skgateway
+cp config/skgateway.yaml.example config/skgateway.local.yaml
+${EDITOR:-vi} config/skgateway.local.yaml
 ```
 
----
+Do not put credential values in YAML. Backend entries name an environment variable or a credential-file path. The secret-handling contract is documented in [`SECURITY.md`](./SECURITY.md) and [`docs/COLD-BOOTSTRAP.md`](./docs/COLD-BOOTSTRAP.md).
 
-## Configuration
+Config path precedence is:
 
-Configuration lives in `config/skgateway.yaml`. All fields have code-level defaults; the file only needs entries that differ from defaults.
+1. `--config PATH`
+2. `SKGATEWAY_CONFIG`
+3. `~/.skcapstone/gateway/skgateway.yaml`
+4. `config/skgateway.yaml` in the checkout
 
-### Server
+Evidence: [`src/config.mjs`](./src/config.mjs) and [`tests/config-path-resolution.test.mjs`](./tests/config-path-resolution.test.mjs).
 
-```yaml
-server:
-  port: 18780           # Proxy port (OpenAI-compatible API)
-  dashboard_port: 18781 # SOC dashboard HTTP server
-  bind: 0.0.0.0         # Bind address (127.0.0.1 for localhost-only)
+### Start
+
+```bash
+node src/index.mjs --config ./config/skgateway.local.yaml
 ```
 
-⚠️ **The `0.0.0.0` default is all interfaces, which includes the LAN.** On the SKWorld
-fleet both nodes run with this default, so the proxy and the SOC dashboard are reachable
-from the LAN as well as the tailnet. That is a known, stated deviation from
-`UNIFIED_INGRESS_STANDARD` (which asks for `127.0.0.1` or the tailnet address), not
-compliance with it. It is not internet-exposed: neither node has a public interface and
-Tailscale Funnel does not publish `:18780` or `:18781`. Set `bind` to the tailnet IP or
-`127.0.0.1`, or set `SKGATEWAY_BIND`, on any host that does not need LAN reach.
-Full analysis: [SOP.md](./SOP.md) §2 "Front-end / Exposure".
+The only entrypoint flags are `--config` and `--port`. Development watch mode is `npm run dev -- --config ./config/skgateway.local.yaml`.
 
-Which file is loaded, first match wins: `--config` → `$SKGATEWAY_CONFIG` →
-`~/.skcapstone/gateway/skgateway.yaml` (Syncthing-synced) → the in-repo
-`config/skgateway.yaml`. The fleet units pass no `--config`, so they read the synced
-file, not the one in your checkout.
+Default ports are:
 
-### Backends
+| Listener | Default | Evidence |
+|---|---:|---|
+| Gateway | `18780` | [`src/config.mjs`](./src/config.mjs) |
+| Dashboard, when enabled | `18781` | [`src/config.mjs`](./src/config.mjs), [`src/dashboard/server.mjs`](./src/dashboard/server.mjs) |
 
-Backends are tried in priority order. Models are matched by exact name or glob.
+The shipped default bind is `0.0.0.0`, not loopback. Review the exposure analysis in [`SOP.md`](./SOP.md#2-front-end--exposure) before starting the service, and set `server.bind: 127.0.0.1` when LAN access is not required.
 
-```yaml
-backends:
-  nvidia:
-    url: https://integrate.api.nvidia.com/v1
-    auth_type: api_key          # api_key | oauth | none
-    api_key_env: NVIDIA_API_KEY # env var holding the key
-    models:
-      - kimi-k2-instruct
-      - kimi-k2.5
-      - minimax-m2.1
-    priority: 1                 # lower = tried first
+### Verify
 
-  anthropic:
-    url: https://api.anthropic.com/v1
-    auth_type: oauth
-    credentials_path: ~/.claude/.credentials.json
-    models:
-      - claude-opus-4-6
-      - claude-sonnet-4-6
-    priority: 2
-
-  ollama:
-    url: http://192.168.0.100:11434/v1
-    auth_type: none
-    models:
-      - "dolphin-*"             # glob patterns supported
-    priority: 3
+```bash
+curl -fsS http://127.0.0.1:18780/health
+curl -fsS http://127.0.0.1:18780/v1/models
 ```
 
-### Local-backend health failover (sovereign-first)
+A completion request uses the normal OpenAI chat shape:
 
-Logical roles (`sk-default`, `ornith-tiny`, …) resolved by the skmodels registry
-to a sovereign LOCAL backend (e.g. ornith on `192.168.0.100:8082`) are a single
-point of failure: if that GPU wedges (broken driver, `llama-server` hung,
-`/chat/completions` never replies) the route would stall every caller to a
-multi-minute timeout. The gateway makes that route HEALTH-AWARE and transparently
-fails over to a known-good cloud FREE model while the local backend is unhealthy,
-routing back automatically once it recovers. The client-visible response shape is
-unchanged (a standard OpenAI chat completion). Two guards, both sovereign-first:
-
-- a fast, cached liveness probe (`GET {base}/models`, short timeout), and
-- a bounded completion timeout so a request that hangs mid-flight still fails over.
-
-Configured entirely by env (defaults shown), and only applies to local/private
-backends (loopback, RFC1918, tailnet):
-
-| Env var | Default | Meaning |
-| --- | --- | --- |
-| `SKGATEWAY_LOCAL_FAILOVER` | `1` (ON) | Master switch. `0`/`false`/`off`/`no` disables it. |
-| `SKGATEWAY_LOCAL_FALLBACK_MODEL` | `deepseek-ai/deepseek-v4-flash` | Cloud model served during a local outage. |
-| `SKGATEWAY_LOCAL_FALLBACK_BACKEND` | `nvidia` | Router backend id that serves the fallback model. |
-| `SKGATEWAY_LOCAL_HEALTH_TIMEOUT_MS` | `3000` | Liveness-probe timeout (ms). |
-| `SKGATEWAY_LOCAL_COMPLETION_TIMEOUT_MS` | `10000` | Bounded local completion timeout (ms) before failover. |
-| `SKGATEWAY_LOCAL_HEALTH_TTL_MS` | `20000` | How long a health verdict is cached (ms) so requests do not re-probe. |
-
-### Tool Reduction
-
-```yaml
-tools:
-  guaranteed:             # These tools are NEVER cut regardless of budget
-    - exec
-    - read
-    - write
-    - edit
-    - message
-  max_budget: 16          # Maximum tools forwarded per request
-  fallback_budget: 8      # Budget when semantic routing finds no match
-  call_limit: 10          # Max tool-call rounds per request
+```bash
+curl -sS http://127.0.0.1:18780/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H 'X-Agent-Id: readme-check' \
+  -d '{
+    "model": "MODEL_CONFIGURED_ON_THIS_HOST",
+    "messages": [{"role": "user", "content": "Reply with hello."}],
+    "max_tokens": 20
+  }'
 ```
 
-### Sanitizer
+This call can contact the selected backend and can incur provider cost. Replace the model deliberately. Do not use a production credential as a documentation check.
 
-Controls message history trimming passed to backends:
+## Security and policy defaults
 
-```yaml
-sanitizer:
-  max_system_bytes: 40000  # System prompt size cap
-  max_body_bytes: 120000   # Total body size cap
-  keep_start: 2            # Always keep first N messages
-  keep_end: 12             # Always keep last N messages
-  strip_thinking: true     # Remove <thinking> blocks before forwarding
-```
+The following defaults matter because implemented code is not the same as enforced policy:
 
-### Metrics and Pricing
-
-```yaml
-metrics:
-  enabled: true
-  db_path: ./data/metrics.db
-  retention_days: 90
-  pricing:
-    claude-opus-4-6:
-      input: 15.00    # USD per million tokens
-      output: 75.00
-    kimi-k2-instruct:
-      input: 0        # free tier
-      output: 0
-```
-
-### SIEM Outputs
-
-```yaml
-siem:
-  enabled: true
-  outputs:
-    - type: file
-      path: ./logs/audit.jsonl
-      rotate_mb: 100
-    - type: syslog
-      host: localhost
-      port: 514
-    - type: elastic
-      url: http://localhost:9200
-      index: skgateway-events
-```
-
-For full config reference see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
-
----
-
-## Request Flow
-
-Every request passes through the following pipeline. Stages that fire `deny` short-circuit the chain and return a 403/429 immediately.
-
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant ID as Identity
-    participant PE as Policy Engine
-    participant CL as Classifier
-    participant TR as Tool Reducer
-    participant RO as Router
-    participant UP as Upstream LLM
-    participant SA as Sanitizer
-    participant ME as Metrics
-    participant SI as SIEM
-
-    C->>ID: POST /v1/chat/completions
-    ID->>ID: CapAuth verify agent_id + session
-    ID-->>PE: identity context
-
-    PE->>PE: Evaluate rules (allow/deny/transform)
-    alt denied
-        PE-->>C: 403 Forbidden
-    end
-    PE-->>CL: enriched request
-
-    CL->>CL: Classify intent, score risk, detect jailbreak, scan PII
-    CL-->>TR: classified request
-
-    TR->>TR: Score tools by semantic keyword match<br/>Trim to max_budget (guaranteed tools survive)
-    TR-->>RO: trimmed request
-
-    RO->>RO: Select backend by model name / priority
-    RO->>UP: Forward request (retry on failure)
-    UP-->>RO: Response (SSE or JSON)
-
-    RO-->>SA: Raw response
-    SA->>SA: Strip leaked model markup<br/>Redact PII if policy active
-    SA-->>ME: Clean response
-
-    ME->>ME: Count tokens, calculate cost, record latency
-    ME-->>SI: metrics payload
-
-    SI->>SI: Emit structured event (CEF/JSONL/syslog)
-    SI-->>C: Final response
-```
-
-### Live request path (what actually runs today)
-
-The sequence above is the **full designed pipeline**. The production entrypoint
-`src/index.mjs` buffers the request body and calls `routeAndSend()`
-(`src/proxy/router.mjs`) directly — it does **not** go through
-`core.mjs`/`handleRequest`. So the layers that are actually invoked on a live
-request today are:
-
-- **Router** — model-name + registry role/context routing, sk-auto difficulty
-  classification, priority failover, per-backend connection pooling, health
-  tracking. ✅ live
-- **SIEM event bus** — `routeAndSend` emits structured `auth`, `request`,
-  `failover`, `error`, and `response` events (status + latency + best-effort
-  token usage), correlated by a per-request `request_id`, through the
-  best-effort hook that appends to `logs/audit.jsonl`, forwards warn+ events to
-  the skcapstone bus, and ships to any enabled syslog output. ✅ live
-- **Metrics** — per-request duration/status/agent/model/backend recorded. ✅ live
-
-The remaining layers are **implemented but wired only into the alternate
-`core.mjs`/`handleRequest` proxy** (used for embedded/library callers and the
-test suite), and are **descoped from the live `routeAndSend` path** until a
-dedicated card unifies the two entrypoints:
-
-| Layer | Status on live path | Decision |
-|---|---|---|
-| Content sanitizer (`sanitizer.mjs`, `max_body_bytes`/`max_system_bytes`) | not invoked | **descoped** — lives in `handleRequest`; unify entrypoints in a follow-up |
-| `model_limits` (per-model body/system caps) | not invoked | **descoped** — same as above |
-| Tool budgets (`tools.max_budget` / `call_limit`, tool reducer) | not invoked | **descoped** — same as above |
-| Identity / CapAuth verification | not invoked | **descoped** — no identity enforcement on the live path yet |
-| Policy engine (allow/deny/transform/rate_limit) | not invoked | **descoped** — planned, not on live path |
-| Prompt classifiers (jailbreak/PII/intent) | difficulty classifier only (sk-auto routing) | **partial** — risk/PII classifiers descoped on live path |
-
-Only the SIEM wiring is addressed by this change; the descoped layers are
-tracked separately. See `docs/deploy-plan/skgateway-bulletproof-deploy.md`.
-
----
-
-## SOC Dashboard
-
-The dashboard at `http://localhost:18781` is a single-page real-time SOC interface that updates via WebSocket every 5 seconds (configurable).
-
-**Panels:**
-
-| Panel | Description |
-|---|---|
-| Request Rate | Live requests/min graph per agent and model |
-| Token Ledger | Rolling token usage - input, output, cache breakdown |
-| Cost Tracker | Cumulative USD spend per agent with budget alert thresholds |
-| Classification | Donut chart of prompt intent categories |
-| Security Events | Live stream of jailbreak alerts, PII detections, policy denials |
-| Backend Health | Status indicators for each configured upstream |
-| Agent Activity | Per-agent request timeline with soul color coding |
-| Latency | P50 / P95 / P99 line charts per backend |
-
-**Design system:** OLED black background (`#000`), glass morphism cards (`backdrop-filter: blur`), Canvas-rendered charts, per-agent accent colors that match soul color assignments in OpenClaw. Built with zero framework dependencies - vanilla JS + CSS Custom Properties.
-
----
-
-## Policy Rules
-
-Policies live in `config/policies.yaml`. Rules are evaluated in declaration order. The first `deny`, `allow`, or `rate_limit` action terminates the chain. `transform` and `alert` actions apply their effect and continue.
-
-### Rule structure
-
-```yaml
-rules:
-  - name: "human-readable-slug"   # required, unique
-    condition:
-      <field>: <value>            # one or more condition fields
-    action: deny | allow | transform | rate_limit | alert
-    message: "Optional human message for deny/rate_limit"
-    severity: info | low | medium | high | critical
-    # For transform action only:
-    transform: redact_pii | downgrade_model | strip_tools | add_safety_prompt
-    fallback_model: "kimi-k2-instruct"   # required with downgrade_model
-    safety_prompt: "..."                  # required with add_safety_prompt
-```
-
-### Condition fields
-
-| Field | Type | Example |
-|---|---|---|
-| `agent_id` | string / glob | `"sentinel"`, `"bot-*"` |
-| `model` | string / glob | `"claude-opus-*"` |
-| `backend` | string | `nvidia`, `anthropic`, `ollama` |
-| `risk_score` | numeric expr | `">= 6"` |
-| `jailbreak_score` | numeric expr | `">= 9"` |
-| `pii_detected` | boolean | `true` |
-| `time_of_day` | HH:MM-HH:MM | `"22:00-06:00"` |
-| `tokens_today` | numeric expr | `">= 500000"` |
-| `budget_remaining` | numeric expr (USD) | `"< 1.00"` |
-| `agent_budget_exceeded` | boolean | `true` |
-
-### Examples
-
-**Hard-block jailbreak attempts:**
-```yaml
-- name: "block-jailbreak-critical"
-  condition:
-    jailbreak_score: ">= 9"
-  action: deny
-  message: "Request blocked: high-confidence jailbreak attempt detected"
-  severity: critical
-```
-
-**Restrict a read-only monitoring agent:**
-```yaml
-- name: "strip-sentinel-tools"
-  condition:
-    agent_id: "sentinel"
-  action: transform
-  transform: strip_tools
-  severity: info
-
-- name: "restrict-sentinel-to-local-models"
-  condition:
-    agent_id: "sentinel"
-    model: "claude-opus-*"
-  action: deny
-  message: "Sentinel is restricted to kimi-k2-instruct"
-  severity: medium
-```
-
-**Auto-downgrade when budget is exhausted:**
-```yaml
-- name: "budget-fallback-downgrade"
-  condition:
-    agent_budget_exceeded: true
-  action: transform
-  transform: downgrade_model
-  fallback_model: "kimi-k2-instruct"
-  severity: medium
-```
-
-**After-hours cost control:**
-```yaml
-- name: "after-hours-model-downgrade"
-  condition:
-    time_of_day: "22:00-06:00"
-    model: "claude-opus-*"
-  action: transform
-  transform: downgrade_model
-  fallback_model: "kimi-k2-instruct"
-  severity: info
-```
-
-### Rate limit configuration
-
-Rate limits are defined separately from rules and are applied cumulatively:
-
-```yaml
-rate_limits:
-  default:
-    requests_per_min: 60
-    tokens_per_min: 200000
-    burst: 10
-
-  agents:
-    lumina:
-      requests_per_min: 120
-      tokens_per_min: 500000
-      burst: 20
-    sentinel:
-      requests_per_min: 10
-      tokens_per_min: 10000
-      burst: 3
-
-  models:
-    "claude-opus-*":
-      requests_per_min: 20
-      tokens_per_min: 50000
-      burst: 5
-```
-
----
-
-## Module Architecture
-
-```mermaid
-graph TD
-    subgraph Entry
-        IDX[src/index.mjs]
-        CFG[src/config.mjs]
-    end
-
-    subgraph Proxy["src/proxy/"]
-        CORE[core.mjs]
-        ROUTER[router.mjs]
-        STREAM[stream.mjs]
-        SANITIZER[sanitizer.mjs]
-        RETRY[retry.mjs]
-        TOOLS[tools.mjs]
-        UPSTREAM[upstream.mjs]
-    end
-
-    subgraph Identity["src/identity/"]
-        CAPAUTH[capauth.mjs]
-        SESSION[session.mjs]
-    end
-
-    subgraph Policy["src/policy/"]
-        ENGINE[engine.mjs]
-        RATELIMIT[ratelimit.mjs]
-    end
-
-    subgraph Classifiers["src/classifiers/"]
-        CLASSIFIER[classifier.mjs]
-    end
-
-    subgraph Metrics["src/metrics/"]
-        COLLECTOR[collector.mjs]
-    end
-
-    subgraph SIEM["src/siem/"]
-        EVENTS[events.mjs]
-        FILE[file.mjs]
-    end
-
-    subgraph Dashboard["src/dashboard/"]
-        DASH[server.mjs]
-    end
-
-    IDX --> CFG
-    IDX --> CORE
-    IDX --> ROUTER
-    IDX --> COLLECTOR
-    IDX --> DASH
-
-    CORE --> CAPAUTH
-    CORE --> SESSION
-    CORE --> ENGINE
-    CORE --> RATELIMIT
-    CORE --> CLASSIFIER
-    CORE --> TOOLS
-    CORE --> SANITIZER
-    CORE --> STREAM
-    CORE --> UPSTREAM
-    CORE --> RETRY
-    CORE --> EVENTS
-
-    EVENTS --> FILE
-    COLLECTOR --> FILE
-    DASH --> COLLECTOR
-    DASH --> EVENTS
-
-    ROUTER --> UPSTREAM
-```
-
----
-
-## Integration with SKCapstone
-
-SKGateway is the network layer of the [SKCapstone](https://github.com/smilinTux/skcapstone) sovereign agent framework. Here is how it connects to the rest of the ecosystem:
-
-```mermaid
-graph LR
-    subgraph Ecosystem["SKCapstone / SKWorld ecosystem"]
-        OC["OpenClaw<br/>agent orchestrator"]
-        SKV["skvoice<br/>voice pipeline"]
-        MEM["skmemory<br/>memory system"]
-        SEC["capauth<br/>PGP identity"]
-        ITIL["skops / skcapstone<br/>ITIL · coord board"]
-        SYNC["Syncthing<br/>config sync"]
-    end
-
-    GW["SKGateway"]
-
-    OC -->|"baseUrl: localhost:18780"| GW
-    SKV -->|"inference requests"| GW
-    GW -->|"identity verification"| SEC
-    GW -->|"agent context enrichment"| MEM
-    GW -->|"critical events via sk-alert"| ITIL
-    SYNC -->|"config/policies.yaml sync"| GW
-```
-
-**OpenClaw** - Set `baseUrl: http://localhost:18780` on any model provider in `openclaw.json`. SKGateway becomes transparent to OpenClaw while gaining full observability over every call.
-
-**SKVoice** - The voice pipeline (`192.168.0.100:18800`) routes all LLM inference through SKGateway, giving the same rate limiting and cost accounting as interactive sessions.
-
-**CapAuth** - PGP-signed agent identities flow through SKGateway's identity module. Every request carries a verified `agent_id` that policies and metrics key off.
-
-**skmemory** - The `before_prompt_build` hook in the skmemory plugin delivers agent identity context (200-byte slim rehydration) that SKGateway can use for routing decisions.
-
-**ITIL / Deming** - On `severity: critical` policy events, SKGateway emits SIEM events that the skcapstone coordination layer can surface as incident tasks.
-
-**Syncthing** - `config/skgateway.yaml` and `config/policies.yaml` are designed to be Syncthing-synced across nodes. Hot-reload (`SIGHUP`) means config updates propagate without service interruption.
-
-### Integration modes (skcapstone)
-
-skgateway is a Node.js service and integrates with skcapstone **file-based** (no Python import):
-
-| Mode | Trigger | Alert path | Scheduler |
+| Control | Default | Effect | Evidence |
 |---|---|---|---|
-| **Standalone** | `SK_STANDALONE=1` or `~/.skcapstone/` not present | No-op (alert() returns false) | Native systemd `skgateway.service` |
-| **Integrated** | `~/.skcapstone/` exists and `SK_STANDALONE` unset | File-based PubSub: writes `~/.skcapstone/pubsub/topics/skgateway.<severity>/msg-*.json` | File-based: writes `~/.skcapstone/config/jobs.d/skgateway_health.yaml` |
-| **Forced standalone** | `SK_STANDALONE=1` env var | No-op | Native |
+| `client_auth.enabled` | `false` | The dedicated client credential boundary is off unless explicitly configured | [`src/config.mjs`](./src/config.mjs), [`tests/client-auth.test.mjs`](./tests/client-auth.test.mjs) |
+| `operator_auth.enabled` | `false` | The dedicated operator credential boundary is off unless explicitly configured | [`src/config.mjs`](./src/config.mjs), [`tests/client-auth.test.mjs`](./tests/client-auth.test.mjs) |
+| `identity.enabled` | `true` | Identity resolution runs, but anonymous callers are allowed by default | [`src/config.mjs`](./src/config.mjs), [`tests/capauth-identity.test.mjs`](./tests/capauth-identity.test.mjs) |
+| `identity.require_agent_id` | `false` | Anonymous requests are not rejected by the identity gate | [`src/config.mjs`](./src/config.mjs), [`tests/capauth-identity.test.mjs`](./tests/capauth-identity.test.mjs) |
+| `authz.enforce` | `false` | No policy-decision call or authorization denial occurs until enforcement is enabled | [`src/config.mjs`](./src/config.mjs), [`tests/authz-enforce-integration.test.mjs`](./tests/authz-enforce-integration.test.mjs) |
+| `classification.enabled` | `true` | Prompt labels are observed and logged; `classification.gate` is reserved and defaults off | [`src/config.mjs`](./src/config.mjs), [`tests/classification-engine.test.mjs`](./tests/classification-engine.test.mjs) |
+| `routing.match_enabled` | `false` | Capability-aware `@match` routing and `x-sk-require` routing are dark by default | [`src/config.mjs`](./src/config.mjs), [`tests/router-match.test.mjs`](./tests/router-match.test.mjs) |
 
-The Node adapter (`src/integration.mjs`) writes the same file formats as the Python SDK so
-`skcapstone alerts` (Python) reads SKGateway messages transparently. See
-`docs/ADR-optional-integration-backbone.md §3.5` (polyglot bridge) and
-`tests/integration.test.mjs` for the validated Node↔Python round-trip.
+Enabling an authentication or authorization flag is an operator decision, not a claim that the control is active on every installation. See [`SECURITY.md`](./SECURITY.md), [`docs/CONFIGURATION.md`](./docs/CONFIGURATION.md), and [`docs/RUNBOOK.md`](./docs/RUNBOOK.md).
 
-### `~/.skcapstone/` filesystem contract
+## Routing and failover
 
-When integrated, skgateway writes:
-- `~/.skcapstone/pubsub/topics/skgateway.<severity>/msg-*.json` - alert messages
-- `~/.skcapstone/registry/skgateway.json` - service discovery entry
+For a concrete model, the router selects eligible configured backends by model match and priority. It tracks observed outcomes, can quarantine repeatedly failing aliases, and can advance to another candidate on server failures and configured throttle conditions. A never-observed backend reports health as `unknown` while remaining selectable. Evidence: [`src/proxy/router.mjs`](./src/proxy/router.mjs), [`tests/health-never-probed.test.mjs`](./tests/health-never-probed.test.mjs), [`tests/quarantine.test.mjs`](./tests/quarantine.test.mjs), and [`tests/router-rate-limit-failover.test.mjs`](./tests/router-rate-limit-failover.test.mjs).
 
-Alert topics follow the sk* convention: `skgateway.<severity>` (e.g. `skgateway.critical`).
-The semantic event name lives in the payload `event` field, not the topic suffix.
+Dynamic discovery is configuration-dependent. NVIDIA and OpenRouter discovery default on in code; newer providers such as OpenCode, Anthropic wrapper discovery, Codex, and Z.ai are opt-in. Discovery failures use cached or static information where available and do not prove a provider is healthy. Evidence: [`src/index.mjs`](./src/index.mjs), [`src/discovery.mjs`](./src/discovery.mjs), and provider tests under [`tests/providers-*.test.mjs`](./tests/).
 
----
+Local-backend health failover is controlled by these environment variables:
 
-## API Reference
-
-### Proxy (`:18780`)
-
-These endpoints speak the OpenAI Chat Completions API. Drop-in replacement for any OpenAI-compatible client.
-
-| Method | Path | Description |
+| Variable | Default | Meaning |
 |---|---|---|
-| `POST` | `/v1/chat/completions` | Chat completions - SSE streaming and JSON both supported |
-| `GET` | `/v1/models` | List available models across all configured backends |
-| `GET` | `/health` | Liveness check - returns `{ status: "ok", uptime: N }` |
+| `SKGATEWAY_LOCAL_FAILOVER` | `1` | Enable the local/private backend failover branch |
+| `SKGATEWAY_LOCAL_FALLBACK_MODEL` | `deepseek-ai/deepseek-v4-flash` | Fallback model |
+| `SKGATEWAY_LOCAL_FALLBACK_BACKEND` | `nvidia` | Configured backend expected to serve the fallback |
+| `SKGATEWAY_LOCAL_HEALTH_TIMEOUT_MS` | `3000` | Liveness-probe timeout |
+| `SKGATEWAY_LOCAL_COMPLETION_TIMEOUT_MS` | `10000` | Local completion timeout |
+| `SKGATEWAY_LOCAL_HEALTH_TTL_MS` | `20000` | Cached health-verdict lifetime |
 
-### Dashboard (`:18781`)
+These defaults are defined and tested in [`src/proxy/local-failover.mjs`](./src/proxy/local-failover.mjs) and [`tests/local-failover.test.mjs`](./tests/local-failover.test.mjs). A fallback backend still needs valid configuration and, when applicable, credentials.
 
-| Method | Path | Description |
+## API summary
+
+### Gateway listener
+
+| Method | Path | Current behavior | Evidence |
+|---|---|---|---|
+| `GET` | `/health`, `/healthz` | Process uptime and observed backend health | [`src/index.mjs`](./src/index.mjs) |
+| `GET` | `/status` | Version, uptime, backend health, pool state, and metrics snapshot | [`src/index.mjs`](./src/index.mjs) |
+| `GET` | `/queue` | Connection-pool utilization and backend queue state | [`src/index.mjs`](./src/index.mjs), [`tests/connection-pool-admission.test.mjs`](./tests/connection-pool-admission.test.mjs) |
+| `GET` | `/v1/models` | Reconciled and allowlisted model catalog | [`src/index.mjs`](./src/index.mjs), [`tests/advertise-lifecycle.test.mjs`](./tests/advertise-lifecycle.test.mjs) |
+| `GET` | `/v1/models/:id` | Retrieve a catalog model or synthesized `sk-*` registry role | [`src/index.mjs`](./src/index.mjs), [`tests/anthropic-frontend.test.mjs`](./tests/anthropic-frontend.test.mjs) |
+| `POST` | `/v1/chat/completions` | Routed OpenAI-style chat completion | [`src/index.mjs`](./src/index.mjs), [`tests/siem-live-hook.test.mjs`](./tests/siem-live-hook.test.mjs) |
+| `POST` | `/v1/messages` | Anthropic request translation through the same routing path | [`src/index.mjs`](./src/index.mjs), [`tests/anthropic-frontend.test.mjs`](./tests/anthropic-frontend.test.mjs) |
+
+Loopback admin and operator-facet routes also ship. Their exact contracts are documented in [`docs/API.md`](./docs/API.md), [`src/index.mjs`](./src/index.mjs), and [`src/operator/http.mjs`](./src/operator/http.mjs). Do not infer that a loopback-only route is safe after placing an unauthenticated forwarding proxy in front of it.
+
+### Dashboard listener
+
+| Method | Path | Current behavior |
 |---|---|---|
-| `GET` | `/` | SOC dashboard HTML |
-| `GET` | `/api/metrics` | Current metrics snapshot (JSON) |
-| `GET` | `/api/metrics/history` | Token/cost/latency time series |
-| `GET` | `/api/agents` | Active agent registry and reputation scores |
-| `GET` | `/api/events` | Recent SIEM events (last 500) |
-| `GET` | `/api/backends` | Backend health and connection status |
-| `WebSocket` | `/ws` | Live event stream for dashboard updates |
+| `GET` | `/` | Static dashboard application |
+| `GET` | `/api/stats` | In-memory metrics snapshot |
+| `GET` | `/api/health` | Router health snapshot |
+| `GET` | `/api/agents` | Active sessions grouped by agent |
+| `GET` | `/api/tokens` | SQLite token rows when metrics are enabled |
+| `GET` | `/api/costs` | SQLite cost rows when metrics are enabled |
+| `GET` | `/api/events` | Dashboard server's in-memory event ring |
+| `GET` | `/api/activity` | Dashboard server's in-memory activity ring |
+| WebSocket | `/ws` | Periodic stats and health frames, plus events directly pushed into the dashboard server |
 
----
+Evidence for this table is [`src/dashboard/server.mjs`](./src/dashboard/server.mjs). The event/activity and demo-data limitation is stated under [Important scope boundaries](#important-scope-boundaries).
+
+## Observability
+
+The live router emits correlated auth, request, failover, error, and response events through the SIEM callback. Response events include status, latency, and best-effort token usage when the response exposes usage. Evidence: [`src/proxy/router.mjs`](./src/proxy/router.mjs) and [`tests/siem-live-hook.test.mjs`](./tests/siem-live-hook.test.mjs).
+
+With metrics enabled, the collector records request/response pairs in SQLite, computes configured-model costs, and retains latency estimators in memory. Unknown pricing is represented as unpriced rather than inventing a cost. Evidence: [`src/metrics/collector.mjs`](./src/metrics/collector.mjs) and [`tests/metrics-collector.test.mjs`](./tests/metrics-collector.test.mjs).
+
+For sink configuration and operational limitations, see [`docs/SIEM.md`](./docs/SIEM.md) and [`docs/DASHBOARD.md`](./docs/DASHBOARD.md).
+
+## SKCapstone integration
+
+Integration is file-based and optional. When `~/.skcapstone/` is present and standalone mode is not forced, the adapter can:
+
+- forward warning-or-higher SIEM events to `~/.skcapstone/pubsub/topics/skgateway.<level>/`; and
+- register gateway health metadata at `~/.skcapstone/registry/skgateway.json`.
+
+When `SK_STANDALONE=1` is set, these operations are no-ops. Evidence: [`src/integration.mjs`](./src/integration.mjs) and [`tests/integration.test.mjs`](./tests/integration.test.mjs).
+
+This repository does not evidence claims that every SKCapstone, SKVoice, SKMemory, OpenClaw, or other ecosystem request currently traverses SKGateway. Each consumer must be configured and qualified separately.
 
 ## Development
 
-### Running tests
+```bash
+npm ci
+npm test
+```
+
+Useful targeted checks include:
 
 ```bash
-npm test
-# Runs node --test on tests/
+node --test --import ./tests/_setup.mjs tests/router-rate-limit-failover.test.mjs
+node --test --import ./tests/_setup.mjs tests/client-auth-integration.test.mjs
+node --test --import ./tests/_setup.mjs tests/metrics-collector.test.mjs
+node --test --import ./tests/_setup.mjs tests/siem-live-hook.test.mjs
 ```
 
-Currently includes:
+Contribution rules, including the branch model, test gate, writing style, and review path, are in [`CONTRIBUTING.md`](./CONTRIBUTING.md).
 
-- `tests/classifier.test.mjs` - Prompt intent classifier unit tests
+## Documentation index
 
-### Adding a backend
-
-1. Add an entry to the `backends` section in `config/skgateway.yaml`.
-2. If it uses a non-standard auth scheme, add a handler in `src/proxy/upstream.mjs`.
-3. Add model pricing entries under `metrics.pricing` if cost tracking is desired.
-4. Restart or send `SIGHUP` to reload.
-
-### Adding a policy rule
-
-1. Edit `config/policies.yaml`.
-2. Add a new entry in the `rules` array at the appropriate priority position.
-3. Send `SIGHUP` - no restart required.
-4. Verify the rule fires by watching `logs/audit.jsonl` or the dashboard Security Events panel.
-
-### Adding a SIEM output
-
-Outputs are pluggable modules in `src/siem/`. To add a new destination (e.g. Splunk HEC):
-
-1. Create `src/siem/splunk.mjs` implementing `write(event)` and `init(config)`.
-2. Register it in `src/siem/events.mjs`.
-3. Add `type: splunk` to the `siem.outputs` list in your config.
-
-### Module conventions
-
-- All source files are ES modules (`.mjs`), Node 20+ native.
-- No build step - run directly with `node`.
-- Config is loaded once at startup from `config/skgateway.yaml` and reloaded on `SIGHUP`.
-- SQLite (`better-sqlite3`) is used for metrics persistence - no external database required.
-
----
-
-## Roadmap
-
-### Phase 6 - Hardening and Integration
-
-- [ ] OpenClaw plugin (`openclaw-plugin/`) - native plugin so OpenClaw auto-routes through gateway with zero config change on the client side
-- [ ] SKVoice integration - dedicated auth path and latency-optimized stream handling for voice inference
-- [ ] Traefik integration - run SKGateway behind Traefik for TLS termination, let's encrypt, and multi-node load balancing
-- [ ] Syncthing auto-reload - file watcher on `config/` triggers hot-reload when Syncthing delivers a new config version
-- [ ] Full docs site - expanded API reference, policy cookbook, deployment guides
-- [ ] `reputation.mjs` and `sentiment.mjs` - complete remaining classifier modules
-- [ ] `syslog.mjs` and `elastic.mjs` - complete remaining SIEM output modules
-- [ ] Prometheus `/metrics` endpoint for Grafana integration
-- [ ] Per-agent budget dashboard with spend forecasting
-- [ ] ITIL incident auto-creation on critical SIEM events
-
----
-
-## First Principles
-
-> **Get back to first principles.**
-> The modern stack is rented. Every prompt your AI sends exits through a cloud provider's
-> endpoint, gets logged in a datacenter you've never seen, and billed through an account
-> you can't fully audit. You don't own the inference path - you rent it.
->
-> SKGateway is the **inference chokepoint you own**. Every prompt inspected on your
-> hardware. Every policy enforced by your rules. Every token counted in your ledger.
-
-Your prompts and completions never reach a third party unexamined. Every request is
-classified, stamped with a CapAuth-verified agent identity, and logged to a local JSONL
-audit trail on your disk before it is forwarded upstream. The SOC dashboard runs locally
-at `:18781` - no telemetry leaves your infrastructure. Metrics and latency history live in
-a local SQLite database. You run the SIEM; you hold the logs. If you point every backend at
-local Ollama, the prompt never leaves your LAN at all.
-
----
-
-## Where it lives in SKStack v2
-
-SKWorld is deployed through **skos** (the sovereign agent OS) using a ports/adapters model,
-organized by the **4 C's** capability map: **cloud · comms · compute · core**. SKGateway is
-a **core** capability - the security plane through which all AI inference traffic flows. It
-sits in front of the **compute** layer's model backends (`skmodel`/Ollama and cloud LLMs),
-enforces **core** identity (`capauth`), and reports up the shared platform primitives
-(`sk-alert`, the coord/ITIL board, `skscheduler`).
-
-It depends only on what it actually touches: `capauth` for PGP agent identity, `skmemory`
-for optional agent-context enrichment, and the file-based `sk-alert` bus + `skscheduler`
-job tree when an `~/.skcapstone/` install is present (otherwise it runs fully standalone).
-
-```mermaid
-flowchart TD
-    CLIENTS["AI clients<br/>OpenClaw · Claude Code · skvoice · skchat · custom apps"]
-    CLIENTS -->|"POST /v1/chat/completions (OpenAI-compatible)"| GW
-
-    subgraph GW["**skgateway** :18780 - core / inference security plane"]
-      direction TB
-      ID["identity<br/>capauth verify · session · reputation"]
-      PE["policy engine<br/>rules · rate limit · transforms"]
-      CL["classifiers<br/>intent · risk · jailbreak · PII"]
-      PC["proxy core<br/>tool-reduce · sanitize · retry · pool"]
-      RO["router<br/>backend select · health · failover"]
-      ME["metrics<br/>tokens · cost · P50/P95/P99 (SQLite)"]
-      SI["SIEM event bus<br/>CEF · JSONL · syslog"]
-      ID --> PE --> CL --> PC --> RO
-      RO --> ME --> SI
-    end
-
-    GW -->|"verified + classified + reduced"| COMPUTE
-    subgraph COMPUTE["compute - model backends"]
-      direction LR
-      SKMODEL["skmodel / Ollama<br/>local models (LAN-only)"]
-      CLOUD["Anthropic · NVIDIA NIM<br/>OpenAI-compat · vLLM"]
-    end
-
-    GW <-->|"PGP agent identity"| CAPAUTH["core · capauth<br/>identity source of truth"]
-    GW <-->|"agent-context rehydration"| SKMEM["core · skmemory<br/>context enrichment"]
-    SI -->|"critical events → file bus"| ALERT["sk-alert<br/>Telegram alert bus"]
-    GW -.->|"health job (when integrated)"| SCHED["skscheduler<br/>fleet job scheduler"]
-    ALERT -.->|"surfaced as incidents"| OPS["skops<br/>ITIL ops board"]
-
-    SOC["SOC dashboard :18781<br/>real-time · WebSocket · OLED"]
-    GW --> SOC
-```
-
-For the request lifecycle, retry state machine, and module-level source map, see
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
-
----
-
-## Related projects / See also
-
-- ⬆️ **Depends on:** [capauth](https://github.com/smilinTux/capauth) - PGP agent identity SKGateway verifies on every request.
-- ⬆️ **Depends on:** [skmemory](https://github.com/smilinTux/skmemory) - optional agent-context rehydration used for routing decisions.
-- ⬇️ **Used by:** [skcapstone](https://github.com/smilinTux/skcapstone) - the sovereign agent framework; agents route inference through the gateway on `:18780`.
-- ⬇️ **Used by:** [skchat](https://github.com/smilinTux/skchat) and skvoice - chat and voice pipelines send LLM inference through the gateway.
-- ↔️ **Sibling:** [skops](https://github.com/smilinTux/skops) - ITIL / coord ops board that surfaces critical SIEM events as incidents.
-- 📐 **Standards:** [sk-standards](https://github.com/smilinTux/sk-standards) - crypto, data-flow, version, and doc/SOP standards this repo follows. See also `SOP.md`, `SECURITY.md`, `CONTRIBUTING.md`, `CHANGELOG.md`.
-
----
+- [Installation](./docs/INSTALL.md)
+- [Configuration](./docs/CONFIGURATION.md)
+- [API](./docs/API.md)
+- [Architecture](./docs/ARCHITECTURE.md)
+- [Policies](./docs/POLICIES.md)
+- [SIEM](./docs/SIEM.md)
+- [Dashboard](./docs/DASHBOARD.md)
+- [Operations runbook](./docs/RUNBOOK.md)
+- [Security](./SECURITY.md)
+- [Standard operating procedures](./SOP.md)
+- [Changelog](./CHANGELOG.md)
 
 ## License
 
-MIT - see [LICENSE](LICENSE) for details.
+MIT. See [`LICENSE`](./LICENSE).
 
----
+## Related projects / See also
 
-Part of the **[SKWorld](https://skworld.io)** sovereign ecosystem · site:
-**[skgateway.skworld.io](https://skgateway.skworld.io)** · 🐧 smilinTux
+- **Depends on:** [capauth](https://github.com/smilinTux/capauth) for optional policy-decision delegation and CapAuth identity formats.
+- **Used by:** [skcapstone](https://github.com/smilinTux/skcapstone) can consume the optional file-based service registration and warning event bridge.
+- **Sibling:** [skops](https://github.com/smilinTux/skops) provides related operational and ITIL surfaces.
+- **Standards:** [sk-standards](https://github.com/smilinTux/sk-standards) defines the repository documentation, ingress, authorization, and observability standards referenced by this project.
