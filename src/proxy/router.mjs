@@ -873,6 +873,11 @@ export class Backend {
     // accepting the socket but never replying) so the router can fail over
     // instead of hanging the request. See sendUpstream(timeoutMs).
     this.timeout_ms = typeof config.timeout_ms === "number" ? config.timeout_ms : 0;
+    // Codex only: output-token ceiling against never-ending replies (0 = off).
+    // See toCodexRequest() in codex-adapter.mjs for why caller caps below it
+    // are not forwarded.
+    this.runaway_max_output_tokens = Number.isInteger(config.runaway_max_output_tokens)
+      ? config.runaway_max_output_tokens : 0;
     // Opt-in fail-closed admission for providers whose health has not yet been
     // observed. Legacy providers retain warm-start behaviour; newly admitted
     // external lanes must prove a bounded probe before receiving work.
@@ -4658,12 +4663,16 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         // the Anthropic branch above: a translatable body is converted and the
         // buffered upstream SSE answer converted back (to SSE for the client
         // when the client asked stream:true); anything else passes through.
-        const tr = toCodexRequest(attemptBody);
+        const tr = toCodexRequest(attemptBody, { runawayMaxOutputTokens: backend.runaway_max_output_tokens });
         if (tr) {
           if (tr.dropped.length) {
+            // The caller's cap value is logged so whether callers' caps could
+            // safely be honored stays measurable (see toCodexRequest).
             console.warn(
               `[router] codex ${backendId}: dropped unsupported params [${tr.dropped.join(",")}] ` +
-                `for model=${candidateModel}`,
+                `for model=${candidateModel}` +
+                (tr.callerMaxTokens !== null ? ` caller_max_tokens=${tr.callerMaxTokens}` : "") +
+                (tr.maxOutputTokens !== null ? ` max_output_tokens=${tr.maxOutputTokens}` : ""),
             );
           }
           const cHeaders = { ...forwardHeaders, ...tr.headers };
@@ -4671,6 +4680,12 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           const raw = await sendUpstream(tr.path, method, cHeaders, tr.body, targetUrl,
             attemptTimeoutMs, abortSignal, probeResponseLimit);
           res = raw?.cancelled ? raw : fromCodexResponse(raw, candidateModel, tr.clientStream);
+          if (res?.incompleteReason) {
+            console.warn(
+              `[router] codex ${backendId}: response incomplete (${res.incompleteReason}) ` +
+                `model=${candidateModel} max_output_tokens=${tr.maxOutputTokens ?? "unset"}`,
+            );
+          }
         } else {
           res = await sendUpstream(upstreamPath, method, forwardHeaders, attemptBody, targetUrl,
             attemptTimeoutMs, abortSignal, probeResponseLimit);

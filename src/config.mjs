@@ -842,6 +842,10 @@ export function assertProviderRoutes(
         (!Number.isFinite(backend.min_output_tokens) || backend.min_output_tokens <= 0)) {
       errs.push(`backends.${name}.min_output_tokens must be a positive number of tokens`);
     }
+    if ('runaway_max_output_tokens' in backend &&
+        (!Number.isInteger(backend.runaway_max_output_tokens) || backend.runaway_max_output_tokens < 16)) {
+      errs.push(`backends.${name}.runaway_max_output_tokens must be an integer >= 16 (the Codex backend minimum)`);
+    }
     if ('require_observed_health' in backend && typeof backend.require_observed_health !== 'boolean') {
       errs.push(`backends.${name}.require_observed_health must be a boolean`);
     }

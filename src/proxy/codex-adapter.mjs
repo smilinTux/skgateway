@@ -19,8 +19,14 @@
  *
  *   POST /responses  requires stream:true ("Stream must be set to true").
  *   Unsupported parameters are hard 400s, not ignored:
- *     max_output_tokens ("Unsupported parameter: max_output_tokens")
- *     temperature, stop  (same shape)
+ *     temperature, stop, max_tokens ("Unsupported parameter: <name>")
+ *   max_output_tokens: a 400 on 2026-08-22, ACCEPTED and enforced when
+ *     re-measured 2026-10-26 (gpt-6.1-sol, gpt-6-luna, gpt-5.6-sol/terra/luna):
+ *     the stream ends with response.incomplete, incomplete_details.reason
+ *     "max_output_tokens", usage.output_tokens == the cap (reasoning tokens
+ *     count against it). Values below 16 are a 400; 1000000 is accepted. A
+ *     function_call cut by the cap arrives as an output item with status
+ *     "incomplete" and truncated arguments.
  *   Accepted: reasoning.effort, tools (FLAT {type:'function', name, ...},
  *     NOT the chat-completions {type:'function', function:{...}} nesting),
  *     tool_choice ('auto' | 'required' | {type:'function', name}),
@@ -111,6 +117,12 @@ const DROPPED_PARAMS = [
   "stream_options",
 ];
 
+/** Smallest max_output_tokens the backend accepts (measured 400 below it). */
+export const CODEX_MIN_OUTPUT_TOKENS = 16;
+
+/** Caller output-cap fields, in the order a cap is read from. */
+const CALLER_CAP_PARAMS = ["max_output_tokens", "max_completion_tokens", "max_tokens"];
+
 /** Is this backend one we must speak the Codex Responses API to? */
 export function isCodexBackend(backend) {
   if (!backend) return false;
@@ -161,10 +173,23 @@ export function readCodexAuthHeaders(path) {
  * response side needs this flag to know whether to hand the client buffered
  * JSON or re-serialised SSE.
  *
+ * RUNAWAY CEILING. `opts.runawayMaxOutputTokens` (backend config
+ * `runaway_max_output_tokens`, 0/absent = off) is sent as the Responses
+ * `max_output_tokens` on every request, raised to the caller's own cap when
+ * the caller asked for MORE. A caller cap BELOW the ceiling is still not
+ * forwarded: measured callers send small caps that the backend has always
+ * ignored (Hermes aux lanes 16/64/96, skcall 150 with replies up to 161
+ * tokens, Pi 16384), and since reasoning tokens count against the cap,
+ * starting to honor them would truncate replies those sessions get today. The
+ * ceiling exists for one failure: a reply that never ends (2026-10-26, ~100k
+ * output tokens over 900 s until the hard deadline 504'd it). Off by default
+ * so an instance without the key keeps today's wire byte for byte.
+ *
  * @param {Buffer} openaiBody
- * @returns {{path: string, headers: Record<string,string>, body: Buffer, clientStream: boolean, dropped: string[]}|null}
+ * @param {{runawayMaxOutputTokens?: number}} [opts]
+ * @returns {{path: string, headers: Record<string,string>, body: Buffer, clientStream: boolean, dropped: string[], callerMaxTokens: number|null, maxOutputTokens: number|null}|null}
  */
-export function toCodexRequest(openaiBody) {
+export function toCodexRequest(openaiBody, opts = {}) {
   let req;
   try { req = JSON.parse(openaiBody.toString("utf-8")); }
   catch { return null; }
@@ -270,6 +295,17 @@ export function toCodexRequest(openaiBody) {
     if (k in req) dropped.push(k);
   }
 
+  let callerMaxTokens = null;
+  for (const k of CALLER_CAP_PARAMS) {
+    if (Number.isFinite(req[k]) && req[k] > 0) { callerMaxTokens = Math.floor(req[k]); break; }
+  }
+  const ceiling = Number.isFinite(opts.runawayMaxOutputTokens) ? Math.floor(opts.runawayMaxOutputTokens) : 0;
+  let maxOutputTokens = null;
+  if (ceiling > 0) {
+    maxOutputTokens = Math.max(ceiling, callerMaxTokens ?? 0, CODEX_MIN_OUTPUT_TOKENS);
+    out.max_output_tokens = maxOutputTokens;
+  }
+
   return {
     path: "/responses",
     headers: {
@@ -281,6 +317,8 @@ export function toCodexRequest(openaiBody) {
     body: Buffer.from(JSON.stringify(out), "utf-8"),
     clientStream: req.stream === true,
     dropped,
+    callerMaxTokens,
+    maxOutputTokens,
   };
 }
 
@@ -392,6 +430,7 @@ export function fromCodexResponse(raw, model, clientStream = false) {
   if (!parsed) return raw; // not SSE we understand: pass through untouched
 
   const { response, items } = parsed;
+  const incomplete = response.status === "incomplete";
   let text = "";
   const toolCalls = [];
   for (const item of items) {
@@ -399,7 +438,9 @@ export function fromCodexResponse(raw, model, clientStream = false) {
       for (const part of item.content) {
         if (part.type === "output_text" && typeof part.text === "string") text += part.text;
       }
-    } else if (item.type === "function_call") {
+    } else if (item.type === "function_call" && item.status !== "incomplete") {
+      // A call cut off by max_output_tokens carries truncated JSON arguments;
+      // handing it to the client as executable would be worse than "length".
       toolCalls.push({
         id: item.call_id || "",
         type: "function",
@@ -417,7 +458,10 @@ export function fromCodexResponse(raw, model, clientStream = false) {
 
   const finish = toolCalls.length
     ? "tool_calls"
-    : (response.status === "incomplete" ? "length" : "stop");
+    : (incomplete ? "length" : "stop");
+  const incompleteReason = incomplete
+    ? (response.incomplete_details?.reason || "incomplete")
+    : null;
 
   const message = { role: "assistant", content: text || null };
   if (toolCalls.length) message.tool_calls = toolCalls;
@@ -441,6 +485,7 @@ export function fromCodexResponse(raw, model, clientStream = false) {
         "content-length": body.length,
       },
       body,
+      incompleteReason,
     };
   }
 
@@ -491,5 +536,5 @@ export function fromCodexResponse(raw, model, clientStream = false) {
   const headers = { ...raw.headers };
   delete headers["content-length"];
   headers["content-type"] = "text/event-stream; charset=utf-8";
-  return { ...raw, headers, body };
+  return { ...raw, headers, body, incompleteReason };
 }
