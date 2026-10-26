@@ -74,6 +74,7 @@ import { genericBucketQualification, applyGenericBucketMetadata, genericBucketQu
 import { readFileSync } from "node:fs";
 import { load as yamlLoad } from "js-yaml";
 import { createShadowRecorder } from "./proxy/semantic-cache-shadow.mjs";
+import { unservedRequest } from "./proxy/unserved-request.mjs";
 
 // ─── Parse CLI args ───
 const args = process.argv.slice(2);
@@ -2451,6 +2452,30 @@ export const server = http.createServer(async (req, res) => {
         // Carry messages for sk-auto difficulty classification (registry.mjs).
         if (Array.isArray(parsed.messages)) parsedMessages = parsed.messages;
       } catch {}
+    }
+
+    // Answer here what no backend can serve: paths outside /v1, and /v1
+    // requests with no model and no registry routing header. Without this
+    // they reached the primary backend and came back as a confusing upstream
+    // 404 (see proxy/unserved-request.mjs for the measured traffic). The
+    // model check also reads a body sent without a JSON content type, which
+    // the parse above skips but the upstream would still have received.
+    // A body that is not JSON at all is left to the backend, as before.
+    let sniffedModel = parsedModel;
+    let opaqueBody = false;
+    if (!sniffedModel && routeBody.length) {
+      try { sniffedModel = JSON.parse(routeBody.toString("utf-8"))?.model; } catch { opaqueBody = true; }
+    }
+    const unserved = unservedRequest({ method: req.method, url: req.url, model: sniffedModel, opaqueBody, headers: req.headers });
+    if (unserved) {
+      siemHook({
+        ts: new Date().toISOString(), event: "request.unserved", status: unserved.status, code: unserved.code,
+        agent_id: identity.agent_id, method: req.method, path: req.url,
+        remote: req.socket?.remoteAddress ?? null, user_agent: req.headers["user-agent"] ?? null,
+      });
+      res.writeHead(unserved.status, { "content-type": "application/json", "cache-control": "no-store" });
+      res.end(req.method === "HEAD" ? undefined : unserved.body);
+      return;
     }
 
     // ── Prompt classification (P3.5) — PASSIVE observability into SIEM ──
