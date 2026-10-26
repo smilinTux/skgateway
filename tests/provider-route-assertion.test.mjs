@@ -87,6 +87,19 @@ describe("assertProviderRoutes() rule coverage", () => {
     assert.ok(errs.some((e) => e.includes("backends.zai.min_output_tokens must be a positive number")));
   });
 
+  test("rejects a codex runaway_max_output_tokens below the backend minimum of 16", () => {
+    for (const bad of [8, 0, 2.5, "32768"]) {
+      const errs = assertProviderRoutes({
+        backends: { codex: { auth_type: "none", runaway_max_output_tokens: bad } },
+      });
+      assert.ok(errs.some((e) => e.includes("backends.codex.runaway_max_output_tokens must be an integer >= 16")), String(bad));
+    }
+    const ok = assertProviderRoutes({
+      backends: { codex: { auth_type: "none", runaway_max_output_tokens: 32768 } },
+    });
+    assert.ok(!ok.some((e) => e.includes("runaway_max_output_tokens")));
+  });
+
   const baseBackends = {
     local: { url: "http://x/v1", auth_type: "none", models: ["good-model", "glob-*"], priority: 1 },
   };

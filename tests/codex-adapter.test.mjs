@@ -353,3 +353,89 @@ test("toCodexRequest: SKGATEWAY_CODEX_CLI_VERSION overrides the version header; 
     else process.env.SKGATEWAY_CODEX_CLI_VERSION = prev;
   }
 });
+
+// ── runaway output ceiling (2026-10-26) ───────────────────────────────────────
+
+test("toCodexRequest: no ceiling configured sends no max_output_tokens (today's wire)", () => {
+  const tr = toCodexRequest(openaiBody({
+    model: "gpt-6.1-sol", max_completion_tokens: 16384, messages: [{ role: "user", content: "hi" }],
+  }));
+  const req = JSON.parse(tr.body.toString("utf-8"));
+  assert.ok(!("max_output_tokens" in req));
+  assert.equal(tr.maxOutputTokens, null);
+  assert.equal(tr.callerMaxTokens, 16384);
+});
+
+test("toCodexRequest: ceiling applies when the caller sends no cap", () => {
+  const tr = toCodexRequest(openaiBody({
+    model: "gpt-6.1-sol", messages: [{ role: "user", content: "hi" }],
+  }), { runawayMaxOutputTokens: 32768 });
+  assert.equal(JSON.parse(tr.body.toString("utf-8")).max_output_tokens, 32768);
+  assert.equal(tr.callerMaxTokens, null);
+});
+
+test("toCodexRequest: a caller cap below the ceiling is NOT forwarded (Pi 16384, Hermes 16, skcall 150)", () => {
+  for (const [field, value] of [["max_completion_tokens", 16384], ["max_tokens", 16], ["max_tokens", 150]]) {
+    const tr = toCodexRequest(openaiBody({
+      model: "gpt-6.1-sol", [field]: value, messages: [{ role: "user", content: "hi" }],
+    }), { runawayMaxOutputTokens: 32768 });
+    const req = JSON.parse(tr.body.toString("utf-8"));
+    assert.equal(req.max_output_tokens, 32768, `${field}=${value}`);
+    assert.ok(!(field in req));
+    assert.equal(tr.callerMaxTokens, value);
+  }
+});
+
+test("toCodexRequest: a caller cap above the ceiling raises it", () => {
+  const tr = toCodexRequest(openaiBody({
+    model: "gpt-6.1-sol", max_tokens: 100000, messages: [{ role: "user", content: "hi" }],
+  }), { runawayMaxOutputTokens: 32768 });
+  assert.equal(JSON.parse(tr.body.toString("utf-8")).max_output_tokens, 100000);
+});
+
+test("toCodexRequest: junk caller caps are ignored", () => {
+  for (const value of ["4096", -5, 0, null]) {
+    const tr = toCodexRequest(openaiBody({
+      model: "gpt-6.1-sol", max_tokens: value, messages: [{ role: "user", content: "hi" }],
+    }), { runawayMaxOutputTokens: 32768 });
+    assert.equal(JSON.parse(tr.body.toString("utf-8")).max_output_tokens, 32768);
+    assert.equal(tr.callerMaxTokens, null);
+  }
+});
+
+// Captured live 2026-10-26 (gpt-5.6-luna, max_output_tokens 16, forced tool
+// call): the cut function_call arrives with status "incomplete".
+const INCOMPLETE_TOOL_SSE = [
+  'data: {"type":"response.output_item.done","sequence_number":9,"output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_810d","name":"save","arguments":"{\\"text\\":\\"1 ","status":"incomplete"}}',
+  "",
+  'data: {"type":"response.incomplete","response":{"id":"resp_3","model":"gpt-5.6-luna","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":57,"output_tokens":16,"total_tokens":73}}}',
+  "",
+].join("\n");
+
+test("fromCodexResponse: a call cut by max_output_tokens is dropped and finish is length", () => {
+  for (const clientStream of [false, true]) {
+    const res = fromCodexResponse(
+      { status: 200, headers: {}, body: Buffer.from(INCOMPLETE_TOOL_SSE) },
+      "gpt-5.6-luna",
+      clientStream,
+    );
+    assert.equal(res.incompleteReason, "max_output_tokens");
+    const text = res.body.toString("utf-8");
+    assert.ok(!text.includes("call_810d"), "truncated call must not reach the client");
+    if (!clientStream) {
+      const oai = JSON.parse(text);
+      assert.equal(oai.choices[0].finish_reason, "length");
+      assert.equal(oai.choices[0].message.tool_calls, undefined);
+      assert.equal(oai.usage.completion_tokens, 16);
+    } else {
+      assert.match(text, /"finish_reason":"length"/);
+    }
+  }
+});
+
+test("fromCodexResponse: a completed answer reports no incompleteReason", () => {
+  const res = fromCodexResponse(
+    { status: 200, headers: {}, body: Buffer.from(TEXT_SSE) }, "gpt-5.6-sol", false,
+  );
+  assert.equal(res.incompleteReason, null);
+});
