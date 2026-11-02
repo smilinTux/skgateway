@@ -10,6 +10,16 @@ const scheduledProbes = new Map();
 const TRANSIENT_RETRY_MS = 5 * 60 * 1000;
 const TERMINAL_RETRY_MS = 30 * 60 * 1000;
 const MODEL_RECOVERY_RETRY_MS = 60 * 1000;
+
+/** Cadence at which the bounded recovery probe may run while provider-wide
+ * subscription_exhausted is in force. The stored retry_at stays whatever the
+ * provider declared (or the 6h default when it said nothing), but between now
+ * and that deadline the provider is probed once per interval so a provider
+ * that is healthy again is re-admitted in minutes, not hours. Incident
+ * 2026-11-02: a single 06:10 z.ai 429 with quota wording and no Retry-After
+ * held every GLM bucket fail-closed until an operator ran clearCapacity at
+ * 12:10, while a direct call at 09:08 already returned 200. */
+export const SUBSCRIPTION_PROBE_INTERVAL_MS = 15 * 60 * 1000;
 const ZAI_RECOVERY_MODELS = Object.freeze(["glm-4.5", "glm-4.6", "glm-4.7", "glm-5", "glm-5.3"]);
 
 /** Keep shared provider recovery on the exact claims qualified for fleet use. */
@@ -48,6 +58,15 @@ export function capacityStatus(provider, model, { now = Date.now(), path = CAPAC
       Number.isFinite(record.observed_at) && Number.isFinite(record.retry_at)) {
     record = { ...record, retry_at: Math.min(record.retry_at, record.observed_at + MODEL_RECOVERY_RETRY_MS) };
   }
+  // Provider-wide subscription exhaustion keeps the declared deadline on
+  // disk but exposes a bounded probe slot every SUBSCRIPTION_PROBE_INTERVAL_MS
+  // from the observation, capped by the declared deadline itself. "pending"
+  // therefore always means "probe due soon", never "silent for 6h".
+  if (record === providerRecord && record.scope === "provider" &&
+      record.reason === "subscription_exhausted" && record.state !== "available" &&
+      Number.isFinite(record.observed_at) && Number.isFinite(record.retry_at)) {
+    record = { ...record, retry_at: Math.min(record.retry_at, record.observed_at + SUBSCRIPTION_PROBE_INTERVAL_MS) };
+  }
   const current = Number.isFinite(record.observed_at) && now - record.observed_at <= 48 * 60 * 60 * 1000;
   if (record.state === "available") return { ...record, current };
   return { ...record, state: "throttled", current };
@@ -55,13 +74,13 @@ export function capacityStatus(provider, model, { now = Date.now(), path = CAPAC
 
 export function recordSubscriptionExhausted(provider, { retryAt, now = Date.now(), path = CAPACITY_STORE_PATH } = {}) {
   const store = load(path);
-  const record = {
-    state: "throttled", scope: "provider", reason: "subscription_exhausted",
+  const declared = {
+    scope: "provider", state: "throttled", reason: "subscription_exhausted",
     retry_at: Math.max(now + 1000, Number(retryAt) || now + 6 * 60 * 60 * 1000),
     probe_state: "pending", observed_at: now,
   };
-  save({ ...store, [`provider:${provider}`]: record }, path);
-  return record;
+  save({ ...store, [`provider:${provider}`]: declared }, path);
+  return declared;
 }
 
 /** Record a fail-closed provider recovery deadline without changing credentials. */

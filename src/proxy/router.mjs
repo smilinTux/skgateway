@@ -361,6 +361,16 @@ function throttleKey(backendId, model) {
   return `${backendId}::${model}`;
 }
 
+/** Drop a door's in-memory 429/402 cooldown. Called when a capacity probe
+ * (or a fresh routed 2xx) proves the backend is serving again: the probe's
+ * evidence is strictly newer than the cooldown it supersedes, and leaving
+ * the stale entry in place kept routing fail-closed for the remaining
+ * DEFAULT_429_COOLDOWN_MS even after the provider record was already
+ * available (observed in the incident 2026-11-02 replay). */
+function clearThrottleCooldown(backendId, model) {
+  _throttleCooldowns.delete(throttleKey(backendId, model));
+}
+
 /**
  * Infer provider name from backend ID (card e19f88db / SKGW-ATTRIBUTION-01).
  * Uses discovery backend flag if set, otherwise infers from known patterns.
@@ -4817,10 +4827,41 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // non-2xx status, so this is also the schema-valid recovery boundary.
     const recoveryProbeSucceeded = capacityAdmission.probe &&
       res.status >= 200 && res.status < 300;
+    if (recoveryProbeSucceeded) {
+      // Authoritative recovery beats the door's stale 429/402 cooldown: the
+      // probe just proved this backend serves again, so the in-memory
+      // cooldown must not keep fail-closing the door after the capacity
+      // record is already available.
+      clearThrottleCooldown(backendId, candidateModel);
+    }
 
     if (providerName === "codex" || providerName === "zai") {
       const retryAfter = res.headers?.["retry-after"] ?? res.headers?.["Retry-After"];
-      const retryAt = Date.now() + Math.min(parseRetryAfterMs(retryAfter) ?? DEFAULT_402_COOLDOWN_MS, MAX_THROTTLE_COOLDOWN_MS);
+      // Provider-wide subscription cooldown. "Not assumed": the 429/402 body
+      // or the provider's documented reset headers may carry the real reset
+      // time (Retry-After seconds/HTTP-date, z.ai x-ratelimit-reset-*, codex
+      // x-codex-*-reset-at). A short, explicitly declared window must hold
+      // verbatim; the 6h DEFAULT_402_COOLDOWN_MS is only the ceiling when the
+      // provider said nothing, and never a silent 6h fail-closed either way,
+      // because capacityStatus() exposes bounded probe slots while the
+      // record stands (incident 2026-11-02).
+      const subscriptionResetMs = (() => {
+        const headerMs = parseRetryAfterMs(retryAfter);
+        if (headerMs !== null) return headerMs;
+        const resetHeader = [
+          "x-ratelimit-reset-requests", "x-ratelimit-reset-tokens",
+          "x-codex-primary-reset-at", "x-codex-secondary-reset-at",
+        ].map((name) => res.headers?.[name])
+          .find((value) => value !== undefined && value !== null && value !== "");
+        const resetMs = resetHeader === undefined ? null : parseRetryAfterMs(String(resetHeader));
+        return resetMs !== null ? resetMs : DEFAULT_402_COOLDOWN_MS;
+      })();
+      const retryAt = Date.now() + Math.min(
+        isSubscriptionExhaustion(res.status, res.body)
+          ? subscriptionResetMs
+          : (parseRetryAfterMs(retryAfter) ?? DEFAULT_402_COOLDOWN_MS),
+        MAX_THROTTLE_COOLDOWN_MS,
+      );
       if (isSubscriptionExhaustion(res.status, res.body)) {
         await emitSiem(EventType.CAPACITY, {
           action: "subscription_exhausted",
