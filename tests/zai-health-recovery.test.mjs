@@ -16,6 +16,7 @@ import {
   recordProviderUnavailable,
   runDueCapacityProbes,
   selectProviderRecoveryModels,
+  SUBSCRIPTION_PROBE_INTERVAL_MS,
 } from "../src/discovery/capacity_store.mjs";
 
 function store(name) {
@@ -81,7 +82,11 @@ test("legacy model-local GLM recovery deadlines normalize without touching polic
     ["zai", "model", "quarantine", now + 6 * 60 * 60 * 1000, now + 6 * 60 * 60 * 1000],
     ["codex", "model", "malformed_response", now + 6 * 60 * 60 * 1000, now + 6 * 60 * 60 * 1000],
     ["zai", "provider", "authentication_failure", now + 30 * 60 * 1000, now + 30 * 60 * 1000],
-    ["zai", "provider", "subscription_exhausted", now + 6 * 60 * 60 * 1000, now + 6 * 60 * 60 * 1000],
+    // Provider-wide subscription exhaustion keeps the declared deadline on
+    // disk (asserted below) but exposes the bounded probe slot: retry_at is
+    // capped to now + SUBSCRIPTION_PROBE_INTERVAL_MS while the record stands
+    // (incident 2026-11-02, see tests/zai-subscription-probe-cadence).
+    ["zai", "provider", "subscription_exhausted", now + 6 * 60 * 60 * 1000, now + SUBSCRIPTION_PROBE_INTERVAL_MS],
   ];
   for (const [provider, scope, reason, retryAt, expected] of cases) {
     const path = store(`${provider}-${scope}-${reason}`);
