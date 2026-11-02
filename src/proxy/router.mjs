@@ -38,6 +38,7 @@ import { getFailoverConfig, isLocalUrl, probeLocalHealth, recordLocalOutcome } f
 import { readMeter } from "./meter-client.mjs";
 import { marginalJoules, imputeJoules, resolveBasis, coeffsForModel, backendIsLocal, usageFromSSE, resolveMeterUrl } from "../metrics/energy.mjs";
 import { observeProviderUsage, providerUsageSnapshot } from "../metrics/provider-usage.mjs";
+import { parseResetDelayMs, MAX_THROTTLE_COOLDOWN_MS } from "./reset-time.mjs";
 import { recordModelOutcome, getLifecycle } from "../discovery/model_catalog_store.mjs";
 import {
   admitCapacity, capacityStatus, clearCapacity, finishCapacityProbe,
@@ -351,12 +352,6 @@ const DEFAULT_429_COOLDOWN_MS = 30_000;
  */
 const DEFAULT_402_COOLDOWN_MS = 6 * 60 * 60 * 1000; // 6h
 
-/** Ceiling on any single cooldown, including a Retry-After-derived one, so a
- * provider that sends back an absurd value (or a full daily reset window in
- * seconds) can never take a door out of rotation for longer than this from
- * this process's point of view. */
-const MAX_THROTTLE_COOLDOWN_MS = 24 * 60 * 60 * 1000; // 24h
-
 function throttleKey(backendId, model) {
   return `${backendId}::${model}`;
 }
@@ -418,26 +413,6 @@ function inferRailFromBackend(backendId, backendUrl, isLocalUrlFn, provider) {
   }
   // Default to cloud for known providers, null for unknown
   return resolvedProvider ? 'cloud' : null;
-}
-
-/**
- * Parse a `Retry-After` header value (delta-seconds or an HTTP-date) into
- * milliseconds. Returns null when absent/unparseable so the caller falls
- * back to a status-specific default.
- *
- * @param {*} value
- * @returns {?number}
- */
-function parseRetryAfterMs(value) {
-  if (value === undefined || value === null || value === "") return null;
-  const secs = Number(value);
-  if (Number.isFinite(secs) && secs >= 0) return secs * 1000;
-  const dateMs = Date.parse(String(value));
-  if (!Number.isNaN(dateMs)) {
-    const delta = dateMs - Date.now();
-    return delta > 0 ? delta : 0;
-  }
-  return null;
 }
 
 /**
@@ -518,7 +493,7 @@ function isThrottleStatus(status) {
 function recordThrottle(backendId, model, status, retryAfterHeader) {
   const key = throttleKey(backendId, model);
   const prior = _throttleCooldowns.get(key);
-  const headerMs = parseRetryAfterMs(retryAfterHeader);
+  const headerMs = parseResetDelayMs(retryAfterHeader);
   const defaultMs = status === 402 ? DEFAULT_402_COOLDOWN_MS : DEFAULT_429_COOLDOWN_MS;
   const cooldownMs = Math.min(headerMs ?? defaultMs, MAX_THROTTLE_COOLDOWN_MS);
   const untilMs = Date.now() + cooldownMs;
@@ -4846,20 +4821,20 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       // because capacityStatus() exposes bounded probe slots while the
       // record stands (incident 2026-11-02).
       const subscriptionResetMs = (() => {
-        const headerMs = parseRetryAfterMs(retryAfter);
+        const headerMs = parseResetDelayMs(retryAfter);
         if (headerMs !== null) return headerMs;
         const resetHeader = [
           "x-ratelimit-reset-requests", "x-ratelimit-reset-tokens",
           "x-codex-primary-reset-at", "x-codex-secondary-reset-at",
         ].map((name) => res.headers?.[name])
           .find((value) => value !== undefined && value !== null && value !== "");
-        const resetMs = resetHeader === undefined ? null : parseRetryAfterMs(String(resetHeader));
+        const resetMs = resetHeader === undefined ? null : parseResetDelayMs(String(resetHeader));
         return resetMs !== null ? resetMs : DEFAULT_402_COOLDOWN_MS;
       })();
       const retryAt = Date.now() + Math.min(
         isSubscriptionExhaustion(res.status, res.body)
           ? subscriptionResetMs
-          : (parseRetryAfterMs(retryAfter) ?? DEFAULT_402_COOLDOWN_MS),
+          : (parseResetDelayMs(retryAfter) ?? DEFAULT_402_COOLDOWN_MS),
         MAX_THROTTLE_COOLDOWN_MS,
       );
       if (isSubscriptionExhaustion(res.status, res.body)) {
