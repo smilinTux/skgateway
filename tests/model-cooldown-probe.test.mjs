@@ -1,10 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { createRouter, routeAndSend } from "../src/proxy/router.mjs";
+import { createRouter, routeAndSend, _resetThrottleCooldownsForTests } from "../src/proxy/router.mjs";
 import * as capacity from "../src/discovery/capacity_store.mjs";
 
 const FLOOR = 180_000;
@@ -94,6 +95,48 @@ test("scheduler model recovery skips healthy and not-yet-due siblings and is sin
   assert.equal(capacity.capacityStatus("zai", "glm-5.3", { now: T + FLOOR, path }).state, "throttled");
 });
 
+test("a model probe token cannot bypass a sibling cooldown or settle its record", (t) => {
+  const path = fixture(t);
+  throttle(path, 1000);
+  throttle(path, 1000, "glm-5.3");
+  const owner = {};
+  assert.equal(capacity.admitCapacity("zai", "glm-5", {
+    now: 181_000, path, publicSynthetic: true, probeOwner: owner,
+  }).probe, true);
+  assert.equal(capacity.admitCapacity("zai", "glm-5.3", {
+    now: 181_000, path, publicSynthetic: true, probeOwner: owner,
+  }).admitted, false);
+  capacity.finishCapacityProbe("zai", true, { probeOwner: owner, model: "glm-5.3", now: 181_000, path });
+  assert.equal(raw(path, "glm-5.3").state, "throttled");
+  assert.equal(capacity.admitCapacity("zai", "glm-5", {
+    now: 181_000, path, publicSynthetic: true, probeOwner: {},
+  }).admitted, false);
+});
+
+test("model probe floor is configurable with a safe default for invalid input", (t) => {
+  const path = fixture(t);
+  throttle(path, 1000);
+  for (const [setting, expected] of [["120000", 121_000], ["invalid", 181_000], ["0", 181_000]]) {
+    const output = execFileSync(process.execPath, ["--input-type=module", "-e", `
+      import { capacityStatus } from './src/discovery/capacity_store.mjs';
+      console.log(capacityStatus('zai', 'glm-5', { now: 1001, path: process.argv[1] }).retry_at);
+    `, path], { env: { ...process.env, SKGATEWAY_MODEL_PROBE_INTERVAL_MS: setting }, encoding: "utf8" });
+    assert.equal(Number(output.trim()), expected);
+  }
+});
+
+test("timed-out model probes re-arm the same bounded cooldown", async (t) => {
+  const path = fixture(t);
+  throttle(path, 1000);
+  const result = await capacity.runDueCapacityProbes(targets, async () => new Promise(() => {}), {
+    now: 181_000, path, deadlineMs: 10,
+  });
+  assert.equal(result.length, 1);
+  assert.match(result[0].error.message, /deadline/);
+  assert.equal(capacity.capacityStatus("zai", "glm-5", { now: 181_001, path }).retry_at, 541_000);
+  assert.equal(raw(path).retry_at, 1000 + LONG);
+});
+
 test("explicit model Retry-After is a hard not-before deadline", (t) => {
   const path = fixture(t);
   throttle(path, 1000, "glm-5", { retryAfterAt: 1_801_000 });
@@ -108,6 +151,7 @@ test("explicit model Retry-After is a hard not-before deadline", (t) => {
 
 async function upstreamFixture(t, response) {
   capacity._resetCapacityProbesForTests();
+  _resetThrottleCooldownsForTests();
   const path = capacity.CAPACITY_STORE_PATH;
   writeFileSync(path, "{}");
   let calls = 0;

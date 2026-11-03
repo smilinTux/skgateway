@@ -4812,6 +4812,8 @@ export async function routeAndSend(router, request, upstreamPath, method, client
 
     if (providerName === "codex" || providerName === "zai") {
       const retryAfter = res.headers?.["retry-after"] ?? res.headers?.["Retry-After"];
+      const retryAfterMs = parseRetryAfterMs(retryAfter);
+      const retryAfterAt = retryAfterMs === null ? undefined : Date.now() + retryAfterMs;
       // Provider-wide subscription cooldown. "Not assumed": the 429/402 body
       // or the provider's documented reset headers may carry the real reset
       // time (Retry-After seconds/HTTP-date, z.ai x-ratelimit-reset-*, codex
@@ -4868,17 +4870,18 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         finishCapacityProbe(providerName, probeSucceeded, {
           probeOwner: capacityProbeOwner, model: candidateModel,
           retryAt: recoveryFailureClass === "authentication_failure" ? retryAt : undefined,
+          retryAfterAt,
           reason: probeSucceeded ? null : recoveryFailureClass,
         });
       } else if (res.status === 429 || res.status === 402) {
-        recordModelThrottled(providerName, candidateModel, { retryAt });
+        recordModelThrottled(providerName, candidateModel, { retryAt, retryAfterAt });
       } else if (res.status >= 200 && res.status < 300) {
         clearCapacity(providerName, candidateModel);
       } else if (providerName === "zai" && recoveryFailureClass === "authentication_failure") {
         recordProviderUnavailable(providerName, { reason: recoveryFailureClass });
       } else if (providerName === "zai" && recoveryFailureClass) {
         recordModelUnavailable(providerName, candidateModel, {
-          reason: recoveryFailureClass,
+          reason: recoveryFailureClass, retryAfterAt,
         });
       }
     }
