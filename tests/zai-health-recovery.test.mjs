@@ -78,9 +78,9 @@ test("legacy model-local GLM recovery deadlines normalize without touching polic
   const cases = [
     ["zai", "model", "malformed_response", now + 6 * 60 * 60 * 1000, now + 60_000],
     ["zai", "model", "backend_cooldown", now + 6 * 60 * 60 * 1000, now + 60_000],
-    ["zai", "model", "rate_limited", now + 6 * 60 * 60 * 1000, now + 6 * 60 * 60 * 1000],
-    ["zai", "model", "quarantine", now + 6 * 60 * 60 * 1000, now + 6 * 60 * 60 * 1000],
-    ["codex", "model", "malformed_response", now + 6 * 60 * 60 * 1000, now + 6 * 60 * 60 * 1000],
+    ["zai", "model", "rate_limited", now + 6 * 60 * 60 * 1000, now + 180_000],
+    ["zai", "model", "quarantine", now + 6 * 60 * 60 * 1000, now + 180_000],
+    ["codex", "model", "malformed_response", now + 6 * 60 * 60 * 1000, now + 180_000],
     ["zai", "provider", "authentication_failure", now + 30 * 60 * 1000, now + 30 * 60 * 1000],
     // Provider-wide subscription exhaustion keeps the declared deadline on
     // disk (asserted below) but exposes the bounded probe slot: retry_at is

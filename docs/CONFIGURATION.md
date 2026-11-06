@@ -242,6 +242,29 @@ backends:
 | `failover_model` | string | — | Model to use on the same backend when the requested model is unavailable. |
 | `model_aliases` | object | `{}` | Map of client-requested model IDs to backend-actual model IDs. Applied before forwarding. |
 
+**Model capacity recovery probes:**
+
+Codex and z.ai model cooldowns reuse the autonomous capacity probe scheduler.
+`SKGATEWAY_MODEL_PROBE_INTERVAL_MS` sets the initial model probe floor in
+milliseconds (default `180000`; values below `1000` or invalid values use the
+default). An earlier stored retry deadline remains eligible at that deadline.
+Existing short GLM malformed-response and backend-cooldown recovery windows
+remain unchanged.
+
+Only a bounded public-synthetic request can use the half-open slot. Recovery
+is single-flight per provider, and a model recovery transaction probes only
+that model, with at most one model transaction per provider per scheduler tick
+(default tick: 30 seconds). Success clears that model's capacity evidence and
+stale in-memory throttle cooldown, not sibling model records. Failure doubles
+the probe interval, capped by the original stored retry deadline; once that
+deadline has passed, failures still wait at least one configured interval.
+The original `retry_at` is preserved on disk. Explicit upstream `Retry-After`
+(seconds or HTTP-date) is persisted separately as `retry_after_at` and is
+always a hard not-before deadline for model probes, including failed probes.
+Legacy model records lack this provenance and use the bounded probe floor.
+The existing eight-second request deadline, response-size bound, and small
+512-token scheduler request still apply. Provider-wide recovery is unchanged.
+
 **Backend health states:**
 
 ```mermaid
