@@ -124,6 +124,46 @@ overrides:
   # only floor S, and would be silently ineligible for sk-l-internal and every
   # other bucket above S. Present in the catalog and unusable is worse than
   # absent, because it looks like it works.
+  claude-opus-5-5:
+    display_name: "Claude Opus 5.5"
+    org: Anthropic
+    summary: "Current flagship reasoning and agentic-coding model. Supersedes Opus 5 as the heavy tier."
+    good_at: [deep reasoning, agentic coding, long-context synthesis, tool use, vision]
+    context_length: 500000
+    max_output_tokens: 64000
+    supported_parameters: [tools, tool_choice, structured_outputs, reasoning]
+    modality: "text+image->text"
+    tier: paid-cloud
+    quant: "n/a (hosted)"
+    speed: "medium; premium quality"
+    license: proprietary
+    size_class: XL
+    latency_class: interactive
+    reasoning: true
+    structured_outputs: true
+    notes: "Limits copied from claude-opus-5. Served by the claude-code-api wrapper with tool calls, verified on chiap01 2026-11-06."
+
+  claude-sonnet-5-5:
+    display_name: "Claude Sonnet 5.5"
+    org: Anthropic
+    summary: "Current mid tier. Balanced quality and latency; the workhorse above Haiku and below Opus."
+    good_at: [coding, tool use, summarisation, structured output, vision]
+    context_length: 500000
+    max_output_tokens: 64000
+    supported_parameters: [tools, tool_choice, structured_outputs, reasoning]
+    modality: "text+image->text"
+    tier: paid-cloud
+    quant: "n/a (hosted)"
+    speed: "fast; strong quality per second"
+    license: proprietary
+    # L not XL, as for claude-sonnet-5: a generous label would let sk-xl work
+    # land on a mid-tier model.
+    size_class: L
+    latency_class: interactive
+    reasoning: true
+    structured_outputs: true
+    notes: "Limits copied from claude-sonnet-5. Served by the claude-code-api wrapper with tool calls, verified on chiap01 2026-11-06."
+
   claude-opus-5:
     display_name: "Claude Opus 5"
     org: Anthropic
