@@ -1,0 +1,1 @@
+- Add model cards for claude-opus-5-5 (XL) and claude-sonnet-5-5 (L), so the chi fleet can see them as routes.
