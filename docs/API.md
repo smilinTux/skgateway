@@ -6,6 +6,7 @@
 2. [Authentication](#authentication)
 3. [Proxy Endpoints](#proxy-endpoints)
    - [POST /v1/chat/completions](#post-v1chatcompletions)
+   - [POST /v1/responses](#post-v1responses)
    - [GET /health](#get-health)
    - [GET /status](#get-status)
 4. [Dashboard API Endpoints](#dashboard-api-endpoints)
@@ -190,6 +191,48 @@ The gateway applies these response fixups after receiving from the backend:
 | `429` | Rate limit exceeded |
 | `502` | All backends failed |
 | `503` | Gateway temporarily unavailable |
+
+---
+
+### POST /v1/responses
+
+OpenAI Responses API frontend, for clients such as Codex CLI that speak nothing else. The request is translated to chat completions and takes the same path as `POST /v1/chat/completions` (routing, buckets, sanitizer, failover, audit), so it works with any gateway model, including chat-only backends. Set `stream: true` for an SSE response. Implementation: [`src/proxy/responses-frontend.mjs`](../src/proxy/responses-frontend.mjs).
+
+**Codex CLI provider:**
+
+```toml
+model = "sk-m"
+model_provider = "skgateway"
+
+[model_providers.skgateway]
+name = "skgateway"
+base_url = "http://<gateway>:18790/v1"
+wire_api = "responses"
+```
+
+**Request fields:**
+
+| Field | Handling |
+|-------|----------|
+| `model`, `temperature`, `top_p` | Passed through |
+| `instructions` | Leading system message |
+| `input` | A string, or items: `message` (`developer` becomes system), `function_call`, `function_call_output`, `custom_tool_call`, `custom_tool_call_output`. `reasoning` items are dropped |
+| `tools` | `function`, `custom` (one string argument, `input`) and `namespace` (flattened to `<namespace>__<name>`) reach the backend. Hosted tools such as `web_search` are left out |
+| `tool_choice`, `parallel_tool_calls` | Passed through when any tool remains |
+| `max_output_tokens` | `max_tokens` |
+| `reasoning.effort` | `reasoning_effort` |
+| `text.format` | `response_format` |
+| `store`, `include`, `prompt_cache_key`, `service_tier`, `client_metadata` | Ignored |
+| `previous_response_id`, `conversation`, `background`, `item_reference` items, `input_file` parts | `400`: the gateway stores nothing, and will not answer as if it had seen them |
+
+**Response:** a Responses object, or the event stream `response.created`, `response.in_progress`, `response.output_item.added`, `response.output_text.delta` and `response.function_call_arguments.delta`/`.done` (with their surrounding part and done events), `response.output_item.done`, then `response.completed`. An answer cut by the token cap or a content filter ends in `response.incomplete` and carries no tool calls, because Codex runs a tool as soon as its `output_item.done` arrives.
+
+**Behavior worth knowing:**
+
+- The stream is written once the whole answer is ready, as on `/v1/messages`. A failure therefore keeps its real HTTP status with an OpenAI-style error body (`429` and `5xx` are what Codex retries), and failover is invisible to the client. Tokens do not arrive incrementally.
+- Reasoning is not returned: the sanitizer removes it from every chat answer.
+- The transport limits in [`request-limits.mjs`](../src/proxy/request-limits.mjs) apply to the translated body, tool schemas included. A Codex profile with many MCP servers can exceed them (one measured at 325 KB of chat body against the default 120000) and is answered `413 request_too_large`. Disable the MCP servers the session does not need, or raise `model_limits.<model>.max_body_bytes` for the serving models.
+- Codex also asks `GET /v1/models?client_version=...` for its own model metadata format. The gateway answers `404`; Codex logs it and uses fallback metadata.
 
 ---
 
