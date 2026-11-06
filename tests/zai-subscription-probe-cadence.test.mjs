@@ -5,7 +5,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-import { createRouter, routeAndSend } from "../src/proxy/router.mjs";
+import { createRouter, routeAndSend, _resetThrottleCooldownsForTests } from "../src/proxy/router.mjs";
 import {
   CAPACITY_STORE_PATH,
   SUBSCRIPTION_PROBE_INTERVAL_MS,
@@ -181,6 +181,9 @@ test("a z.ai reset header bounds the subscription deadline instead of the 6h def
   assert.equal(capacityStatus("zai", "glm-5", { path: sharedStore }).retry_at, stored.retry_at);
 });
 
+// The codex cases below use auth_type "none", so they exercise the generic
+// router path rather than the codex adapter body/header reshaping in
+// fromCodexResponse. That reshaping is pinned separately in codex-adapter.test.mjs.
 test("a codex reset header bounds the subscription deadline instead of the 6h default", async (t) => {
   _resetCapacityProbesForTests();
   const sharedStore = CAPACITY_STORE_PATH;
@@ -202,4 +205,59 @@ test("a codex reset header bounds the subscription deadline instead of the 6h de
   const stored = providerRecord(sharedStore, "codex");
   const declared = stored.retry_at - stored.observed_at;
   assert.ok(declared > 280_000 && declared < 320_000, `declared reset honoured, got ${declared}ms`);
+});
+
+test("a z.ai duration reset header (60s) bounds the subscription deadline instead of the 6h default", async (t) => {
+  _resetCapacityProbesForTests();
+  _resetThrottleCooldownsForTests();
+  const sharedStore = CAPACITY_STORE_PATH;
+  clearCapacity("zai", null, { path: sharedStore });
+  t.after(() => clearCapacity("zai", null, { path: sharedStore }));
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(429, {
+      "content-type": "application/json",
+      "x-ratelimit-limit-requests": "20",
+      "x-ratelimit-remaining-requests": "0",
+      "x-ratelimit-reset-requests": "60s",
+    });
+    res.end(JSON.stringify({ error: "subscription usage limit reached" }));
+  });
+  await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => upstream.close(resolve)));
+  const router = createRouter({ backends: { zai: {
+    url: `http://127.0.0.1:${upstream.address().port}/v1`, auth_type: "none",
+    discovery: "zai", models: ["glm-5"],
+  } } });
+  const result = await routeAndSend(router, { model: "glm-5" }, "/v1/chat/completions", "POST", {},
+    Buffer.from(JSON.stringify({ model: "glm-5", messages: [], max_tokens: 512 })), false);
+  assert.equal(result.status, 429);
+  const stored = providerRecord(sharedStore);
+  const declared = stored.retry_at - stored.observed_at;
+  assert.ok(declared > 50_000 && declared < 70_000, `duration reset honoured, got ${declared}ms`);
+  assert.equal(capacityStatus("zai", "glm-5", { path: sharedStore }).retry_at, stored.retry_at);
+});
+
+test("a codex epoch reset header bounds the subscription deadline instead of the 6h default", async (t) => {
+  _resetCapacityProbesForTests();
+  _resetThrottleCooldownsForTests();
+  const sharedStore = CAPACITY_STORE_PATH;
+  clearCapacity("codex", null, { path: sharedStore });
+  t.after(() => clearCapacity("codex", null, { path: sharedStore }));
+  const epochSeconds = String(Math.floor(Date.now() / 1000) + 90);
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(429, { "content-type": "application/json", "x-codex-primary-reset-at": epochSeconds });
+    res.end(JSON.stringify({ error: "subscription usage limit reached" }));
+  });
+  await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => upstream.close(resolve)));
+  const router = createRouter({ backends: { codex: {
+    url: `http://127.0.0.1:${upstream.address().port}/v1`, auth_type: "none",
+    discovery: "codex", models: ["gpt-5"],
+  } } });
+  const result = await routeAndSend(router, { model: "gpt-5" }, "/v1/chat/completions", "POST", {},
+    Buffer.from(JSON.stringify({ model: "gpt-5", messages: [], max_tokens: 512 })), false);
+  assert.equal(result.status, 429);
+  const stored = providerRecord(sharedStore, "codex");
+  const declared = stored.retry_at - stored.observed_at;
+  assert.ok(declared > 80_000 && declared < 100_000, `epoch reset honoured, got ${declared}ms`);
 });
