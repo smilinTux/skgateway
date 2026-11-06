@@ -172,6 +172,7 @@ The main runtime implements these public protocol surfaces in
 | --- | --- | --- |
 | `POST` | `/v1/chat/completions` | OpenAI compatible chat completion |
 | `POST` | `/v1/messages` | Anthropic Messages frontend |
+| `POST` | `/v1/responses` | OpenAI Responses frontend (Codex CLI), see [docs/API.md](docs/API.md) |
 | `POST` | `/v1/embeddings` | Local-only embeddings (`sk-embed`), see [Speech-to-text and embeddings](#speech-to-text-and-embeddings) |
 | `POST` | `/v1/audio/transcriptions` | Local-only speech-to-text (`sk-stt`), see [Speech-to-text and embeddings](#speech-to-text-and-embeddings) |
 | `GET` | `/v1/models` | Reconciled public model catalog |
