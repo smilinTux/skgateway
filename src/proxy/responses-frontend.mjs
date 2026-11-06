@@ -46,7 +46,7 @@
  * @module proxy/responses-frontend
  */
 
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 
 /** Efforts forwarded as reasoning_effort; anything else is dropped. */
 const KNOWN_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
@@ -133,9 +133,23 @@ function toolOutput(output) {
   return { text: texts.join("\n"), images };
 }
 
-/** Chat name of a tool: a namespaced tool's name is prefixed by its namespace. */
+/** Longest function name strict chat backends accept. */
+const MAX_TOOL_NAME = 64;
+
+/**
+ * Chat name of a tool: a namespaced tool's name is prefixed by its namespace, as
+ * mcp__server__tool. Must be deterministic: a replayed call carries only
+ * namespace and name, and has to come out under the name the tool was offered
+ * with. Measured: Codex's codex_apps names reach 65 characters, so a long name
+ * keeps its start and takes a short hash of the whole.
+ */
 function qualifiedName(namespace, name) {
-  return namespace ? `${namespace}${name}` : name;
+  if (!namespace) return name;
+  const separator = namespace.endsWith("_") || name.startsWith("_") ? "" : "__";
+  const full = `${namespace}${separator}${name}`;
+  if (full.length <= MAX_TOOL_NAME) return full;
+  const hash = createHash("sha256").update(full).digest("hex").slice(0, 8);
+  return `${full.slice(0, MAX_TOOL_NAME - 9)}_${hash}`;
 }
 
 /** Freeform tool to a function tool taking its raw text as one string argument. */

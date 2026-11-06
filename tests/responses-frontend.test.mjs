@@ -211,6 +211,26 @@ describe("fromResponsesRequest", () => {
     assert.equal(replay.messages[2].tool_calls[0].function.name, "mcp__fs__read");
   });
 
+  test("namespaced tool names are readable, within 64 chars, and stable across a replay", () => {
+    const longNamespace = "mcp__codex_apps__codex_document_control";
+    const longName = "_get_document_tool_schemas_and_more";
+    const { chat, toolMap } = fr({ model: "m", input: "x", tools: [
+      { type: "namespace", name: "mcp__skmemory", tools: [{ type: "function", name: "memory_health" }] },
+      { type: "namespace", name: "mcp__apps", tools: [{ type: "function", name: "_adopt" }] },
+      { type: "namespace", name: longNamespace, tools: [{ type: "function", name: longName }] },
+    ] });
+    const names = chat.tools.map((t) => t.function.name);
+    assert.equal(names[0], "mcp__skmemory__memory_health");
+    assert.equal(names[1], "mcp__apps_adopt");
+    assert.ok(names[2].length <= 64, names[2]);
+    assert.deepEqual(toolMap[names[2]], { kind: "function", name: longName, namespace: longNamespace });
+
+    const replay = fr({ model: "m", input: [
+      { type: "function_call", call_id: "c", name: longName, namespace: longNamespace, arguments: "{}" },
+    ] }).chat;
+    assert.equal(replay.messages[0].tool_calls[0].function.name, names[2]);
+  });
+
   test("text.format json_schema -> response_format", () => {
     const schema = { type: "object" };
     const { chat } = fr({ model: "m", input: "x", text: { format: { type: "json_schema", name: "out", schema, strict: true } } });
@@ -559,6 +579,23 @@ describe("POST /v1/responses through the real gateway", () => {
     assert.equal(replayed[2].tool_calls[0].id, "call_abc");
     assert.equal(replayed[3].tool_call_id, "call_abc");
     assert.deepEqual(seen.at(-1).body.tools[0].function.name, "shell");
+  });
+
+  test("Codex's several developer items reach the backend as one leading system message", async () => {
+    answer = () => ({ status: 200, body: {
+      id: "c5", model: "stub-model",
+      choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+    } });
+    const res = await post({ model: "stub-model", input: [
+      { type: "message", role: "developer", content: [{ type: "input_text", text: "one" }] },
+      { type: "message", role: "developer", content: [{ type: "input_text", text: "two" }] },
+      userItem("hi"),
+    ] });
+    assert.equal(res.status, 200);
+    assert.deepEqual(seen.at(-1).body.messages, [
+      { role: "system", content: "one\n\ntwo" },
+      { role: "user", content: "hi" },
+    ]);
   });
 
   // Last dispatching test: the router then counts the backend as throttled.
