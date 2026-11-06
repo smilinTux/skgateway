@@ -15,7 +15,8 @@ import { createProxyServer, handleRequest, buildConfig, trimSystemMessages, trim
 import { ingressRequestLimit, requestLimitResponse } from "./proxy/request-limits.mjs";
 import { createRouter, routeAndSend, startKimiAuthKeepalive } from "./proxy/router.mjs";
 import { normalizeSystemMessageOrder, sanitizeResponse } from "./proxy/sanitizer.mjs";
-import { applyCapacityView, availabilityState, buildModelCatalog, reconcileModeFromConfig, tagLocalModels, mergeDiscoveredCatalog, isModelAvailable, excludedModelIds, withoutExcludedModels } from "./proxy/advertise.mjs";
+import { applyCapacityView, availabilityState, buildModelCatalog, reconcileModeFromConfig, tagLocalModels, mergeDiscoveredCatalog, isModelAvailable, isCatalogDisabledBackend, excludedModelIds, withoutExcludedModels } from "./proxy/advertise.mjs";
+import { isDeepStrictEqual } from "node:util";
 import { loadAllowlist, saveAllowlist, applyAllowlist } from "./advertise.mjs";
 import { discoverCatalog, loadCache, saveCache, fetchNvidia, fetchOpenRouter, fetchOpencode, fetchAnthropicWrapper, fetchCodex, fetchZai, fetchDeepSeek, catalogStatus, loadCardOverrides, applyCardOverlays, buildServingCatalog } from "./discovery.mjs";
 import { getPool, resetPool } from "./proxy/connection-pool.mjs";
@@ -108,13 +109,20 @@ let operatorAuthenticator = config.operator_auth?.enabled ? new ClientAuthentica
 export const matchRoutingEnabled = !!(config.routing && config.routing.match_enabled);
 
 // ─── Initialize subsystems ───
-// Map YAML credentials_path → credentials_file (Backend reads credentials_file)
-const _routerBackends = {};
-for (const [id, b] of Object.entries(config.backends || {})) {
-  _routerBackends[id] = { ...b };
+/** Normalize one backend entry for the router registry and reload diffs. */
+function normalizeBackendConfig(id, b) {
+  const normalized = { ...b, id };
   if (b.credentials_path && !b.credentials_file) {
-    _routerBackends[id].credentials_file = b.credentials_path;
+    normalized.credentials_file = b.credentials_path;
   }
+  return normalized;
+}
+
+// Map YAML credentials_path → credentials_file (Backend reads credentials_file)
+let _routerBackends = {};
+for (const [id, b] of Object.entries(config.backends || {})) {
+  if (isCatalogDisabledBackend(b)) continue;
+  _routerBackends[id] = normalizeBackendConfig(id, b);
 }
 const router = createRouter({ backends: _routerBackends, quarantine: config.quarantine, routing: config.routing });
 
@@ -122,7 +130,7 @@ const router = createRouter({ backends: _routerBackends, quarantine: config.quar
 // catalog is reconciled against live backend health so callers are not offered
 // models whose only backend(s) are down or quarantined. Default "flag" is
 // non-breaking (annotate status, hide nothing). See src/proxy/advertise.mjs.
-const advertiseReconcileMode = reconcileModeFromConfig(config);
+let advertiseReconcileMode = reconcileModeFromConfig(config);
 console.log(`[skgateway] advertised-catalog reconcile mode: ${advertiseReconcileMode}`);
 
 // ─── Dynamic provider-model discovery (Task 5, wiring Tasks 1-4) ───
@@ -941,14 +949,14 @@ if (config.discovery?.enabled !== false) {
 }
 
 // Initialize connection pool with per-backend limits from config
-const poolConfig = {
+let poolConfig = {
   defaultMaxConcurrent: config.pooling?.default_max_concurrent || 20,
   defaultMaxQueue: config.pooling?.default_max_queue || 1000,
   queueTimeoutMs: config.pooling?.queue_timeout_ms || 300000,
   perBackend: config.pooling?.per_backend || {},
   capacityDomains: config.pooling?.capacity_domains || {},
 };
-const pool = getPool(poolConfig);
+let pool = getPool(poolConfig);
 
 // Subscription recovery is autonomous: once retry_at is due, one bounded,
 // public-synthetic request tests the exact provider/model. routeAndSend owns
@@ -3083,12 +3091,66 @@ process.on("SIGINT", () => shutdown("SIGINT"));
 
 // ─── Hot reload config on SIGHUP ───
 // config.mjs registers its own SIGHUP handler that re-reads + validates the
-// file and emits "config-changed"; we just refresh our local snapshot from it.
+// file and emits "config-changed"; we refresh every config-derived structure
+// (router backends, capacity pools, catalog/discovery) so adds, removals and
+// edits of backends and pooling.capacity_domains take effect for new requests
+// without a restart. Unchanged backends keep their Backend objects and health.
+
+/** Reconcile the router's backend registry against the freshly loaded config. */
+function reconcileRouterBackends(nextBackends) {
+  const next = nextBackends || {};
+  const prevIds = new Set(Object.keys(_routerBackends));
+  const nextIds = new Set();
+  for (const [id, b] of Object.entries(next)) {
+    if (!isCatalogDisabledBackend(b)) nextIds.add(id);
+  }
+
+  // Remove backends that disappeared or became disabled.
+  for (const id of prevIds) {
+    if (!nextIds.has(id)) router.removeBackend(id);
+  }
+
+  // Add new backends and replace edited ones. Unchanged backends are left
+  // alone so their Backend instances (and health state) survive the reload.
+  const nextSnapshot = {};
+  for (const [id, b] of Object.entries(next)) {
+    if (isCatalogDisabledBackend(b)) continue;
+    const normalized = normalizeBackendConfig(id, b);
+    nextSnapshot[id] = normalized;
+    if (!_routerBackends[id] || !isDeepStrictEqual(_routerBackends[id], normalized)) {
+      router.addBackend(normalized);
+    }
+  }
+
+  _routerBackends = nextSnapshot;
+}
+
+/** Rebuild the connection pool from the freshly loaded pooling settings. */
+function rebuildCapacityPools() {
+  poolConfig = {
+    defaultMaxConcurrent: config.pooling?.default_max_concurrent || 20,
+    defaultMaxQueue: config.pooling?.default_max_queue || 1000,
+    queueTimeoutMs: config.pooling?.queue_timeout_ms || 300000,
+    perBackend: config.pooling?.per_backend || {},
+    capacityDomains: config.pooling?.capacity_domains || {},
+  };
+  resetPool();
+  pool = getPool(poolConfig);
+}
+
 _cfgEmitter.on("config-changed", () => {
   try {
     Object.assign(config, _cfgEmitter.current());
     clientAuthenticator = config.client_auth?.enabled ? new ClientAuthenticator(config.client_auth) : null;
     operatorAuthenticator = config.operator_auth?.enabled ? new ClientAuthenticator(config.operator_auth) : null;
+    advertiseReconcileMode = reconcileModeFromConfig(config);
+    reconcileRouterBackends(config.backends || {});
+    rebuildCapacityPools();
+    if (config.discovery?.enabled !== false) {
+      refreshCatalog(config).catch((e) => {
+        console.warn("[skgateway] post-reload catalog discovery failed (fail-soft, serving stale):", e.message);
+      });
+    }
     console.log("[skgateway] config reloaded");
   } catch (e) {
     if (clientAuthenticator) clientAuthenticator.available = false;
