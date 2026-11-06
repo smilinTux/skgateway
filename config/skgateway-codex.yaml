@@ -55,6 +55,16 @@ pooling:
       max: 1
       maxQueue: 4
       queueTimeoutMs: 30000
+    ## Kimi services have independent account capacity. Keep these as explicit
+    ## domains so startup and the read-only queue projection expose the limits.
+    kimi-coding:
+      members: [kimi-coding]
+      max: 28
+      maxQueue: 400
+    kimi-k3:
+      members: [kimi-k3]
+      max: 14
+      maxQueue: 400
     ## 2026-09-18, set by Chef: raise the estate kimi ceiling to NINE
     ## concurrent sessions, 5 here plus 4 on kimi-k3. The previous 1+1 was
     ## NOT a measured ceiling the way zai's 10 is. It was the conservative
