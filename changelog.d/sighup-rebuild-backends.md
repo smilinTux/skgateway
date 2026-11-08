@@ -1,0 +1,1 @@
+- SIGHUP config reload now rebuilds backends and capacity pools: added, removed and edited backends (and `pooling.capacity_domains` changes) reach the router, health monitor and connection pool without a restart, unchanged backends keep their health state, and the advertised catalog is re-discovered fail-soft. An invalid reload keeps the old config active.
