@@ -836,6 +836,10 @@ export class Backend {
     // is meant to be used without a key, rather than the gateway inferring it
     // from an env var that happens to be missing. See buildAuthHeaders().
     this.auth_optional = config.auth_optional === true;
+    // Card ba782c14: config/skgateway.yaml backends may declare no_failover.
+    // It takes effect on the registry path (the only path that has a cloud
+    // failover) when the registry target's url matches this configured backend.
+    this.no_failover = config.no_failover === true;
     this.api_key_env = config.api_key_env || null;
     this.models = Array.isArray(config.models) ? config.models : [];
     // Marks a discovery-driven backend (e.g. openrouter, see config.mjs
@@ -3802,14 +3806,17 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         // substituted, failing loudly is the correct answer and answering
         // quietly is the harmful one. Opt-in: absent means failover is unchanged.
         const fc = getFailoverConfig();
-        if (reg.noFailover) {
+        // Declared in registry.yaml (reg.noFailover) OR on the matching
+        // config/skgateway.yaml backend (same url).
+        const noFailover = reg.noFailover || regBackendInstance?.no_failover === true;
+        if (noFailover) {
           console.warn(
             `[router] backend=${reg.backend} declares no_failover — NOT substituting ` +
               `with ${fc.fallbackBackend}; request will fail with the upstream error`,
           );
         }
         const fb =
-          fc.enabled && !reg.noFailover && isLocalUrl(reg.url)
+          fc.enabled && !noFailover && isLocalUrl(reg.url)
             ? router.getBackend(fc.fallbackBackend)
             : null;
         if (fb) {
