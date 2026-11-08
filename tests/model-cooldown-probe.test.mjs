@@ -223,3 +223,20 @@ test("still-throttled routed model re-arms without a request storm and honors fr
   assert.equal(calls(), 1);
   assert.equal(capacity.capacityStatus("zai", "glm-5", { path }).state, "throttled");
 });
+
+test("Retry-After of one year is capped at 24h and a persisted uncapped record is clamped on load", async (t) => {
+  const { path, send } = await upstreamFixture(t, (_req, res) => {
+    res.writeHead(429, { "content-type": "application/json", "retry-after": "31536000" });
+    res.end(JSON.stringify({ error: "rate limit exceeded" }));
+  });
+  assert.equal((await send("glm-5")).status, 429);
+  const record = raw(path);
+  assert.ok(record.retry_after_at <= Date.now() + 24 * 3_600_000 + 5000);
+  assert.ok(capacity.capacityStatus("zai", "glm-5", { path }).retry_at <= Date.now() + 24 * 3_600_000 + 5000);
+  // Record written by the pre-cap build: a year-long retry_after_at on disk.
+  const now = Date.now();
+  writeFileSync(path, JSON.stringify({ "model:zai:glm-5": { state: "throttled", scope: "model",
+    reason: "rate_limited", retry_at: now + LONG, observed_at: now, probe_state: "pending",
+    retry_after_at: now + 31_536_000_000 } }));
+  assert.ok(capacity.capacityStatus("zai", "glm-5", { now, path }).retry_at <= now + 24 * 3_600_000);
+});

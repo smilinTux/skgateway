@@ -23,6 +23,13 @@ export const MODEL_PROBE_INTERVAL_MS = Number.isFinite(configuredModelProbeInter
  * held every GLM bucket fail-closed until an operator ran clearCapacity at
  * 12:10, while a direct call at 09:08 already returned 200. */
 export const SUBSCRIPTION_PROBE_INTERVAL_MS = 15 * 60 * 1000;
+/** Hard ceiling on an upstream-declared Retry-After (matches the router's
+ * MAX_THROTTLE_COOLDOWN_MS). Applied on write and again on read so records
+ * persisted before the cap existed cannot hold a model for years. */
+export const MAX_RETRY_AFTER_MS = 24 * 60 * 60 * 1000;
+function clampRetryAfterAt(at, observedAt) {
+  return Number.isFinite(at) && Number.isFinite(observedAt) ? Math.min(at, observedAt + MAX_RETRY_AFTER_MS) : at;
+}
 const ZAI_RECOVERY_MODELS = Object.freeze(["glm-4.5", "glm-4.6", "glm-4.7", "glm-5", "glm-5.3"]);
 
 /** Keep shared provider recovery on the exact claims qualified for fleet use. */
@@ -79,7 +86,7 @@ export function capacityStatus(provider, model, { now = Date.now(), path = CAPAC
     const nextProbeAt = Number.isFinite(record.next_probe_at) ? record.next_probe_at
       : Math.min(record.retry_at, record.observed_at + MODEL_PROBE_INTERVAL_MS);
     record = { ...record, probe_state: "pending",
-      retry_at: Math.max(nextProbeAt, record.retry_after_at || 0) };
+      retry_at: Math.max(nextProbeAt, clampRetryAfterAt(record.retry_after_at, record.observed_at) || 0) };
   }
   const current = Number.isFinite(record.observed_at) && now - record.observed_at <= 48 * 60 * 60 * 1000;
   if (record.state === "available") return { ...record, current };
@@ -130,7 +137,7 @@ export function recordModelUnavailable(provider, model, {
     state: "throttled", scope: "model", reason,
     retry_at: Math.max(now + 1000, Number(retryAt) || now + MODEL_RECOVERY_RETRY_MS),
     probe_state: "pending", observed_at: now,
-    ...(Number.isFinite(retryAfterAt) ? { retry_after_at: retryAfterAt } : {}),
+    ...(Number.isFinite(retryAfterAt) ? { retry_after_at: clampRetryAfterAt(retryAfterAt, now) } : {}),
   };
   save({ ...store, [`model:${provider}:${model}`]: record }, path);
   return record;
@@ -184,7 +191,7 @@ export function finishCapacityProbe(provider, success, {
       reason: reason || record.reason,
       probe_state: "pending", observed_at: now, probe_interval_ms: interval,
       next_probe_at: nextProbeAt,
-      ...(Number.isFinite(retryAfterAt) ? { retry_after_at: retryAfterAt } : {}),
+      ...(Number.isFinite(retryAfterAt) ? { retry_after_at: clampRetryAfterAt(retryAfterAt, now) } : {}),
     } }, path);
     return capacityStatus(provider, model, { now, path });
   }

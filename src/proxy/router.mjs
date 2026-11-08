@@ -4813,7 +4813,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     if (providerName === "codex" || providerName === "zai") {
       const retryAfter = res.headers?.["retry-after"] ?? res.headers?.["Retry-After"];
       const retryAfterMs = parseRetryAfterMs(retryAfter);
-      const retryAfterAt = retryAfterMs === null ? undefined : Date.now() + retryAfterMs;
+      const retryAfterAt = retryAfterMs === null ? undefined : Date.now() + Math.min(retryAfterMs, MAX_THROTTLE_COOLDOWN_MS);
       // Provider-wide subscription cooldown. "Not assumed": the 429/402 body
       // or the provider's documented reset headers may carry the real reset
       // time (Retry-After seconds/HTTP-date, z.ai x-ratelimit-reset-*, codex
