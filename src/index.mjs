@@ -41,6 +41,7 @@ import {
   handleAct as handleOperatorAct,
 } from "./operator/http.mjs";
 import { fromAnthropicRequest, toAnthropicMessage, modelRetrieveObject } from "./proxy/anthropic-frontend.mjs";
+import { fromResponsesRequest, normalizeErrorBody, responsesError, responsesStreamEvents, toResponsesObject } from "./proxy/responses-frontend.mjs";
 import { readCodexAuthHeaders } from "./proxy/codex-adapter.mjs";
 import { readZaiAuthHeaders, ZAI_CREDENTIALS_PATH } from "./proxy/zai-adapter.mjs";
 import { SSEWriter, jsonToSSE } from "./proxy/stream.mjs";
@@ -2443,9 +2444,31 @@ export const server = http.createServer(async (req, res) => {
       }
     }
 
+    // ── OpenAI Responses FRONTEND (POST /v1/responses) ──
+    // The same bridge for Codex CLI, which only speaks the Responses API. Unlike
+    // /v1/messages there is no pass-through fallback: an upstream cannot be
+    // assumed to serve this path, so what cannot be translated is a 400 here.
+    let responsesWant = false;
+    let responsesStream = false;
+    let responsesToolMap = {};
+    if (req.method === "POST" && req.url.split("?")[0] === "/v1/responses") {
+      const conv = fromResponsesRequest(body);
+      if (conv.error) {
+        res.writeHead(conv.status, { "content-type": "application/json", "cache-control": "no-store" });
+        res.end(JSON.stringify(conv.error));
+        return;
+      }
+      responsesWant = true;
+      responsesStream = conv.stream;
+      responsesToolMap = conv.toolMap;
+      routeBody = conv.body;
+      routePath = "/v1/chat/completions";
+    }
+    const translatedWant = anthropicWant || responsesWant;
+
     let parsedModel = req.headers["x-model"] || undefined;
     let parsedMessages = undefined;
-    if (anthropicWant || (req.headers["content-type"]?.includes("application/json") && routeBody.length)) {
+    if (translatedWant || (req.headers["content-type"]?.includes("application/json") && routeBody.length)) {
       try {
         const parsed = JSON.parse(routeBody.toString("utf-8"));
         parsedModel = parsed.model || parsedModel;
@@ -2680,7 +2703,7 @@ export const server = http.createServer(async (req, res) => {
 
         // Re-serialize the body with transformed messages
         // This replaces routeBody before it goes to routeAndSend
-        if (anthropicWant || (req.headers["content-type"]?.includes("application/json"))) {
+        if (translatedWant || (req.headers["content-type"]?.includes("application/json"))) {
           const requestObj = JSON.parse(routeBody.toString("utf-8"));
           requestObj.messages = transformedMessages;
           transformedBody = Buffer.from(JSON.stringify(requestObj), "utf-8");
@@ -2968,6 +2991,42 @@ export const server = http.createServer(async (req, res) => {
             jsonToSSE(writer, amsg);
           } else {
             const outBuf = Buffer.from(JSON.stringify(amsg), "utf-8");
+            res.writeHead(200, {
+              "content-type": "application/json",
+              "content-length": outBuf.length,
+              ...skHeaders,
+            });
+            res.end(outBuf);
+          }
+        }
+      } else if (responsesWant) {
+        // Translate the buffered chat result back to the Responses wire format.
+        // No bytes have gone out yet, so every failure keeps a real HTTP status
+        // and Codex's retry policy (429 and 5xx) applies as it would upstream.
+        let chat = null;
+        try { chat = JSON.parse((result.body || "").toString("utf-8")); } catch {}
+        const status = result.status >= 300 ? result.status : Array.isArray(chat?.choices) && chat.choices.length ? 200 : 502;
+        if (status !== 200) {
+          // Keeps upstream headers such as retry-after.
+          const headers = { ...result.headers, ...skHeaders, "content-type": "application/json" };
+          delete headers["content-length"];
+          delete headers["transfer-encoding"];
+          delete headers["content-encoding"];
+          const errorBody = result.status >= 300
+            ? normalizeErrorBody(result.body, status)
+            : responsesError("The upstream answered without a completion", "invalid_upstream_response", { type: "server_error" });
+          res.writeHead(status, headers);
+          res.end(JSON.stringify(errorBody));
+        } else {
+          const response = toResponsesObject(chat, parsedModel, responsesToolMap);
+          if (responsesStream) {
+            // No [DONE]: the Responses stream ends at its terminal event.
+            const writer = new SSEWriter(res, { keepAliveMs: 0, extraHeaders: skHeaders });
+            writer.start();
+            for (const event of responsesStreamEvents(response)) writer.write(event, event.type);
+            res.end();
+          } else {
+            const outBuf = Buffer.from(JSON.stringify(response), "utf-8");
             res.writeHead(200, {
               "content-type": "application/json",
               "content-length": outBuf.length,
