@@ -138,17 +138,57 @@ export class ConnectionPool {
 
     /** Explicit aliases which consume one physical service's shared capacity. */
     this._capacityDomains = config.capacityDomains || {};
-    this._memberDomains = new Map();
-    for (const [domainId, domain] of Object.entries(this._capacityDomains)) {
+    this._memberDomains = ConnectionPool._buildMemberDomains(this._capacityDomains);
+  }
+
+  static _buildMemberDomains(capacityDomains) {
+    const memberDomains = new Map();
+    for (const [domainId, domain] of Object.entries(capacityDomains)) {
       const members = [...new Set([domainId, ...(domain.members || [])])];
       for (const member of members) {
-        const existing = this._memberDomains.get(member);
+        const existing = memberDomains.get(member);
         if (existing && existing !== domainId) {
           throw new Error(
             `[connection-pool] member=${member} belongs to both ${existing} and ${domainId}`
           );
         }
-        this._memberDomains.set(member, domainId);
+        memberDomains.set(member, domainId);
+      }
+    }
+    return memberDomains;
+  }
+
+  /**
+   * Apply new pooling settings IN PLACE. Existing PoolState objects (and so
+   * their active counters, queues, waiters, tickets and metrics) are kept:
+   * only their limits and membership are updated. Throws before mutating
+   * anything if the new config is invalid (member in two domains).
+   * @param {object} [config] same shape as the constructor config
+   */
+  reconfigure(config = {}) {
+    const memberDomains = ConnectionPool._buildMemberDomains(config.capacityDomains || {});
+    this._defaultMax = config.defaultMaxConcurrent ?? DEFAULT_MAX_CONCURRENT;
+    this._defaultMaxQueue = config.defaultMaxQueue ?? DEFAULT_MAX_QUEUE;
+    this._queueTimeoutMs = config.queueTimeoutMs ?? DEFAULT_QUEUE_TIMEOUT_MS;
+    this._overrides = config.perBackend || {};
+    this._capacityDomains = config.capacityDomains || {};
+    this._memberDomains = memberDomains;
+    for (const [key, state] of this._pools) {
+      const settings = this._settings(key);
+      state.max = Math.max(1, settings.maxConcurrent);
+      state.maxQueue = Math.max(0, settings.maxQueue);
+      state.queueTimeoutMs = Math.max(1, settings.queueTimeoutMs);
+      state.members = [...settings.members];
+      this._promote(state);
+    }
+  }
+
+  _promote(state) {
+    while (state.queue.length > 0 && state.active < state.max) {
+      const waiter = state.queue.shift();
+      if (waiter.promote()) {
+        state.active++;
+        if (state.active > state.peakActive) state.peakActive = state.active;
       }
     }
   }
@@ -395,17 +435,9 @@ export class ConnectionPool {
     if (state.active <= 0) return false;
     state.active--;
 
-    // Promote the next waiter from the queue
-    while (state.queue.length > 0) {
-      const waiter = state.queue.shift();
-      if (state.active < state.max) {
-        if (waiter.promote()) {
-          state.active++;
-          if (state.active > state.peakActive) state.peakActive = state.active;
-          break; // Only one slot released
-        }
-      }
-    }
+    // Promote waiters while capacity is free (never discards a waiter when
+    // the limit was lowered and the pool is still at or over it).
+    this._promote(state);
     return true;
   }
 
