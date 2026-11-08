@@ -1,7 +1,8 @@
 /**
  * config-backend-no-failover.test.mjs: a no_failover declaration on a
  * config/skgateway.yaml backend must block the registry-path cloud failover
- * when the registry target's url matches that backend. Control case proves the
+ * when the registry target's MODEL is served by that backend, even though the
+ * registry addresses it by a different host string (IP vs hostname). Control case proves the
  * same setup DOES fail over without the flag.
  *
  * Run with:  node --test tests/config-backend-no-failover.test.mjs
@@ -21,7 +22,7 @@ process.env.SKMODELS_REGISTRY = REG_PATH;
 process.env.SKGATEWAY_MODEL_CATALOG_STORE_PATH = join(REG_DIR, "model_catalog_store.json");
 
 const { resetLocalHealth } = await import("../src/proxy/local-failover.mjs");
-const { createRouter, routeAndSend } = await import("../src/proxy/router.mjs");
+const { createRouter, routeAndSend, unmatchedNoFailoverBackends, warnUnmatchedNoFailover } = await import("../src/proxy/router.mjs");
 
 function upstream(handler) {
   const state = { chat: 0 };
@@ -44,7 +45,7 @@ describe("config backend no_failover", () => {
   const send = (router) => routeAndSend(router, { model: "sk-default" }, "/v1/chat/completions", "POST", H, body(), false);
   const mk = (noFailover) => createRouter({
     backends: {
-      sovereign: { url: local.base, auth_type: "none", models: ["ornith-1.0-9b"], priority: 1,
+      sovereign: { url: "http://chiap08-hostname.invalid:11439/v1", auth_type: "none", models: ["ornith-1.0-9b"], priority: 1,
         ...(noFailover ? { no_failover: true } : {}) },
       cloud: { url: cloud.base, auth_type: "none", models: ["*"], priority: 9 },
     },
@@ -100,4 +101,28 @@ defaults:
 test("tracked registry template declares no_failover on the sovereign qwen38 backend", () => {
   const reg = yamlLoad(readFileSync(new URL("../config/registry.yaml", import.meta.url), "utf8"));
   assert.equal(reg.backends.qwen38.no_failover, true);
+});
+
+test("a no_failover backend that matches no registry route emits a startup warning", () => {
+  const backends = [
+    { id: "orphan", no_failover: true, models: ["nobody-serves-this"], url: "http://orphan:1/v1" },
+    { id: "covered", no_failover: true, models: ["m1"], url: "http://covered:1/v1" },
+    { id: "plain", models: ["m2"], url: "http://plain:1/v1" },
+  ];
+  const registry = { backends: { r: { url: "http://10.0.0.1:1/v1", model: "m1" } } };
+  assert.deepEqual(unmatchedNoFailoverBackends(backends, registry), ["orphan"]);
+  const logs = [];
+  warnUnmatchedNoFailover(backends, registry, (m) => logs.push(m));
+  assert.equal(logs.length, 1);
+  assert.match(logs[0], /backend=orphan declares no_failover/);
+});
+
+test("repo config: report which no_failover config backends match the tracked registry template", () => {
+  const cfg = yamlLoad(readFileSync(new URL("../config/skgateway.yaml", import.meta.url), "utf8"));
+  const reg = yamlLoad(readFileSync(new URL("../config/registry.yaml", import.meta.url), "utf8"));
+  const backends = Object.entries(cfg.backends).map(([id, b]) => ({ id, ...b }));
+  const unmatched = unmatchedNoFailoverBackends(backends, reg);
+  // qwen38 template route (tailnet IP) must cover both replicas by model id.
+  assert.equal(unmatched.includes("chiap08-qwen38"), false);
+  assert.equal(unmatched.includes("chiap01-qwen38"), false);
 });
