@@ -1,0 +1,1 @@
+- Honour `no_failover` on config/skgateway.yaml backends (registry-path cloud failover is blocked when the target url matches such a backend) and declare it on the sovereign qwen38 backend in the tracked registry template.
