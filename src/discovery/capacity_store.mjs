@@ -10,6 +10,9 @@ const scheduledProbes = new Map();
 const TRANSIENT_RETRY_MS = 5 * 60 * 1000;
 const TERMINAL_RETRY_MS = 30 * 60 * 1000;
 const MODEL_RECOVERY_RETRY_MS = 60 * 1000;
+const configuredModelProbeInterval = Number(process.env.SKGATEWAY_MODEL_PROBE_INTERVAL_MS);
+export const MODEL_PROBE_INTERVAL_MS = Number.isFinite(configuredModelProbeInterval) && configuredModelProbeInterval >= 1000
+  ? configuredModelProbeInterval : 3 * 60 * 1000;
 
 /** Cadence at which the bounded recovery probe may run while provider-wide
  * subscription_exhausted is in force. The stored retry_at stays whatever the
@@ -20,6 +23,13 @@ const MODEL_RECOVERY_RETRY_MS = 60 * 1000;
  * held every GLM bucket fail-closed until an operator ran clearCapacity at
  * 12:10, while a direct call at 09:08 already returned 200. */
 export const SUBSCRIPTION_PROBE_INTERVAL_MS = 15 * 60 * 1000;
+/** Hard ceiling on an upstream-declared Retry-After (matches the router's
+ * MAX_THROTTLE_COOLDOWN_MS). Applied on write and again on read so records
+ * persisted before the cap existed cannot hold a model for years. */
+export const MAX_RETRY_AFTER_MS = 24 * 60 * 60 * 1000;
+function clampRetryAfterAt(at, observedAt) {
+  return Number.isFinite(at) && Number.isFinite(observedAt) ? Math.min(at, observedAt + MAX_RETRY_AFTER_MS) : at;
+}
 const ZAI_RECOVERY_MODELS = Object.freeze(["glm-4.5", "glm-4.6", "glm-4.7", "glm-5", "glm-5.3"]);
 
 /** Keep shared provider recovery on the exact claims qualified for fleet use. */
@@ -67,6 +77,17 @@ export function capacityStatus(provider, model, { now = Date.now(), path = CAPAC
       Number.isFinite(record.observed_at) && Number.isFinite(record.retry_at)) {
     record = { ...record, retry_at: Math.min(record.retry_at, record.observed_at + SUBSCRIPTION_PROBE_INTERVAL_MS) };
   }
+  // Model cooldown evidence can outlive a provider outage. Reuse the existing
+  // half-open slot, but never shorten an explicit upstream Retry-After.
+  // Legacy records have no retry_after_at, so their long fallback deadline is
+  // eligible too (incident 2026-11-03). Keep the original retry_at on disk.
+  if (record.scope === "model" && record.state !== "available" &&
+      Number.isFinite(record.observed_at) && Number.isFinite(record.retry_at)) {
+    const nextProbeAt = Number.isFinite(record.next_probe_at) ? record.next_probe_at
+      : Math.min(record.retry_at, record.observed_at + MODEL_PROBE_INTERVAL_MS);
+    record = { ...record, probe_state: "pending",
+      retry_at: Math.max(nextProbeAt, clampRetryAfterAt(record.retry_after_at, record.observed_at) || 0) };
+  }
   const current = Number.isFinite(record.observed_at) && now - record.observed_at <= 48 * 60 * 60 * 1000;
   if (record.state === "available") return { ...record, current };
   return { ...record, state: "throttled", current };
@@ -101,21 +122,22 @@ export function recordProviderUnavailable(provider, {
 }
 
 export function recordModelThrottled(provider, model, {
-  retryAt, now = Date.now(), path = CAPACITY_STORE_PATH,
+  retryAt, retryAfterAt, now = Date.now(), path = CAPACITY_STORE_PATH,
 } = {}) {
   return recordModelUnavailable(provider, model, {
-    reason: "rate_limited", retryAt, now, path,
+    reason: "rate_limited", retryAt, retryAfterAt, now, path,
   });
 }
 
 export function recordModelUnavailable(provider, model, {
-  reason = "backend_cooldown", retryAt, now = Date.now(), path = CAPACITY_STORE_PATH,
+  reason = "backend_cooldown", retryAt, retryAfterAt, now = Date.now(), path = CAPACITY_STORE_PATH,
 } = {}) {
   const store = load(path);
   const record = {
     state: "throttled", scope: "model", reason,
     retry_at: Math.max(now + 1000, Number(retryAt) || now + MODEL_RECOVERY_RETRY_MS),
-    probe_state: "none", observed_at: now,
+    probe_state: "pending", observed_at: now,
+    ...(Number.isFinite(retryAfterAt) ? { retry_after_at: clampRetryAfterAt(retryAfterAt, now) } : {}),
   };
   save({ ...store, [`model:${provider}:${model}`]: record }, path);
   return record;
@@ -135,7 +157,8 @@ export function admitCapacity(provider, model, {
   publicSynthetic = false, probeOwner = null, now = Date.now(), path = CAPACITY_STORE_PATH,
 } = {}) {
   const status = capacityStatus(provider, model, { now, path });
-  if (probeOwner && probes.get(provider) === probeOwner) {
+  const active = probes.get(provider);
+  if (probeOwner && active?.owner === probeOwner && (!active.model || active.model === model)) {
     return { admitted: true, probe: true, status: { ...status, probe_state: "in_progress" } };
   }
   if (status.state !== "throttled") return { admitted: true, probe: false, status };
@@ -143,25 +166,38 @@ export function admitCapacity(provider, model, {
       !publicSynthetic || !probeOwner || probes.has(provider)) {
     return { admitted: false, probe: false, status };
   }
-  probes.set(provider, probeOwner);
+  probes.set(provider, { owner: probeOwner, model: status.scope === "model" ? model : null });
   return { admitted: true, probe: true, status: { ...status, probe_state: "in_progress" } };
 }
 
 export function finishCapacityProbe(provider, success, {
-  probeOwner = null, model = null, retryAt, providerWide = false, reason = null,
+  probeOwner = null, model = null, retryAt, retryAfterAt, providerWide = false, reason = null,
   now = Date.now(), path = CAPACITY_STORE_PATH,
 } = {}) {
   const status = capacityStatus(provider, model, { now, path });
-  if (!probeOwner || probes.get(provider) !== probeOwner) return status;
+  const active = probes.get(provider);
+  if (!probeOwner || active?.owner !== probeOwner || (active.model && active.model !== model)) return status;
   probes.delete(provider);
   if (success) return clearCapacity(provider, model, { now, path });
   if (providerWide) return recordSubscriptionExhausted(provider, { retryAt, now, path });
+  if (model && status.scope === "model") {
+    const store = load(path);
+    const key = `model:${provider}:${model}`;
+    const record = store[key];
+    const interval = Math.min((record.probe_interval_ms || MODEL_PROBE_INTERVAL_MS) * 2,
+      Math.max(MODEL_PROBE_INTERVAL_MS, record.retry_at - now));
+    const nextProbeAt = record.retry_at > now ? Math.min(record.retry_at, now + interval) : now + interval;
+    save({ ...store, [key]: { ...record,
+      reason: reason || record.reason,
+      probe_state: "pending", observed_at: now, probe_interval_ms: interval,
+      next_probe_at: nextProbeAt,
+      ...(Number.isFinite(retryAfterAt) ? { retry_after_at: clampRetryAfterAt(retryAfterAt, now) } : {}),
+    } }, path);
+    return capacityStatus(provider, model, { now, path });
+  }
   if (model && (reason === "malformed_response" || reason === "response_budget")) {
     clearCapacity(provider, model, { now, path });
-    return recordModelUnavailable(provider, model, { reason, retryAt, now, path });
-  }
-  if (!providerWide && status.scope === "model") {
-    return recordModelThrottled(provider, model, { retryAt, now, path });
+    return recordModelUnavailable(provider, model, { reason, retryAt, retryAfterAt, now, path });
   }
   if (reason || status.reason !== "subscription_exhausted") {
     return recordProviderUnavailable(provider, {
@@ -172,7 +208,7 @@ export function finishCapacityProbe(provider, success, {
 }
 
 export function releaseCapacityProbe(provider, probeOwner) {
-  if (!probeOwner || probes.get(provider) !== probeOwner) return false;
+  if (!probeOwner || probes.get(provider)?.owner !== probeOwner) return false;
   probes.delete(provider);
   return true;
 }
@@ -206,14 +242,17 @@ export async function runDueCapacityProbes(targets, probe, {
     if (!admission.probe) continue;
     handledProviders.add(target.provider);
     scheduledProbes.set(target.provider, owner);
-    const providerTargets = targets.filter((candidate) => candidate.provider === target.provider);
+    // Provider recovery still qualifies every exact claim. A model cooldown
+    // gets only its own request, at most one per provider per scheduler tick.
+    const providerTargets = status.scope === "model" ? [target]
+      : targets.filter((candidate) => candidate.provider === target.provider);
     try {
       for (const exactTarget of providerTargets) {
         // routeAndSend settles and releases this token after each exact model.
         // Reuse the same transaction owner so one result cannot suppress the
         // remaining exact claims, while scheduledProbes still excludes every
         // concurrent provider recovery transaction.
-        probes.set(target.provider, owner);
+        probes.set(target.provider, { owner, model: status.scope === "model" ? exactTarget.model : null });
         const controller = new AbortController();
         let timer;
         try {
@@ -227,7 +266,7 @@ export async function runDueCapacityProbes(targets, probe, {
             probe(exactTarget, { signal: controller.signal, probeOwner: owner }), deadline,
           ]) });
         } catch (error) {
-          if (probes.get(target.provider) === owner) {
+          if (probes.get(target.provider)?.owner === owner) {
             finishCapacityProbe(target.provider, false, {
               probeOwner: owner, model: exactTarget.model, now, path,
             });
@@ -235,7 +274,7 @@ export async function runDueCapacityProbes(targets, probe, {
           results.push({ ...exactTarget, error });
         } finally {
           clearTimeout(timer);
-          if (probes.get(target.provider) === owner) {
+          if (probes.get(target.provider)?.owner === owner) {
             finishCapacityProbe(target.provider, false, {
               probeOwner: owner, model: exactTarget.model, now, path,
             });
