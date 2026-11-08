@@ -398,4 +398,96 @@ describe("SIGHUP rebuilds backend-derived structures", () => {
       await fast.close();
     }
   });
+
+  test("unchanged pooling on SIGHUP keeps in-flight accounting: next request queues", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "skgw-sighup-pool-same-"));
+    tmpDirs.push(dir);
+    const port = await freePort();
+    const cfgPath = join(dir, "gw.yaml");
+    const slow = await startUpstream({ hold: true, model: "model-a" });
+    const cfg = () => buildConfig({
+      backends: { "old-a": { url: slow.url, priority: 1, models: ["model-a"] } },
+      capacityDomains: {
+        "old-a": { max: 1, maxQueue: 4, queueTimeoutMs: 30000, members: ["old-a"] },
+      },
+    });
+    try {
+      writeFileSync(cfgPath, cfg());
+      const gw = await bootGateway(cfgPath, port, dir);
+      try {
+        const seen = slow.requestSeen();
+        const first = completion(port, "model-a");
+        await seen;
+        assert.equal((await getQueue(port)).backends["old-a"].active, 1);
+
+        writeFileSync(cfgPath, `${cfg()}# touched\n`);
+        await reload(gw);
+
+        const q = (await getQueue(port)).backends["old-a"];
+        assert.equal(q.active, 1, "in-flight request must still count after reload");
+        assert.equal(q.max, 1);
+
+        const second = completion(port, "model-a");
+        await new Promise((r) => setTimeout(r, 400));
+        assert.equal(slow.attempts, 1, "second request must queue, not run concurrently");
+        assert.equal((await getQueue(port)).backends["old-a"].queued, 1);
+
+        slow.release();
+        assert.equal((await first).status, 200);
+        const seen2 = slow.requestSeen();
+        await seen2;
+        slow.release();
+        assert.equal((await second).status, 200);
+        assert.equal(slow.attempts, 2);
+      } finally {
+        await gw.stop();
+      }
+    } finally {
+      await slow.close();
+    }
+  });
+
+  test("a pooling limit change keeps in-flight accounting and applies the new limit", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "skgw-sighup-pool-change-"));
+    tmpDirs.push(dir);
+    const port = await freePort();
+    const cfgPath = join(dir, "gw.yaml");
+    const slow = await startUpstream({ hold: true, model: "model-a" });
+    const cfg = (max) => buildConfig({
+      backends: { "old-a": { url: slow.url, priority: 1, models: ["model-a"] } },
+      capacityDomains: {
+        "old-a": { max, maxQueue: 4, queueTimeoutMs: 30000, members: ["old-a"] },
+      },
+    });
+    try {
+      writeFileSync(cfgPath, cfg(1));
+      const gw = await bootGateway(cfgPath, port, dir);
+      try {
+        const seen = slow.requestSeen();
+        const first = completion(port, "model-a");
+        await seen;
+
+        writeFileSync(cfgPath, cfg(2));
+        await reload(gw);
+        const q = (await getQueue(port)).backends["old-a"];
+        assert.equal(q.active, 1, "in-flight accounting must carry over a limit change");
+        assert.equal(q.max, 2);
+
+        const seen2 = slow.requestSeen();
+        const second = completion(port, "model-a");
+        await seen2;
+        assert.equal(slow.attempts, 2, "raised limit admits a second concurrent request");
+        assert.equal((await getQueue(port)).backends["old-a"].active, 2);
+
+        slow.release();
+        slow.release();
+        assert.equal((await first).status, 200);
+        assert.equal((await second).status, 200);
+      } finally {
+        await gw.stop();
+      }
+    } finally {
+      await slow.close();
+    }
+  });
 });

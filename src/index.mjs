@@ -19,7 +19,7 @@ import { applyCapacityView, availabilityState, buildModelCatalog, reconcileModeF
 import { isDeepStrictEqual } from "node:util";
 import { loadAllowlist, saveAllowlist, applyAllowlist } from "./advertise.mjs";
 import { discoverCatalog, loadCache, saveCache, fetchNvidia, fetchOpenRouter, fetchOpencode, fetchAnthropicWrapper, fetchCodex, fetchZai, fetchDeepSeek, catalogStatus, loadCardOverrides, applyCardOverlays, buildServingCatalog } from "./discovery.mjs";
-import { getPool, resetPool } from "./proxy/connection-pool.mjs";
+import { getPool } from "./proxy/connection-pool.mjs";
 import { loadAgentRegistry, extractIdentity, normalizeAgentId, ANONYMOUS_AGENT_ID } from "./identity/capauth.mjs";
 import { ClientAuthenticator, classifyAuthenticationRoute, stripCallerCredentials, stripCredentialQuery } from "./identity/client-auth.mjs";
 import { createAuthzClient } from "./policy/authz_decide.mjs";
@@ -3105,40 +3105,78 @@ function reconcileRouterBackends(nextBackends) {
     if (!isCatalogDisabledBackend(b)) nextIds.add(id);
   }
 
-  // Remove backends that disappeared or became disabled.
-  for (const id of prevIds) {
-    if (!nextIds.has(id)) router.removeBackend(id);
-  }
-
-  // Add new backends and replace edited ones. Unchanged backends are left
-  // alone so their Backend instances (and health state) survive the reload.
+  // Build the full new set first: a normalization failure here leaves the
+  // running router untouched.
   const nextSnapshot = {};
   for (const [id, b] of Object.entries(next)) {
     if (isCatalogDisabledBackend(b)) continue;
-    const normalized = normalizeBackendConfig(id, b);
-    nextSnapshot[id] = normalized;
-    if (!_routerBackends[id] || !isDeepStrictEqual(_routerBackends[id], normalized)) {
-      router.addBackend(normalized);
+    nextSnapshot[id] = normalizeBackendConfig(id, b);
+  }
+
+  // Apply, remembering what we did so a mid-way failure restores the old set.
+  const prevSnapshot = _routerBackends;
+  const undo = [];
+  try {
+    // Remove backends that disappeared or became disabled.
+    for (const id of prevIds) {
+      if (!nextIds.has(id)) {
+        router.removeBackend(id);
+        undo.push(() => router.addBackend(prevSnapshot[id]));
+      }
     }
+    // Add new backends and replace edited ones. Unchanged backends are left
+    // alone so their Backend instances (and health state) survive the reload.
+    for (const [id, normalized] of Object.entries(nextSnapshot)) {
+      if (!prevSnapshot[id] || !isDeepStrictEqual(prevSnapshot[id], normalized)) {
+        router.addBackend(normalized);
+        undo.push(prevSnapshot[id]
+          ? () => router.addBackend(prevSnapshot[id])
+          : () => router.removeBackend(id));
+      }
+    }
+  } catch (err) {
+    for (const fn of undo.reverse()) {
+      try { fn(); } catch {}
+    }
+    throw err;
   }
 
   _routerBackends = nextSnapshot;
 }
 
+/** Put the router back on a previously normalized backend snapshot. */
+function restoreRouterBackends(prev) {
+  for (const id of Object.keys(_routerBackends)) {
+    if (!prev[id]) router.removeBackend(id);
+  }
+  for (const [id, b] of Object.entries(prev)) {
+    if (!_routerBackends[id] || !isDeepStrictEqual(_routerBackends[id], b)) router.addBackend(b);
+  }
+  _routerBackends = prev;
+}
+
 /** Rebuild the connection pool from the freshly loaded pooling settings. */
 function rebuildCapacityPools() {
-  poolConfig = {
+  const nextPoolConfig = {
     defaultMaxConcurrent: config.pooling?.default_max_concurrent || 20,
     defaultMaxQueue: config.pooling?.default_max_queue || 1000,
     queueTimeoutMs: config.pooling?.queue_timeout_ms || 300000,
     perBackend: config.pooling?.per_backend || {},
     capacityDomains: config.pooling?.capacity_domains || {},
   };
-  resetPool();
-  pool = getPool(poolConfig);
+  // Unchanged pooling: touch nothing. Changed: update limits IN PLACE on the
+  // live pool so in-flight requests, queued waiters and counters carry over
+  // (requests capture their pool at start; a replacement pool would start at
+  // active=0 and oversubscribe the limit until the old one drained).
+  if (isDeepStrictEqual(poolConfig, nextPoolConfig)) return;
+  pool.reconfigure(nextPoolConfig);
+  poolConfig = nextPoolConfig;
 }
 
 _cfgEmitter.on("config-changed", () => {
+  const prevConfig = { ...config };
+  const prevRouterBackends = _routerBackends;
+  const prevPoolConfig = poolConfig;
   try {
     Object.assign(config, _cfgEmitter.current());
     clientAuthenticator = config.client_auth?.enabled ? new ClientAuthenticator(config.client_auth) : null;
@@ -3153,9 +3191,15 @@ _cfgEmitter.on("config-changed", () => {
     }
     console.log("[skgateway] config reloaded");
   } catch (e) {
+    // Keep the old config: restore config keys, the router backend set and
+    // the pool limits as they were before this reload attempt.
+    for (const k of Object.keys(config)) delete config[k];
+    Object.assign(config, prevConfig);
+    try { restoreRouterBackends(prevRouterBackends); } catch {}
+    try { if (prevPoolConfig !== poolConfig) { pool.reconfigure(prevPoolConfig); poolConfig = prevPoolConfig; } } catch {}
     if (clientAuthenticator) clientAuthenticator.available = false;
     if (operatorAuthenticator) operatorAuthenticator.available = false;
-    console.error("[skgateway] config reload failed:", e.message);
+    console.error("[skgateway] config reload failed (old config kept):", e.message);
   }
 });
 
