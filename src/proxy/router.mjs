@@ -3344,7 +3344,7 @@ export function shouldUseRegistryRouting(router, request, bootstrapProbe = false
   const model = request?.model;
   if (typeof model !== "string") return true;
   const exactAdmissionOwner = (typeof router.getBackends === "function"
-    ? [...router.getBackends().values()]
+    ? router.getBackends()
     : []
   ).some((backend) => backend?.require_observed_health === true &&
     backend.models?.some((pattern) =>
