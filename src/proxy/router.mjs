@@ -824,6 +824,49 @@ class LatencyTracker {
  * Represents one upstream LLM backend with its configuration, health state,
  * and auth-token cache.
  */
+/**
+ * Does any no_failover config backend cover this registry target? Matches on
+ * the registry entry's model id (in the backend's `models`, wildcard ignored)
+ * or on an exact url. NOT on url alone: the registry addresses chiap08 by
+ * tailnet IP while skgateway.yaml uses the hostname, so url strings never agree.
+ * @param {Iterable<Backend>} backends
+ * @param {{model?:string,url?:string}} reg
+ */
+export function configNoFailoverCovers(backends, reg) {
+  const url = String(reg?.url || "").replace(/\/$/, "");
+  for (const b of backends || []) {
+    if (!b || b.no_failover !== true) continue;
+    if (reg?.model && Array.isArray(b.models) && b.models.includes(reg.model)) return true;
+    if (url && b.url === url) return true;
+  }
+  return false;
+}
+
+/**
+ * Config backends that declare no_failover but cover no registry route, so the
+ * flag can never take effect. Callers warn on these at startup.
+ * @param {Iterable<Backend>} backends
+ * @param {{backends?:object}} registry parsed registry
+ * @returns {string[]} backend ids
+ */
+export function unmatchedNoFailoverBackends(backends, registry) {
+  const targets = Object.values(registry?.backends || {});
+  return [...(backends || [])]
+    .filter((b) => b && b.no_failover === true)
+    .filter((b) => !targets.some((t) => configNoFailoverCovers([b], t)))
+    .map((b) => b.id);
+}
+
+export function warnUnmatchedNoFailover(backends, registry, log = console.warn) {
+  const ids = unmatchedNoFailoverBackends(backends, registry);
+  for (const id of ids) {
+    log(`[router] WARNING backend=${id} declares no_failover but no registry route targets its ` +
+      `model or url, so the flag has no effect (failover stays OPEN for it). Declare no_failover ` +
+      `on the registry backend or point a registry route at it.`);
+  }
+  return ids;
+}
+
 export class Backend {
   /**
    * @param {BackendConfig} config
@@ -836,6 +879,10 @@ export class Backend {
     // is meant to be used without a key, rather than the gateway inferring it
     // from an env var that happens to be missing. See buildAuthHeaders().
     this.auth_optional = config.auth_optional === true;
+    // Card ba782c14: config/skgateway.yaml backends may declare no_failover.
+    // It takes effect on the registry path (the only path that has a cloud
+    // failover) when the registry target's url matches this configured backend.
+    this.no_failover = config.no_failover === true;
     this.api_key_env = config.api_key_env || null;
     this.models = Array.isArray(config.models) ? config.models : [];
     // Marks a discovery-driven backend (e.g. openrouter, see config.mjs
@@ -3802,14 +3849,18 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         // substituted, failing loudly is the correct answer and answering
         // quietly is the harmful one. Opt-in: absent means failover is unchanged.
         const fc = getFailoverConfig();
-        if (reg.noFailover) {
+        // Declared in registry.yaml (reg.noFailover) OR on the matching
+        // config/skgateway.yaml backend (same url).
+        const noFailover = reg.noFailover || regBackendInstance?.no_failover === true ||
+          configNoFailoverCovers(router.getBackends?.().values?.(), reg);
+        if (noFailover) {
           console.warn(
             `[router] backend=${reg.backend} declares no_failover — NOT substituting ` +
               `with ${fc.fallbackBackend}; request will fail with the upstream error`,
           );
         }
         const fb =
-          fc.enabled && !reg.noFailover && isLocalUrl(reg.url)
+          fc.enabled && !noFailover && isLocalUrl(reg.url)
             ? router.getBackend(fc.fallbackBackend)
             : null;
         if (fb) {

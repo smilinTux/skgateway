@@ -13,6 +13,8 @@ backends:
     model: qwen3.8-27b-huihui-abliterated-q4_k_m
     vision: true
     min_output_tokens: 8192
+    # Sovereign-only: abliterated content no cloud substitute may answer.
+    no_failover: true
   codex-frontier:
     url: https://chatgpt.com/backend-api/codex
     model: gpt-5.6-sol

@@ -1,0 +1,1 @@
+- Honour `no_failover` on config/skgateway.yaml backends: the registry-path cloud failover is blocked when the registry target's model id is served by such a backend (matched by model, not url string). Warn at startup for any no_failover config backend that matches no registry route. Declare `no_failover` on the sovereign qwen38 backend in the tracked registry template.

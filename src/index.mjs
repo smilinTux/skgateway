@@ -13,7 +13,7 @@ import http from "node:http";
 import { loadConfig, getConfig } from "./config.mjs";
 import { createProxyServer, handleRequest, buildConfig, trimSystemMessages, trimConversationHistory } from "./proxy/core.mjs";
 import { ingressRequestLimit, requestLimitResponse } from "./proxy/request-limits.mjs";
-import { createRouter, routeAndSend, startKimiAuthKeepalive } from "./proxy/router.mjs";
+import { createRouter, routeAndSend, startKimiAuthKeepalive, warnUnmatchedNoFailover } from "./proxy/router.mjs";
 import { normalizeSystemMessageOrder, sanitizeResponse } from "./proxy/sanitizer.mjs";
 import { applyCapacityView, availabilityState, buildModelCatalog, reconcileModeFromConfig, tagLocalModels, mergeDiscoveredCatalog, isModelAvailable, isCatalogDisabledBackend, excludedModelIds, withoutExcludedModels } from "./proxy/advertise.mjs";
 import { isDeepStrictEqual } from "node:util";
@@ -126,6 +126,7 @@ for (const [id, b] of Object.entries(config.backends || {})) {
   _routerBackends[id] = normalizeBackendConfig(id, b);
 }
 const router = createRouter({ backends: _routerBackends, quarantine: config.quarantine, routing: config.routing });
+warnUnmatchedNoFailover(router.getBackends().values(), loadRegistry());
 
 // Advertised-vs-working reconciliation mode (card 5c680ee9). The /v1/models
 // catalog is reconciled against live backend health so callers are not offered
