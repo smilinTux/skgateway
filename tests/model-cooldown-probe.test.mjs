@@ -240,3 +240,9 @@ test("Retry-After of one year is capped at 24h and a persisted uncapped record i
     retry_after_at: now + 31_536_000_000 } }));
   assert.ok(capacity.capacityStatus("zai", "glm-5", { now, path }).retry_at <= now + 24 * 3_600_000);
 });
+
+test("router has no reference to the removed parseRetryAfterMs helper (#204 and #205 clash guard)", () => {
+  const src = readFileSync(new URL("../src/proxy/router.mjs", import.meta.url), "utf8");
+  assert.equal(/parseRetryAfterMs/.test(src), false);
+  assert.match(src, /parseResetDelayMs\(retryAfter\);\s*\n\s*const retryAfterAt/);
+});
