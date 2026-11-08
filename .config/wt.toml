@@ -1,0 +1,16 @@
+# worktrunk project config (skcapstone docs/fleet/WORKTRUNK.md).
+# Approved per host by `sk-wt-gc --approve`, only from a clean main checkout, so
+# these commands change only through a reviewed merge.
+
+# Fresh dependencies per worktree. Never symlink node_modules from another tree:
+# one install would then silently change both (2026-08-29, prod deps mutated).
+pre-start = "npm ci --prefer-offline --no-audit --no-fund"
+
+[list]
+url = "http://localhost:{{ branch | hash_port }}"
+
+[aliases]
+# A worktree gateway on its own stable ports, never prod's 18780/18781, with its
+# own metrics DB. It still reads the runtime config, so do not point real
+# traffic at it.
+dev = "SKGATEWAY_PORT={{ branch | hash_port }} SKGATEWAY_DASHBOARD_PORT={{ (branch ~ '-dash') | hash_port }} SKGATEWAY_METRICS_DB=/tmp/skgw-{{ branch | sanitize }}.db npm run dev"
