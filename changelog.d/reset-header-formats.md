@@ -1,0 +1,1 @@
+- router: provider reset headers in duration form ("60s", "2m", "1h") and epoch seconds or milliseconds now bound the subscription reset deadline and the 429/402 cooldown through one shared parser (alongside Retry-After delta-seconds and HTTP-date), instead of silently dropping to the 6 hour default. Values stay capped at the 24 hour cooldown ceiling.

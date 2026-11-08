@@ -1,3 +1,5 @@
+import { parseResetDelayMs } from "../proxy/reset-time.mjs";
+
 const DEFAULT_MAX_AGE_MS = 15 * 60 * 1000;
 const records = new Map();
 
@@ -23,16 +25,8 @@ function finite(value) {
 }
 
 function resetAt(value, now) {
-  if (value === undefined || value === null || value === "") return null;
-  const seconds = finite(value);
-  if (seconds !== null) {
-    const ms = seconds > 10_000_000_000 ? seconds : seconds * 1000;
-    return new Date(ms > now ? ms : now + ms).toISOString();
-  }
-  const duration = String(value).match(/^(\d+(?:\.\d+)?)(ms|s|m|h)$/i);
-  if (!duration) return null;
-  const scale = { ms: 1, s: 1000, m: 60_000, h: 3_600_000 }[duration[2].toLowerCase()];
-  return new Date(now + Number(duration[1]) * scale).toISOString();
+  const delayMs = parseResetDelayMs(value, now);
+  return delayMs === null ? null : new Date(now + delayMs).toISOString();
 }
 
 /** Parse only documented, provider-owned rate-limit headers. Arbitrary headers
