@@ -4736,6 +4736,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         status: 502,
         headers: {},
         body: Buffer.from(JSON.stringify({ error: { message: err.message } })),
+        transportError: "upstream_exception",
       };
       attemptConcurrency = meterUrl ? inFlightOnMeter(meterUrl) : 1;
     } finally {
@@ -5167,6 +5168,12 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // the same ruling the energy headers already follow.
     lastResult = {
       ...res,
+      // Card 9fbca169: the status the upstream itself answered with, or null
+      // when the gateway synthesized it (transport failure). Lets
+      // request_log.error_msg name the real upstream status, never a body.
+      // Read from upstreamStatus (captured before enforceResponseContract),
+      // not res.status: the contract rewrites a rejected upstream 2xx to 502.
+      upstreamStatus: res?.transportError ? null : (upstreamStatus ?? null),
       backendId,
       requestedModel,
       readinessRevision: backend.readinessRevision,
@@ -5457,6 +5464,9 @@ export async function routeAndSend(router, request, upstreamPath, method, client
 
   // All backends failed for some other (non-throttle) reason: return the
   // last response so the caller can relay the error.
+  // Card 9fbca169: say so on the result, so the terminal request_log row can
+  // tell an exhausted failover chain from a single relayed failure.
+  if (lastResult) lastResult.allFailed = true;
   await emitSiem("response", {
     status: lastResult?.status ?? 502,
     failover: didFailover,

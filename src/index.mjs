@@ -1225,6 +1225,7 @@ if (siemEnabled) {
 // Optional skcapstone bridge — shares warn+ SIEM events on the mesh-wide
 // sk-alert bus when ~/.skcapstone is present; no-op otherwise.
 import * as skcapstone from "./integration.mjs";
+import { describeFailure, describeException } from "./metrics/failure-reason.mjs";
 
 // ─── Syslog output (RFC 5424) — disabled by default ───
 // Build one adapter per `type: syslog` output in config.siem.outputs. Each is a
@@ -2722,7 +2723,7 @@ export const server = http.createServer(async (req, res) => {
       // Fail-closed: any error during limit application rejects the request
       // before provider dispatch
       console.error("[skgateway] model limits processing failed (fail-closed):", e.message);
-      closeMetrics({ statusCode: 500, errorMsg: "Request processing failed" });
+      closeMetrics({ statusCode: 500, errorMsg: describeException(e, "request_processing_failed") });
       if (!res.headersSent) {
         res.writeHead(500, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: { message: "Request processing failed", code: 500 } }));
@@ -2846,7 +2847,7 @@ export const server = http.createServer(async (req, res) => {
         } catch (e) {
           // Fail-closed: sanitization error rejects before sending to client
           console.error("[skgateway] response sanitization failed (fail-closed):", e.message);
-          closeMetrics({ statusCode: 500, errorMsg: "Response sanitization failed" });
+          closeMetrics({ statusCode: 500, errorMsg: describeException(e, "response_sanitization_failed") });
           if (!res.headersSent) {
             res.writeHead(500, { "content-type": "application/json" });
             res.end(JSON.stringify({ error: { message: "Response sanitization failed", code: 500 } }));
@@ -3076,7 +3077,8 @@ export const server = http.createServer(async (req, res) => {
           responseHeaders: {},
           responseBody: null,
           backend: result?.backendId,
-          errorMsg: dispatchError.message,
+          // Name and code only: an exception message can carry a body or a host.
+          errorMsg: describeException(dispatchError),
           energy: result?.energy,
           energyAttempts: result?.energyAttempts,
           result,
@@ -3091,8 +3093,13 @@ export const server = http.createServer(async (req, res) => {
           // request content or credentials.
           parsedBody = result?.body ?? null;
         }
+        const terminalStatus = result?.status ?? res.statusCode;
         closeMetrics({
-          statusCode: result?.status ?? res.statusCode,
+          statusCode: terminalStatus,
+          // Card 9fbca169: a relayed upstream failure, an exhausted failover
+          // chain and a gateway-made 4xx/5xx all close here without throwing,
+          // and used to leave error_msg NULL. Class and upstream status only.
+          errorMsg: describeFailure(result, terminalStatus),
           firstByteMs: result?.firstByteMs,
           generationMs: result?.generationMs,
           responseHeaders: result?.headers ?? {},
