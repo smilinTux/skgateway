@@ -307,7 +307,7 @@ describe("cost tracking — price table (card 9bbcd420)", () => {
   });
 });
 
-describe("cost tracking — Claude 5.5 price table (SKRSI P0.3, card c1844964)", () => {
+describe("cost tracking - Claude 5.5 price table (SKRSI P0.3, card c1844964)", () => {
   // Source: Anthropic published model pricing page (USD per MTok), fetched
   // 2026-11-12 from https://platform.claude.com/docs/en/about-claude/pricing
   // (docs.claude.com redirects there). cache_write is the 5m write rate.
