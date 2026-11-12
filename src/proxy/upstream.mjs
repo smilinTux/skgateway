@@ -215,6 +215,7 @@ export function sendUpstream(reqUrl, method, headers, body, targetUrl, timeoutMs
               headers: {},
               body: Buffer.from(JSON.stringify({ error: { code: "response_too_large" } })),
               ...terminalTiming(),
+              transportError: "response_too_large",
             });
             upstreamRes.destroy();
             upstreamReq.destroy();
@@ -273,6 +274,7 @@ export function sendUpstream(reqUrl, method, headers, body, targetUrl, timeoutMs
             },
           })),
           ...terminalTiming(),
+          transportError: "upstream_deadline",
         });
         upstreamReq.destroy();
       }, deadlineMs);
@@ -298,7 +300,13 @@ export function sendUpstream(reqUrl, method, headers, body, targetUrl, timeoutMs
           },
         })),
         ...terminalTiming(),
-        ...(cancelled ? { cancelled: true } : {}),
+        // Card 9fbca169: marks a status the GATEWAY made up, so request_log
+        // never reports it as an upstream status. A metadata token only.
+        ...(cancelled ? { cancelled: true } : {
+          transportError: deadlineExceeded
+            ? "upstream_deadline"
+            : (timedOut ? "upstream_timeout" : "upstream_unreachable"),
+        }),
       });
     });
 

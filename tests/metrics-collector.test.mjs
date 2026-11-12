@@ -13,9 +13,13 @@
  * Run with:  node --test tests/metrics-collector.test.mjs
  */
 
-import { test, describe } from "node:test";
+import { test, describe, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, existsSync, rmSync } from "node:fs";
+import { mkdtempSync, existsSync, rmSync, writeFileSync } from "node:fs";
+import http from "node:http";
+import net from "node:net";
+import { spawn } from "node:child_process";
+import Database from "better-sqlite3";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createMetricsCollector } from "../src/metrics/collector.mjs";
@@ -481,5 +485,234 @@ describe("cost tracking — bounded memory + /status exposure (card 9bbcd420)", 
     const sumAgents = Object.values(s.costByAgent).reduce((a, v) => a + v.costUsd, 0);
     assert.ok(Math.abs(sumAgents - s.totalCostUsd) < 1e-6, "bounded breakdown conserves total spend");
     collector.close?.();
+  });
+});
+
+// ─── error_msg on every failed terminal row (card 9fbca169 / SKRSI P0.2) ─────
+//
+// The live sk-default 502s could not be explained from metrics.db because every
+// one of them had error_msg NULL: only the paths where routeAndSend THREW set
+// it. A relayed upstream failure, an exhausted failover chain and a gateway-made
+// 404 all close the row through the non-throwing branch, which passed no
+// errorMsg. These tests boot the REAL gateway against a stub upstream and read
+// the terminal request_log row for each failure path.
+//
+// error_msg carries an error CLASS and the UPSTREAM STATUS, never a response
+// body: the stub's error body holds a marker string that must never reach the
+// row.
+
+const BODY_MARKER = "P02-UPSTREAM-BODY-MUST-NOT-BE-LOGGED";
+const INDEX = new URL("../src/index.mjs", import.meta.url).pathname;
+
+function p02FreePort() {
+  return new Promise((res, rej) => {
+    const s = net.createServer();
+    s.once("error", rej);
+    s.listen(0, "127.0.0.1", () => {
+      const { port } = s.address();
+      s.close(() => res(port));
+    });
+  });
+}
+
+/** Stub upstream: fails by model id, answers 200 otherwise. */
+function p02StartUpstream() {
+  return new Promise((res) => {
+    const server = http.createServer((req, r) => {
+      const chunks = [];
+      req.on("data", (c) => chunks.push(c));
+      req.on("end", () => {
+        let parsed = {};
+        try { parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")); } catch {}
+        const fail = { "p02-fail502": 502, "p02-failover": 503 }[parsed.model];
+        if (fail) {
+          r.writeHead(fail, { "content-type": "application/json" });
+          r.end(JSON.stringify({ error: { message: `${BODY_MARKER} upstream detail`, code: "boom" } }));
+          return;
+        }
+        r.writeHead(200, { "content-type": "application/json" });
+        r.end(JSON.stringify({
+          id: "c1", model: parsed.model,
+          choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+          usage: { prompt_tokens: 1, completion_tokens: 1 },
+        }));
+      });
+    });
+    server.listen(0, "127.0.0.1", () => {
+      res({ url: `http://127.0.0.1:${server.address().port}/v1`, close: () => new Promise((d) => server.close(d)) });
+    });
+  });
+}
+
+function p02BootGateway({ port, dashPort, upstreamUrl, deadUrl, dbPath, dir }) {
+  const cfgPath = join(dir, "gw.yaml");
+  writeFileSync(cfgPath, [
+    "server:",
+    "  bind: 127.0.0.1",
+    `  port: ${port}`,
+    `  dashboard_port: ${dashPort}`,
+    "discovery:",
+    "  enabled: false",
+    "dashboard:",
+    `  port: ${dashPort}`,
+    "identity:",
+    "  enabled: false",
+    "metrics:",
+    "  enabled: true",
+    `  db_path: ${dbPath}`,
+    "backends:",
+    "  stub:",
+    `    url: ${upstreamUrl}`,
+    "    auth_type: none",
+    "    priority: 1",
+    "    models:",
+    "      - p02-ok",
+    "      - p02-fail502",
+    "      - p02-failover",
+    "  dead:",
+    `    url: ${deadUrl}`,
+    "    auth_type: none",
+    "    priority: 2",
+    "    models:",
+    "      - p02-failover",
+    "",
+  ].join("\n"));
+  const child = spawn(process.execPath, [INDEX, "--config", cfgPath, "--port", String(port)], {
+    env: { ...process.env, SKGATEWAY_MODEL_CATALOG_STORE_PATH: join(dir, "store.json") },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  return new Promise((resolveBoot, rejectBoot) => {
+    let out = "";
+    const timer = setTimeout(() => rejectBoot(new Error(`gateway did not start:\n${out}`)), 20000);
+    const onData = (buf) => {
+      out += buf.toString();
+      if (/\[skgateway\] listening/.test(out)) { clearTimeout(timer); resolveBoot(child); }
+    };
+    child.stdout.on("data", onData);
+    child.stderr.on("data", onData);
+    child.on("exit", (code) => { clearTimeout(timer); rejectBoot(new Error(`gateway exited (${code}):\n${out}`)); });
+  });
+}
+
+describe("error_msg on failed terminal rows, live gateway (card 9fbca169)", () => {
+  let up, child, dir, dbPath;
+  const calls = {};
+
+  async function rowFor(reqId) {
+    for (let i = 0; i < 40; i++) {
+      if (existsSync(dbPath)) {
+        const db = new Database(dbPath, { readonly: true });
+        let row = null;
+        try { row = db.prepare("SELECT * FROM request_log WHERE id = ?").get(reqId) ?? null; } catch {}
+        db.close();
+        if (row && row.status_code !== null) return row;
+      }
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    return null;
+  }
+
+  before(async () => {
+    dir = mkdtempSync(join(tmpdir(), "skgw-p02-"));
+    writeFileSync(join(dir, "store.json"), "{}");
+    dbPath = join(dir, "metrics.db");
+    up = await p02StartUpstream();
+    const port = await p02FreePort();
+    const dashPort = await p02FreePort();
+    const deadPort = await p02FreePort();   // released: nothing listens there
+    child = await p02BootGateway({
+      port, dashPort, upstreamUrl: up.url, deadUrl: `http://127.0.0.1:${deadPort}/v1`, dbPath, dir,
+    });
+    for (const model of ["p02-ok", "p02-fail502", "p02-failover", "p02-no-such-model"]) {
+      const r = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model, messages: [{ role: "user", content: "hi" }] }),
+      });
+      await r.text();
+      calls[model] = { status: r.status, reqId: r.headers.get("x-sk-req-id") };
+    }
+  });
+
+  after(async () => {
+    try { child?.kill("SIGKILL"); } catch {}
+    await up?.close();
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  });
+
+  function assertReason(row, { cls, upstream }) {
+    assert.ok(row, "no closed request_log row");
+    assert.ok(row.error_msg, `error_msg is ${row.error_msg} on a ${row.status_code} row`);
+    assert.match(row.error_msg, new RegExp(`(^| )class=${cls}( |$)`), row.error_msg);
+    assert.match(row.error_msg, new RegExp(`(^| )upstream_status=${upstream}( |$)`), row.error_msg);
+    assert.ok(!row.error_msg.includes(BODY_MARKER), "a response body leaked into error_msg");
+    assert.ok(row.error_msg.length <= 120, `error_msg is metadata, not a body (${row.error_msg.length} chars)`);
+  }
+
+  test("NEGATIVE CONTROL: a 200 row keeps error_msg NULL", async () => {
+    assert.equal(calls["p02-ok"].status, 200);
+    const row = await rowFor(calls["p02-ok"].reqId);
+    assert.ok(row);
+    assert.equal(row.error_msg, null);
+  });
+
+  test("relayed upstream 502: class and upstream status, no body", async () => {
+    assert.equal(calls["p02-fail502"].status, 502);
+    const row = await rowFor(calls["p02-fail502"].reqId);
+    assert.equal(row?.status_code, 502);
+    assertReason(row, { cls: "upstream_error", upstream: "502" });
+  });
+
+  test("failover exhausted: every candidate failed, the row says so", async () => {
+    assert.ok(calls["p02-failover"].status >= 500, `status ${calls["p02-failover"].status}`);
+    const row = await rowFor(calls["p02-failover"].reqId);
+    assertReason(row, { cls: "failover_exhausted", upstream: "(none|\\d{3})" });
+    assert.match(row.error_msg, /(^| )last=\w+/, row.error_msg);
+  });
+
+  test("no model 404: gateway-made, no upstream status", async () => {
+    assert.equal(calls["p02-no-such-model"].status, 404);
+    const row = await rowFor(calls["p02-no-such-model"].reqId);
+    assert.equal(row?.status_code, 404);
+    assertReason(row, { cls: "unknown_model", upstream: "none" });
+  });
+});
+
+describe("describeFailure / describeException units (card 9fbca169)", async () => {
+  const { describeFailure, describeException } = await import("../src/metrics/failure-reason.mjs");
+  const body = (o) => Buffer.from(JSON.stringify(o));
+
+  test("2xx and 3xx rows get no reason", () => {
+    assert.equal(describeFailure({ status: 200, upstreamStatus: 200 }, 200), undefined);
+    assert.equal(describeFailure(null, 304), undefined);
+  });
+
+  test("no result at all", () => {
+    assert.equal(describeFailure(null, 502), "class=no_backend_result upstream_status=none");
+  });
+
+  test("transport failure is never reported as an upstream status", () => {
+    const r = { status: 504, upstreamStatus: null, transportError: "upstream_timeout",
+      body: body({ error: { message: `${BODY_MARKER} 10.0.0.9`, code: "upstream_timeout" } }) };
+    assert.equal(describeFailure(r, 504), "class=upstream_timeout upstream_status=none");
+  });
+
+  test("gateway-made body: code token only, free text and generic types ignored", () => {
+    const quarantined = { status: 503, body: body({ error: { message: BODY_MARKER, code: 503, type: "model_claim_quarantined" } }) };
+    assert.equal(describeFailure(quarantined, 503), "class=model_claim_quarantined upstream_status=none");
+    const freeText = { status: 400, body: body({ error: { code: `${BODY_MARKER} spaces`, type: "invalid_request_error" } }) };
+    assert.equal(describeFailure(freeText, 400), "class=gateway_400 upstream_status=none");
+  });
+
+  test("a relayed body is never read, even a token-shaped code", () => {
+    const r = { status: 400, upstreamStatus: 400, body: body({ error: { code: "secret_token_shape" } }) };
+    assert.equal(describeFailure(r, 400), "class=upstream_error upstream_status=400");
+  });
+
+  test("exceptions keep name or code, never the message", () => {
+    const err = Object.assign(new Error(`${BODY_MARKER} host.internal`), { code: "ECONNRESET" });
+    assert.equal(describeException(err), "class=dispatch_exception upstream_status=none err=econnreset");
+    assert.equal(describeException(new TypeError(BODY_MARKER), "request_processing_failed"),
+      "class=request_processing_failed upstream_status=none err=typeerror");
   });
 });
