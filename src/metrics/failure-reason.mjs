@@ -40,6 +40,13 @@ function gatewayBodyClass(body) {
 /** Class of the attempt the result came from. */
 function attemptClass(result) {
   if (result?.cancelled) return "client_closed";
+  // The upstream answered 2xx and the response contract rejected it (empty
+  // content, invalid tool calls, invalid completion), so the client got a
+  // gateway-made 502 while upstream_status stays the real 2xx.
+  if (Number.isInteger(result?.upstreamStatus) && result.upstreamStatus < 300 &&
+      Number.isInteger(result?.status) && result.status >= 400) {
+    return "invalid_upstream_response";
+  }
   return token(result?.transportError) ?? "upstream_error";
 }
 

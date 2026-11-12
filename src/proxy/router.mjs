@@ -5171,7 +5171,9 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       // Card 9fbca169: the status the upstream itself answered with, or null
       // when the gateway synthesized it (transport failure). Lets
       // request_log.error_msg name the real upstream status, never a body.
-      upstreamStatus: res?.transportError ? null : (res?.status ?? null),
+      // Read from upstreamStatus (captured before enforceResponseContract),
+      // not res.status: the contract rewrites a rejected upstream 2xx to 502.
+      upstreamStatus: res?.transportError ? null : (upstreamStatus ?? null),
       backendId,
       requestedModel,
       readinessRevision: backend.readinessRevision,

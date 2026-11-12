@@ -530,10 +530,13 @@ function p02StartUpstream() {
           r.end(JSON.stringify({ error: { message: `${BODY_MARKER} upstream detail`, code: "boom" } }));
           return;
         }
+        // p02-empty200: the upstream answers 200 with no visible content, which
+        // the response contract rewrites to a client-facing 502.
+        const content = parsed.model === "p02-empty200" ? "" : "ok";
         r.writeHead(200, { "content-type": "application/json" });
         r.end(JSON.stringify({
           id: "c1", model: parsed.model,
-          choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+          choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
           usage: { prompt_tokens: 1, completion_tokens: 1 },
         }));
       });
@@ -569,6 +572,7 @@ function p02BootGateway({ port, dashPort, upstreamUrl, deadUrl, dbPath, dir }) {
     "      - p02-ok",
     "      - p02-fail502",
     "      - p02-failover",
+    "      - p02-empty200",
     "  dead:",
     `    url: ${deadUrl}`,
     "    auth_type: none",
@@ -623,7 +627,7 @@ describe("error_msg on failed terminal rows, live gateway (card 9fbca169)", () =
     child = await p02BootGateway({
       port, dashPort, upstreamUrl: up.url, deadUrl: `http://127.0.0.1:${deadPort}/v1`, dbPath, dir,
     });
-    for (const model of ["p02-ok", "p02-fail502", "p02-failover", "p02-no-such-model"]) {
+    for (const model of ["p02-ok", "p02-fail502", "p02-failover", "p02-empty200", "p02-no-such-model"]) {
       const r = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -666,8 +670,18 @@ describe("error_msg on failed terminal rows, live gateway (card 9fbca169)", () =
   test("failover exhausted: every candidate failed, the row says so", async () => {
     assert.ok(calls["p02-failover"].status >= 500, `status ${calls["p02-failover"].status}`);
     const row = await rowFor(calls["p02-failover"].reqId);
-    assertReason(row, { cls: "failover_exhausted", upstream: "(none|\\d{3})" });
-    assert.match(row.error_msg, /(^| )last=\w+/, row.error_msg);
+    // Stub answers 503, then the dead port refuses: the LAST attempt is a
+    // transport failure, so there is no upstream status to report.
+    assert.equal(row.error_msg, "class=failover_exhausted upstream_status=none last=upstream_unreachable");
+    assertReason(row, { cls: "failover_exhausted", upstream: "none" });
+  });
+
+  test("upstream 200 the response contract rejects: client 502, row keeps upstream 200", async () => {
+    assert.equal(calls["p02-empty200"].status, 502);
+    const row = await rowFor(calls["p02-empty200"].reqId);
+    assert.equal(row?.status_code, 502);
+    assert.equal(row.error_msg, "class=invalid_upstream_response upstream_status=200");
+    assertReason(row, { cls: "invalid_upstream_response", upstream: "200" });
   });
 
   test("no model 404: gateway-made, no upstream status", async () => {
@@ -702,6 +716,13 @@ describe("describeFailure / describeException units (card 9fbca169)", async () =
     assert.equal(describeFailure(quarantined, 503), "class=model_claim_quarantined upstream_status=none");
     const freeText = { status: 400, body: body({ error: { code: `${BODY_MARKER} spaces`, type: "invalid_request_error" } }) };
     assert.equal(describeFailure(freeText, 400), "class=gateway_400 upstream_status=none");
+  });
+
+  test("an upstream 2xx the response contract rejected names the contract", () => {
+    const r = { status: 502, upstreamStatus: 200, body: body({ error: { code: "empty_upstream_response" } }) };
+    assert.equal(describeFailure(r, 502), "class=invalid_upstream_response upstream_status=200");
+    assert.equal(describeFailure({ ...r, failover: true, allFailed: true }, 502),
+      "class=failover_exhausted upstream_status=200 last=invalid_upstream_response");
   });
 
   test("a relayed body is never read, even a token-shaped code", () => {
