@@ -249,6 +249,8 @@ const DEFAULTS = {
       // (https://platform.claude.com/docs/en/about-claude/pricing, 2026-11-12).
       // cache_write is the 5m write rate. Haiku 5.5 is tiered; the up-to-100k
       // prompt tier is recorded (over 100k it is 0.50 / 2.50).
+      // These ids are served over the subscription wrapper, so the figure is the list-price
+      // equivalent (as for the 4.x entries above), not a metered bill.
       'claude-fable-5-2': { input: 8.00, output: 40.00, cache_read: 0.2, cache_write: 10.00 },
       'claude-opus-5-5': { input: 4.00, output: 20.00, cache_read: 0.2, cache_write: 5.00 },
       'claude-sonnet-5-5': { input: 2.00, output: 10.00, cache_read: 0.1, cache_write: 2.5 },
