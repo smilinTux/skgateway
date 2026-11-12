@@ -21,6 +21,8 @@ import net from "node:net";
 import { spawn } from "node:child_process";
 import Database from "better-sqlite3";
 import { join } from "node:path";
+import { readFileSync } from "node:fs";
+import { load as yamlLoad } from "js-yaml";
 import { tmpdir } from "node:os";
 import { createMetricsCollector } from "../src/metrics/collector.mjs";
 import { loadConfig, getPricing } from "../src/config.mjs";
@@ -302,6 +304,67 @@ describe("cost tracking — price table (card 9bbcd420)", () => {
     assert.equal(unknown.input, 0);
     assert.equal(unknown.output, 0);
     assert.equal(unknown.unpriced, true);
+  });
+});
+
+describe("cost tracking — Claude 5.5 price table (SKRSI P0.3, card c1844964)", () => {
+  // Source: Anthropic published model pricing page (USD per MTok), fetched
+  // 2026-11-12 from https://platform.claude.com/docs/en/about-claude/pricing
+  // (docs.claude.com redirects there). cache_write is the 5m write rate.
+  // Haiku 5.5 is tiered by prompt size; the table is flat, so the up-to-100k
+  // tier is recorded.
+  const PUBLISHED = {
+    "claude-fable-5-2":   { input: 8.0, output: 40.0, cache_read: 0.20, cache_write: 10.0 },
+    "claude-opus-5-5":    { input: 4.0, output: 20.0, cache_read: 0.20, cache_write: 5.0 },
+    "claude-sonnet-5-5":  { input: 2.0, output: 10.0, cache_read: 0.10, cache_write: 2.5 },
+    "claude-haiku-5-5":   { input: 0.10, output: 0.50, cache_read: 0.01, cache_write: 0.125 },
+  };
+
+  test("getPricing: every Claude 5.5 id is priced at the published rate", () => {
+    for (const [model, want] of Object.entries(PUBLISHED)) {
+      const p = getPricing(model);
+      assert.equal(p.unpriced, false, `${model} must not be unpriced`);
+      for (const k of Object.keys(want)) assert.equal(p[k], want[k], `${model}.${k}`);
+      // A dated suffix resolves through the prefix match to the same entry.
+      assert.equal(getPricing(`${model}-20261112`).unpriced, false, `${model} dated`);
+    }
+  });
+
+  test("YAML price tables carry the same Claude 5.5 entries as the defaults", () => {
+    for (const file of ["config/skgateway.yaml", "config/skgateway.yaml.example"]) {
+      const doc = yamlLoad(readFileSync(new URL(`../${file}`, import.meta.url), "utf8"));
+      const table = doc.metrics.pricing;
+      for (const [model, want] of Object.entries(PUBLISHED)) {
+        for (const k of Object.keys(want)) assert.equal(table[model]?.[k], want[k], `${file} ${model}.${k}`);
+      }
+    }
+  });
+
+  test("cost matches a hand-computed value for opus-5-5 and sonnet-5-5", () => {
+    const dir = mkdtempSync(join(tmpdir(), "skgw-cost55-"));
+    let collector;
+    try {
+      collector = createMetricsCollector(metricsCfg(dir));
+      // opus-5-5: 200k in * 4 + 100k out * 20 + 500k cache_read * 0.20 + 40k cache_write * 5
+      //   = 0.80 + 2.00 + 0.10 + 0.20 = 3.10
+      feedCost(collector, {
+        agentId: "opus", model: "claude-opus-5-5",
+        usage: {
+          input_tokens: 200_000, output_tokens: 100_000,
+          cache_read_input_tokens: 500_000, cache_creation_input_tokens: 40_000,
+        },
+      });
+      assert.ok(Math.abs(collector.getStats().totalCostUsd - 3.10) < 1e-9);
+      // sonnet-5-5: 1M in * 2 + 1M out * 10 = 12.00
+      feedCost(collector, {
+        agentId: "opus", model: "claude-sonnet-5-5",
+        usage: { input_tokens: 1_000_000, output_tokens: 1_000_000 },
+      });
+      assert.ok(Math.abs(collector.getStats().totalCostUsd - 15.10) < 1e-9);
+    } finally {
+      collector?.close?.();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

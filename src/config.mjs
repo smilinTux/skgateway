@@ -245,6 +245,14 @@ const DEFAULTS = {
       'claude-opus-4-7': { input: 15.00, output: 75.00, cache_read: 1.50, cache_write: 3.75 },
       'claude-sonnet-4-6': { input: 3.00, output: 15.00, cache_read: 0.30, cache_write: 0.375 },
       'claude-haiku-4-5': { input: 0.80, output: 4.00, cache_read: 0.08, cache_write: 0.10 },
+      // Claude 5.5 family, USD per MTok from Anthropic's published pricing page
+      // (https://platform.claude.com/docs/en/about-claude/pricing, 2026-11-12).
+      // cache_write is the 5m write rate. Haiku 5.5 is tiered; the up-to-100k
+      // prompt tier is recorded (over 100k it is 0.50 / 2.50).
+      'claude-fable-5-2': { input: 8.00, output: 40.00, cache_read: 0.2, cache_write: 10.00 },
+      'claude-opus-5-5': { input: 4.00, output: 20.00, cache_read: 0.2, cache_write: 5.00 },
+      'claude-sonnet-5-5': { input: 2.00, output: 10.00, cache_read: 0.1, cache_write: 2.5 },
+      'claude-haiku-5-5': { input: 0.1, output: 0.5, cache_read: 0.01, cache_write: 0.125 },
       'moonshotai/kimi-k2.6': { input: 0, output: 0 },
       'minimaxai/minimax-m2.7': { input: 0, output: 0 },
       'default_local': { input: 0, output: 0 },

@@ -315,6 +315,30 @@ metrics:
       output: 15.00
       cache_read: 0.30
       cache_write: 0.375
+    ## Claude 5.5 family: USD per MTok from Anthropic's published pricing page
+    ## (https://platform.claude.com/docs/en/about-claude/pricing, 2026-11-12).
+    ## cache_write is the 5m write rate. Haiku 5.5 is tiered; the up-to-100k
+    ## prompt tier is recorded (over 100k it is 0.50 in / 2.50 out).
+    claude-fable-5-2:
+      input: 8.00
+      output: 40.00
+      cache_read: 0.2
+      cache_write: 10.00
+    claude-opus-5-5:
+      input: 4.00
+      output: 20.00
+      cache_read: 0.2
+      cache_write: 5.00
+    claude-sonnet-5-5:
+      input: 2.00
+      output: 10.00
+      cache_read: 0.1
+      cache_write: 2.5
+    claude-haiku-5-5:
+      input: 0.1
+      output: 0.5
+      cache_read: 0.01
+      cache_write: 0.125
     ## Codex subscription models: the incremental per-token price IS zero
     ## (a flat plan quota, not a metered bill). Cost dashboards must not
     ## invent per-token prices for subscription inference; the real budget

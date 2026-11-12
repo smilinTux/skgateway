@@ -1,0 +1,1 @@
+- Add pricing entries for claude-fable-5-2, claude-opus-5-5, claude-sonnet-5-5 and claude-haiku-5-5 (published list prices), so their cost stops reading as zero. Static table only; takes effect on deploy.
