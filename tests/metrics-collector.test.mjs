@@ -15,12 +15,13 @@
 
 import { test, describe, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, existsSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, existsSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import http from "node:http";
 import net from "node:net";
 import { spawn } from "node:child_process";
 import Database from "better-sqlite3";
 import { join } from "node:path";
+import { load as yamlLoad } from "js-yaml";
 import { tmpdir } from "node:os";
 import { createMetricsCollector } from "../src/metrics/collector.mjs";
 import { loadConfig, getPricing } from "../src/config.mjs";
@@ -302,6 +303,56 @@ describe("cost tracking — price table (card 9bbcd420)", () => {
     assert.equal(unknown.input, 0);
     assert.equal(unknown.output, 0);
     assert.equal(unknown.unpriced, true);
+  });
+});
+
+describe("cost tracking - Claude 5.5 price table (SKRSI P0.3, card c1844964)", () => {
+  // Every claude-* route is the flat-subscription wrapper, so the 5.5 ids are
+  // priced 0 (like the Codex entries). A 0 entry is PRICED: unpriced=false.
+  // Published list prices live in the config comments for reference only.
+  const IDS = ["claude-fable-5-2", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"];
+  const ZERO = { input: 0, output: 0, cache_read: 0, cache_write: 0 };
+
+  test("getPricing: every Claude 5.5 id is priced (not unpriced) at 0", () => {
+    for (const model of IDS) {
+      const p = getPricing(model);
+      assert.equal(p.unpriced, false, `${model} must not be unpriced`);
+      for (const k of Object.keys(ZERO)) assert.equal(p[k], 0, `${model}.${k}`);
+      // A dated suffix resolves through the prefix match to the same entry.
+      assert.equal(getPricing(`${model}-20261112`).unpriced, false, `${model} dated`);
+    }
+  });
+
+  test("YAML price tables carry the same Claude 5.5 entries as the defaults", () => {
+    for (const file of ["config/skgateway.yaml", "config/skgateway.yaml.example"]) {
+      const doc = yamlLoad(readFileSync(new URL(`../${file}`, import.meta.url), "utf8"));
+      const table = doc.metrics.pricing;
+      for (const model of IDS) {
+        for (const k of Object.keys(ZERO)) assert.equal(table[model]?.[k], 0, `${file} ${model}.${k}`);
+      }
+    }
+  });
+
+  test("cost for Claude 5.5 ids is 0 and unpriced=false", () => {
+    const dir = mkdtempSync(join(tmpdir(), "skgw-cost55-"));
+    let collector;
+    try {
+      collector = createMetricsCollector(metricsCfg(dir));
+      for (const model of IDS) {
+        feedCost(collector, {
+          agentId: "opus", model,
+          usage: {
+            input_tokens: 200_000, output_tokens: 100_000,
+            cache_read_input_tokens: 500_000, cache_creation_input_tokens: 40_000,
+          },
+        });
+        assert.equal(getPricing(model).unpriced, false, `${model} unpriced`);
+      }
+      assert.equal(collector.getStats().totalCostUsd, 0);
+    } finally {
+      collector?.close?.();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
