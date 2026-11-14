@@ -149,7 +149,7 @@ The in-memory ring buffer holds the last 200 events. Events older than the ring 
 **Audit log file** — all events are also written to `./logs/audit.jsonl` (JSON Lines format, one event per line). Files are rotated at 100MB. You can tail this file for real-time monitoring:
 
 ```bash
-tail -f ~/clawd/skcapstone-repos/skgateway/logs/audit.jsonl | jq .
+tail -f /home/YOUR_USER/skcapstone-repos/skgateway/logs/audit.jsonl | jq .
 ```
 
 ---

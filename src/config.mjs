@@ -28,6 +28,7 @@ import { homedir } from 'node:os';
 import { load as yamlLoad } from 'js-yaml';
 import { isRegistryRouted, loadRegistry } from './proxy/registry.mjs';
 import { assertCodexConfigPurity, assertCodexRegistryPurity } from './policy/codex-purity.mjs';
+import { normalizeGenericParticipation } from './policy/generic-participation.mjs';
 
 // ─── paths ────────────────────────────────────────────────────────────────────
 
@@ -55,21 +56,58 @@ function expandHome(p) {
 export const SYNCED_CONFIG_PATH = resolve(homedir(), '.skcapstone', 'gateway', 'skgateway.yaml');
 
 /**
+ * Per-estate runtime config path. One skgateway `main` serves estates that run
+ * entirely different provider sets (nor: ccapi + local/free models; chi: glm,
+ * kimi, codex, deepseek), so the estate name belongs in the FILENAME rather
+ * than in a branch or a checkout. Set `$SKWORLD_ESTATE=nor` and this host reads
+ * `~/.skcapstone/gateway/skgateway.nor.yaml`, which cannot collide with chi's
+ * file even if the directory is synced to both.
+ *
+ * @param {string} estate
+ * @returns {string}
+ */
+export function estateConfigPath(estate) {
+  return resolve(homedir(), '.skcapstone', 'gateway', `skgateway.${estate}.yaml`);
+}
+
+/**
  * Resolve which skgateway.yaml to load, in precedence order:
  *   1. `explicit` (a function-arg / --config override) if provided
  *   2. `$SKGATEWAY_CONFIG` if set
- *   3. the Syncthing-synced path (SYNCED_CONFIG_PATH) if it exists on disk
- *   4. the in-repo `config/skgateway.yaml` (pre-migration fallback)
+ *   3. the per-estate synced path, when `$SKWORLD_ESTATE` is set and the file exists
+ *   4. the Syncthing-synced path (SYNCED_CONFIG_PATH) if it exists on disk
+ *   5. nothing -- throw
  * `~/` is expanded in 1 and 2 (systemd Environment= does not expand it).
+ *
+ * There is deliberately no in-repo fallback. `config/skgateway.yaml` is a real
+ * 499-line estate config and `config/skgateway-codex.yaml` is chi's, so falling
+ * through to either meant a host with a missing or misnamed runtime config
+ * silently booted ANOTHER estate's provider set, endpoints and admission caps
+ * instead of refusing to start. For a router that is worse than downtime: it
+ * looks healthy while sending traffic to backends this estate does not own.
+ * Those files stay in the tree because the test suite loads them as fixtures;
+ * they are no longer a runtime fallback. Fail closed and say what to set.
  *
  * @param {string} [explicit]  Optional explicit override.
  * @returns {string} Absolute path to the config file to load.
+ * @throws {Error} When no config can be resolved.
  */
 export function resolveConfigPath(explicit) {
   if (explicit) return expandHome(explicit);
   if (process.env.SKGATEWAY_CONFIG) return expandHome(process.env.SKGATEWAY_CONFIG);
+  const estate = (process.env.SKWORLD_ESTATE || '').trim();
+  if (estate) {
+    const perEstate = estateConfigPath(estate);
+    if (existsSync(perEstate)) return perEstate;
+  }
   if (existsSync(SYNCED_CONFIG_PATH)) return SYNCED_CONFIG_PATH;
-  return resolve(REPO_ROOT, 'config', 'skgateway.yaml');
+  throw new Error(
+    'skgateway: no runtime config found. Set $SKGATEWAY_CONFIG to an absolute ' +
+      'path, or set $SKWORLD_ESTATE=<estate> and create ' +
+      `${estateConfigPath(estate || '<estate>')}, or create ${SYNCED_CONFIG_PATH}. ` +
+      'The in-repo config/ files are per-estate fixtures, not a fallback: booting ' +
+      "another estate's provider set silently is worse than refusing to start.",
+  );
 }
 
 // ─── defaults ─────────────────────────────────────────────────────────────────
@@ -276,6 +314,34 @@ const DEFAULTS = {
   routing: {
     strict_targets: true,
     match_enabled: false,
+    // Generic bucket participation. Strict, hot-reloadable policy over the
+    // open generic S/M/L buckets only: favor or disable a provider or model
+    // there without touching direct routes or provider-focused
+    // `sk-<provider>-<bucket>` routes. Normalized by
+    // normalizeGenericParticipation() in validate(), so boot and SIGHUP
+    // reload share one validator and an invalid candidate never replaces the
+    // active policy. Empty (the default) means every routable provider
+    // participates with weight 1; an operator's instance config sets its own
+    // weights, never a site-specific default baked into this public repo.
+    generic_participation: {
+      providers: {},
+      models: {},
+      buckets: {},
+    },
+    // Operator-fenced model ids excluded from GENERIC bucket membership only
+    // (never a focused or direct route). Survives a discovery refresh: the
+    // exclusion is re-applied from this config on every catalog rebuild, so
+    // a model cannot silently reappear in rotation just because discovery
+    // re-fetched it.
+    bucket_excluded_models: [],
+    // GENERIC-bucket-only fences (sk-s/sk-m/sk-l/sk-xl and the other
+    // provider-less buckets). bucket_excluded_models above applies to every
+    // bucket including focused sk-<provider>-<bucket> aliases, so it cannot be
+    // a fleet on/off switch. These two never touch focused or direct routes.
+    //   generic_bucket_providers        allowed provider/backend names; [] = all
+    //   generic_bucket_excluded_models  exact model ids kept out of generic buckets
+    generic_bucket_providers: [],
+    generic_bucket_excluded_models: [],
   },
 
   // CapAuth agent-identity (SKGateway P2.1). Every /v1/* request is resolved to
@@ -913,6 +979,25 @@ export function assertProviderRoutes(
     }
   }
 
+  // Generic participation policy. Run the SAME strict normalizer at boot and
+  // on every SIGHUP reload; on any schema violation push an error so the
+  // candidate config is rejected and the active policy is left untouched.
+  // Normalizing in place means consumers always read a frozen, validated
+  // policy.
+  try {
+    const routing = cfg.routing;
+    const normalized = normalizeGenericParticipation(
+      routing && typeof routing === 'object'
+        ? routing.generic_participation
+        : undefined,
+    );
+    if (routing && typeof routing === 'object') {
+      routing.generic_participation = normalized;
+    }
+  } catch (err) {
+    errs.push(`routing.generic_participation: ${err.message}`);
+  }
+
   // Codex is a provider boundary, not a capability hint. Validate both the
   // configured backends and live registry at boot and reload so a Codex-named
   // direct target, alias or bucket cannot point at another provider even
@@ -937,6 +1022,22 @@ export function assertProviderRoutes(
  */
 function validate(cfg, removedBackendIds = new Set()) {
   const errs = [];
+
+  const bucketExcluded = cfg.routing?.bucket_excluded_models;
+  if (!Array.isArray(bucketExcluded) || bucketExcluded.some((id) =>
+    typeof id !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9._:/-]*$/.test(id))) {
+    errs.push('routing.bucket_excluded_models must be an array of exact model IDs');
+  }
+  const genericProviders = cfg.routing?.generic_bucket_providers;
+  if (genericProviders !== undefined && (!Array.isArray(genericProviders) || genericProviders.some((id) =>
+    typeof id !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9._:-]*$/.test(id)))) {
+    errs.push('routing.generic_bucket_providers must be an array of provider/backend names');
+  }
+  const genericExcluded = cfg.routing?.generic_bucket_excluded_models;
+  if (genericExcluded !== undefined && (!Array.isArray(genericExcluded) || genericExcluded.some((id) =>
+    typeof id !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9._:/-]*$/.test(id)))) {
+    errs.push('routing.generic_bucket_excluded_models must be an array of exact model IDs');
+  }
 
   // server
   if (!Number.isInteger(cfg.server.port) || cfg.server.port < 1 || cfg.server.port > 65535)
@@ -1029,6 +1130,10 @@ function validate(cfg, removedBackendIds = new Set()) {
   // discovery
   if (typeof cfg.discovery.enabled !== 'boolean')
     errs.push('discovery.enabled must be a boolean');
+  for (const [name, provider] of Object.entries(cfg.discovery.providers ?? {})) {
+    if (typeof provider?.enabled !== 'boolean')
+      errs.push(`discovery.providers.${name}.enabled must be a boolean`);
+  }
 
   // authorization
   if (typeof cfg.authz.enforce !== 'boolean')
@@ -1214,7 +1319,15 @@ function _readAndBuild(filePath, silent) {
  * Handle SIGHUP: reload config and emit 'config-changed' if successful.
  * On validation failure, log the error but keep the old config active.
  *
+ * Returns the outcome instead of throwing, so BOTH the raw OS-signal listener
+ * and reloadConfig() (its exported wrapper for tests/tooling) can observe
+ * whether a reload actually applied. Previously this caught its own error and
+ * never threw, which meant reloadConfig()'s own try/catch around this call
+ * never fired: reloadConfig() silently reported `{ ok: true }` even when a
+ * reload failed validation and the old config was kept.
+ *
  * @param {boolean} silent
+ * @returns {{ ok: boolean, error?: Error }}
  */
 function _handleSighup(silent) {
   if (!silent) process.stderr.write('[skgateway:config] SIGHUP received — reloading config…\n');
@@ -1224,8 +1337,10 @@ function _handleSighup(silent) {
     _current = next;
     emitter.emit('config-changed', next, prev);
     if (!silent) process.stderr.write('[skgateway:config] Config reloaded successfully.\n');
+    return { ok: true };
   } catch (err) {
     process.stderr.write(`[skgateway:config] Reload failed — keeping old config: ${err.message}\n`);
+    return { ok: false, error: err };
   }
 }
 
@@ -1237,12 +1352,7 @@ function _handleSighup(silent) {
  * @returns {{ ok: boolean, error?: Error }}
  */
 export function reloadConfig(silent = false) {
-  try {
-    _handleSighup(silent);
-    return { ok: true };
-  } catch (err) {
-    return { ok: false, error: err };
-  }
+  return _handleSighup(silent);
 }
 
 /**

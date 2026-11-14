@@ -1,0 +1,18 @@
+## Placeholder config for the OPTIONAL shadow instance (SHADOW_ENABLED=1 in
+## instance.env). Only read when the shadow add-on is enabled; delete this
+## file if you don't use it. A shadow instance typically serves a narrower
+## backend profile on a loopback-only port, reached through its own ingress
+## or proxy rather than directly.
+
+server:
+  port: 28880
+  bind: 127.0.0.1
+  dashboard_enabled: false
+
+backends:
+  example-shadow-backend:
+    url: http://example-backend-host:11439/v1
+    auth_type: none
+    models:
+      - example-model-id
+    priority: 1

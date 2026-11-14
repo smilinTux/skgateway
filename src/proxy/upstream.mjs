@@ -15,6 +15,19 @@
  *    would otherwise hang the request forever. An optional idle timeout
  *    (`timeoutMs`) converts that into a fast 504 so the router can fail
  *    over instead of blocking. Disabled (0) by default: current behavior.
+ *  - `timeoutMs` is an IDLE timer and cannot bound total duration. Node resets
+ *    `ClientRequest#setTimeout` on any socket activity, so an upstream that
+ *    dribbles bytes, or a stalled SSE body emitting framing at any interval
+ *    under the timeout, never trips it and hangs indefinitely. Measured
+ *    2026-09-19: `kimi-for-coding` carried `timeout_ms: 30000` and hung past
+ *    45s without ever resolving. Because the router records backend health
+ *    only from a COMPLETED attempt, a request that never resolves never calls
+ *    `recordOutcome()`, so that backend reported healthy at a 0% error rate
+ *    for hours while every request to it wedged, and the fleet lane depending
+ *    on it stalled behind a health surface insisting it was fine.
+ *    `hardTimeoutMs` is therefore a true wall-clock ceiling: armed once at
+ *    send time, never reset by activity. It is what makes a wedge OBSERVABLE,
+ *    because the resulting 504 reaches `recordOutcome(false)`.
  *  - Hop-by-hop headers (`connection`, `keep-alive`) are stripped from
  *    proxied request headers to avoid confusing the upstream server.
  */
@@ -27,6 +40,17 @@ import { URL } from "node:url";
 // instead of a fresh TCP(+TLS) handshake per call (cuts ~tens of ms proxy tax).
 const _agentOpts = { keepAlive: true, keepAliveMsecs: 30000, maxSockets: 64, maxFreeSockets: 16 };
 const httpAgent = new http.Agent(_agentOpts);
+
+// A backend that sets an idle timeout is asserting that a healthy reply
+// arrives within this window. The wall-clock ceiling is that assertion times
+// this multiplier, so a normal slow completion is never cut off while an
+// upstream that has plainly wedged still terminates and becomes visible to
+// health. Derived rather than passed per call site on purpose: the router
+// reaches sendUpstream() from five places, and a ceiling that some call sites
+// forget to pass is exactly the silent gap this exists to close. A backend
+// with no idle timeout keeps the current unbounded behaviour, because giving
+// it a ceiling is a config decision and not one to make on its behalf here.
+const HARD_DEADLINE_MULTIPLIER = 3;
 const httpsAgent = new https.Agent(_agentOpts);
 
 // Matches a leading /v<digits> path segment, e.g. /v1/chat/completions -> /v1
@@ -101,6 +125,11 @@ export function buildUpstreamUrl(reqUrl, targetUrl) {
  * @param {AbortSignal|null} [signal=null]
  *   Downstream-client lifetime. Aborting it destroys the active upstream
  *   request and resolves with `status: 499` / `client_closed`.
+ * @param {number} [hardTimeoutMs=0]
+ *   Total wall-clock ceiling in milliseconds, armed once when the request is
+ *   sent and never reset by upstream activity. Unlike `timeoutMs` this bounds
+ *   the whole attempt, so it catches a slow-drip wedge that keeps the socket
+ *   nominally busy. Resolves `status: 504` / `upstream_deadline`. 0 disables.
  * @param {number} [maxResponseBytes=0]
  *   Local buffered-response ceiling. Zero disables it. This bounds providers
  *   whose native wire rejects token-limit parameters.
@@ -108,7 +137,7 @@ export function buildUpstreamUrl(reqUrl, targetUrl) {
  *   Always resolves.  Network failures resolve with `status: 502`; an idle
  *   timeout resolves with `status: 504`; both carry a JSON `{ error }` body.
  */
-export function sendUpstream(reqUrl, method, headers, body, targetUrl, timeoutMs = 0, signal = null, maxResponseBytes = 0) {
+export function sendUpstream(reqUrl, method, headers, body, targetUrl, timeoutMs = 0, signal = null, maxResponseBytes = 0, hardTimeoutMs = 0) {
   return new Promise((resolve) => {
     const upstream = buildUpstreamUrl(reqUrl, targetUrl);
 
@@ -116,13 +145,21 @@ export function sendUpstream(reqUrl, method, headers, body, targetUrl, timeoutMs
     // the 'error' handler, and we must resolve exactly once.
     let settled = false;
     let onAbort = null;
+    let deadlineTimer = null;
     const done = (r) => {
       if (settled) return;
       settled = true;
       if (signal && onAbort) signal.removeEventListener("abort", onAbort);
+      if (deadlineTimer !== null) clearTimeout(deadlineTimer);
       resolve(r);
     };
     let timedOut = false;
+    let deadlineExceeded = false;
+    // Explicit override wins; otherwise derive from the idle timeout this
+    // backend already declares. 0 stays 0: no timeout configured, no ceiling.
+    const deadlineMs = hardTimeoutMs > 0
+      ? hardTimeoutMs
+      : (timeoutMs > 0 ? timeoutMs * HARD_DEADLINE_MULTIPLIER : 0);
     let cancelled = false;
     const startedAt = Date.now();
     let firstByteAt = null;
@@ -215,18 +252,49 @@ export function sendUpstream(reqUrl, method, headers, body, targetUrl, timeoutMs
       });
     }
 
+    // The wall-clock ceiling. Armed once here and never rearmed, which is the
+    // whole point: upstream activity must not be able to postpone it.
+    if (deadlineMs > 0) {
+      deadlineTimer = setTimeout(() => {
+        deadlineExceeded = true;
+        // Resolve here rather than leaning on the request to emit an error.
+        // Once response headers have arrived, destroying the ClientRequest
+        // does not reliably emit `error` (the abort surfaces on the response
+        // object instead), so a deadline that merely destroyed would hang the
+        // very request it exists to terminate. Verified against a dribbling
+        // upstream that writes one byte every 500ms and never ends.
+        done({
+          status: 504,
+          headers: {},
+          body: Buffer.from(JSON.stringify({
+            error: {
+              message: `upstream exceeded hard deadline after ${deadlineMs}ms`,
+              code: "upstream_deadline",
+            },
+          })),
+          ...terminalTiming(),
+        });
+        upstreamReq.destroy();
+      }, deadlineMs);
+      deadlineTimer?.unref?.();
+    }
+
     upstreamReq.on("error", (err) => {
       done({
-        status: cancelled ? 499 : (timedOut ? 504 : 502),
+        status: cancelled ? 499 : ((timedOut || deadlineExceeded) ? 504 : 502),
         headers: {},
         body: Buffer.from(JSON.stringify({
           error: {
             message: cancelled
               ? "downstream client disconnected"
-              : (timedOut ? `upstream idle timeout after ${timeoutMs}ms` : err.message),
+              : deadlineExceeded
+                ? `upstream exceeded hard deadline after ${deadlineMs}ms`
+                : (timedOut ? `upstream idle timeout after ${timeoutMs}ms` : err.message),
             code: cancelled
               ? "client_closed"
-              : (timedOut ? "upstream_timeout" : "upstream_unreachable"),
+              : deadlineExceeded
+                ? "upstream_deadline"
+                : (timedOut ? "upstream_timeout" : "upstream_unreachable"),
           },
         })),
         ...terminalTiming(),

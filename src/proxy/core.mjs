@@ -56,8 +56,13 @@ import http from "node:http";
 import { URL } from "node:url";
 
 import { sendUpstream } from "./upstream.mjs";
+import { ingressRequestLimit, requestLimitError, requestLimitResponse } from "./request-limits.mjs";
 import { reduceTools, stripToolCallHistory } from "./tools.mjs";
-import { sanitizeContent, trimHistoryToBudget } from "./sanitizer.mjs";
+import {
+  normalizeSystemMessageOrder,
+  sanitizeContent,
+  trimHistoryToBudget,
+} from "./sanitizer.mjs";
 import { parseRetryAfter, jitteredBackoff } from "./retry.mjs";
 import { shouldForceNonStream } from "../classifiers/classifier.mjs";
 
@@ -285,6 +290,68 @@ const toolCallCounters = new Map();
 // ---------------------------------------------------------------------------
 
 /**
+ * Apply the response fixups shared by the standalone core and the composed
+ * gateway entrypoint. Mutates the parsed response in place.
+ *
+ * @param {object} resBody Parsed JSON response body from upstream.
+ * @param {ProxyConfig} cfg Active proxy config.
+ * @returns {object} The same response object after normalization.
+ */
+export function normalizeSuccessfulResponse(resBody, cfg) {
+  const log = cfg.logger.log.bind(cfg.logger);
+  const sanitize = cfg.sanitizer;
+  const choice = resBody.choices?.[0];
+
+  if (choice?.message?.content) {
+    choice.message.content = sanitize(choice.message.content);
+  }
+
+  const hadReasoning = !!(choice?.message?.reasoning || choice?.message?.reasoning_content);
+
+  if (choice?.message && !choice.message.content && choice.message.reasoning) {
+    const cleaned = sanitize(choice.message.reasoning.trim());
+    if (cleaned.length > cfg.reasoningPromoteThreshold) {
+      choice.message.content = cleaned;
+      log(`promoted reasoning to content (${cleaned.length} chars)`);
+    } else if (cleaned.length > 0) {
+      log(`suppressed short reasoning (${cleaned.length} chars): ${cleaned.slice(0, 80)}...`);
+    } else {
+      log("suppressed empty reasoning after sanitization");
+    }
+    delete choice.message.reasoning;
+  }
+
+  if (choice?.message && !choice.message.tool_calls?.length && choice.finish_reason !== "tool_calls") {
+    if (!choice.message.content || choice.message.content.trim().length === 0) {
+      if (hadReasoning) {
+        log("suppressed reasoning-only turn (no content, no tool calls)");
+      } else {
+        choice.message.content = cfg.emptyResponseFallback;
+        log("injected fallback for empty text response");
+      }
+    }
+  }
+
+  return resBody;
+}
+
+/**
+ * Sanitize a buffered successful JSON response while preserving the exact
+ * upstream bytes when no fixup is needed.
+ *
+ * @param {Buffer} body Buffered upstream response.
+ * @param {ProxyConfig} cfg Active proxy config.
+ * @returns {Buffer}
+ */
+export function sanitizeSuccessfulResponseBody(body, cfg) {
+  const parsed = JSON.parse(body.toString("utf-8"));
+  const before = JSON.stringify(parsed);
+  normalizeSuccessfulResponse(parsed, cfg);
+  const after = JSON.stringify(parsed);
+  return after === before ? body : Buffer.from(after, "utf-8");
+}
+
+/**
  * Sanitize and send a successful (200) response to the client.
  *
  * When `asSSE` is true the JSON non-streaming response is converted to a
@@ -303,54 +370,9 @@ const toolCallCounters = new Map();
  * @param {ProxyConfig} cfg  Active proxy config.
  */
 export function sendOk(clientRes, resBody, headers, asSSE, cfg) {
-  const log = cfg.logger.log.bind(cfg.logger);
-  const sanitize = cfg.sanitizer;
-  const choice = resBody.choices?.[0];
+  normalizeSuccessfulResponse(resBody, cfg);
 
-  // --- 1. Sanitize main content ---
-  if (choice?.message?.content) {
-    choice.message.content = sanitize(choice.message.content);
-  }
-
-  // --- 2. Track whether original response had reasoning BEFORE we delete it ---
-  // This is important: if the entire response was reasoning (no content, no tool
-  // calls), we must NOT inject the fallback text — it would be visible to the
-  // user and is misleading when the model was just "thinking between rounds".
-  const hadReasoning = !!(choice?.message?.reasoning || choice?.message?.reasoning_content);
-
-  // --- 3. Promote reasoning → content when content is empty ---
-  // Kimi K2.5 sometimes puts its actual user-facing response in `reasoning`
-  // instead of `content`.  Only promote if it's substantial and looks like
-  // a real answer (not inner monologue like "Let me call the tool").
-  if (choice?.message && !choice.message.content && choice.message.reasoning) {
-    const cleaned = sanitize(choice.message.reasoning.trim());
-    if (cleaned.length > cfg.reasoningPromoteThreshold) {
-      choice.message.content = cleaned;
-      log(`promoted reasoning→content (${cleaned.length} chars)`);
-    } else if (cleaned.length > 0) {
-      log(`suppressed short reasoning (${cleaned.length} chars): ${cleaned.slice(0, 80)}...`);
-    } else {
-      log(`suppressed empty reasoning after sanitization`);
-    }
-    delete choice.message.reasoning;
-  }
-
-  // --- 4. Inject fallback when model returns empty text with no tool calls ---
-  // But suppress the fallback for reasoning-only turns (K2.5 "thinking between
-  // rounds") — the gateway will handle this as an empty assistant turn.
-  if (choice?.message && !choice.message.tool_calls?.length && choice.finish_reason !== "tool_calls") {
-    if (!choice.message.content || choice.message.content.trim().length === 0) {
-      if (hadReasoning) {
-        // K2.5 thinking between rounds — leave empty, don't inject visible fallback
-        log(`suppressed reasoning-only turn (no content, no tool calls)`);
-      } else {
-        choice.message.content = cfg.emptyResponseFallback;
-        log(`injected fallback for empty text response`);
-      }
-    }
-  }
-
-  // --- 5. Send the response ---
+  // --- Send the response ---
   if (asSSE) {
     // Client requested streaming — convert the buffered JSON response to SSE
     if (!clientRes.headersSent) {
@@ -487,6 +509,10 @@ function truncateLargeToolResults(parsed) {
  * @param {ProxyConfig} cfg
  */
 export function trimConversationHistory(parsed, cfg) {
+  // Logical GLM limits are resolved at dispatch. Silently trimming here hides
+  // the real context size from native workers and prevents their compaction.
+  // Ingress and per-candidate transport limits still reject oversized bodies.
+  if (/^sk-(?:glm|zai)-(?:s|m|l)$/.test(parsed.model)) return;
   if (!Array.isArray(parsed.messages) || parsed.messages.length < 6) return;
 
   // Pass 1: truncate large tool results - ONLY over budget. This used to run
@@ -571,6 +597,39 @@ export function trimSystemMessages(parsed, cfg) {
       .reduce((sum, m) => sum + Buffer.byteLength(m.content, "utf-8"), 0);
     log(`trimmed system prompt: ${before} → ${after} bytes (${trimmedCount} messages trimmed)`);
   }
+}
+
+/**
+ * Apply the configured global or per-model request limits to a tool request.
+ * Non-tool requests are left byte-for-byte unchanged by returning `body: null`.
+ * A request that still exceeds either limit after the existing trim stages is
+ * rejected by the caller instead of being sent upstream unsanitized.
+ *
+ * @param {object} parsed Parsed request body (mutated in place when applicable).
+ * @param {ProxyConfig} cfg Active proxy config.
+ * @returns {{applied:boolean, ok:boolean, body:Buffer|null, bodyBytes:number, systemBytes:number}}
+ */
+export function applyModelLimits(parsed, cfg) {
+  if (!parsed || !Array.isArray(parsed.tools) || parsed.tools.length === 0) {
+    return { applied: false, ok: true, body: null, bodyBytes: 0, systemBytes: 0 };
+  }
+
+  const perModel = cfg.modelLimits?.[parsed.model || ""];
+  const effectiveCfg = perModel ? { ...cfg, ...perModel } : cfg;
+
+  trimSystemMessages(parsed, effectiveCfg);
+  trimConversationHistory(parsed, effectiveCfg);
+
+  const body = Buffer.from(JSON.stringify(parsed), "utf-8");
+  const systemBytes = Array.isArray(parsed.messages)
+    ? parsed.messages
+      .filter((message) => message.role === "system" && typeof message.content === "string")
+      .reduce((sum, message) => sum + Buffer.byteLength(message.content, "utf-8"), 0)
+    : 0;
+  const bodyBytes = body.length;
+  const ok = bodyBytes <= effectiveCfg.maxBodyBytes && systemBytes <= effectiveCfg.maxSystemBytes;
+
+  return { applied: true, ok, body, bodyBytes, systemBytes };
 }
 
 // ---------------------------------------------------------------------------
@@ -667,8 +726,34 @@ export async function handleRequest(clientReq, clientRes, cfg) {
   const error = cfg.logger.error.bind(cfg.logger);
 
   // --- Buffer the full request body ---
+  // The model isn't known yet (routing happens after the body is read), so
+  // the ingress ceiling admits the largest body any configured model may
+  // send; a tighter per-model bound is enforced below once parsed.
+  const transportConfig = {
+    sanitizer: { max_body_bytes: cfg.maxBodyBytes, max_system_bytes: cfg.maxSystemBytes },
+    model_limits: Object.fromEntries(Object.entries(cfg.modelLimits || {}).map(([model, limits]) =>
+      [model, { max_body_bytes: limits.maxBodyBytes, max_system_bytes: limits.maxSystemBytes }])),
+  };
+  const ingressLimit = ingressRequestLimit(transportConfig);
+  const reject = (rejection) => {
+    const result = requestLimitResponse(rejection);
+    clientRes.writeHead(result.status, result.headers);
+    clientRes.end(result.body);
+  };
   const chunks = [];
-  for await (const chunk of clientReq) chunks.push(chunk);
+  let receivedBytes = 0;
+  for await (const chunk of clientReq) {
+    receivedBytes += chunk.length;
+    if (receivedBytes > ingressLimit) {
+      reject({
+        message: "Request body exceeds the configured transport limit; history was not modified",
+        code: "request_too_large", type: "invalid_request_error", param: "body",
+        actual_bytes: receivedBytes, limit_bytes: ingressLimit, retryable: false,
+      });
+      return;
+    }
+    chunks.push(chunk);
+  }
   let body = Buffer.concat(chunks);
 
   const contentType = clientReq.headers["content-type"] || "";
@@ -681,9 +766,38 @@ export async function handleRequest(clientReq, clientRes, cfg) {
   if (isChatCompletion) {
     try {
       parsed = JSON.parse(body.toString("utf-8"));
+      if (normalizeSystemMessageOrder(parsed.messages)) {
+        body = Buffer.from(JSON.stringify(parsed), "utf-8");
+      }
     } catch {
       // Parse failure — fall through to transparent relay
     }
+  }
+
+  // --- Explicit byte-limit rejection, once the concrete model is known ---
+  // A request whose size is dominated by its tool definitions gets one
+  // retry: reduce to the same proactive tool budget the tool-processing path
+  // below would apply anyway, and re-check before rejecting. This lets a
+  // caller that shipped its full toolset (instead of declaring
+  // enabled_toolsets) succeed on the first request rather than being bounced
+  // to retry smaller itself.
+  if (parsed) {
+    const perModelCfg = { ...cfg, ...cfg.modelLimits?.[parsed.model || ""] };
+    let rejection = requestLimitError(body, perModelCfg);
+    if (rejection && Array.isArray(parsed.tools) && parsed.tools.length > cfg.proactiveToolLimit) {
+      const reducedTools = cfg.toolReducer(parsed.tools, parsed.messages, cfg.proactiveToolLimit);
+      const reducedBody = Buffer.from(JSON.stringify({ ...parsed, tools: reducedTools }), "utf-8");
+      const retryRejection = requestLimitError(reducedBody, perModelCfg);
+      if (retryRejection) {
+        rejection = retryRejection;
+      } else {
+        log(`request limit retry: reduced ${parsed.tools.length}->${reducedTools.length} tools, now within limit`);
+        parsed.tools = reducedTools;
+        body = reducedBody;
+        rejection = null;
+      }
+    }
+    if (rejection) { reject(rejection); return; }
   }
 
   // --- Transparent relay for non-tool or non-chat requests ---
@@ -798,15 +912,19 @@ export async function handleRequest(clientReq, clientRes, cfg) {
     }
   }
 
-  // --- Resolve per-model limits (overrides global maxBodyBytes / maxSystemBytes) ---
-  const perModel = cfg.modelLimits?.[parsed.model || ""];
-  const effectiveCfg = perModel ? { ...cfg, ...perModel } : cfg;
-
-  // --- Trim system messages first (to free budget for history) ---
-  trimSystemMessages(parsed, effectiveCfg);
-
-  // --- Trim conversation history ---
-  trimConversationHistory(parsed, effectiveCfg);
+  // --- Apply global or per-model request limits ---
+  const limitResult = applyModelLimits(parsed, cfg);
+  if (!limitResult.ok) {
+    clientRes.writeHead(413, { "content-type": "application/json" });
+    clientRes.end(JSON.stringify({
+      error: {
+        message: "Request still exceeds configured model limits after trimming",
+        code: "model_limit_exceeded",
+        status: 413,
+      },
+    }));
+    return;
+  }
 
   // --- Tool round limit check ---
   // Track consecutive tool result turns per model to prevent infinite loops.
@@ -841,6 +959,8 @@ export async function handleRequest(clientReq, clientRes, cfg) {
       toolCallCounters.set(modelKey, 0);
     }
   }
+
+  normalizeSystemMessageOrder(parsed.messages);
 
   const model = parsed.model || "unknown";
 

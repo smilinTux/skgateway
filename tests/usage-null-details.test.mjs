@@ -66,7 +66,7 @@ test("omitted and well-formed detail blocks still pass", () => {
 });
 
 test("a malformed non-null detail block is still rejected", () => {
-  // Wrong key, extra key, wrong type, and out-of-range must all stay invalid —
+  // Wrong key, extra key, wrong type, and out-of-range must all stay invalid.
   // null-tolerance must not become "skip the check".
   assert.notEqual(statusOf({ ...BASE, prompt_tokens_details: { wrong_key: 1 } }), "200");
   assert.notEqual(statusOf({ ...BASE, prompt_tokens_details: { cached_tokens: 0, extra: 1 } }), "200");

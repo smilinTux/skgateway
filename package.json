@@ -11,7 +11,7 @@
     "start": "node src/index.mjs",
     "dev": "node --watch src/index.mjs",
     "sync:pi-models": "node scripts/sync-pi-models.mjs",
-    "test": "node --test --import ./tests/_setup.mjs tests/*.test.mjs"
+    "test": "node scripts/test-per-file.mjs"
   },
   "dependencies": {
     "better-sqlite3": "^12.10.1",

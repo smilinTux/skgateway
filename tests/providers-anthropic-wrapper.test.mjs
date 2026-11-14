@@ -6,7 +6,20 @@ test('normalize keeps Claude chat IDs as paid anthropic models', () => {
   assert.deepEqual(normalize({ data: [
     { id: 'claude-sonnet-new' },
     { id: 'not-claude' },
-  ]}), [{ id: 'claude-sonnet-new', provider: 'anthropic', free: false, card: null }]);
+  ]}), [{
+    id: 'claude-sonnet-new',
+    provider: 'anthropic',
+    free: false,
+    capability: {
+      served_id: 'claude-sonnet-new',
+      revision: null,
+      context_limit: null,
+      availability: false,
+      provider_route: 'anthropic',
+      public_eligible: false,
+    },
+    card: null,
+  }]);
 });
 
 test('fetch authenticates against the wrapper models endpoint', async () => {

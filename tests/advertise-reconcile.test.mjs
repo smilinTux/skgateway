@@ -24,7 +24,7 @@ import {
 } from "../src/proxy/advertise.mjs";
 
 // ── Fake backend matching the router's Backend public surface ──
-function fakeBackend({ models = [], available = true }) {
+function fakeBackend({ models = [], available = true, claimAvailable = true }) {
   return {
     models,
     supportsModel(model) {
@@ -33,6 +33,9 @@ function fakeBackend({ models = [], available = true }) {
     },
     isAvailable() {
       return available;
+    },
+    isModelClaimAvailable() {
+      return claimAvailable;
     },
   };
 }
@@ -89,6 +92,12 @@ describe("isModelAvailable composes with quarantine/health", () => {
   });
   test("unavailable when every serving backend is down/quarantined", () => {
     assert.equal(isModelAvailable("nvidia/llama-3.1-70b", router({ localUp: true, nvidiaUp: false })), false);
+  });
+  test("unavailable while the exact model claim is quarantined", () => {
+    const r = fakeRouter({
+      zai: fakeBackend({ models: ["glm-4.6"], available: true, claimAvailable: false }),
+    });
+    assert.equal(isModelAvailable("glm-4.6", r), false);
   });
   test("fails OPEN when no router signal is present", () => {
     assert.equal(isModelAvailable("anything", null), true);

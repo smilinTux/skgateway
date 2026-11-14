@@ -181,6 +181,11 @@ backends:
     priority: 1
 
   anthropic:
+    # DISABLED 2026-10-16 (Chef's directive): the claude-code-api wrapper at
+    # :18782 is off the route; claude-* requests now 503 fail-closed instead
+    # of hitting the wrapper. Re-enable by flipping this to true once the
+    # wrapper is back and `GET /v1/models` + a real completion verify.
+    enabled: false
     # Route Claude models through the LOCAL Claude Code client wrapper
     # (claude-code-api :18782 = `claude --print`) so they bill as genuine
     # FIRST-PARTY subscription usage. Hitting api.anthropic.com directly with the

@@ -156,7 +156,7 @@ curl -s "http://localhost:18781/api/costs?period=24h" | jq .rows
 Token data is stored in SQLite at `./data/metrics.db` and retained for 90 days by default. You can query it directly for custom reports:
 
 ```bash
-sqlite3 ~/clawd/skcapstone-repos/skgateway/data/metrics.db \
+sqlite3 /home/YOUR_USER/skcapstone-repos/skgateway/data/metrics.db \
   "SELECT day_bucket, SUM(input_tokens), SUM(output_tokens)
    FROM token_usage
    WHERE agent_id = 'opus'

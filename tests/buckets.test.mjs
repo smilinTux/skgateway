@@ -23,10 +23,12 @@ import {
   resolveBucket,
   capacityRoutabilityRejection,
   orderMembersByCost,
+  orderMembersForClass,
   selectMember,
   gradeVocabulary,
   measuredClassCeiling,
   effectiveClass,
+  physicalCapacity,
 } from '../src/policy/buckets.mjs';
 import { TRUST_ZONES } from '../src/policy/sensitivity.mjs';
 
@@ -95,7 +97,11 @@ describe('C9: bucket addressing', () => {
     assert.deepEqual(v.sensitivity.values, ['public', 'internal', 'secret']);
     // risk is a SEPARATE axis and must not have been folded into the bucket id
     assert.deepEqual(v.risk.values, ['low', 'med', 'high', 'crit']);
-    assert.equal(allBuckets().length, 28, '12 scoped, 4 short public, and 12 provider-focused S/M/L buckets');
+    // 12 scoped + 4 short public + 15 provider-focused S/M/L: allBuckets()
+    // generates one bucket per class for each of zai, glm, kimi, codex,
+    // deepseek (5 names x 3 classes = 15; cursor is parsed/addressed via the
+    // regexes but is not in this generation loop, same as before this change).
+    assert.equal(allBuckets().length, 31, '12 scoped, 4 short public, and 15 provider-focused S/M/L buckets');
     assert.equal(parseBucketId('sk-kimi-xl'), null);
     assert.equal(looksLikeBucketAttempt('sk-kimi-xl').attempted, true);
     assert.equal(allBuckets().some(({ bucket }) => bucket.startsWith('sk-cursor-')), false);
@@ -161,17 +167,35 @@ describe('C9: eligibility composes the floor with the sovereignty ceiling', () =
     assert.ok(rejected.find((r) => r.id === 'tiny-free').reason.includes('below floor M'));
   });
 
-  test('sk-l-public excludes local Qwen and keeps eligible subscription providers', () => {
+  test('sk-l-public excludes local Qwen and keeps every eligible remote pool', () => {
     const cloudCatalog = [
       { ...entry('qwen3.8-27b', { zone: TRUST_ZONES.SOVEREIGN_LOCAL, declared: 'L' }), provider: 'local' },
       { ...entry('glm-4.7', { zone: TRUST_ZONES.FREE_REMOTE, declared: 'L' }), provider: 'zai' },
       { ...entry('kimi-for-coding', { zone: TRUST_ZONES.FREE_REMOTE, declared: 'L' }), provider: 'kimi-for-coding' },
       { ...entry('gpt-5.6-luna', { zone: TRUST_ZONES.FREE_REMOTE, declared: 'L' }), provider: 'codex' },
+      { ...entry('vendor/model-30b:free', { zone: TRUST_ZONES.FREE_REMOTE, declared: 'L' }), provider: 'openrouter' },
+      { ...entry('nvidia/nemotron-3-ultra', { zone: TRUST_ZONES.FREE_REMOTE, declared: 'L' }), provider: 'nvidia' },
     ];
     for (const id of ['sk-l-public', 'sk-l']) {
       const { members, rejected } = resolveBucket({ bucket: parseBucketId(id), catalog: cloudCatalog });
-      assert.deepEqual(members.map((model) => model.id), ['glm-4.7', 'kimi-for-coding', 'gpt-5.6-luna']);
-      assert.match(rejected.find((model) => model.id === 'qwen3.8-27b').reason, /subscription providers/);
+      assert.deepEqual(members.map((model) => model.id), [
+        'glm-4.7', 'kimi-for-coding', 'gpt-5.6-luna', 'vendor/model-30b:free', 'nvidia/nemotron-3-ultra',
+      ]);
+      // The local exclusion card a46b53e exists for is the part that must hold.
+      assert.match(rejected.find((model) => model.id === 'qwen3.8-27b').reason, /admits only remote pools/);
+      assert.equal(members.some((model) => model.id === 'qwen3.8-27b'), false);
+    }
+  });
+
+  test('the free remote pools stay out of internal and secret L buckets', () => {
+    const cloudCatalog = [
+      { ...entry('vendor/model-30b:free', { zone: TRUST_ZONES.FREE_REMOTE, declared: 'L' }), provider: 'openrouter' },
+      { ...entry('nvidia/nemotron-3-ultra', { zone: TRUST_ZONES.FREE_REMOTE, declared: 'L' }), provider: 'nvidia' },
+    ];
+    for (const id of ['sk-l-internal', 'sk-l-secret']) {
+      const { members, rejected } = resolveBucket({ bucket: parseBucketId(id), catalog: cloudCatalog });
+      assert.deepEqual(members, [], `${id} must not admit a free remote pool`);
+      assert.ok(rejected.every((model) => /trust zone|exceeds ceiling/i.test(model.reason)));
     }
   });
 
@@ -344,6 +368,34 @@ describe('C9: cost-ranked selection rotates only among equal-cost members', () =
     );
   });
 
+  test('S, M, L and XL select the nearest admitted class instead of one cheap XL model', () => {
+    const mixed = [
+      { id: 'xl-cheap', model_class: 'XL', cost_tier: 'local' },
+      { id: 's-paid', model_class: 'S', cost_tier: 'paid-cloud' },
+      { id: 'l-free', model_class: 'L', cost_tier: 'free-remote' },
+      { id: 'm-paid', model_class: 'M', cost_tier: 'paid-cloud' },
+    ];
+
+    assert.deepEqual(
+      ['S', 'M', 'L', 'XL'].map((modelClass) =>
+        selectMember(mixed, 0, null, modelClass).id),
+      ['s-paid', 'm-paid', 'l-free', 'xl-cheap'],
+    );
+  });
+
+  test('class-fit ordering retains larger classes as upward-only failover', () => {
+    const mixed = [
+      { id: 'xl', model_class: 'XL', cost_tier: 'local' },
+      { id: 'm', model_class: 'M', cost_tier: 'paid-cloud' },
+      { id: 'l', model_class: 'L', cost_tier: 'free-remote' },
+    ];
+
+    assert.deepEqual(
+      orderMembersForClass(mixed, 'M', 0).map((member) => member.id),
+      ['m', 'l', 'xl'],
+    );
+  });
+
   test('DRILL: an S-graded public card moves from blind fleet rotation to the sovereign local tier', () => {
     const liveShape = [
       ...Array.from({ length: 17 }, (_, i) => ({ id: `paid-${i}`, cost_tier: 'paid-cloud' })),
@@ -377,6 +429,19 @@ describe('C9: cost-ranked selection rotates only among equal-cost members', () =
     for (const c of [-1, -7, 1e9, 0.5]) {
       assert.ok(members.includes(selectMember(members, c)));
     }
+  });
+
+  test('four aliases on one llama server report one physical service', () => {
+    const members = ['qwen-a', 'qwen-b', 'qwen-c', 'qwen-d'].map((id) => ({
+      id,
+      backend: 'chiap08-qwen38',
+      physical_service: 'http://chiap08:11439/v1',
+    }));
+    assert.deepEqual(physicalCapacity(members), [{
+      service: 'http://chiap08:11439/v1',
+      backend: 'chiap08-qwen38',
+      models: ['qwen-a', 'qwen-b', 'qwen-c', 'qwen-d'],
+    }]);
   });
 
   test('NEGATIVE CONTROL: ranking cannot admit a member rejected by the trust ceiling', () => {

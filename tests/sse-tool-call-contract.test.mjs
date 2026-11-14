@@ -195,8 +195,13 @@ describe("completed SSE tool-call structure", () => {
     assert.equal(result.status, 200);
     assert.match(result.body.toString(), /"total_tokens":5/);
 
+    // A top-level `usage: null` is deliberately NOT in this rejected list: a
+    // provider (DeepSeek among them) that sends `usage: null` on a non-final
+    // chunk means "no usage in this frame yet", the same tolerance already
+    // given to the nested prompt_tokens_details/completion_tokens_details
+    // blocks (tests/usage-null-details.test.mjs). Omitting the `usage` key
+    // entirely already validated; a present-but-null value must too.
     for (const usage of [
-      null,
       [],
       { prompt_tokens: 1 },
       { prompt_tokens: 1, completion_tokens: "1", total_tokens: 2 },
@@ -207,6 +212,11 @@ describe("completed SSE tool-call structure", () => {
     ]) assertCompletionRejected(rawResponse([contentFrame("stop"), usageFrame(usage), "data: [DONE]"]));
 
     assertCompletionRejected(rawResponse([contentFrame("stop"), valid, valid, "data: [DONE]"]));
+
+    assert.equal(
+      rawResponse([contentFrame("stop"), usageFrame(null), "data: [DONE]"]).status, 200,
+      "a top-level usage: null frame must validate like an omitted usage key",
+    );
   });
 
   test("accepts bounded reasoning-token usage details", () => {

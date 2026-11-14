@@ -100,6 +100,14 @@ export function normalize(json, opts = {}) {
         // is no free tier of this backend to detect, so the flag is constant
         // rather than derived from data that does not exist.
         free: false,
+        capability: {
+          served_id: m.slug,
+          revision: typeof m.revision === 'string' ? m.revision : null,
+          context_limit: typeof m.context_window === 'number' ? m.context_window : null,
+          availability: m.visibility !== 'hide' && m.supported_in_api !== false,
+          provider_route: 'codex',
+          public_eligible: m.public_eligible === true,
+        },
         card: {
           context_length: typeof m.context_window === 'number' ? m.context_window : null,
           max_output_tokens: null,

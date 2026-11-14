@@ -31,6 +31,8 @@ const savedEnv = {};
 beforeEach(() => {
   savedEnv.HOME_ENV = process.env.SKCAPSTONE_HOME;
   savedEnv.STANDALONE = process.env.SK_STANDALONE;
+  savedEnv.HEALTH_URL = process.env.SKGATEWAY_HEALTH_URL;
+  delete process.env.SKGATEWAY_HEALTH_URL;
   delete process.env.SK_STANDALONE;
   home = mkdtempSync(join(tmpdir(), "skgw_sk_"));
   process.env.SKCAPSTONE_HOME = home;
@@ -38,6 +40,8 @@ beforeEach(() => {
 
 afterEach(() => {
   rmSync(home, { recursive: true, force: true });
+  if (savedEnv.HEALTH_URL === undefined) delete process.env.SKGATEWAY_HEALTH_URL;
+  else process.env.SKGATEWAY_HEALTH_URL = savedEnv.HEALTH_URL;
   if (savedEnv.HOME_ENV === undefined) delete process.env.SKCAPSTONE_HOME;
   else process.env.SKCAPSTONE_HOME = savedEnv.HOME_ENV;
   if (savedEnv.STANDALONE === undefined) delete process.env.SK_STANDALONE;
@@ -120,13 +124,31 @@ describe("present (file-based publish)", () => {
 
   test("registerService writes a discovery registry entry", () => {
     assert.equal(
-      registerService({ healthUrl: "http://localhost:18780/health" }),
+      registerService({ healthUrl: "https://gateway.example/health" }),
       true,
     );
     const entry = JSON.parse(
       readFileSync(join(home, "registry", "skgateway.json"), "utf8"),
     );
     assert.equal(entry.name, "skgateway");
-    assert.equal(entry.health_url, "http://localhost:18780/health");
+    assert.equal(entry.health_url, "https://gateway.example/health");
   });
+});
+
+
+test("unconfigured or host-local startup preserves the shared gateway record", () => {
+  assert.equal(registerService({ healthUrl: "https://gateway.example/health" }), true);
+  const path = join(home, "registry", "skgateway.json");
+  const before = readFileSync(path, "utf8");
+  assert.equal(registerService(), false);
+  for (const healthUrl of ["http://localhost:1234/health", "http://127.0.0.1/health", "http://[::1]/health", "http://[::ffff:127.0.0.1]/health", "http://127.9.8.7/health", "http://localhost./health", "http://0.0.0.0/health", "http://[::]/health", "https://user:password@gateway.example/health", "file:///tmp/health", "invalid"]) {
+    assert.equal(registerService({ healthUrl }), false);
+    assert.equal(readFileSync(path, "utf8"), before);
+  }
+});
+
+test("startup can advertise an explicit reachable liveness endpoint", () => {
+  process.env.SKGATEWAY_HEALTH_URL = "https://gateway.example/health";
+  assert.equal(registerService(), true);
+  assert.equal(JSON.parse(readFileSync(join(home, "registry", "skgateway.json"))).health_url, process.env.SKGATEWAY_HEALTH_URL);
 });

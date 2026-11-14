@@ -22,6 +22,7 @@ import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
 import { sendUpstream } from "./upstream.mjs";
+import { modelRequestLimits, requestLimitError, requestLimitResponse } from "./request-limits.mjs";
 import { createEvent, EventType } from "../siem/events.mjs";
 import { isAnthropicBackend, toAnthropicRequest, toOpenAIResponse } from "./anthropic-adapter.mjs";
 import {
@@ -50,6 +51,7 @@ import { enforceResponseContract } from "./response-contract.mjs";
 import { shouldForceNonStream } from "../classifiers/classifier.mjs";
 import { openAIJsonToSSEBuffer } from "./stream.mjs";
 import { createDecisionCache, decisionKey } from "./decision-cache.mjs";
+import { bucketAffinityKey, isContinuation, preferRemembered } from "../policy/bucket-affinity.mjs";
 // card P4.2 (@match routing): reuse the existing ranker + capability deriver
 // + discovery cache reader + allowlist/availability checks as-is, no
 // reimplementation. getConfig() gates the whole branch behind
@@ -70,7 +72,9 @@ import {
 import {
   parseBucketId,
   resolveBucket,
+  orderMembersForClass,
   orderMembersByCost,
+  orderMembersByGenericWeight,
   validateFamilyPreference,
   applyFamilyPreference,
   selectMember,
@@ -78,12 +82,18 @@ import {
   looksLikeBucketAttempt,
   allBuckets,
   publicLSubscriptionOwns,
+  isGenericBucket,
+  genericBucketFence,
 } from "../policy/buckets.mjs";
 import { codexPurityProblems } from "../policy/codex-purity.mjs";
 
 const KIMI_OAUTH_HOST = "https://auth.kimi.com";
 const KIMI_OAUTH_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098";
 const KIMI_REFRESH_BUFFER_MS = 60_000;
+// How often startKimiAuthKeepalive polls kimi_oauth backends (see that
+// function below). Well under KIMI_REFRESH_BUFFER_MS so the poll cannot
+// step over the refresh window between two ticks.
+const KIMI_KEEPALIVE_INTERVAL_MS = 30_000;
 const kimiRefreshes = new Map();
 
 function writeJsonAtomic(filePath, value) {
@@ -106,6 +116,9 @@ function writeJsonAtomic(filePath, value) {
 
 // sk-auto routing decision cache (TTL+LRU); keyed by request fingerprint + config epoch.
 const _autoDecisionCache = createDecisionCache({ ttlMs: 60_000, maxEntries: 500 });
+// One agent session stays on one bucket member (see policy/bucket-affinity.mjs).
+// Two hours covers a long builder session; 5000 entries bounds memory.
+const _bucketAffinity = createDecisionCache({ ttlMs: 2 * 60 * 60 * 1000, maxEntries: 5000 });
 // @match ranked-pick decision cache (card P4.2). Separate from the sk-auto
 // cache above so entries never collide; same TTL/LRU discipline.
 const _matchDecisionCache = createDecisionCache({ ttlMs: 60_000, maxEntries: 500 });
@@ -880,7 +893,7 @@ export class Backend {
     this.model_claim_quarantine_cooldown_ms = typeof config.model_claim_quarantine_cooldown_ms === "number"
       ? config.model_claim_quarantine_cooldown_ms
       : DEFAULT_MODEL_CLAIM_QUARANTINE_COOLDOWN_MS;
-    /** @type {Map<string,{failures:number,quarantinedAt:number,lastStatus:number}>} */
+    /** @type {Map<string,{failures:number,quarantinedAt:number,lastStatus:number,lastReason:?string,probing:boolean,probingSince?:number}>} */
     this._modelClaimFailures = new Map();
 
     // Auth credentials. credentials_path (the key the YAML schema and
@@ -997,20 +1010,65 @@ export class Backend {
   /** Whether this exact declared backend-model claim is currently selectable. */
   isModelClaimAvailable(model) {
     const state = this._modelClaimFailures.get(model);
-    if (!state?.quarantinedAt) return true;
-    return Date.now() - state.quarantinedAt >= this.model_claim_quarantine_cooldown_ms;
+    return !state?.quarantinedAt;
   }
 
-  /** Observable exact-claim state for the shared recovery scheduler. */
+  /**
+   * Admit one half-open recovery probe after cooldown, never ordinary traffic.
+   * The lease is bounded to one cooldown window: route() can take it for a
+   * candidate that is never sent (the lifecycle-gate check discards route()
+   * results, and @match/bucket chains stop at the first success), and an
+   * unbounded lease would then pin the claim quarantined forever. An expired
+   * lease may be re-acquired, so at most one probe runs per window.
+   */
+  tryAcquireModelClaimProbe(model) {
+    const state = this._modelClaimFailures.get(model);
+    if (!state?.quarantinedAt) return false;
+    const now = Date.now();
+    const window = this.model_claim_quarantine_cooldown_ms;
+    if (now - state.quarantinedAt < window) return false;
+    if (state.probing && now - (state.probingSince || 0) < window) return false;
+    state.probing = true;
+    state.probingSince = now;
+    return true;
+  }
+
+  /** Release a half-open lease when no upstream attempt was made. */
+  releaseModelClaimProbe(model) {
+    const state = this._modelClaimFailures.get(model);
+    if (state?.probing) {
+      state.probing = false;
+      state.probingSince = 0;
+    }
+  }
+
+  /**
+   * Truthful, non-mutating claim state for health, catalog, and the shared
+   * recovery scheduler. Always returns an object, never null (card 2d1f3a2c
+   * predecessor contract, tests/model-claim-contract-failure.test.mjs and
+   * tests/zai-health-recovery.test.mjs read `.quarantined`/`.failures`
+   * unconditionally, including right after a readmission clears all
+   * history). A populated `failures` count appears as soon as any failure is
+   * on record, even below quarantine threshold. Once quarantined, the object
+   * also exposes the half-open probe state and the truthful upstream
+   * failure reason (tests/ornith-fast-failure.test.mjs).
+   */
   getModelClaimHealth(model) {
     const state = this._modelClaimFailures.get(model);
     if (!state?.quarantinedAt) {
       return { quarantined: false, failures: state?.failures || 0, retryAt: null };
     }
+    const retryAt = state.quarantinedAt + this.model_claim_quarantine_cooldown_ms;
     return {
+      status: state.probing ? "half_open" : "quarantined",
       quarantined: true,
+      probing: Boolean(state.probing),
       failures: state.failures,
-      retryAt: state.quarantinedAt + this.model_claim_quarantine_cooldown_ms,
+      lastStatus: state.lastStatus,
+      lastFailureReason: state.lastReason || `http_${state.lastStatus}`,
+      quarantinedAt: state.quarantinedAt,
+      cooldownMs: this.model_claim_quarantine_cooldown_ms,
+      retryAt,
     };
   }
 
@@ -1019,19 +1077,32 @@ export class Backend {
    * wrong answers quarantine. Success clears the exact claim. 504 and other
    * slow/ambiguous outcomes do not participate.
    */
-  recordModelClaimOutcome(model, status) {
+  recordModelClaimOutcome(model, status, reason = null) {
     if (!model || !this.supportsModel(model) || this.model_claim_quarantine_threshold <= 0) return null;
     if (status >= 200 && status < 300) {
       const prior = this._modelClaimFailures.get(model);
       this._modelClaimFailures.delete(model);
       return prior?.quarantinedAt ? { transition: "readmitted", model, failures: 0 } : null;
     }
-    if (!isFastModelClaimFailure(status)) return null;
+    if (!isFastModelClaimFailure(status)) {
+      const prior = this._modelClaimFailures.get(model);
+      if (prior?.probing) {
+        prior.probing = false;
+        prior.quarantinedAt = Date.now();
+        prior.lastStatus = status;
+        prior.lastReason = reason;
+      }
+      return null;
+    }
 
-    const prior = this._modelClaimFailures.get(model) || { failures: 0, quarantinedAt: 0, lastStatus: 0 };
+    const prior = this._modelClaimFailures.get(model) || {
+      failures: 0, quarantinedAt: 0, lastStatus: 0, lastReason: null, probing: false,
+    };
     const failures = prior.failures + 1;
     const quarantinedAt = failures >= this.model_claim_quarantine_threshold ? Date.now() : prior.quarantinedAt;
-    this._modelClaimFailures.set(model, { failures, quarantinedAt, lastStatus: status });
+    this._modelClaimFailures.set(model, {
+      failures, quarantinedAt, lastStatus: status, lastReason: reason, probing: false,
+    });
     if (!prior.quarantinedAt && quarantinedAt) {
       return { transition: "quarantined", model, failures, status };
     }
@@ -1116,6 +1187,16 @@ export class Backend {
         ? this._quarantinedSince + this.quarantine_cooldown_ms
         : this._status === "down" ? this._downSince + this.cooldown_ms : null,
       lastFailureClass: this._lastFailureClass,
+      // Per-claim quarantine state (card 566f659d), truthful snapshot for the
+      // shared recovery scheduler and health endpoints. getModelClaimHealth()
+      // always returns an object, so gate on `.quarantined` rather than
+      // truthiness or every model this backend has ever failed once would
+      // show up here forever.
+      modelClaims: Object.fromEntries(
+        [...this._modelClaimFailures.keys()]
+          .map((model) => [model, this.getModelClaimHealth(model)])
+          .filter(([, state]) => state?.quarantined),
+      ),
     };
   }
 
@@ -1698,6 +1779,66 @@ export class Backend {
 }
 
 // ---------------------------------------------------------------------------
+// Kimi OAuth proactive keepalive
+// ---------------------------------------------------------------------------
+
+/**
+ * Poll every kimi_oauth backend on a timer so its cached token is refreshed
+ * and persisted to disk before it expires, independent of request traffic.
+ *
+ * Kimi access tokens are short lived (observed expires_in: 900 seconds), and
+ * the design this backend shipped with (see the kimi_oauth feat commit above
+ * _getKimiAuthHeaders) assumed an external kimi CLI keepalive timer kept the
+ * credentials file fresh, with the gateway only re-reading it. That external
+ * timer was never installed on either chi host: systemctl reports
+ * kimi-auth-keepalive.timer as not-found, not merely disabled. PR #137 added
+ * a fallback so _getKimiAuthHeaders refreshes the cached token itself near
+ * expiry, but only as a side effect of a request calling buildAuthHeaders.
+ * If a backend goes quiet, whether from a lull in traffic or because the
+ * router failed it over to another backend after an earlier error, nothing
+ * ever calls that path again. The in-memory token and the on-disk file both
+ * go stale, and because the actual failure mode on an expired Kimi token is
+ * a hang rather than a clean 401, no error ever arrives to shake it loose.
+ * The process then serves (or hangs) on a dead token until it is restarted.
+ *
+ * This scheduler closes that gap: it does not duplicate the refresh logic,
+ * it just calls the existing, already-tested buildAuthHeaders() on a timer
+ * so the near-expiry check inside it fires on a schedule instead of only on
+ * demand.
+ *
+ * @param {object} options
+ * @param {() => Backend[]} options.getBackends
+ * @param {number} [options.intervalMs]
+ * @param {typeof setInterval} [options.setIntervalFn]
+ * @returns {{ tick: () => Promise<void>, timer: NodeJS.Timeout }}
+ */
+export function startKimiAuthKeepalive({
+  getBackends, intervalMs = KIMI_KEEPALIVE_INTERVAL_MS, setIntervalFn = setInterval,
+}) {
+  let inFlight = false;
+  const tick = async () => {
+    if (inFlight) return;
+    inFlight = true;
+    try {
+      const backends = getBackends() || [];
+      for (const backend of backends) {
+        if (!backend || backend.auth_type !== "kimi_oauth") continue;
+        try {
+          await backend.buildAuthHeaders();
+        } catch (error) {
+          console.error(`[router] backend=${backend.id} kimi keepalive tick failed: ${error.message}`);
+        }
+      }
+    } finally {
+      inFlight = false;
+    }
+  };
+  const timer = setIntervalFn(tick, intervalMs);
+  timer?.unref?.();
+  return { tick, timer };
+}
+
+// ---------------------------------------------------------------------------
 // Router factory
 // ---------------------------------------------------------------------------
 
@@ -1798,6 +1939,12 @@ export function createRouter(config = {}) {
     let matched = available.filter(
       (b) => b.supportsModel(model) && b.isModelClaimAvailable(model),
     );
+    if (matched.length === 0) {
+      const probe = available.find(
+        (b) => b.supportsModel(model) && b.tryAcquireModelClaimProbe(model),
+      );
+      if (probe) matched.push(probe);
+    }
 
     // Admission-gated providers start unknown after every gateway restart.
     // Permit only an explicitly marked public-synthetic request to establish
@@ -1810,12 +1957,22 @@ export function createRouter(config = {}) {
       b.models.some((pattern) => pattern.toLowerCase() === model.toLowerCase()));
     if (admissionOwners.length > 0) {
       if (admissionOwners.every((b) => !b.isModelClaimAvailable(model))) {
-        const claimQuarantined = [];
-        claimQuarantined.claimQuarantined = true;
-        return claimQuarantined;
+        // Card 566f659d: isModelClaimAvailable() is now strictly fail-closed
+        // for the whole cooldown (no more time-based bypass), so an
+        // admission-gated owner's own exact-claim quarantine needs the same
+        // one-probe recovery path as any other backend, or it would never
+        // recover once quarantined.
+        const probeOwner = admissionOwners.find((b) => b.tryAcquireModelClaimProbe(model));
+        if (!probeOwner) {
+          const claimQuarantined = [];
+          claimQuarantined.claimQuarantined = true;
+          return claimQuarantined;
+        }
+        matched = [probeOwner];
+      } else {
+        matched = available.filter((b) =>
+          admissionOwners.includes(b) && b.isModelClaimAvailable(model));
       }
-      matched = available.filter((b) =>
-        admissionOwners.includes(b) && b.isModelClaimAvailable(model));
       const unobserved = admissionOwners
         .filter((b) => b.require_observed_health && b.getHealth().observed === false)
         .filter((b) => b.allowsAgent(agentId) && b.isModelClaimAvailable(model))
@@ -2079,6 +2236,7 @@ export function createRouter(config = {}) {
         backendUrl: b.url,
         authHeaders: await b.buildAuthHeaders(),
         backend: b,
+        modelClaimProbe: Boolean(b.getModelClaimHealth(model)?.probing),
       }))
     );
 
@@ -2913,12 +3071,21 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
     wantsTools = false;
   }
 
+  // Operator fences survive discovery refresh without fabricating lifecycle state.
+  // They affect bucket selection only; explicit diagnostic model requests remain available.
+  const excluded = new Set(getConfig().routing?.bucket_excluded_models || []);
+  // Generic-only fence (routing.generic_bucket_providers /
+  // generic_bucket_excluded_models): narrows provider-less buckets only, so a
+  // focused sk-<provider>-<bucket> alias is never affected by it.
+  const genericFence = isGenericBucket(addr) ? genericBucketFence(getConfig().routing) : null;
   const { members, rejected, ceiling } = resolveBucket({
     bucket: addr,
     catalog,
     sensitivityPolicy: policy,
     requireToolUse: wantsTools,
     isRoutable: (e) => {
+      if (excluded.has(e.id)) return false;
+      if (genericFence && !genericFence(e)) return false;
       const claimers = typeof router.getBackends === "function"
         ? router.getBackends()
           .filter((backend) => backend.supportsModel(e.id))
@@ -2972,8 +3139,8 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
     };
   }
 
-  const n = (_bucketCounters.get(addr.bucket) || 0) + 1;
-  _bucketCounters.set(addr.bucket, n);
+  const n = _bucketCounters.get(addr.bucket) || 0;
+  _bucketCounters.set(addr.bucket, n + 1);
   
   // Read and validate family preference from x-sk-prefer header (card 1e26943e)
   const prefHeader = request.headers?.['x-sk-prefer'];
@@ -3010,8 +3177,42 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
     }
   }
 
-  // Apply family preference within cheapest cost tier
-  const picked = selectMember(members, n, familyPreference);
+  const isWeightedGeneric = !addr.provider && ['S', 'M', 'L'].includes(addr.model_class);
+  const genericPolicy = isWeightedGeneric
+    ? getConfig()?.routing?.generic_participation
+    : null;
+  let orderedMembers = isWeightedGeneric
+    ? orderMembersByGenericWeight(members, n, addr, genericPolicy)
+    : orderMembersByCost(members, n);
+  if (familyPreference && orderedMembers.length > 0) {
+    const selectedProvider = orderedMembers[0].provider;
+    const sameProvider = orderedMembers.filter((member) => member.provider === selectedProvider);
+    const rest = orderedMembers.filter((member) => member.provider !== selectedProvider);
+    orderedMembers = [...applyFamilyPreference(sameProvider, familyPreference), ...rest];
+  }
+  // Non-generic buckets keep card 617ddc13's class-floor-aware selection:
+  // selectMember's 4th argument prefers the admitted class nearest the
+  // bucket's floor rather than plain cheapest-cost. Weighted generic buckets
+  // (S/M/L with no explicit provider) use the ticket-weighted pick above
+  // instead, which already encodes its own provider/weight policy.
+  const affinityMessages = extractMessages(request, body);
+  const affinityKey = bucketAffinityKey(
+    addr.bucket,
+    affinityMessages,
+    request.headers?.["x-session-id"],
+  );
+  const remembered = affinityKey && isContinuation(affinityMessages)
+    ? _bucketAffinity.get(affinityKey)
+    : null;
+  if (isWeightedGeneric) orderedMembers = preferRemembered(orderedMembers, remembered);
+  let picked = isWeightedGeneric ? (orderedMembers[0] || null)
+    : selectMember(members, n, familyPreference, addr.model_class);
+  if (!isWeightedGeneric && picked && remembered) {
+    picked = preferRemembered(
+      [picked, ...members.filter((member) => member.id !== picked.id)],
+      remembered,
+    )[0];
+  }
   
   if (!picked) {
     console.warn(`[router] bucket ${addr.bucket} no member selected after preference`);
@@ -3021,21 +3222,25 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
         headers: { "content-type": "application/json" },
         body: Buffer.from(JSON.stringify({
           error: {
-            message: `No model available for bucket ${addr.bucket}`,
+            message: `No enabled provider is eligible for bucket ${addr.bucket}`,
             code: 503,
-            type: "bucket_no_member",
+            type: "bucket_no_eligible_provider",
           },
         }), "utf-8"),
       },
     };
   }
 
+  if (affinityKey) _bucketAffinity.set(affinityKey, { id: picked.id, family: picked.family });
+  const sticky = Boolean(remembered && remembered.id === picked.id);
+
   console.log(
     `[router] bucket ${addr.bucket} -> ${picked.id} ` +
       `(class ${picked.model_class || "?"} via ${picked.class_basis}, zone ${picked.trust_zone ?? "?"}, ` +
       `family ${picked.family || "?"}, ` +
       `${members.length} eligible)` +
-      (familyPreference ? ` [preference: ${familyPreference.join(',')}]` : ''),
+      (familyPreference ? ` [preference: ${familyPreference.join(',')}]` : '') +
+      (sticky ? " [session affinity]" : ""),
   );
 
   // Resolve the chosen id through the router's own model matching, so
@@ -3054,16 +3259,22 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
   // path does await the same call; this one was simply missed, and no test ever
   // reached it. The normalization is kept for the resolved value, which really
   // can be a single object or an array.
-  // selectMember() returns the ONE best member (cheapest cost tier, preference
-  // applied within that tier). The candidate loop below still needs the full
-  // member list so failover, quarantine and pooling keep working when the
-  // chosen member's backend is down. Rebuild it with the picked member first,
-  // then every other member in cost order: the preference decides who serves,
-  // it does not remove anyone from the failover chain.
-  const orderedMembers = [
-    picked,
-    ...orderMembersByCost(members, n).filter((m) => m.id !== picked.id),
-  ];
+  // selectMember() returns the ONE best member: for weighted generic buckets
+  // that is the ticket-weighted pick computed above (orderedMembers already
+  // holds its full failover chain); for everything else it is card
+  // 617ddc13's class-floor-aware pick (nearest admitted class, then cost).
+  // The candidate loop below still needs the full member list so failover,
+  // quarantine and pooling keep working when the chosen member's backend is
+  // down. Rebuild it with the picked member first, then the rest in
+  // class-floor order: the preference decides who serves, it does not remove
+  // anyone from the failover chain. Larger classes remain upward-only
+  // capability failover candidates.
+  if (!isWeightedGeneric) {
+    orderedMembers = [
+      picked,
+      ...orderMembersForClass(members, addr.model_class, n).filter((m) => m.id !== picked.id),
+    ];
+  }
 
   const candidates = [];
   const seen = new Set();
@@ -3072,6 +3283,24 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
     provider: result?.backend?.discovery || inferProviderFromBackend(result?.backendId),
   }, addr);
   for (const member of orderedMembers) {
+    const memberClaimers = typeof router.getBackends === "function"
+      ? router.getBackends().filter(
+        (backend) => typeof backend?.supportsModel === "function" &&
+          backend.supportsModel(member.id),
+      )
+      : null;
+    if (memberClaimers?.length === 0) {
+      skipped.push(member.id);
+      await emitSiem(EventType.ANOMALY, {
+        type: "bucket_member_skipped",
+        outcome: "skipped",
+        bucket: addr.bucket,
+        member: member.id,
+        reason: "missing_backend_binding",
+        detail: "no configured backend claims the selected bucket member",
+      }, {});
+      continue;
+    }
     let results;
     try {
       results = await router.route({ ...request, model: member.id, agentId: request.agentId });
@@ -3121,6 +3350,7 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
         }
         const list2 = Array.isArray(results) ? results : results ? [results] : [];
         for (const result of list2) {
+          if (memberClaimers && !memberClaimers.includes(result.backend)) continue;
           if (!candidateAllowed(result)) continue;
           const key = `${result.backendId}:${member.id}`;
           if (seen.has(key)) continue;
@@ -3131,6 +3361,10 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
             model: member.id,
             bucket: addr.bucket,
             bucketMember: member.id,
+            genericPolicyRevision: member.generic_policy_revision,
+            genericProviderWeight: member.generic_provider_weight,
+            genericParticipationReason: member.generic_participation_reason,
+            genericRotationCounter: member.generic_rotation_counter,
           });
         }
         continue;
@@ -3139,6 +3373,7 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
     }
     const list = Array.isArray(results) ? results : results ? [results] : [];
     for (const result of list) {
+      if (memberClaimers && !memberClaimers.includes(result.backend)) continue;
       if (!candidateAllowed(result)) continue;
       const key = `${result.backendId}:${member.id}`;
       if (seen.has(key)) continue;
@@ -3149,6 +3384,10 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
         model: member.id,
         bucket: addr.bucket,
         bucketMember: member.id,
+        genericPolicyRevision: member.generic_policy_revision,
+        genericProviderWeight: member.generic_provider_weight,
+        genericParticipationReason: member.generic_participation_reason,
+        genericRotationCounter: member.generic_rotation_counter,
       });
     }
   }
@@ -3179,6 +3418,14 @@ async function resolveBucketCandidates(router, addr, request, body, emitSiem = a
     phase: "candidate_chain",
     outcome: "candidate_chain_built",
     bucket: addr.bucket,
+    logical_route: addr.bucket,
+    selected_provider: picked.provider || null,
+    selected_model: picked.id,
+    generic_policy_revision: picked.generic_policy_revision || null,
+    generic_provider_weight: picked.generic_provider_weight ?? null,
+    generic_participation_reason: picked.generic_participation_reason || null,
+    generic_exclusion_reason: null,
+    generic_rotation_counter: picked.generic_rotation_counter ?? null,
     chain_length: candidates.length,
     skipped,
   }, {});
@@ -3220,20 +3467,19 @@ export function createRouteSiemEmitter(siem, requestSource = {}, requestId = ran
 
 /**
  * Preserve logical routing for synthetic traffic unless the concrete model has
- * an exact admission-gated owner whose initial health this request can prove.
+ * an exact configured owner that this request is intended to probe.
  */
 export function shouldUseRegistryRouting(router, request, bootstrapProbe = false) {
   if (!isRegistryRouted(request)) return false;
   if (!bootstrapProbe) return true;
   const model = request?.model;
   if (typeof model !== "string") return true;
-  const exactAdmissionOwner = (typeof router.getBackends === "function"
+  const exactOwner = (typeof router.getBackends === "function"
     ? [...router.getBackends().values()]
     : []
-  ).some((backend) => backend?.require_observed_health === true &&
-    backend.models?.some((pattern) =>
+  ).some((backend) => backend?.models?.some((pattern) =>
       typeof pattern === "string" && pattern.toLowerCase() === model.toLowerCase()));
-  return !exactAdmissionOwner;
+  return !exactOwner;
 }
 
 export function configuredModelAlias(model, config = null) {
@@ -3253,6 +3499,8 @@ export function configuredModelAlias(model, config = null) {
 export async function routeAndSend(router, request, upstreamPath, method, clientHeaders, body, usePool = true, siem = null, abortSignal = null, exactBackendId = null) {
   const pool = usePool ? getPool() : null;
   const requestedModel = request?.model;
+  let requestLimitsConfig;
+  try { requestLimitsConfig = getConfig(); } catch { /* Direct callers may not load configuration. */ }
   const aliasTarget = configuredModelAlias(requestedModel);
   if (!exactBackendId && aliasTarget) {
     request = { ...request, model: aliasTarget };
@@ -3844,19 +4092,53 @@ export async function routeAndSend(router, request, upstreamPath, method, client
   // row rather than being overwritten by the attempt that happened to win.
   // Stays empty on the disabled path, where it is never attached to a result.
   const energyAttempts = [];
+  // Which doors refused admission, so attribution can say a request failed over
+  // on CAPACITY rather than silently reporting only the door that served it.
+  // Bounded on purpose: one entry per candidate is already bounded by the
+  // candidate list, but the list is built per request from config and a
+  // misconfigured fan-out should not be able to grow this without limit.
+  const admissionAttempts = [];
+  const MAX_ADMISSION_ATTEMPTS = 16;
+  // Detail of the rejection that caused the NEXT candidate to be tried.
+  // It rides on the failover event instead of a second response event.
+  let admissionRejectionDetail = null;
+  // True when some LATER candidate sits in a different capacity domain, i.e.
+  // there is a genuinely different door to try. Candidates sharing a domain
+  // are the same door and must not be treated as failover targets.
+  const hasDifferentDomainLater = (idx, backendId) => {
+    const dom = (bid) => {
+      try {
+        return pool?.getStats(bid)?.capacityDomain ?? null;
+      } catch {
+        return null;
+      }
+    };
+    const mine = dom(backendId);
+    return candidates.slice(idx + 1).some((c) => dom(c.backendId) !== mine);
+  };
   // Every candidate that ended in a throttle (429/402), whether an actual
   // upstream response or a still-cooling-down door skipped without a
   // network call (card 9e28de88 fix #3/#6). Drives the attributable-429
   // synthesis at the bottom of the loop, and is the attribution payload
   // itself: {backendId, model, status, cooldownMs, skipped?}.
   const throttledAttempts = [];
+  const transportRejections = [];
 
   for (let i = 0; i < candidates.length; i++) {
-    const { backendId, backendUrl, authHeaders, backend } = candidates[i];
+    const { backendId, backendUrl, authHeaders, backend, modelClaimProbe } = candidates[i];
     // A candidate may carry a per-attempt body (e.g. the cloud-fallback
     // candidate rewrites the model to a cloud-served id). Default to the shared
     // body when no override is present.
     let attemptBody = candidates[i].bodyOverride || attemptBodyBase;
+    const candidateModel = candidates[i].model || request.model;
+    if (requestLimitsConfig) {
+      const rejection = requestLimitError(attemptBody,
+        modelRequestLimits(requestLimitsConfig, candidateModel, requestedModel));
+      if (rejection) {
+        transportRejections.push({ ...rejection, backend: backendId, model: candidateModel });
+        continue;
+      }
+    }
 
     // Context preflight (card 9ed4a9f7): a backend may declare context_limit,
     // the true serving-engine token ceiling (e.g. llama.cpp --ctx-size 32768
@@ -3874,6 +4156,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       // tokenizer when preflight false-negatives matter.
       const estimatedTokens = Math.ceil(attemptBody.length / 3);
       if (estimatedTokens > backend.context_limit) {
+        if (modelClaimProbe) backend.releaseModelClaimProbe(candidates[i].model || request.model);
         console.warn(
           `[routeAndSend] context preflight rejected backend=${backendId}: ` +
             `estimated ${estimatedTokens} tokens exceeds context_limit ${backend.context_limit}; ` +
@@ -3896,7 +4179,6 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     // every other candidate serves the same model as every other candidate
     // in the list (candidatesFor() only ever matches on model id), so
     // request.model is the correct default.
-    const candidateModel = candidates[i].model || request.model;
     attemptBody = applyBodyFloor(
       attemptBody,
       candidateModel,
@@ -3927,7 +4209,12 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         from_backend: candidates[i - 1].backendId,
         to_backend: backendId,
         reason: `previous_status_${lastResult?.status ?? "error"}`,
+        // Capacity detail for a rejection that no longer emits its own
+        // response event. Without this the failover would record THAT it
+        // happened but not the queue wait or admission outcome behind it.
+        ...(admissionRejectionDetail || {}),
       }, { backend: backendId });
+      admissionRejectionDetail = null;
     }
 
     // Model-granular throttle cooldown (card 9e28de88 fix #2): this exact
@@ -3963,6 +4250,10 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     }
     const probeResponseLimit = capacityAdmission.probe ? 1024 * 1024 : 0;
     if (!capacityAdmission.admitted) {
+      // A held half-open model-claim probe lease must not stay pinned
+      // (locking out the exact-claim recovery scheduler) just because the
+      // unrelated provider-wide capacity domain also throttled this attempt.
+      if (modelClaimProbe) backend.releaseModelClaimProbe(candidateModel);
       const remainingMs = Math.max(1000, (capacityAdmission.status.retry_at || Date.now() + 1000) - Date.now());
       throttledAttempts.push({ backendId, model: candidateModel, status: 429,
         cooldownMs: remainingMs, skipped: true, reason: capacityAdmission.status.reason });
@@ -3970,6 +4261,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     }
 
     if (isThrottled(backendId, candidateModel) && !capacityAdmission.probe) {
+      if (modelClaimProbe) backend.releaseModelClaimProbe(candidateModel);
       const state = _throttleCooldowns.get(throttleKey(backendId, candidateModel));
       const remainingMs = Math.max(0, (state?.untilMs ?? 0) - Date.now());
       console.warn(
@@ -4037,7 +4329,23 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     let slot = null;
     if (pool) {
       try {
-        slot = await pool.acquire(backendId, { signal: abortSignal });
+        // Only fail fast when there is somewhere ELSE to go.
+        //
+        // A candidate may queue if it is the last one, OR if every remaining
+        // candidate shares its capacity domain. Two backend ids in the same
+        // domain are the SAME DOOR: capacity domains exist precisely to pool
+        // them, so "failing over" between them buys nothing and costs the
+        // request its queue position.
+        //
+        // Found by tests/qwen-capacity-domain.test.mjs, whose domain declares
+        // members ["chiap08-qwen38", "reg:qwen38"]. Treating those as separate
+        // doors made a request that should have queued skip through both and
+        // never queue at all, which hung that test rather than failing it.
+        const mayQueue = !hasDifferentDomainLater(i, backendId);
+        slot = await pool.acquire(backendId, {
+          signal: abortSignal,
+          nonBlocking: !mayQueue,
+        });
       } catch (err) {
         // Capacity admission owns a provider-wide half-open lock. Pool
         // rejection happens before the upstream try/finally below, so it must
@@ -4048,6 +4356,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         // A client which leaves while queued is the same neutral 499 as one
         // which leaves after dispatch: no failover and no backend-health write.
         if (err instanceof PoolAdmissionError && err.code === "client_closed") {
+          if (modelClaimProbe) backend.releaseModelClaimProbe(candidateModel);
           const queueWaitMs = err.queueWaitMs;
           await emitSiem("response", {
             status: 499,
@@ -4084,6 +4393,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         const code = err instanceof PoolAdmissionError
           ? err.code
           : "capacity_exceeded";
+        if (modelClaimProbe) backend.releaseModelClaimProbe(candidateModel);
         const capacityDomain = err instanceof PoolAdmissionError
           ? err.capacityDomain
           : backendId;
@@ -4111,7 +4421,69 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         const backoffClassification = code === "queue_timeout"
           ? "timeout"
           : "local_admission_denial";
-        await emitSiem("response", {
+        // Whether this rejection is TERMINAL is knowable here, so say it
+        // truthfully. This used to hardcode failover:false and emit before the
+        // decision, so a request that failed over successfully still wrote a
+        // 503 "response" event claiming it had not, and the later 200 wrote a
+        // second one. Two terminal responses for one request, one of them a
+        // lie, is worse than no telemetry: it makes admission failover look
+        // like a 503 rate in every dashboard reading these events.
+        // Terminal in the same sense: nowhere else to send it.
+        const admissionIsTerminal = !hasDifferentDomainLater(i, backendId);
+
+        // ABORT RACE: FIXED BY REMOVING THE EMIT, NOT BY A GUARD.
+        //
+        // Review 2927a814 reproduced [503, 499] for one cancelled request by
+        // aborting during the admission_rejected emission. The prescribed
+        // repair was a guard before that emit. I implemented both a pre-emit
+        // and a post-emit guard and then proved BOTH unreachable: deleting
+        // either fails no test, and the reasoning holds beyond the tests.
+        //
+        //   pool.acquire() checks signal.aborted FIRST and returns
+        //   client_closed, so a client that has already left never reaches
+        //   the capacity branch at all.
+        //
+        //   After the rejection, a non-final candidate now has NO await
+        //   before the failover decision, so that window is synchronous and
+        //   nothing can abort inside it.
+        //
+        //   For the FINAL candidate the 503 IS the correct terminal response.
+        //   A guard there would emit a 499 after it and produce the very
+        //   [503, 499] this was meant to prevent.
+        //
+        // Two dead guards would be the same defect the review caught in the
+        // attribution test: code that looks like a fix and is never executed.
+        //
+        // A NON-TERMINAL rejection emits NO "response" event.
+        //
+        // Reproduced by review 2927a814: aborting during the admission_rejected
+        // emission produced the terminal sequence [503, 499] for ONE cancelled
+        // request. No guard placement fixes that, because a guard before the
+        // emit cannot see an abort that lands inside it, and a guard after it
+        // cannot unsend what was already sent.
+        //
+        // The emit itself was the defect. A rejection on a non-final candidate
+        // is not a response to the client, it is an internal step, and the
+        // router ALREADY records it: the failover event below carries
+        // previous_status 503 with the backend and model. Emitting a second
+        // "response" for the same step double-counted it, and made every
+        // capacity failover look like a 503 downstream.
+        //
+        // So intermediate detail rides on the failover event, and only the
+        // FINAL candidate emits a terminal response. One request, one response.
+        if (!admissionIsTerminal) {
+          admissionRejectionDetail = {
+            queue_wait_ms: queueWaitMs,
+            inflight_concurrency: inflightConcurrency,
+            admission_outcome: admissionOutcome,
+            backoff_classification: backoffClassification,
+            retry_after_seconds: retryAfterSeconds,
+            admission_rejected: true,
+            code,
+            capacity_domain: capacityDomain,
+          };
+        }
+        if (admissionIsTerminal) await emitSiem("response", {
           status: 503,
           latency_ms: queueWaitMs,
           queue_wait_ms: queueWaitMs,
@@ -4120,11 +4492,12 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           backoff_classification: backoffClassification,
           retry_after_seconds: retryAfterSeconds,
           failover: false,
+          terminal: true,
           admission_rejected: true,
           code,
           capacity_domain: capacityDomain,
         }, { backend: backendId });
-        return {
+        const admissionRejection = {
           status: 503,
           headers: {
             "content-type": "application/json",
@@ -4151,6 +4524,55 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           retryAfterSeconds,
           failover: didFailover,
         };
+
+        // An admission rejection is a CAPACITY outcome on THIS door, not
+        // evidence that the model or the backend is unhealthy. The code above
+        // already says so, and deliberately does not write a health outcome.
+        // It is therefore failover-eligible in exactly the way an upstream 5xx
+        // is: try the next candidate, which may be completely idle.
+        //
+        // Until now this returned immediately with failover:false, so a full
+        // pool killed the request even when a sibling door had free slots.
+        // Measured on the chi cluster 2026-09-01: chiap08-qwen38 was admitting
+        // against a vLLM engine that sustains 2 to 3 concurrent, while
+        // chiap01-qwen38 sat at totalProcessed=0 for its entire lifetime. In
+        // the first hour after the admission cap was corrected, 49 of 103
+        // admitted requests timed out with an idle door one position down the
+        // candidate list. The config comment in skgateway-codex.yaml records
+        // the same conclusion and says the only safe setting was to WAIT
+        // rather than die, because dying could not fail over.
+        //
+        // Only the LAST candidate returns. Anything earlier hands the 503 to
+        // lastResult and continues, so the existing i > 0 branch at the top of
+        // the loop emits the failover audit with previous_status_503. No new
+        // SIEM event type is introduced, which matters because that emitter is
+        // a fail-closed boundary where an unknown type would throw into the
+        // request path.
+        //
+        // route() already trims candidates to a single entry when failover is
+        // disabled, so config with failover:false keeps returning immediately
+        // and its behaviour is unchanged.
+        if (admissionAttempts.length < MAX_ADMISSION_ATTEMPTS) {
+          admissionAttempts.push({
+            backendId,
+            capacityDomain,
+            code,
+            queueWaitMs,
+            inflightConcurrency,
+          });
+        }
+        admissionRejection.admissionAttempts = admissionAttempts;
+
+        if (i < candidates.length - 1) {
+          console.warn(
+            `[routeAndSend] admission ${code} on backend=${backendId} ` +
+            `(domain=${capacityDomain}), trying next backend ` +
+            `${candidates[i + 1].backendId}`
+          );
+          lastResult = admissionRejection;
+          continue;
+        }
+        return admissionRejection;
       }
     }
 
@@ -4456,6 +4878,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       // A cancellation is not evidence of what was served: keep the value
       // enforceResponseContract observed (including null), never the
       // routing candidate. Card bc908525 / review b62e19f8 findings 1-2.
+      if (modelClaimProbe) backend.releaseModelClaimProbe(candidateModel);
       lastResult = {
         ...res,
         backendId,
@@ -4532,14 +4955,52 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     const modelContractFailure = upstreamStatus >= 200 && upstreamStatus < 300 &&
       res.status === 502 &&
       (recoveryFailureClass === "malformed_response" || recoveryFailureClass === "response_budget");
-    const healthy = res.status < 500 || modelContractFailure;
+    // A fast wrong answer (404/410/502, including a refused connection as
+    // normalized by sendUpstream) is exact-claim evidence: the claim machine
+    // below quarantines that one backend-model pair. Feeding the same 502 into
+    // the backend-wide machine too let a single failing alias mark the WHOLE
+    // backend down on its first failure, which starved the claim counter
+    // (routing stopped trying the backend, so it never reached its threshold)
+    // and took every sibling model on that backend out with it. When claim
+    // quarantine is active for this exact claim, the claim machine owns the
+    // signal. A backend with claim quarantine disabled, or a model it does not
+    // claim, keeps the full backend-wide 502 signal.
+    const claimOwnsFastFailure = Boolean(candidateModel) &&
+      isFastModelClaimFailure(res.status) &&
+      backend.model_claim_quarantine_threshold > 0 &&
+      backend.supportsModel(candidateModel);
+    const healthy = res.status < 500 || modelContractFailure || claimOwnsFastFailure;
     const qTransition = backend.recordOutcome(healthy, latencyMs, {
       failureClass: recoveryFailureClass,
       authoritativeRecovery: recoveryProbeSucceeded,
     });
+    // Model-claim tracking always sees the gateway's outward status, never
+    // the raw upstream one. When modelContractFailure is true, res.status is
+    // already 502 (it is part of the condition above), so the two arms below
+    // were never meant to diverge: passing upstreamStatus (the original 2xx)
+    // here fed recordModelClaimOutcome's success branch, which deletes the
+    // failure entry, so every content-invalid completion was recorded as a
+    // claim success and could never accumulate toward exact-claim
+    // quarantine. Passing res.status lets a repeated malformed_response or
+    // response_budget 502 accumulate and eventually quarantine the exact
+    // model claim, as the comment above already said it should.
+    //
+    // Card 566f659d: capture the truthful upstream failure reason (the
+    // error body's code/type) so getModelClaimHealth().lastFailureReason
+    // reports what actually went wrong instead of only the bare HTTP status.
+    let claimFailureReason = null;
+    if (res.status >= 400) {
+      try {
+        const parsed = JSON.parse(res.body?.toString("utf-8") || "{}");
+        claimFailureReason = parsed?.error?.code || parsed?.error?.type || null;
+      } catch {
+        // Non-JSON upstream errors retain the deterministic HTTP fallback.
+      }
+    }
     const claimTransition = backend.recordModelClaimOutcome(
       candidateModel,
-      modelContractFailure ? upstreamStatus : res.status,
+      res.status,
+      claimFailureReason,
     );
     if (claimTransition) {
       const quarantined = claimTransition.transition === "quarantined";
@@ -4580,12 +5041,23 @@ export async function routeAndSend(router, request, upstreamPath, method, client
     const claimsHere = candidateModel && typeof backend.supportsModel === "function"
       ? backend.supportsModel(candidateModel)
       : false;
-    const anyClaimer = typeof router.getBackends === "function" && candidateModel
-      ? router.getBackends().some(
+    // A permanent error from one claimer while ANOTHER backend also claims
+    // the id is exact-claim evidence (handled by recordModelClaimOutcome
+    // above), not evidence that the model itself is gone. Counting it toward
+    // the global EOL verdict let one bad door EOL a model a valid door still
+    // serves, the outcome ModelClaimQuarantinedError is documented to avoid.
+    const claimers = typeof router.getBackends === "function" && candidateModel
+      ? router.getBackends().filter(
           (b) => typeof b.supportsModel === "function" && b.supportsModel(candidateModel)
         )
-      : false;
-    recordModelOutcome(candidateModel, { status: res.status, now: Date.now(), claiming: claimsHere || !anyClaimer });
+      : [];
+    const anyClaimer = claimers.length > 0;
+    const anotherClaimer = claimers.some((b) => b !== backend);
+    recordModelOutcome(candidateModel, {
+      status: res.status,
+      now: Date.now(),
+      claiming: (claimsHere && !anotherClaimer) || !anyClaimer,
+    });
 
     // Feed the real completion outcome back into the local-health verdict so a
     // wedged local backend that got past the probe but then hung/errored is
@@ -4847,6 +5319,11 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       retryAfterSeconds: retryAfterSec,
       failover: didFailover,
     };
+  }
+
+  if (!lastResult && transportRejections.length > 0) {
+    await emitSiem("response", { status: 413, failover: false, request_too_large: true }, {});
+    return requestLimitResponse({ ...transportRejections[0], candidates: transportRejections });
   }
 
   // Context preflight rejected every door (card 9ed4a9f7): the request can

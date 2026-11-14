@@ -44,6 +44,10 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve as resolvePath } from 'node:path';
 
 import { resolveZoneCeiling, isZoneAllowed, TRUST_ZONES } from './sensitivity.mjs';
+import {
+  genericParticipationDecision,
+  genericPolicyRevision,
+} from './generic-participation.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -83,10 +87,42 @@ export function classRank(cls, vocab = gradeVocabulary()) {
 /** Bucket ids look like `sk-<class>-<sensitivity>`, case-insensitive. */
 const BUCKET_RE = /^sk-(s|m|l|xl)-(public|internal|secret)$/i;
 const SHORT_BUCKET_RE = /^sk-(s|m|l|xl)$/i;
-const PROVIDER_BUCKET_RE = /^sk-(zai|glm|kimi|codex|cursor)-(s|m|l)$/i;
+const PROVIDER_BUCKET_RE = /^sk-(zai|glm|kimi|codex|cursor|deepseek)-(s|m|l)$/i;
 
 const PROVIDER_ALIASES = Object.freeze({ glm: 'zai' });
 const PUBLIC_L_SUBSCRIPTION_PROVIDERS = new Set(['zai', 'codex']);
+
+/**
+ * Paid cloud providers that also satisfy `sk-l-public` by per-model
+ * qualification. DeepSeek publishes no pricing in its catalog (`free: false`,
+ * tier `paid-cloud`), so it is not a subscription and not a free pool, but a
+ * DeepSeek model that independently clears the L floor is a remote pool whose
+ * exposure ceiling is unchanged: it sits in the least-trusted zone, which
+ * `public` already admits and `internal`/`secret` still refuse. Admitting it
+ * widens MEMBERSHIP only, exactly like the free-remote pools above.
+ */
+const PUBLIC_L_PAID_CLOUD_PROVIDERS = new Set(['deepseek']);
+
+/**
+ * Free remote pools that also satisfy `sk-l-public`, alongside the paid
+ * subscriptions above.
+ *
+ * Card a46b53e restricted this bucket to subscription providers for one
+ * reason, stated in its test name: keep public L work OFF sovereign-local
+ * hardware. Nothing about that intent excludes a free REMOTE pool, and the
+ * narrow allowlist it shipped had a practical cost — on a fleet with no Z.ai,
+ * Kimi or Codex credentials configured, `sk-l-public` fail-closed 503 with all
+ * 20 catalog members rejected for the same reason, while `sk-xl-public` and
+ * `sk-m-public` served fine. A public bucket that no deployment can satisfy
+ * teaches callers to stop using buckets.
+ *
+ * Both pools here are discovered `free_only` (skgateway.yaml `discovery:
+ * free`), and both sit in trust zone 2, which `public` already admits and
+ * `internal`/`secret` still refuse. So this widens the MEMBERSHIP of a bucket
+ * whose exposure ceiling is unchanged; it does not relax the ceiling, and the
+ * local-exclusion the card cared about still holds.
+ */
+const PUBLIC_L_FREE_REMOTE_PROVIDERS = new Set(['openrouter', 'nvidia']);
 
 function providerOwns(entry, requested) {
   if (!requested) return true;
@@ -99,7 +135,53 @@ function providerOwns(entry, requested) {
 export function publicLSubscriptionOwns(entry, bucket) {
   if (bucket.provider || !['sk-l-public', 'sk-l'].includes(bucket.bucket)) return true;
   const provider = String(entry?.provider || '').toLowerCase();
-  return PUBLIC_L_SUBSCRIPTION_PROVIDERS.has(provider) || provider === 'kimi' || provider.startsWith('kimi-');
+  return PUBLIC_L_SUBSCRIPTION_PROVIDERS.has(provider)
+    || PUBLIC_L_FREE_REMOTE_PROVIDERS.has(provider)
+    || PUBLIC_L_PAID_CLOUD_PROVIDERS.has(provider)
+    || provider === 'kimi' || provider.startsWith('kimi-');
+}
+
+/** True for a provider-less bucket (sk-m, sk-m-public, ...), never a focused alias. */
+export function isGenericBucket(bucket) {
+  return Boolean(bucket) && !bucket.provider;
+}
+
+/**
+ * Operator fence for GENERIC bucket membership only, read from gateway config:
+ *
+ *   routing.generic_bucket_providers        provider/backend names allowed as
+ *                                           generic members; empty = all
+ *   routing.generic_bucket_excluded_models  exact ids kept out of generic buckets
+ *
+ * Focused `sk-<provider>-<bucket>` aliases and explicit model requests never
+ * consult this, which is the point: the fleet can turn a model on or off for
+ * sk-s/sk-m/sk-l/sk-xl without touching the provider-focused routes other
+ * consumers depend on. A provider name matches the entry's provider (with the
+ * glm->zai alias and the kimi-* family) or the serving backend id (owned_by).
+ *
+ * @param {object} [routing] config.routing
+ * @returns {(entry: object) => boolean} true when the entry may be a generic member
+ */
+export function genericBucketFence(routing = {}) {
+  const norm = (v) => {
+    const s = String(v || '').toLowerCase();
+    return PROVIDER_ALIASES[s] || s;
+  };
+  const providers = new Set((Array.isArray(routing?.generic_bucket_providers)
+    ? routing.generic_bucket_providers : []).map(norm).filter(Boolean));
+  const excluded = new Set(Array.isArray(routing?.generic_bucket_excluded_models)
+    ? routing.generic_bucket_excluded_models : []);
+  return (entry) => {
+    if (excluded.has(entry?.id)) return false;
+    if (providers.size === 0) return true;
+    for (const candidate of [entry?.provider, entry?.owned_by]) {
+      const name = norm(candidate);
+      if (!name) continue;
+      if (providers.has(name)) return true;
+      if (providers.has('kimi') && name.startsWith('kimi-')) return true;
+    }
+    return false;
+  };
 }
 
 /**
@@ -161,7 +243,7 @@ export function isBucketId(id) {
  * `sk-code-review-fast` has four and never matches.
  */
 const BUCKET_SHAPE_RE = /^sk-([^-]*)-([^-]*)$/i;
-const FOCUSED_BUCKET_SHAPE_RE = /^sk-(zai|glm|kimi|codex|cursor)-([^-]+)$/i;
+const FOCUSED_BUCKET_SHAPE_RE = /^sk-(zai|glm|kimi|codex|cursor|deepseek)-([^-]+)$/i;
 
 /**
  * Did the caller MEAN to address a bucket and get it wrong?
@@ -258,7 +340,7 @@ export function allBuckets(vocab = gradeVocabulary()) {
   for (const c of classes) out.push({ bucket: `sk-${String(c).toLowerCase()}`, model_class: String(c).toUpperCase(), sensitivity: 'public' });
   // Cursor parses fail-closed now but is advertised only after its transport
   // adapter and health probes qualify it.
-  for (const provider of ['zai', 'glm', 'kimi', 'codex']) {
+  for (const provider of ['zai', 'glm', 'kimi', 'codex', 'deepseek']) {
     for (const c of classes.filter((value) => value !== 'XL')) {
       out.push({
         bucket: `sk-${provider}-${String(c).toLowerCase()}`,
@@ -335,6 +417,45 @@ export function effectiveClass(declared, measured) {
     : { cls: declared, basis: 'declared-size-prior' };
 }
 
+const QUALIFICATION_HASH_RE = /^[a-f0-9]{64}$/;
+
+/**
+ * Fold a reviewed qualification into a declared capability prior.
+ * An absent or unreviewed result preserves existing behavior. Once a result
+ * is marked reviewed, malformed, failed, or expired evidence fails closed for
+ * generic membership. A passing result can lower the prior and cannot raise it.
+ */
+export function effectiveQualifiedClass(declared, qualification, now = Date.now()) {
+  if (!qualification || qualification.reviewed !== true) {
+    return { cls: declared || null, basis: declared ? 'declared-size-prior' : 'unknown', eligible: true };
+  }
+  const hashesValid = ['case_set_hash', 'response_schema_hash', 'result_hash']
+    .every((key) => QUALIFICATION_HASH_RE.test(qualification[key] || ''));
+  const expiresAt = Date.parse(qualification.expires_at);
+  if (!hashesValid || !Number.isFinite(expiresAt) || !Number.isFinite(now)) {
+    return { cls: null, basis: 'reviewed-qualification-malformed', eligible: false };
+  }
+  if (expiresAt <= now) {
+    return { cls: null, basis: 'reviewed-qualification-expired', eligible: false };
+  }
+  if (qualification.status !== 'pass') {
+    return { cls: null, basis: 'reviewed-qualification-failed', eligible: false };
+  }
+  const declaredRank = classRank(declared);
+  const qualifiedRank = classRank(qualification.qualified_class);
+  if (declaredRank === null || qualifiedRank === null) {
+    return { cls: null, basis: 'reviewed-qualification-malformed', eligible: false };
+  }
+  const cls = declaredRank <= qualifiedRank ? declared : qualification.qualified_class;
+  return {
+    cls,
+    basis: cls === declared
+      ? 'reviewed-qualification capped by declared prior'
+      : `reviewed-qualification ${qualification.qualified_class} below declared ${declared}`,
+    eligible: true,
+  };
+}
+
 /**
  * Does this model meet the bucket's capability FLOOR?
  *
@@ -354,7 +475,10 @@ export function effectiveClass(declared, measured) {
  * @param {string} floorClass required model_class
  * @returns {{ok: boolean, basis: string, modelClass: string|null}}
  */
-export function meetsClassFloor(entry, floorClass) {
+export function meetsClassFloor(entry, floorClass, {
+  applyReviewedQualification = false,
+  now = Date.now(),
+} = {}) {
   const need = classRank(floorClass);
   if (need === null) return { ok: false, basis: 'unknown-floor', modelClass: null };
 
@@ -367,7 +491,17 @@ export function meetsClassFloor(entry, floorClass) {
   const declared = caps.size_class || entry?.card?.size_class || null;
   const measured = entry?.lifecycle?.measured_capabilities || entry?.measured_capabilities || null;
 
-  const { cls, basis } = effectiveClass(declared, measured);
+  let { cls, basis } = effectiveClass(declared, measured);
+  if (applyReviewedQualification && entry?.card?.qualification?.reviewed === true) {
+    const qualified = effectiveQualifiedClass(declared, entry.card.qualification, now);
+    if (!qualified.eligible) {
+      return { ok: false, basis: qualified.basis, modelClass: null };
+    }
+    if (!cls || classRank(qualified.cls) < classRank(cls)) {
+      cls = qualified.cls;
+      basis = qualified.basis;
+    }
+  }
   if (!cls) {
     // S is the floor everything clears; anything higher needs actual evidence.
     return { ok: need === 0, basis: 'unknown', modelClass: null };
@@ -468,7 +602,7 @@ export function resolveBucket({
       continue;
     }
     if (!publicLSubscriptionOwns(entry, bucket)) {
-      rejected.push({ id: entry.id, reason: 'sk-l-public admits only Z.ai, Kimi, or Codex subscription providers' });
+      rejected.push({ id: entry.id, reason: 'sk-l-public admits only remote pools: Z.ai, Kimi or Codex subscriptions, or the OpenRouter/NIM free tiers' });
       continue;
     }
     const routabilityRejection = getRoutabilityRejection?.(entry);
@@ -490,7 +624,9 @@ export function resolveBucket({
       });
       continue;
     }
-    const floor = meetsClassFloor(entry, bucket.model_class);
+    const floor = meetsClassFloor(entry, bucket.model_class, {
+      applyReviewedQualification: !bucket.provider,
+    });
     if (!floor.ok) {
       rejected.push({
         id: entry.id,
@@ -507,6 +643,10 @@ export function resolveBucket({
     }
     members.push({
       id: entry.id,
+      ...(entry.provider ? {
+        provider: PROVIDER_ALIASES[String(entry.provider).toLowerCase()] ||
+          String(entry.provider).toLowerCase(),
+      } : {}),
       class_basis: floor.basis,
       model_class: floor.modelClass,
       trust_zone: zone ?? null,
@@ -527,6 +667,19 @@ export function resolveBucket({
   }
 
   return { members, rejected, ceiling };
+}
+
+/** Honest physical capacity view: aliases on one service count once. */
+export function physicalCapacity(members = []) {
+  const services = new Map();
+  for (const member of members) {
+    const service = member?.physical_service || member?.backend || member?.id;
+    if (!services.has(service)) {
+      services.set(service, { service, backend: member?.backend || null, models: [] });
+    }
+    services.get(service).models.push(member.id);
+  }
+  return [...services.values()];
 }
 
 /**
@@ -717,34 +870,179 @@ export function orderMembersByCost(members, counter = 0) {
 }
 
 /**
+ * Order an admitted bucket pool by class fit, then cost.
+ *
+ * A model_class is a floor, so larger models remain valid failover candidates.
+ * They must not, however, win every bucket merely because they share the
+ * cheapest cost tier. The nearest class AT OR ABOVE the requested floor is
+ * preferred; cost and rotation break ties within that class. This makes S, M,
+ * L and XL useful addresses while preserving upward-only capability failover.
+ *
+ * This function only reorders members already admitted by resolveBucket(). It
+ * cannot widen the sensitivity ceiling, and it must not let a member BELOW the
+ * class floor look "nearest" either: a signed rank difference lets a cheaper
+ * under-floor member outscore a correctly-floored one (a rank one notch below
+ * the floor and one notch above both have |distance| 1, but only the one above
+ * is actually admissible as a floor). Below-floor members sort last, same as
+ * an unrecognised class, so they never win the "closest class" comparison.
+ *
+ * @param {Array<object>} members members already admitted by resolveBucket
+ * @param {string|null} requestedClass bucket model_class
+ * @param {number} counter monotonically increasing per bucket
+ * @returns {Array<object>}
+ */
+export function orderMembersForClass(members, requestedClass, counter = 0) {
+  const costOrdered = orderMembersByCost(members, counter);
+  const requestedRank = classRank(requestedClass);
+  if (requestedRank === null) return costOrdered;
+
+  return costOrdered
+    .map((member, index) => ({ member, index, rank: classRank(member.model_class) }))
+    .sort((a, b) => {
+      const aDistance = a.rank === null || a.rank < requestedRank
+        ? Number.POSITIVE_INFINITY
+        : a.rank - requestedRank;
+      const bDistance = b.rank === null || b.rank < requestedRank
+        ? Number.POSITIVE_INFINITY
+        : b.rank - requestedRank;
+      return aDistance - bDistance || a.index - b.index;
+    })
+    .map(({ member }) => member);
+}
+
+/**
+ * Order a generic bucket's eligible members by bounded provider tickets.
+ * Provider aliases collapse before weights are counted, and model aliases do
+ * not create additional tickets. The returned first member is the selection;
+ * the rest form a deterministic failover chain containing enabled providers
+ * only. Focused provider routes keep their existing cost order.
+ */
+export function orderMembersByGenericWeight(members, counter, bucket, policy) {
+  if (!Array.isArray(members) || members.length === 0) return [];
+  if (!Number.isSafeInteger(counter) || counter < 0) return [];
+
+  const parsed = typeof bucket === 'string' ? parseBucketId(bucket) : bucket;
+  if (!parsed || typeof parsed.bucket !== 'string') return [];
+  const revision = genericPolicyRevision(policy);
+
+  if (parsed.provider) {
+    return orderMembersByCost(members, counter).map((member) => ({
+      ...member,
+      generic_policy_revision: revision,
+      generic_rotation_counter: counter,
+      generic_provider_weight: 1,
+      generic_participation_reason: 'focused-route',
+    }));
+  }
+
+  const seenModelProviders = new Map();
+  const groups = new Map();
+  for (const member of [...members].sort((a, b) =>
+    String(a?.id || '').localeCompare(String(b?.id || '')))) {
+    const provider = PROVIDER_ALIASES[String(member?.provider || '').toLowerCase()] ||
+      String(member?.provider || '').toLowerCase();
+    if (!provider || !member?.id) return [];
+    const previous = seenModelProviders.get(member.id);
+    if (previous && previous !== provider) return [];
+    seenModelProviders.set(member.id, provider);
+
+    const decision = genericParticipationDecision({ ...member, provider }, parsed, policy);
+    if (!decision.eligible || decision.weight === 0) continue;
+    if (!groups.has(provider)) groups.set(provider, { members: [], decisions: [] });
+    groups.get(provider).members.push({ ...member, provider });
+    groups.get(provider).decisions.push(decision);
+  }
+
+  const families = [...groups.keys()].sort();
+  const weighted = [];
+  let totalWeight = 0;
+  for (const provider of families) {
+    const group = groups.get(provider);
+    const providerDecision = genericParticipationDecision({ provider }, parsed, policy);
+    const modelWeights = new Set(group.decisions
+      .filter((decision) => decision.scope === 'model' || decision.scope === 'bucket-model')
+      .map((decision) => decision.weight));
+    if (modelWeights.size > 1) return [];
+    const weight = modelWeights.size === 1 ? [...modelWeights][0] : providerDecision.weight;
+    if (!providerDecision.eligible || !Number.isInteger(weight) || weight <= 0) continue;
+    totalWeight += weight;
+    weighted.push({ provider, weight, group });
+  }
+  if (!Number.isSafeInteger(totalWeight) || totalWeight <= 0) return [];
+
+  const ticket = counter % totalWeight;
+  let cursor = 0;
+  let selectedIndex = -1;
+  for (let i = 0; i < weighted.length; i++) {
+    cursor += weighted[i].weight;
+    if (ticket < cursor) {
+      selectedIndex = i;
+      break;
+    }
+  }
+  if (selectedIndex < 0) return [];
+
+  const providerOrder = [
+    ...weighted.slice(selectedIndex),
+    ...weighted.slice(0, selectedIndex),
+  ];
+  const ordered = [];
+  for (const item of providerOrder) {
+    const models = item.group.members;
+    const start = counter % models.length;
+    for (const member of [...models.slice(start), ...models.slice(0, start)]) {
+      const decision = genericParticipationDecision(member, parsed, policy);
+      ordered.push({
+        ...member,
+        generic_policy_revision: revision,
+        generic_rotation_counter: counter,
+        generic_provider_weight: item.weight,
+        generic_participation_reason: decision.reason,
+      });
+    }
+  }
+  return ordered;
+}
+
+/**
  * Pick which member serves THIS request.
  *
- * Selection rotates only within the cheapest available cost tier. Costlier
- * tiers remain failover candidates through `orderMembersByCost()`, but are not
- * selected while an equally eligible cheaper tier exists.
+ * Selection first chooses the closest admitted model_class, then rotates only
+ * within that class's cheapest cost tier. Larger classes and costlier tiers
+ * remain failover candidates through orderMembersForClass().
  *
- * An optional family preference is applied WITHIN the selected cost tier,
- * allowing callers to prefer a family at the same cost level. The preference
- * never widens the member set and never selects a costlier tier over a cheaper
- * one. If no member in the cheapest tier matches the preference, the normal
- * cost-tier rotation is used.
+ * An optional family preference is applied within the selected class and cost
+ * tier. It never widens the member set or crosses the sensitivity ceiling.
  *
  * @param {Array<object>} members members already admitted by resolveBucket
  * @param {number} counter monotonically increasing per bucket
  * @param {Array<string>|null} [familyPreference=null] ordered list of family names or 'free'/'sovereign'
+ * @param {string|null} [requestedClass=null] bucket model_class
  * @returns {object|null}
  */
-export function selectMember(members, counter = 0, familyPreference = null) {
-  const costOrdered = orderMembersByCost(members, counter);
-  if (costOrdered.length === 0) return null;
+export function selectMember(members, counter = 0, familyPreference = null, requestedClass = null) {
+  const ordered = orderMembersForClass(members, requestedClass, counter);
+  if (ordered.length === 0) return null;
 
-  // Find all members in the cheapest cost tier
-  const cheapestTier = costOrdered[0].cost_tier;
-  const cheapestMembers = costOrdered.filter(m => m.cost_tier === cheapestTier);
+  // Without a requested class this helper retains its historical pool
+  // semantics: all admitted members participate in cost-tier rotation. The
+  // class-specific narrowing is only meaningful for an addressed bucket.
+  const closestClass = requestedClass === null ? null : ordered[0].model_class;
+  const closestMembers = closestClass === null
+    ? ordered
+    : ordered.filter((member) => member.model_class === closestClass);
 
-  // Apply family preference only within the cheapest tier
+  // `closestMembers` is a filtered slice of `ordered`, which orderMembersForClass()
+  // already produced from a single counter-rotated orderMembersByCost() pass (the
+  // class-distance sort is stable, so it preserves that cost order within any one
+  // class). Re-running orderMembersByCost() here on the same counter would rotate
+  // a second time and could cancel the first rotation out entirely, e.g. two
+  // 'local' members would get rotated, then un-rotated, and the same member would
+  // be picked on every request regardless of counter. Read the cheapest tier
+  // straight off the already-ordered slice instead of re-deriving it.
+  const cheapestTier = closestMembers[0].cost_tier;
+  const cheapestMembers = closestMembers.filter((member) => member.cost_tier === cheapestTier);
   const preferredInCheapest = applyFamilyPreference(cheapestMembers, familyPreference);
 
-  // Return the first preferred member in the cheapest tier
   return preferredInCheapest[0] || null;
 }

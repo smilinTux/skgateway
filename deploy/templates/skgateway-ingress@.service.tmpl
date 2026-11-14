@@ -1,0 +1,23 @@
+[Unit]
+Description=SKGateway tailnet ingress proxy: __INSTANCE__
+Documentation=https://github.com/smilinTux/skgateway
+BindsTo=skgateway-ingress-__INSTANCE__.socket
+After=network-online.target
+StartLimitIntervalSec=60s
+StartLimitBurst=3
+
+[Service]
+Type=simple
+## Forwards the socket-activated connection to the instance's own loopback
+## port. systemd-socket-proxyd ships with systemd; it takes the socket the
+## paired .socket unit accepted and proxies it, so there is no separate proxy
+## process to manage.
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd --exit-idle-time=300s 127.0.0.1:__PORT__
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=skgateway-ingress-__INSTANCE__
+
+[Install]
+WantedBy=default.target
