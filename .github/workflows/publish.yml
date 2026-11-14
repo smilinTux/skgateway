@@ -50,14 +50,20 @@ jobs:
   publish-npm:
     needs: test
     runs-on: ubuntu-latest
+    # npm trusted publishing (OIDC): no stored token; provenance is signed.
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag || github.ref }}
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "24"
           registry-url: "https://registry.npmjs.org"
+      - name: npm 11.5.1 or newer (trusted publishing)
+        run: npm install -g npm@^11.5.1
       - name: Sync version from tag
         env:
           REL_TAG: ${{ inputs.tag || github.ref_name }}
@@ -72,12 +78,10 @@ jobs:
         run: npm run build 2>/dev/null || true
       - name: Publish to npm
         run: |
-          OUTPUT=$(npm publish --access public 2>&1) && exit 0
+          OUTPUT=$(npm publish --provenance --access public 2>&1) && exit 0
           if echo "$OUTPUT" | grep -q "cannot publish over the previously published"; then
             echo "::warning::Version already exists on npm: skipping"
           else
             echo "$OUTPUT"
             exit 1
           fi
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
