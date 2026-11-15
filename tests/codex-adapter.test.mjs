@@ -439,3 +439,73 @@ test("fromCodexResponse: a completed answer reports no incompleteReason", () => 
   );
   assert.equal(res.incompleteReason, null);
 });
+
+// ── prompt_cache_key and cached tokens (2026-11-13) ──────────────────────────
+
+function cacheKeyOf(messages, opts) {
+  const tr = toCodexRequest(openaiBody({ model: "gpt-6.1-sol", messages }), opts);
+  return JSON.parse(tr.body.toString("utf-8")).prompt_cache_key;
+}
+
+test("prompt_cache_key: stable across turns, differs between conversations, hash only", () => {
+  const sys = { role: "system", content: "SECRET-SYSTEM-TEXT" };
+  const u1 = { role: "user", content: "SECRET-BRIEF-ONE" };
+  const k1 = cacheKeyOf([sys, u1]);
+  const k2 = cacheKeyOf([sys, u1, { role: "assistant", content: "ok" }, { role: "user", content: "next" }]);
+  assert.match(k1, /^skgw-[0-9a-f]{40}$/);
+  assert.equal(k1, k2, "same conversation, growing history, same key");
+  assert.notEqual(k1, cacheKeyOf([sys, { role: "user", content: "SECRET-BRIEF-TWO" }]));
+  assert.ok(!k1.includes("SECRET"), "no prompt text in the key");
+});
+
+test("prompt_cache_key: session header wins, then a client key", () => {
+  const msgs = [{ role: "user", content: "a" }];
+  const s1 = cacheKeyOf(msgs, { sessionId: "sess-1" });
+  assert.equal(s1, cacheKeyOf([{ role: "user", content: "different" }], { sessionId: "sess-1" }));
+  assert.notEqual(s1, cacheKeyOf(msgs, { sessionId: "sess-2" }));
+  assert.notEqual(s1, cacheKeyOf(msgs));
+  assert.ok(!s1.includes("sess-1"));
+  const tr = toCodexRequest(openaiBody({ model: "m", prompt_cache_key: "client-k", messages: msgs }));
+  const ck = JSON.parse(tr.body.toString("utf-8")).prompt_cache_key;
+  assert.match(ck, /^skgw-[0-9a-f]{40}$/);
+  assert.notEqual(ck, cacheKeyOf(msgs));
+  assert.equal(tr.promptCacheKey, ck);
+});
+
+test("prompt_cache_key: kill switch SKGW_CODEX_PROMPT_CACHE_KEY=0 omits it", () => {
+  process.env.SKGW_CODEX_PROMPT_CACHE_KEY = "0";
+  try {
+    const tr = toCodexRequest(openaiBody({ model: "m", messages: [{ role: "user", content: "a" }] }));
+    assert.equal("prompt_cache_key" in JSON.parse(tr.body.toString("utf-8")), false);
+    assert.equal(tr.promptCacheKey, null);
+  } finally {
+    delete process.env.SKGW_CODEX_PROMPT_CACHE_KEY;
+  }
+});
+
+const CACHED_SSE = [
+  'event: response.completed',
+  'data: {"type":"response.completed","response":{"id":"resp_c","model":"gpt-6.1-sol","status":"completed","usage":{"input_tokens":1000,"input_tokens_details":{"cached_tokens":896},"output_tokens":5,"total_tokens":1005}}}',
+  '',
+  '',
+].join("\n");
+
+test("fromCodexResponse: cached_tokens passed through (buffered and SSE)", () => {
+  const raw = { status: 200, headers: {}, body: Buffer.from(CACHED_SSE) };
+  const res = fromCodexResponse(raw, "gpt-6.1-sol", false);
+  const oai = JSON.parse(res.body.toString("utf-8"));
+  assert.deepEqual(oai.usage.prompt_tokens_details, { cached_tokens: 896 });
+  assert.deepEqual(res.cacheUsage, { input: 1000, cached: 896 });
+  const sse = fromCodexResponse(raw, "gpt-6.1-sol", true).body.toString("utf-8");
+  const usageChunk = sse.split("\n").filter((l) => l.startsWith("data: {"))
+    .map((l) => JSON.parse(l.slice(6))).find((c) => c.usage);
+  assert.deepEqual(usageChunk.usage.prompt_tokens_details, { cached_tokens: 896 });
+});
+
+test("fromCodexResponse: no cached-token details still works", () => {
+  const res = fromCodexResponse(
+    { status: 200, headers: {}, body: Buffer.from(TEXT_SSE) }, "gpt-5.6-sol", false);
+  const oai = JSON.parse(res.body.toString("utf-8"));
+  assert.equal("prompt_tokens_details" in oai.usage, false);
+  assert.deepEqual(res.cacheUsage, { input: 11, cached: null });
+});

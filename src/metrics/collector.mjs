@@ -422,7 +422,7 @@ function pad(n) { return String(n).padStart(2, '0'); }
  * @returns {{ input_tokens: number|null, output_tokens: number|null,
  *             cache_read_tokens: number|null, cache_write_tokens: number|null }}
  */
-function extractTokens({ headers = {}, body = {} } = {}) {
+export function extractTokens({ headers = {}, body = {} } = {}) {
   const observedCount = (value) => Number.isInteger(value) && value >= 0 ? value : null;
   let input = null, output = null, cacheRead = null, cacheWrite = null;
 
