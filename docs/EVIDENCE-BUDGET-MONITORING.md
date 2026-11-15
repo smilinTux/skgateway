@@ -187,6 +187,28 @@ written whether or not the feature is on:
 Pinned regexes: `\[router\] 200 OK backend=([A-Za-z0-9_.-]+)` and
 `\[router\] (402|429) THROTTLED backend=([A-Za-z0-9_.-]+)`.
 
+### Metrics database (read by evidence collectors)
+
+Evidence collectors open `metrics.db` read only (`file:...?mode=ro`) and read
+these `request_log` columns. They are part of this contract whether or not the
+feature is on:
+
+| Column | Type | Meaning |
+| --- | --- | --- |
+| `started_at` | integer | Request start, Unix milliseconds |
+| `model` | text or null | The model the caller asked for |
+| `status_code` | integer or null | HTTP status sent to the caller |
+| `cost_truth` | text or null | `actual`, `estimated` or `unknown` |
+| `agent_id` | text or null | Resolved agent identity |
+| `session_id` | text or null | `x-session-id` |
+| `client` | text or null | `x-app` |
+
+Locate the file from `metrics.db_path` in the instance config (the file the
+unit passes as `--config`), never from the framework's install directory: a
+release export holds no state. A deployment that keeps state outside the
+export also sets the unit's `WorkingDirectory` to the directory that holds
+`data/metrics.db`, for collectors that look there.
+
 ### Related, always-on surfaces
 
 - Dashboard `GET /api/tokens?period=...` (token rows by bucket, agent, model,

@@ -120,6 +120,18 @@ const tables = (g) => {
   finally { db.close(); }
 };
 
+test("metrics.db request_log has every column the contract names for collectors", () => {
+  for (const g of [gws.off, gws.on]) {
+    const db = new Database(join(g.dir, "metrics.db"), { readonly: true });
+    const cols = new Map(db.prepare("PRAGMA table_info(request_log)").all().map((c) => [c.name, c.type]));
+    db.close();
+    for (const [name, spec] of Object.entries(SPEC.metrics_db.request_log)) {
+      assert.ok(cols.has(name), `request_log.${name} missing`);
+      assert.equal(cols.get(name), spec.startsWith("integer") ? "INTEGER" : "TEXT", `request_log.${name} type`);
+    }
+  }
+});
+
 test("off: /status has exactly the keys it had before the feature", async () => {
   const st = await (await fetch(`http://127.0.0.1:${gws.off.port}/status`)).json();
   assert.deepEqual(Object.keys(st).sort(), SPEC.status_keys_without_feature);

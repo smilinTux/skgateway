@@ -29,5 +29,18 @@
     "throttled": "[router] <402|429> THROTTLED backend=<backend id> model=<model> cooldown=<ms>ms",
     "success_regex": "\\[router\\] 200 OK backend=([A-Za-z0-9_.-]+)",
     "throttled_regex": "\\[router\\] (402|429) THROTTLED backend=([A-Za-z0-9_.-]+)"
+  },
+  "metrics_db": {
+    "location": "metrics.db_path of the instance config (the --config file). A deployment that keeps state outside the framework export also sets the unit's WorkingDirectory to the directory holding data/metrics.db, for collectors that look there.",
+    "access": "read only (sqlite URI with mode=ro); collectors never write",
+    "request_log": {
+      "started_at": "integer (unix ms)",
+      "model": "text|null (requested model)",
+      "status_code": "integer|null",
+      "cost_truth": "text|null (actual|estimated|unknown)",
+      "agent_id": "text|null",
+      "session_id": "text|null",
+      "client": "text|null (x-app)"
+    }
   }
 }
