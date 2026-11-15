@@ -13,6 +13,7 @@ ExecStart=/usr/bin/env node __RELEASE_DIR__/src/index.mjs --port __PORT__
 Environment=NODE_ENV=production
 Environment=SKGATEWAY_CONFIG=__SKGATEWAY_CONFIG__
 __NODE_OPTIONS_LINE__
+__CLIENT_CAPS_LINE__
 EnvironmentFile=__SECRETS_ENV_PATH__
 Restart=on-failure
 RestartSec=5s

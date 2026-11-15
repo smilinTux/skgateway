@@ -122,11 +122,10 @@ test("incident 2026-11-02: one-off 429 exhaustion recovers via the bounded probe
   const throttled = capacityStatus("zai", "glm-5", { path: sharedStore });
   assert.ok(throttled.retry_at - stored.observed_at <= SUBSCRIPTION_PROBE_INTERVAL_MS);
 
-  // T+15min: z.ai is healthy again, so a probe slot must be open
+  // One probe interval later: z.ai is healthy again, so a probe slot must be open
   healthy = true;
-  const fifteenMin = 15 * 60 * 1000;
   const aged = { ...JSON.parse(readFileSync(sharedStore, "utf8")) };
-  aged["provider:zai"] = { ...stored, observed_at: stored.observed_at - fifteenMin };
+  aged["provider:zai"] = { ...stored, observed_at: stored.observed_at - SUBSCRIPTION_PROBE_INTERVAL_MS };
   writeFileSync(sharedStore, JSON.stringify(aged, null, 2));
 
   const results = await runDueCapacityProbes(

@@ -1,0 +1,91 @@
+## skgateway per-client guard rails (src/policy/client-guard.mjs). EXAMPLE: the
+## guard reads $SKGATEWAY_CLIENT_CAPS (skgateway-deploy sets it from the instance
+## dir's client-caps.yaml) or config/client-caps.yaml; with neither it is off.
+## Client = the x-app header (pi sends SKGW_CLIENT there); "untagged" when absent.
+## Re-read within 10 s of a save, no restart needed. Approved by Chef 2026-11-14.
+## Defaults are a gateway-wide backstop per client at about 2x the lane budget
+## caps (lanes/budget-caps.json: deepseek 3000, codex 1500, glm 1500 calls a day),
+## so today's traffic is only logged, never blocked.
+enabled: true
+
+## Untagged requests are always logged with their remote address (audit event
+## client.untagged). reject_untagged: true answers them 400. Keep false until
+## every caller sends x-app. untagged_grace_until only changes the audit warning text.
+reject_untagged: false
+untagged_grace_until: "2026-11-21"
+
+## Local models: never capped, never counted (rate limits still apply).
+exempt_backends: [chiap08-qwen38, ziowk01-qwen38]
+
+## Provider family = gateway backend id. Requested model patterns (glob, case
+## insensitive) decide the family before routing. A model listed under several
+## families (generic buckets) is refused only when all of them are over the cap.
+families:
+  codex: ["gpt-*", "sk-codex-*", "codex-*"]
+  deepseek: ["deepseek-*", "sk-deepseek-*", "sk-s", "sk-m", "sk-l", "sk-xl"]
+  zai: ["glm-*", "sk-glm-*", "sk-zai-*", "sk-s", "sk-m", "sk-l", "sk-xl"]
+
+## Daily caps per client per family, America/Chicago days. calls = successful
+## calls; tokens = input + output tokens as the metrics collector counts them
+## (cached input not included). A missing or 0 value means no cap.
+## Token defaults: 2x calls cap times the measured tokens per call on 2026-11-13
+## (codex 33.9k, deepseek 3.5k, zai 1.25k).
+caps:
+  default:
+    codex:    { calls: 3000, tokens: 100000000 }
+    deepseek: { calls: 6000, tokens: 25000000 }
+    zai:      { calls: 3000, tokens: 5000000 }
+  clients: {}
+  ## example:
+  ## clients:
+  ##   fwe-research: { deepseek: { calls: 1500 } }
+
+## Calls per minute, sliding 60 s window. Measured peak 2026-11-11..14 for ALL
+## callers together: 230 a minute (deepseek). 0 means no limit.
+rate_limits:
+  default: { client_per_minute: 600, session_per_minute: 120 }
+  clients: {}
+
+## Alerts go to the outbox; scripts/post-alerts.py posts them to NAM Admin
+## (Windmill f/ops/notify). Each fires once per threshold per Chicago day; the
+## fired state is the alert_fired table in data/metrics.db (survives restarts).
+alerts:
+  outbox: ./logs/alerts.jsonl
+  cap_percent: 80              # per client per family per unit
+  spike_factor: 5              # last hour calls over 5x the trailing 24 h hourly average
+  spike_min_calls: 200         # ... and at least this many calls in the last hour
+  codex_used_percent: 80       # Codex primary or secondary window, from real call headers
+  stale_hours: 2               # backend used in this window with no fresh provider snapshot
+
+## DeepSeek balance: GET https://api.deepseek.com/user/balance (free, no tokens)
+## every deepseek_balance_poll_minutes (0 = off). Alert below the floor (USD);
+## null = no alert until Chef sets it. Proposed: 15 (PROPOSAL-skgateway-pck3.md).
+deepseek_balance_poll_minutes: 60
+deepseek_balance_floor: 25   # USD, Chef 2026-11-14 (about two days of warning at the 3,000-call cap)
+
+## Dollars per million tokens. Lookup order: served model, requested model,
+## backend id. Subscriptions (codex, zai) are 0: their budget is plan quota.
+## Each entry is { input, output, cached } or { peak: {...}, offpeak: {...} }, with
+## input = cache miss, cached = cache hit, output = output. A call is priced at its
+## request time: peak when its UTC weekday is in peak_weekdays, its UTC date is not
+## in holidays, and its UTC time is inside one of peak_windows_utc; otherwise off-peak.
+prices_as_read: "2026-11-14 https://api-docs.deepseek.com/quick_start/pricing"
+peak_windows_utc: ["01:00-04:00", "06:00-10:00"]
+peak_weekdays: [Mon, Tue, Wed, Thu, Fri]
+## Chinese public holidays (off-peak all day), YYYY-MM-DD in quotes. Chef adds dates.
+holidays: []
+prices:
+  deepseek-v4-pro:
+    peak:    { input: 1.32, output: 3.96, cached: 0.044 }
+    offpeak: { input: 0.66, output: 1.98, cached: 0.022 }
+  deepseek-flash:
+    peak:    { input: 0.30, output: 1.20, cached: 0.006 }
+    offpeak: { input: 0.15, output: 0.60, cached: 0.003 }
+  deepseek-v4-flash:   # legacy name, bills at Flash
+    peak:    { input: 0.30, output: 1.20, cached: 0.006 }
+    offpeak: { input: 0.15, output: 0.60, cached: 0.003 }
+  deepseek:            # any other deepseek model: v4-pro rates
+    peak:    { input: 1.32, output: 3.96, cached: 0.044 }
+    offpeak: { input: 0.66, output: 1.98, cached: 0.022 }
+  codex:           { input: 0, output: 0, cached: 0 }
+  zai:             { input: 0, output: 0, cached: 0 }

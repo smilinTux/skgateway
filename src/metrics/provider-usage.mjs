@@ -70,6 +70,8 @@ export function observeProviderUsage(provider, response, { now = Date.now() } = 
   if (!Object.hasOwn(HEADER_SCHEMAS, provider)) return;
   const prior = records.get(provider);
   const windows = parseProviderQuota(provider, response?.headers, { now });
+  persistHeaderWindows(provider, windows, now);
+  
   const status = Number(response?.status) || null;
   const throttled = status === 429 || status === 402;
   records.set(provider, {
@@ -113,3 +115,118 @@ export function providerUsageSnapshot({ now = Date.now(), maxAgeMs = DEFAULT_MAX
 }
 
 export function _resetProviderUsageForTests() { records.clear(); }
+
+// ─── pck3: persisted provider snapshot for GET /status provider_usage ───
+// The latest figures per backend and source survive restarts in metrics.db
+// (table provider_snapshot). Sources: "headers" (rate-limit headers of real
+// calls, Codex and zai) and "balance" (DeepSeek /user/balance, hourly).
+// No new completion probes. No raw headers, no credentials are stored.
+export const STATUS_BACKENDS = ["codex", "deepseek", "zai"];
+const PERSIST_EVERY_MS = 60_000;
+let snapshotDb = null;
+let snapshotHook = null;
+const lastPersist = new Map();
+const memorySnapshots = new Map(); // "backend\tsource" -> { observed_at, data }
+
+/** Attach metrics.db (may be null) and an alert hook (backend, source, data, now). */
+export function attachProviderStore({ db = null, onSnapshot = null } = {}) {
+  snapshotDb = db;
+  snapshotHook = onSnapshot;
+  if (db) db.exec(`CREATE TABLE IF NOT EXISTS provider_snapshot (
+    backend TEXT NOT NULL, source TEXT NOT NULL, observed_at TEXT NOT NULL, data TEXT NOT NULL,
+    PRIMARY KEY (backend, source));
+    CREATE TABLE IF NOT EXISTS deepseek_balance_log (observed_at TEXT NOT NULL, currency TEXT NOT NULL, total_balance REAL);
+    CREATE INDEX IF NOT EXISTS idx_deepseek_balance_log_ts ON deepseek_balance_log (observed_at);`);
+}
+
+function saveSnapshot(backend, source, data, now, { force = false } = {}) {
+  const k = `${backend}\t${source}`;
+  const observed_at = new Date(now).toISOString();
+  memorySnapshots.set(k, { observed_at, data });
+  try { snapshotHook?.(backend, source, data, now); } catch { /* alerts never break routing */ }
+  if (!snapshotDb || (!force && now - (lastPersist.get(k) || 0) < PERSIST_EVERY_MS)) return;
+  lastPersist.set(k, now);
+  try {
+    snapshotDb.prepare(`INSERT INTO provider_snapshot (backend, source, observed_at, data) VALUES (?, ?, ?, ?)
+      ON CONFLICT (backend, source) DO UPDATE SET observed_at = excluded.observed_at, data = excluded.data`)
+      .run(backend, source, observed_at, JSON.stringify(data));
+  } catch (e) { console.warn(`[provider-usage] snapshot persist failed: ${e.message}`); }
+}
+
+const windowView = (w) => ({
+  name: w.name, unit: w.unit || "count", limit: w.limit, remaining: w.remaining,
+  used_percent: w.limit > 0 ? Math.round(((w.limit - w.remaining) / w.limit) * 1000) / 10 : null,
+  reset_at: w.reset_at ?? null,
+});
+
+/** Called from observeProviderUsage when a real call carried quota headers. */
+function persistHeaderWindows(provider, windows, now) {
+  if (STATUS_BACKENDS.includes(provider) && windows.length) saveSnapshot(provider, "headers", { windows: windows.map(windowView) }, now);
+}
+
+export const DEEPSEEK_BALANCE_URL = "https://api.deepseek.com/user/balance";
+
+/**
+ * GET the DeepSeek balance (free, no tokens). The key is used only for the
+ * authorization header; errors carry the HTTP status only, never the key.
+ */
+export async function pollDeepseekBalance({ key, fetchFn = globalThis.fetch, now = Date.now } = {}) {
+  if (!key) return { ok: false, reason: "no_key" };
+  let res;
+  try {
+    res = await fetchFn(DEEPSEEK_BALANCE_URL, { headers: { authorization: `Bearer ${key}`, accept: "application/json" }, signal: AbortSignal.timeout(15_000) });
+  } catch (e) { return { ok: false, reason: `fetch_failed:${e?.name || "error"}` }; }
+  if (!res.ok) return { ok: false, reason: `http_${res.status}` };
+  let body;
+  try { body = await res.json(); } catch { return { ok: false, reason: "bad_json" }; }
+  // {} or null or no balance rows is a failed read, never a fresh snapshot.
+  if (!body || typeof body !== "object" || !Array.isArray(body.balance_infos) || !body.balance_infos.length) return { ok: false, reason: "empty_balance" };
+  const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : null);
+  const balances = (body?.balance_infos || []).map((b) => ({
+    currency: String(b.currency || ""), total_balance: num(b.total_balance),
+    granted_balance: num(b.granted_balance), topped_up_balance: num(b.topped_up_balance),
+  }));
+  const data = { is_available: body?.is_available === true, balances };
+  const t = now();
+  saveSnapshot("deepseek", "balance", data, t, { force: true });
+  if (snapshotDb) {
+    try {
+      const ins = snapshotDb.prepare("INSERT INTO deepseek_balance_log (observed_at, currency, total_balance) VALUES (?, ?, ?)");
+      for (const b of balances) ins.run(new Date(t).toISOString(), b.currency, b.total_balance);
+    } catch (e) { console.warn(`[provider-usage] balance history write failed: ${e.message}`); }
+  }
+  return { ok: true, data };
+}
+
+/**
+ * The provider_usage block of GET /status. Every backend in STATUS_BACKENDS is
+ * present; a backend with no snapshot has observed_at null and age_seconds null.
+ */
+export function providerUsageStatus({ now = Date.now() } = {}) {
+  const rows = new Map(memorySnapshots);
+  if (snapshotDb) {
+    try {
+      for (const r of snapshotDb.prepare("SELECT backend, source, observed_at, data FROM provider_snapshot").all()) {
+        const k = `${r.backend}\t${r.source}`;
+        const mem = rows.get(k);
+        if (!mem || mem.observed_at < r.observed_at) rows.set(k, { observed_at: r.observed_at, data: JSON.parse(r.data) });
+      }
+    } catch { /* memory only */ }
+  }
+  const age = (iso) => (iso ? Math.max(0, Math.round((now - Date.parse(iso)) / 1000)) : null);
+  const backends = {};
+  for (const backend of STATUS_BACKENDS) {
+    const sources = {};
+    let newest = null;
+    for (const [k, v] of rows) {
+      const [b, source] = k.split("\t");
+      if (b !== backend) continue;
+      sources[source] = { observed_at: v.observed_at, age_seconds: age(v.observed_at), ...v.data };
+      if (!newest || v.observed_at > newest) newest = v.observed_at;
+    }
+    backends[backend] = { backend, observed_at: newest, age_seconds: age(newest), sources };
+  }
+  return { schema: "skgw-provider-usage/1", generated_at: new Date(now).toISOString(), backends };
+}
+
+export function _resetProviderStoreForTests() { snapshotDb = null; snapshotHook = null; lastPersist.clear(); memorySnapshots.clear(); }

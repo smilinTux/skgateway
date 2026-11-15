@@ -22,7 +22,7 @@ export const MODEL_PROBE_INTERVAL_MS = Number.isFinite(configuredModelProbeInter
  * 2026-11-02: a single 06:10 z.ai 429 with quota wording and no Retry-After
  * held every GLM bucket fail-closed until an operator ran clearCapacity at
  * 12:10, while a direct call at 09:08 already returned 200. */
-export const SUBSCRIPTION_PROBE_INTERVAL_MS = 15 * 60 * 1000;
+export const SUBSCRIPTION_PROBE_INTERVAL_MS = 60 * 60 * 1000;
 /** Hard ceiling on an upstream-declared Retry-After (matches the router's
  * MAX_THROTTLE_COOLDOWN_MS). Applied on write and again on read so records
  * persisted before the cap existed cannot hold a model for years. */
