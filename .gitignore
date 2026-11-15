@@ -22,3 +22,6 @@ config/skgateway-codex.yaml
 config/registry.yaml
 *.bak-*
 *.pre-*
+
+# Per-instance client caps live in the config repo (or $SKGATEWAY_CLIENT_CAPS).
+config/client-caps.yaml

@@ -317,11 +317,17 @@ do_deploy() {
 
   local node_options_line=""
   [ -n "$NODE_OPTIONS_VAL" ] && node_options_line="Environment=NODE_OPTIONS=$NODE_OPTIONS_VAL"
+  # Per-client guard rails (src/policy/client-guard.mjs) read their caps from
+  # the instance's own client-caps.yaml when the config repo has one. Without
+  # it the guard is off: the release ships only config/client-caps.yaml.example.
+  local client_caps_line=""
+  [ -f "$(dirname "$config_path_abs")/client-caps.yaml" ] \
+    && client_caps_line="Environment=SKGATEWAY_CLIENT_CAPS=$(dirname "$config_path_abs")/client-caps.yaml"
   local new_unit_content
   new_unit_content="$(render_template_file "$TEMPLATE_DIR/skgateway-instance.service.tmpl" \
     __INSTANCE__ "$INSTANCE" __PORT__ "$PORT" __RELEASE_DIR__ "$RELEASE_DIR" \
     __SKGATEWAY_CONFIG__ "$config_path_abs" __SECRETS_ENV_PATH__ "$SECRETS_DEST" \
-    __NODE_OPTIONS_LINE__ "$node_options_line")"
+    __NODE_OPTIONS_LINE__ "$node_options_line" __CLIENT_CAPS_LINE__ "$client_caps_line")"
 
   local old_current_unit="$STATE_DIR/current/unit"
   local old_current_release=""

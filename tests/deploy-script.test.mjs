@@ -303,6 +303,35 @@ describe('skgateway-deploy', () => {
     }
   });
 
+  test('client-caps.yaml in the instance dir sets SKGATEWAY_CLIENT_CAPS; absent, no line', async () => {
+    const home = freshHome();
+    const configRepo = buildConfigRepo({
+      withcaps: { port: 19231, release: source.tagV1 },
+      nocaps: { port: 19232, release: source.tagV1 },
+    });
+    writeFileSync(join(configRepo, 'withcaps', 'client-caps.yaml'), 'enabled: true\n');
+    gitCommitAll(configRepo, 'caps for withcaps');
+    const h1 = await startHealthServer(19231);
+    const h2 = await startHealthServer(19232);
+    try {
+      for (const inst of ['withcaps', 'nocaps']) {
+        const r = await runDeploy(
+          ['--release', source.tagV1, '--config-repo', configRepo, '--instance', inst, '--execute'],
+          { home, repoRoot: source.dir, extraEnv: FAST_HEALTH },
+        );
+        assert.equal(r.status, 0, r.stderr + r.stdout);
+      }
+      assert.match(
+        readFileSync(unitPath(home, 'withcaps'), 'utf8'),
+        /^Environment=SKGATEWAY_CLIENT_CAPS=.*\/withcaps\/client-caps\.yaml$/m,
+      );
+      assert.doesNotMatch(readFileSync(unitPath(home, 'nocaps'), 'utf8'), /SKGATEWAY_CLIENT_CAPS/);
+    } finally {
+      await stopServer(h1);
+      await stopServer(h2);
+    }
+  });
+
   test('refuses a tag that is not reachable from main', async () => {
     const home = freshHome();
     const configRepo = buildConfigRepo({ demo: { port: 19203, release: source.tagUnreachable } });

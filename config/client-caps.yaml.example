@@ -1,4 +1,6 @@
-## skgateway pck3 per-client guard rails (src/policy/client-guard.mjs).
+## skgateway per-client guard rails (src/policy/client-guard.mjs). EXAMPLE: the
+## guard reads $SKGATEWAY_CLIENT_CAPS (skgateway-deploy sets it from the instance
+## dir's client-caps.yaml) or config/client-caps.yaml; with neither it is off.
 ## Client = the x-app header (pi sends SKGW_CLIENT there); "untagged" when absent.
 ## Re-read within 10 s of a save, no restart needed. Approved by Chef 2026-11-14.
 ## Defaults are a gateway-wide backstop per client at about 2x the lane budget
