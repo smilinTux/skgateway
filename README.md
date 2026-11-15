@@ -37,6 +37,7 @@ do not claim that every component is enabled in a deployed gateway.
 | Optional local SOC dashboard with REST data endpoints and WebSocket updates | [`src/dashboard/server.mjs`](src/dashboard/server.mjs) and the static UI in [`src/dashboard/static/index.html`](src/dashboard/static/index.html) |
 | File based SKCapstone alert and service registration integration when a shared SKCapstone home exists | [`src/integration.mjs`](src/integration.mjs) and [`tests/integration.test.mjs`](tests/integration.test.mjs) |
 | Configuration reload on `SIGHUP` | [`src/config.mjs`](src/config.mjs) and live credential rotation coverage in [`tests/client-auth-integration.test.mjs`](tests/client-auth-integration.test.mjs) |
+| Optional evidence and budget monitoring (off by default): per-client caps and limits, provider limit and balance snapshots, `/status` `provider_usage` under the versioned contract `skgw-provider-usage/1`, alert outbox | [`docs/EVIDENCE-BUDGET-MONITORING.md`](docs/EVIDENCE-BUDGET-MONITORING.md), [`src/policy/client-guard.mjs`](src/policy/client-guard.mjs), [`src/metrics/provider-usage.mjs`](src/metrics/provider-usage.mjs), [`tests/evidence-budget-monitoring.test.mjs`](tests/evidence-budget-monitoring.test.mjs) and [`tests/evidence-budget-contract.test.mjs`](tests/evidence-budget-contract.test.mjs) |
 | Local-only speech-to-text and embeddings via `sk-stt`/`sk-embed` aliases, no cloud failover | [`src/proxy/media-routes.mjs`](src/proxy/media-routes.mjs) and [`tests/media-routes.test.mjs`](tests/media-routes.test.mjs) |
 
 ## Speech-to-text and embeddings
@@ -183,6 +184,10 @@ The runtime also has authenticated admin and operator routes. Their exact contra
 is documented in [`docs/API.md`](docs/API.md) and exercised by
 [`tests/operator-http.test.mjs`](tests/operator-http.test.mjs) and
 [`tests/admin-models-cards.test.mjs`](tests/admin-models-cards.test.mjs).
+
+With [evidence and budget monitoring](docs/EVIDENCE-BUDGET-MONITORING.md) on,
+`GET /status` also carries `provider_usage` and `clients`, and the loopback-only
+`GET /admin/clients/usage` is served. The feature is off by default.
 
 When enabled, the dashboard server exposes `/api/stats`, `/api/health`,
 `/api/agents`, `/api/tokens`, `/api/costs`, `/api/events`, `/api/activity`, and
