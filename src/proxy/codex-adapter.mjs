@@ -63,6 +63,7 @@
  */
 
 import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 
 /**
  * Codex CLI version reported in the originator/version headers. The backend
@@ -186,7 +187,16 @@ export function readCodexAuthHeaders(path) {
  * so an instance without the key keeps today's wire byte for byte.
  *
  * @param {Buffer} openaiBody
- * @param {{runawayMaxOutputTokens?: number}} [opts]
+ * PROMPT CACHE KEY (2026-11-13). The backend accepts `prompt_cache_key`
+ * (measured, module doc) and routes cache hits by it, so every request gets
+ * an opaque per-conversation key: sha256 of the client x-session-id header
+ * (opts.sessionId), else of a client-sent prompt_cache_key, else of the
+ * instructions plus the first user message (stable across turns of one
+ * conversation; changes when a client compaction rewrites that message).
+ * Only the hash is sent, never prompt text. SKGW_CODEX_PROMPT_CACHE_KEY=0
+ * turns it off without a release.
+ *
+ * @param {{runawayMaxOutputTokens?: number, sessionId?: string}} [opts]
  * @returns {{path: string, headers: Record<string,string>, body: Buffer, clientStream: boolean, dropped: string[], callerMaxTokens: number|null, maxOutputTokens: number|null}|null}
  */
 export function toCodexRequest(openaiBody, opts = {}) {
@@ -255,6 +265,16 @@ export function toCodexRequest(openaiBody, opts = {}) {
   };
   if (systemTexts.length) out.instructions = systemTexts.join("\n\n");
 
+  let promptCacheKey = null;
+  if (process.env.SKGW_CODEX_PROMPT_CACHE_KEY !== "0") {
+    const firstUser = items.find((i) => i.type === "message" && i.role === "user");
+    const seed = (typeof opts.sessionId === "string" && opts.sessionId)
+      || (typeof req.prompt_cache_key === "string" && req.prompt_cache_key)
+      || (out.instructions || "") + "\n" + JSON.stringify(firstUser?.content ?? "");
+    promptCacheKey = "skgw-" + createHash("sha256").update(seed).digest("hex").slice(0, 40);
+    out.prompt_cache_key = promptCacheKey;
+  }
+
   if (Array.isArray(req.tools) && req.tools.length) {
     const tools = req.tools
       .filter((t) => t && t.type === "function" && t.function && t.function.name)
@@ -319,6 +339,7 @@ export function toCodexRequest(openaiBody, opts = {}) {
     dropped,
     callerMaxTokens,
     maxOutputTokens,
+    promptCacheKey,
   };
 }
 
@@ -455,6 +476,12 @@ export function fromCodexResponse(raw, model, clientStream = false) {
     completion_tokens: u.output_tokens ?? 0,
     total_tokens: u.total_tokens ?? ((u.input_tokens ?? 0) + (u.output_tokens ?? 0)),
   };
+  // Responses API field; the response contract allows exactly this shape.
+  const cached = u.input_tokens_details?.cached_tokens;
+  if (Number.isSafeInteger(cached) && cached >= 0 && cached <= usage.prompt_tokens) {
+    usage.prompt_tokens_details = { cached_tokens: cached };
+  }
+  const cacheUsage = { input: usage.prompt_tokens, cached: usage.prompt_tokens_details?.cached_tokens ?? null };
 
   const finish = toolCalls.length
     ? "tool_calls"
@@ -486,6 +513,7 @@ export function fromCodexResponse(raw, model, clientStream = false) {
       },
       body,
       incompleteReason,
+      cacheUsage,
     };
   }
 
@@ -536,5 +564,5 @@ export function fromCodexResponse(raw, model, clientStream = false) {
   const headers = { ...raw.headers };
   delete headers["content-length"];
   headers["content-type"] = "text/event-stream; charset=utf-8";
-  return { ...raw, headers, body, incompleteReason };
+  return { ...raw, headers, body, incompleteReason, cacheUsage };
 }

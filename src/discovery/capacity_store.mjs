@@ -19,7 +19,7 @@ const MODEL_RECOVERY_RETRY_MS = 60 * 1000;
  * 2026-11-02: a single 06:10 z.ai 429 with quota wording and no Retry-After
  * held every GLM bucket fail-closed until an operator ran clearCapacity at
  * 12:10, while a direct call at 09:08 already returned 200. */
-export const SUBSCRIPTION_PROBE_INTERVAL_MS = 15 * 60 * 1000;
+export const SUBSCRIPTION_PROBE_INTERVAL_MS = 60 * 60 * 1000;
 const ZAI_RECOVERY_MODELS = Object.freeze(["glm-4.5", "glm-4.6", "glm-4.7", "glm-5", "glm-5.3"]);
 
 /** Keep shared provider recovery on the exact claims qualified for fleet use. */

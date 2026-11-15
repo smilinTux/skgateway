@@ -74,6 +74,8 @@ import { genericBucketQualification, applyGenericBucketMetadata, genericBucketQu
 import { readFileSync } from "node:fs";
 import { load as yamlLoad } from "js-yaml";
 import { createShadowRecorder } from "./proxy/semantic-cache-shadow.mjs";
+import { createClientGuard, clientOf } from "./policy/client-guard.mjs";
+import { attachProviderStore, pollDeepseekBalance, providerUsageStatus } from "./metrics/provider-usage.mjs";
 import { unservedRequest } from "./proxy/unserved-request.mjs";
 
 // ─── Parse CLI args ───
@@ -1273,6 +1275,34 @@ function siemHook(evt) {
   }
 }
 
+// ─── Per-client guard rails (pck3, config/client-caps.yaml) ───
+// Client identity from x-app, daily caps, rate limits, alert outbox, spend.
+const clientGuard = createClientGuard({ getDb: () => metrics?.db ?? null, siem: siemHook });
+// Provider snapshot (pck3): rate-limit headers of real calls and the DeepSeek
+// balance persist in metrics.db and feed GET /status provider_usage; the guard
+// raises the Codex 80 percent, DeepSeek floor and stale-snapshot alerts.
+attachProviderStore({ db: metrics?.db ?? null, onSnapshot: (b, src, data, t) => clientGuard.providerObserved(b, src, data, t) });
+let _deepseekBalanceAt = 0;
+async function providerTick() {
+  try {
+    const minutes = Number(clientGuard._config().deepseek_balance_poll_minutes ?? 60);
+    if (minutes > 0 && config.backends?.deepseek && Date.now() - _deepseekBalanceAt >= minutes * 60_000) {
+      _deepseekBalanceAt = Date.now();
+      // The key stays in-process: only the authorization header uses it.
+      const r = await pollDeepseekBalance({ key: process.env[config.backends.deepseek.api_key_env || "DEEPSEEK_API_KEY"] });
+      if (!r.ok) {
+        console.warn(`[skgateway] deepseek balance poll skipped or failed: ${r.reason}`);
+        _deepseekBalanceAt = Date.now() - minutes * 60_000 + 5 * 60_000; // retry in 5 minutes
+      }
+    }
+    clientGuard.checkStale(providerUsageStatus());
+  } catch (e) {
+    console.warn("[skgateway] provider tick failed:", e.message);
+  }
+}
+setTimeout(providerTick, 5_000).unref();
+setInterval(providerTick, 60_000).unref();
+
 /**
  * One recorder for the process. Built lazily on first eligible request so a
  * disabled cache costs nothing at boot and an unreachable embedder cannot stop
@@ -1762,6 +1792,16 @@ export const server = http.createServer(async (req, res) => {
       backends: router.getHealth(),
       pool: pool.getTotalStats(),
       metrics: metrics?.getStats() || null,
+      // pck3: provider limits/balance snapshot and per-client caps, usage, dollars.
+      provider_usage: (() => {
+        try {
+          const pu = providerUsageStatus();
+          try { const daily = clientGuard.deepseekDaily(); if (daily) pu.backends.deepseek.daily = daily; }
+          catch (e) { pu.backends.deepseek.daily = { error: e.message }; }
+          return pu;
+        } catch (e) { return { error: e.message }; }
+      })(),
+      clients: (() => { try { return clientGuard.snapshot(); } catch (e) { return { error: e.message }; } })(),
     }));
     return;
   }
@@ -2068,6 +2108,25 @@ export const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Per-client usage (pck3): today's counters against the caps, plus estimated
+  // dollars per Chicago day, client and provider from request_log. ?days=1..31
+  if (req.url.split("?")[0] === "/admin/clients/usage" && req.method === "GET") {
+    if (!isLoopback(req)) {
+      res.writeHead(403, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "Admin routes are loopback only", code: 403 } }));
+      return;
+    }
+    try {
+      const days = new URL(req.url, "http://x").searchParams.get("days") || 1;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ today: clientGuard.snapshot(), spend: clientGuard.spend({ days }) }));
+    } catch (e) {
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: e.message, code: 500 } }));
+    }
+    return;
+  }
+
   // ── Admin: force an immediate re-discovery, bypassing the refresh interval ──
   // Kicks a fresh NVIDIA+OpenRouter fetch now and returns the updated status
   // (lastRefreshedAt advances on success). Fail-soft: refreshCatalog() is built
@@ -2363,6 +2422,7 @@ export const server = http.createServer(async (req, res) => {
       ts: new Date().toISOString(),
       event: "identity.resolved",
       agent_id: identity.agent_id,
+      client: clientOf(req.headers),
       method: identity.method,
       verified: identity.verified,
       session_id: identity.session_id,
@@ -2478,6 +2538,22 @@ export const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // ── Per-client guard rails (pck3) ──
+    // Untagged logging/reject, daily caps and rate limits, before any dispatch.
+    // A guard failure never fails the request: it degrades to logging only.
+    let skClient = clientOf(req.headers);
+    try {
+      const guard = clientGuard.check({ headers: req.headers, model: parsedModel, remote: req.socket?.remoteAddress ?? null, path: req.url });
+      skClient = guard.client;
+      if (guard.reject) {
+        res.writeHead(guard.reject.status, guard.reject.headers);
+        res.end(guard.reject.body);
+        return;
+      }
+    } catch (err) {
+      console.error("[skgateway] client guard check failed (request allowed):", err.message);
+    }
+
     // ── Prompt classification (P3.5) — PASSIVE observability into SIEM ──
     // Label the request's intent/risk/jailbreak/injection and emit it. Pure
     // heuristic (no network, sub-10ms), fail-open, and it NEVER changes routing.
@@ -2565,7 +2641,16 @@ export const server = http.createServer(async (req, res) => {
     // failure here must not become a second, fabricated error stacked on top
     // of whatever the request path already did.
     let metricsClosed = false;
+    let guardRecorded = false;
     function closeMetrics({ statusCode, firstByteMs, generationMs, responseHeaders, responseBody, backend, modelServed, errorMsg, energy, energyAttempts, result } = {}) {
+      if (!guardRecorded) {
+        guardRecorded = true;
+        try {
+          clientGuard.record({ client: skClient, backend, statusCode, headers: responseHeaders ?? {}, body: responseBody, model: parsedModel, modelServed, at: startTime });
+        } catch (err) {
+          console.error("[skgateway] client guard record failed:", err.message);
+        }
+      }
       if (!metrics || !metricsReqId || metricsClosed) return;
       metricsClosed = true;
       try {
@@ -2590,7 +2675,7 @@ export const server = http.createServer(async (req, res) => {
           errorMsg,
           // Provider-neutral rail attribution (card e19f88db / SKGW-ATTRIBUTION-01)
           attribution: {
-            client: req.headers["x-app"] || undefined,
+            client: skClient,
             application: req.headers["user-agent"] || undefined,
             // One canonical source: the router's result.logicalRoute, the
             // same value response headers expose. Never re-derive here.
@@ -2706,6 +2791,8 @@ export const server = http.createServer(async (req, res) => {
       // Preserve the resolved request/session identity on every typed router
       // audit event, alongside agent and per-request correlation ids.
       sessionId: identity.session_id || req.headers["x-session-id"] || undefined,
+      // x-app client (pck3), "untagged" when absent: carried on every router audit event.
+      client: skClient,
       // skmodels registry role/context routing (single source of truth).
       // Present => routeAndSend resolves via ~/.skcapstone/models/registry.yaml
       // (precedence context > service > role > default) before backend select.

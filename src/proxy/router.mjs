@@ -3476,6 +3476,8 @@ export function createRouteSiemEmitter(siem, requestSource = {}, requestId = ran
       ...(request?.model ? { model: request.model } : {}),
       ...ctx,
     });
+    // pck3: x-app client ("untagged" when absent) on every router audit event.
+    if (request?.client) event.client = request.client;
     if (typeof siem !== "function") return null;
     await siem(event);
     return event;
@@ -4673,7 +4675,10 @@ export async function routeAndSend(router, request, upstreamPath, method, client
         // the Anthropic branch above: a translatable body is converted and the
         // buffered upstream SSE answer converted back (to SSE for the client
         // when the client asked stream:true); anything else passes through.
-        const tr = toCodexRequest(attemptBody, { runawayMaxOutputTokens: backend.runaway_max_output_tokens });
+        const tr = toCodexRequest(attemptBody, {
+          runawayMaxOutputTokens: backend.runaway_max_output_tokens,
+          sessionId: request?.headers?.["x-session-id"],
+        });
         if (tr) {
           if (tr.dropped.length) {
             // The caller's cap value is logged so whether callers' caps could
@@ -4690,6 +4695,13 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           const raw = await sendUpstream(tr.path, method, cHeaders, tr.body, targetUrl,
             attemptTimeoutMs, abortSignal, probeResponseLimit);
           res = raw?.cancelled ? raw : fromCodexResponse(raw, candidateModel, tr.clientStream);
+          if (res?.cacheUsage) {
+            console.warn(
+              `[router] codex ${backendId}: cache model=${candidateModel} ` +
+                `key=${tr.promptCacheKey ? tr.promptCacheKey.slice(5, 13) : "off"} ` +
+                `input=${res.cacheUsage.input} cached=${res.cacheUsage.cached ?? "n/a"}`,
+            );
+          }
           if (res?.incompleteReason) {
             console.warn(
               `[router] codex ${backendId}: response incomplete (${res.incompleteReason}) ` +
