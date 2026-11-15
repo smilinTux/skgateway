@@ -1286,13 +1286,27 @@ function siemHook(evt) {
   }
 }
 
-// ─── Per-client guard rails (pck3, config/client-caps.yaml) ───
-// Client identity from x-app, daily caps, rate limits, alert outbox, spend.
-const clientGuard = createClientGuard({ getDb: () => metrics?.db ?? null, siem: siemHook });
-// Provider snapshot (pck3): rate-limit headers of real calls and the DeepSeek
-// balance persist in metrics.db and feed GET /status provider_usage; the guard
-// raises the Codex 80 percent, DeepSeek floor and stale-snapshot alerts.
-attachProviderStore({ db: metrics?.db ?? null, onSnapshot: (b, src, data, t) => clientGuard.providerObserved(b, src, data, t) });
+// ─── Evidence and budget monitoring (docs/EVIDENCE-BUDGET-MONITORING.md) ───
+// One feature, OFF by default, decided at boot from evidence_budget_monitoring
+// in the config (a restart toggles it; the caps file itself hot-reloads).
+// On: client guard (x-app identity, daily caps, rate limits, alert outbox,
+// spend), provider snapshot store (rate-limit headers of real calls and the
+// DeepSeek balance in metrics.db), /status provider_usage (contract
+// skgw-provider-usage/1) and clients, /admin/clients/usage. Off: none of it
+// runs, and /status, audit events and metrics.db are what they were before it.
+const ebm = config.evidence_budget_monitoring ?? { enabled: false };
+const EBM_ON = ebm.enabled === true;
+const clientGuard = EBM_ON
+  ? createClientGuard({ configPath: ebm.client_caps, getDb: () => metrics?.db ?? null, siem: siemHook })
+  : null;
+if (EBM_ON) {
+  console.log(`[skgateway] evidence and budget monitoring on (caps ${ebm.client_caps})`);
+  attachProviderStore({
+    db: metrics?.db ?? null,
+    backends: ebm.provider_backends,
+    onSnapshot: (b, src, data, t) => clientGuard.providerObserved(b, src, data, t),
+  });
+}
 let _deepseekBalanceAt = 0;
 async function providerTick() {
   try {
@@ -1311,8 +1325,10 @@ async function providerTick() {
     console.warn("[skgateway] provider tick failed:", e.message);
   }
 }
-setTimeout(providerTick, 5_000).unref();
-setInterval(providerTick, 60_000).unref();
+if (EBM_ON) {
+  setTimeout(providerTick, 5_000).unref();
+  setInterval(providerTick, 60_000).unref();
+}
 
 /**
  * One recorder for the process. Built lazily on first eligible request so a
@@ -1803,16 +1819,21 @@ export const server = http.createServer(async (req, res) => {
       backends: router.getHealth(),
       pool: pool.getTotalStats(),
       metrics: metrics?.getStats() || null,
-      // pck3: provider limits/balance snapshot and per-client caps, usage, dollars.
-      provider_usage: (() => {
-        try {
-          const pu = providerUsageStatus();
-          try { const daily = clientGuard.deepseekDaily(); if (daily) pu.backends.deepseek.daily = daily; }
-          catch (e) { pu.backends.deepseek.daily = { error: e.message }; }
-          return pu;
-        } catch (e) { return { error: e.message }; }
-      })(),
-      clients: (() => { try { return clientGuard.snapshot(); } catch (e) { return { error: e.message }; } })(),
+      // Evidence and budget monitoring only: provider limits/balance snapshot
+      // (contract skgw-provider-usage/1) and per-client caps, usage, dollars.
+      ...(EBM_ON ? {
+        provider_usage: (() => {
+          try {
+            const pu = providerUsageStatus();
+            if (pu.backends.deepseek) {
+              try { const daily = clientGuard.deepseekDaily(); if (daily) pu.backends.deepseek.daily = daily; }
+              catch (e) { pu.backends.deepseek.daily = { error: e.message }; }
+            }
+            return pu;
+          } catch (e) { return { error: e.message }; }
+        })(),
+        clients: (() => { try { return clientGuard.snapshot(); } catch (e) { return { error: e.message }; } })(),
+      } : {}),
     }));
     return;
   }
@@ -2119,9 +2140,10 @@ export const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Per-client usage (pck3): today's counters against the caps, plus estimated
-  // dollars per Chicago day, client and provider from request_log. ?days=1..31
-  if (req.url.split("?")[0] === "/admin/clients/usage" && req.method === "GET") {
+  // Per-client usage (evidence and budget monitoring only): today's counters
+  // against the caps, plus estimated dollars per day, client and provider from
+  // request_log. ?days=1..31
+  if (EBM_ON && req.url.split("?")[0] === "/admin/clients/usage" && req.method === "GET") {
     if (!isLoopback(req)) {
       res.writeHead(403, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: { message: "Admin routes are loopback only", code: 403 } }));
@@ -2433,7 +2455,7 @@ export const server = http.createServer(async (req, res) => {
       ts: new Date().toISOString(),
       event: "identity.resolved",
       agent_id: identity.agent_id,
-      client: clientOf(req.headers),
+      ...(EBM_ON ? { client: clientOf(req.headers) } : {}),
       method: identity.method,
       verified: identity.verified,
       session_id: identity.session_id,
@@ -2571,11 +2593,12 @@ export const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // ── Per-client guard rails (pck3) ──
+    // ── Per-client guard rails (evidence and budget monitoring only) ──
     // Untagged logging/reject, daily caps and rate limits, before any dispatch.
     // A guard failure never fails the request: it degrades to logging only.
-    let skClient = clientOf(req.headers);
-    try {
+    // Off: the raw x-app header (or nothing) is the attribution client, as before.
+    let skClient = EBM_ON ? clientOf(req.headers) : (req.headers["x-app"] || undefined);
+    if (EBM_ON) try {
       const guard = clientGuard.check({ headers: req.headers, model: parsedModel, remote: req.socket?.remoteAddress ?? null, path: req.url });
       skClient = guard.client;
       if (guard.reject) {
@@ -2676,7 +2699,7 @@ export const server = http.createServer(async (req, res) => {
     let metricsClosed = false;
     let guardRecorded = false;
     function closeMetrics({ statusCode, firstByteMs, generationMs, responseHeaders, responseBody, backend, modelServed, errorMsg, energy, energyAttempts, result } = {}) {
-      if (!guardRecorded) {
+      if (EBM_ON && !guardRecorded) {
         guardRecorded = true;
         try {
           clientGuard.record({ client: skClient, backend, statusCode, headers: responseHeaders ?? {}, body: responseBody, model: parsedModel, modelServed, at: startTime });
@@ -2824,8 +2847,9 @@ export const server = http.createServer(async (req, res) => {
       // Preserve the resolved request/session identity on every typed router
       // audit event, alongside agent and per-request correlation ids.
       sessionId: identity.session_id || req.headers["x-session-id"] || undefined,
-      // x-app client (pck3), "untagged" when absent: carried on every router audit event.
-      client: skClient,
+      // x-app client, "untagged" when absent: on every router audit event
+      // with evidence and budget monitoring on (absent with it off, as before).
+      client: EBM_ON ? skClient : undefined,
       // skmodels registry role/context routing (single source of truth).
       // Present => routeAndSend resolves via ~/.skcapstone/models/registry.yaml
       // (precedence context > service > role > default) before backend select.

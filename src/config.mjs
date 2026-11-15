@@ -291,6 +291,26 @@ const DEFAULTS = {
     gate: false,
   },
 
+  // Evidence and budget monitoring (docs/EVIDENCE-BUDGET-MONITORING.md). OFF by
+  // default: with it off the gateway serves no provider_usage or clients block
+  // on /status, keeps no provider snapshot tables, polls no provider balance,
+  // runs no client guard and has no /admin/clients/usage route.
+  //   enabled           true turns it on. null (unset) means on only when
+  //                     $SKGATEWAY_CLIENT_CAPS is set (the instance deployer sets
+  //                     it when the config repo ships a client-caps.yaml); false
+  //                     is off even then.
+  //   client_caps       caps, limits and alerts file. Relative paths resolve
+  //                     against this config file's folder. Unset: the
+  //                     $SKGATEWAY_CLIENT_CAPS path, else client-caps.yaml next
+  //                     to this config file.
+  //   provider_backends backends listed in /status provider_usage (contract
+  //                     skgw-provider-usage/1), each always present.
+  evidence_budget_monitoring: {
+    enabled: null,
+    client_caps: null,
+    provider_backends: ['codex', 'deepseek', 'zai'],
+  },
+
   dashboard: {
     enabled: true,
     refresh_ms: 5_000,
@@ -1310,6 +1330,28 @@ export function getConfig() {
  * @param {boolean} silent
  * @returns {object}
  */
+/**
+ * Settle the evidence_budget_monitoring section: a boolean `enabled` and an
+ * absolute `client_caps` path. Exported for tests.
+ *
+ * @param {object} section  The merged section (defaults plus the file).
+ * @param {string} configFile  The config file it came from.
+ * @param {NodeJS.ProcessEnv} [env]
+ * @returns {{enabled: boolean, client_caps: string, provider_backends: string[]}}
+ */
+export function resolveEvidenceBudgetMonitoring(section = {}, configFile = SYNCED_CONFIG_PATH, env = process.env) {
+  const s = section && typeof section === 'object' ? section : {};
+  const envCaps = (env.SKGATEWAY_CLIENT_CAPS || '').trim();
+  const enabled = s.enabled === true || ((s.enabled === null || s.enabled === undefined) && !!envCaps);
+  const base = dirname(resolve(configFile));
+  let caps = s.client_caps ? String(s.client_caps) : (envCaps || 'client-caps.yaml');
+  caps = caps.startsWith('~') ? expandHome(caps) : resolve(base, caps);
+  const backends = Array.isArray(s.provider_backends) && s.provider_backends.length
+    ? s.provider_backends.map(String)
+    : ['codex', 'deepseek', 'zai'];
+  return { enabled, client_caps: caps, provider_backends: backends };
+}
+
 function _readAndBuild(filePath, silent) {
   const base = deepClone(DEFAULTS);
 
@@ -1332,6 +1374,7 @@ function _readAndBuild(filePath, silent) {
   base.semantic_cache = normalizeSemanticCache(base.semantic_cache);
   applyEnvOverrides(base);
   resolvePaths(base);
+  base.evidence_budget_monitoring = resolveEvidenceBudgetMonitoring(base.evidence_budget_monitoring, filePath);
   validate(base, removedBackendIds);   // throws ConfigError on bad values
 
   return base;

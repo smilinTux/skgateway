@@ -1,0 +1,33 @@
+{
+  "contract": "skgw-provider-usage/1",
+  "description": "GET /status blocks and log lines of the evidence_budget_monitoring feature. Consumers (budget guards, collectors, dashboards) may rely on every field listed here. Removing or renaming a field, or changing its type, needs a new contract version; adding a field does not. Pinned by tests/evidence-budget-contract.test.mjs.",
+  "status_keys_without_feature": ["backends", "metrics", "pool", "status", "uptime", "version"],
+  "status_keys_with_feature": ["backends", "clients", "metrics", "pool", "provider_usage", "status", "uptime", "version"],
+  "provider_usage": {
+    "keys": { "schema": "string", "generated_at": "iso8601", "backends": "object" },
+    "backend": { "backend": "string", "observed_at": "iso8601|null", "age_seconds": "integer|null", "sources": "object" },
+    "backend_optional": { "daily": "object (deepseek only)" },
+    "source_common": { "observed_at": "iso8601", "age_seconds": "integer" },
+    "sources": {
+      "headers": { "windows": "array" },
+      "balance": { "is_available": "boolean", "balances": "array" }
+    },
+    "window": { "name": "string", "unit": "string", "limit": "number", "remaining": "number", "used_percent": "number|null", "reset_at": "iso8601|null" },
+    "balance": { "currency": "string", "total_balance": "number|null", "granted_balance": "number|null", "topped_up_balance": "number|null" },
+    "daily": { "day": "yyyy-mm-dd", "readings": "integer", "first": "object|null", "last": "object|null", "balance_drop": "number|null", "estimated_dollars": "number|null", "drift_percent": "number|null" }
+  },
+  "clients": {
+    "keys": { "day": "yyyy-mm-dd", "enabled": "boolean", "reject_untagged": "boolean", "clients": "array" },
+    "row": { "client": "string", "family": "string", "calls": "integer", "tokens": "integer", "dollars": "number", "cap_calls": "number|null", "cap_tokens": "number|null" }
+  },
+  "alert_record": {
+    "keys": { "ts": "iso8601", "day": "yyyy-mm-dd", "kind": "cap|spike|codex|deepseek_floor|stale", "key": "string", "severity": "string", "title": "string", "summary": "string" },
+    "optional": { "room": "string" }
+  },
+  "router_log_lines": {
+    "success": "[router] <status> OK backend=<backend id> latency=<ms>ms",
+    "throttled": "[router] <402|429> THROTTLED backend=<backend id> model=<model> cooldown=<ms>ms",
+    "success_regex": "\\[router\\] 200 OK backend=([A-Za-z0-9_.-]+)",
+    "throttled_regex": "\\[router\\] (402|429) THROTTLED backend=([A-Za-z0-9_.-]+)"
+  }
+}

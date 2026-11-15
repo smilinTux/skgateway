@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Post skgateway client-guard alerts (logs/alerts.jsonl) to NAM Admin.
+"""Post skgateway evidence and budget monitoring alerts from the outbox to chat.
 
-Usage: post-alerts.py [outbox]   (default ./logs/alerts.jsonl, run from the release folder)
+Usage: post-alerts.py [outbox]   (default ./logs/alerts.jsonl)
 
-Delivery reuses notify() from ~/comms/cutover/lanes/host-reprobe.py (Windmill f/ops/notify,
-room NAM Admin), which reads WM_URL, WM_WORKSPACE and WM_TOKEN_FILE from the environment
-(EnvironmentFile=%h/.config/lane-sweep.env, as fwe-budget-collect.service does). The token is
-read there and never printed. The byte offset of the last delivered line is kept in
+The gateway writes one JSON line per alert to the outbox (alerts.outbox in the
+client caps file; docs/EVIDENCE-BUDGET-MONITORING.md has the record format).
+Delivery is the operator's: SKGW_NOTIFY_MODULE names a Python file that defines
+notify(title, summary) -> bool (True when delivered). Its own settings and
+credentials come from its environment, never from this script, and are never
+printed. The byte offset of the last delivered line is kept in
 <outbox>.posted; a failed post stops the run and is retried on the next run.
 """
 import importlib.util
@@ -15,11 +17,12 @@ import os
 import sys
 from pathlib import Path
 
-NOTIFY = Path(os.environ.get('SKGW_NOTIFY_MODULE', Path.home() / 'comms/cutover/lanes/host-reprobe.py'))
-
 
 def load_notify():
-    spec = importlib.util.spec_from_file_location('reprobe', NOTIFY)
+    path = os.environ.get('SKGW_NOTIFY_MODULE', '').strip()
+    if not path:
+        sys.exit('post-alerts: set SKGW_NOTIFY_MODULE to a Python file defining notify(title, summary)')
+    spec = importlib.util.spec_from_file_location('skgw_notify', Path(path).expanduser())
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod.notify

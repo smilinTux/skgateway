@@ -116,20 +116,31 @@ export function providerUsageSnapshot({ now = Date.now(), maxAgeMs = DEFAULT_MAX
 
 export function _resetProviderUsageForTests() { records.clear(); }
 
-// ─── pck3: persisted provider snapshot for GET /status provider_usage ───
-// The latest figures per backend and source survive restarts in metrics.db
-// (table provider_snapshot). Sources: "headers" (rate-limit headers of real
-// calls, Codex and zai) and "balance" (DeepSeek /user/balance, hourly).
-// No new completion probes. No raw headers, no credentials are stored.
+// ─── Evidence and budget monitoring: persisted provider snapshot ───
+// Part of the evidence_budget_monitoring feature (docs/EVIDENCE-BUDGET-MONITORING.md),
+// which feeds GET /status provider_usage (contract skgw-provider-usage/1).
+// Nothing here runs until attachProviderStore() is called, which index.mjs does
+// only with the feature on. The latest figures per backend and source survive
+// restarts in metrics.db (table provider_snapshot). Sources: "headers"
+// (rate-limit headers of real calls, Codex and zai) and "balance" (DeepSeek
+// /user/balance). No new completion probes. No raw headers, no credentials.
+export const PROVIDER_USAGE_SCHEMA = "skgw-provider-usage/1";
 export const STATUS_BACKENDS = ["codex", "deepseek", "zai"];
 const PERSIST_EVERY_MS = 60_000;
+let storeAttached = false;
+let statusBackends = STATUS_BACKENDS;
 let snapshotDb = null;
 let snapshotHook = null;
 const lastPersist = new Map();
 const memorySnapshots = new Map(); // "backend\tsource" -> { observed_at, data }
 
-/** Attach metrics.db (may be null) and an alert hook (backend, source, data, now). */
-export function attachProviderStore({ db = null, onSnapshot = null } = {}) {
+/**
+ * Turn the store on: metrics.db (may be null for memory only), an alert hook
+ * (backend, source, data, now) and the backends /status lists.
+ */
+export function attachProviderStore({ db = null, onSnapshot = null, backends = STATUS_BACKENDS } = {}) {
+  storeAttached = true;
+  statusBackends = Array.isArray(backends) && backends.length ? [...backends] : STATUS_BACKENDS;
   snapshotDb = db;
   snapshotHook = onSnapshot;
   if (db) db.exec(`CREATE TABLE IF NOT EXISTS provider_snapshot (
@@ -161,7 +172,7 @@ const windowView = (w) => ({
 
 /** Called from observeProviderUsage when a real call carried quota headers. */
 function persistHeaderWindows(provider, windows, now) {
-  if (STATUS_BACKENDS.includes(provider) && windows.length) saveSnapshot(provider, "headers", { windows: windows.map(windowView) }, now);
+  if (storeAttached && statusBackends.includes(provider) && windows.length) saveSnapshot(provider, "headers", { windows: windows.map(windowView) }, now);
 }
 
 export const DEEPSEEK_BALANCE_URL = "https://api.deepseek.com/user/balance";
@@ -188,6 +199,7 @@ export async function pollDeepseekBalance({ key, fetchFn = globalThis.fetch, now
   }));
   const data = { is_available: body?.is_available === true, balances };
   const t = now();
+  if (!storeAttached) return { ok: true, data };
   saveSnapshot("deepseek", "balance", data, t, { force: true });
   if (snapshotDb) {
     try {
@@ -199,7 +211,7 @@ export async function pollDeepseekBalance({ key, fetchFn = globalThis.fetch, now
 }
 
 /**
- * The provider_usage block of GET /status. Every backend in STATUS_BACKENDS is
+ * The provider_usage block of GET /status. Every configured backend is
  * present; a backend with no snapshot has observed_at null and age_seconds null.
  */
 export function providerUsageStatus({ now = Date.now() } = {}) {
@@ -215,7 +227,7 @@ export function providerUsageStatus({ now = Date.now() } = {}) {
   }
   const age = (iso) => (iso ? Math.max(0, Math.round((now - Date.parse(iso)) / 1000)) : null);
   const backends = {};
-  for (const backend of STATUS_BACKENDS) {
+  for (const backend of statusBackends) {
     const sources = {};
     let newest = null;
     for (const [k, v] of rows) {
@@ -226,7 +238,7 @@ export function providerUsageStatus({ now = Date.now() } = {}) {
     }
     backends[backend] = { backend, observed_at: newest, age_seconds: age(newest), sources };
   }
-  return { schema: "skgw-provider-usage/1", generated_at: new Date(now).toISOString(), backends };
+  return { schema: PROVIDER_USAGE_SCHEMA, generated_at: new Date(now).toISOString(), backends };
 }
 
-export function _resetProviderStoreForTests() { snapshotDb = null; snapshotHook = null; lastPersist.clear(); memorySnapshots.clear(); }
+export function _resetProviderStoreForTests() { storeAttached = false; statusBackends = STATUS_BACKENDS; snapshotDb = null; snapshotHook = null; lastPersist.clear(); memorySnapshots.clear(); }

@@ -1,17 +1,20 @@
 /**
- * client-guard.mjs (pck3): per-client guard rails keyed on the x-app header.
+ * client-guard.mjs: per-client guard rails keyed on the x-app header, part of
+ * the evidence_budget_monitoring feature (docs/EVIDENCE-BUDGET-MONITORING.md).
+ * index.mjs creates it only with the feature on.
  *
  *   - client identity: x-app (pi sends SKGW_CLIENT there), "untagged" when absent
  *   - daily caps per client and provider family, in successful calls and tokens
- *     (input + output as the metrics collector counts them), America/Chicago days
+ *     (input + output as the metrics collector counts them), days in the caps
+ *     file's `timezone` (default UTC)
  *   - calls-per-minute rate limits per client and per session (x-session-id)
- *   - alerts to an outbox file (80 percent of a cap, hourly spike), posted to
- *     NAM Admin by scripts/post-alerts.py
+ *   - alerts to an outbox file (cap percent, hourly spike, Codex window,
+ *     DeepSeek floor, stale snapshot), posted by scripts/post-alerts.py
  *   - estimated dollars from a price table
  *
- * Config: config/client-caps.yaml (or $SKGATEWAY_CLIENT_CAPS), re-read when its
- * mtime changes. A missing or unreadable file leaves only the client logging on.
- * Never sees or logs prompt content: only headers, model ids and usage counts.
+ * Config: the feature's client_caps file, re-read when its mtime changes. A
+ * missing or unreadable file leaves only the client logging on. Never sees or
+ * logs prompt content: only headers, model ids and usage counts.
  */
 import { readFileSync, statSync, appendFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -24,15 +27,33 @@ try { ({ extractTokens } = await import("../metrics/collector.mjs")); } catch { 
 export const DEFAULT_CONFIG_PATH = process.env.SKGATEWAY_CLIENT_CAPS
   || fileURLToPath(new URL("../../config/client-caps.yaml", import.meta.url));
 
-const TZ = "America/Chicago";
-const DAY_FMT = new Intl.DateTimeFormat("en-CA", { timeZone: TZ });
-const CLOCK_FMT = new Intl.DateTimeFormat("en-GB", { timeZone: TZ, hourCycle: "h23", hour: "2-digit", minute: "2-digit", second: "2-digit" });
+export const DEFAULT_TIMEZONE = "UTC";
+const fmtCache = new Map();
+function fmt(kind, tz) {
+  const k = `${kind}\t${tz}`;
+  let f = fmtCache.get(k);
+  if (!f) {
+    f = kind === "day"
+      ? new Intl.DateTimeFormat("en-CA", { timeZone: tz })
+      : new Intl.DateTimeFormat("en-GB", { timeZone: tz, hourCycle: "h23", hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    fmtCache.set(k, f);
+  }
+  return f;
+}
 
-export const chicagoDay = (ms) => DAY_FMT.format(new Date(ms));
+/** A valid IANA zone name or the default. */
+export function zoneOf(tz) {
+  if (!tz) return DEFAULT_TIMEZONE;
+  try { new Intl.DateTimeFormat("en-US", { timeZone: String(tz) }); return String(tz); }
+  catch { return DEFAULT_TIMEZONE; }
+}
 
-/** Seconds until the next Chicago midnight (off by an hour on DST change days). */
-export function secondsToChicagoMidnight(ms) {
-  const [h, m, s] = CLOCK_FMT.format(new Date(ms)).split(":").map(Number);
+/** The YYYY-MM-DD day of `ms` in zone `tz`. */
+export const dayIn = (ms, tz = DEFAULT_TIMEZONE) => fmt("day", tz).format(new Date(ms));
+
+/** Seconds until the next midnight in zone `tz` (off by an hour on DST change days). */
+export function secondsToMidnight(ms, tz = DEFAULT_TIMEZONE) {
+  const [h, m, s] = fmt("clock", tz).format(new Date(ms)).split(":").map(Number);
   return Math.max(1, 86400 - (h * 3600 + m * 60 + s));
 }
 
@@ -95,6 +116,10 @@ export function createClientGuard({ configPath = DEFAULT_CONFIG_PATH, getDb = ()
   }
 
   const active = () => cfg.enabled === true;
+  const tz = () => zoneOf(cfg.timezone);
+  const dayOf = (ms) => dayIn(ms, tz());
+  // Optional estate wording appended to an alert summary: alerts.notes.<kind>.
+  const note = (kind) => { const v = cfg.alerts?.notes?.[kind]; return v ? ` ${String(v).trim()}` : ""; };
   const exempt = (backend) => (cfg.exempt_backends || []).includes(backend);
   const familiesFor = (model) => familyRes.filter(([, res]) => res.some((re) => re.test(String(model || "")))).map(([f]) => f);
   const isFamily = (backend) => !!backend && !exempt(backend) && familyRes.some(([f]) => f === backend);
@@ -111,7 +136,7 @@ export function createClientGuard({ configPath = DEFAULT_CONFIG_PATH, getDb = ()
   const lastUse = new Map();          // backend -> ms of the last successful paid call
 
   function usageFor(client, family, t) {
-    const day = chicagoDay(t);
+    const day = dayOf(t);
     if (day !== usageDay) { usageDay = day; usage = new Map(); }
     const k = `${client}\t${family}`;
     let u = usage.get(k);
@@ -138,9 +163,9 @@ export function createClientGuard({ configPath = DEFAULT_CONFIG_PATH, getDb = ()
     return firedTable ? db : null;
   }
 
-  /** Fire once per key per Chicago day: outbox line (posted to NAM Admin) plus an audit event. */
+  /** Fire once per key per day: outbox line (posted by scripts/post-alerts.py) plus an audit event. */
   function alertOnce(kind, name, fields, t) {
-    const day = chicagoDay(t);
+    const day = dayOf(t);
     const key = `${day}\t${kind}\t${name}`;
     if (fired.has(key)) return false;
     const db = firedDb();
@@ -150,7 +175,7 @@ export function createClientGuard({ configPath = DEFAULT_CONFIG_PATH, getDb = ()
       } catch (e) { log.error?.(`[client-guard] alert_fired write: ${e.message}`); }
     }
     fired.add(key);
-    const rec = { ts: new Date(t).toISOString(), day, kind, key, severity: "warning", room: "NAM Admin", ...fields };
+    const rec = { ts: new Date(t).toISOString(), day, kind, key, severity: "warning", ...(cfg.alerts?.room ? { room: String(cfg.alerts.room) } : {}), ...fields };
     try { appendFileSync(cfg.alerts?.outbox || "./logs/alerts.jsonl", JSON.stringify(rec) + "\n"); }
     catch (e) { log.error?.(`[client-guard] alert outbox write failed: ${e.message}`); }
     siem({ ts: rec.ts, event: "client.alert", kind, client: fields.client ?? null, backend: fields.backend ?? null, title: fields.title, summary: fields.summary });
@@ -158,9 +183,9 @@ export function createClientGuard({ configPath = DEFAULT_CONFIG_PATH, getDb = ()
   }
 
   const n = (v) => Number(v).toLocaleString("en-US");
-  const centralTime = (iso) => {
+  const localTime = (iso) => {
     const d = Date.parse(iso || "");
-    return Number.isFinite(d) ? new Intl.DateTimeFormat("en-US", { timeZone: TZ, month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(new Date(d)) + " Central" : "an unknown time";
+    return Number.isFinite(d) ? new Intl.DateTimeFormat("en-US", { timeZone: tz(), month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(new Date(d)) + ` ${tz()}` : "an unknown time";
   };
 
   function checkCapAlert(client, family, u, t) {
@@ -173,7 +198,7 @@ export function createClientGuard({ configPath = DEFAULT_CONFIG_PATH, getDb = ()
       alertOnce("cap", `${client}\t${family}\t${unit}\t${pct}`, {
         client, family, unit, used: u[unit], limit,
         title: `skgateway: client ${client} at ${pct} percent of its ${family} daily cap`,
-        summary: `Client ${client}: ${n(u[unit])} of ${n(limit)} ${unit} on ${family} today (${chicagoDay(t)}, Chicago day). At ${n(limit)} the gateway answers 429 to ${client}'s ${family} calls until midnight Central; its other families and other clients are not held. Caps: config/client-caps.yaml on chiap01.`,
+        summary: `Client ${client}: ${n(u[unit])} of ${n(limit)} ${unit} on ${family} today (${dayOf(t)}, ${tz()}). At ${n(limit)} the gateway answers 429 to ${client}'s ${family} calls until midnight ${tz()}; its other families and other clients are not held.${note("cap")}`,
       }, t);
     }
   }
@@ -198,7 +223,7 @@ export function createClientGuard({ configPath = DEFAULT_CONFIG_PATH, getDb = ()
     alertOnce("spike", client, {
       client, last_hour_calls: lastHour, trailing_hourly_avg: Math.round(avg * 10) / 10, factor,
       title: `skgateway: call rate jump from client ${client}`,
-      summary: `Client ${client}: ${n(lastHour)} paid-provider calls in the last hour, over ${factor} times its trailing 24-hour average of ${avg.toFixed(1)} an hour. Nothing is held by this alert; its daily caps and per-minute limits still apply.`,
+      summary: `Client ${client}: ${n(lastHour)} paid-provider calls in the last hour, over ${factor} times its trailing 24-hour average of ${avg.toFixed(1)} an hour. Nothing is held by this alert; its daily caps and per-minute limits still apply.${note("spike")}`,
     }, t);
   }
 
@@ -213,7 +238,7 @@ export function createClientGuard({ configPath = DEFAULT_CONFIG_PATH, getDb = ()
         alertOnce("codex", `${w.name}\t${pct}`, {
           backend, window: w.name, used_percent: w.used_percent, reset_at: w.reset_at,
           title: `skgateway: Codex ${w.name} window at ${w.used_percent} percent used`,
-          summary: `codex ${w.name} window ${w.used_percent}% used, resets ${centralTime(w.reset_at)}. At 100% Codex answers 429 and Codex lanes hold until the reset (the runner holds code and review briefs instead of moving them to GLM).`,
+          summary: `codex ${w.name} window ${w.used_percent}% used, resets ${localTime(w.reset_at)}. At 100% Codex answers 429 until the reset.${note("codex")}`,
         }, t);
       }
     }
@@ -225,7 +250,7 @@ export function createClientGuard({ configPath = DEFAULT_CONFIG_PATH, getDb = ()
         alertOnce("deepseek_floor", `${b.currency}\t${floor}`, {
           backend, currency: b.currency, total_balance: b.total_balance, floor: Number(floor),
           title: `skgateway: DeepSeek balance ${b.total_balance} ${b.currency} is below the floor`,
-          summary: `DeepSeek balance ${b.total_balance} ${b.currency}, floor ${floor}. At 0 DeepSeek answers 402 and every DeepSeek lane holds (research and code briefs wait in the queue). A top-up is Chef's call.`,
+          summary: `DeepSeek balance ${b.total_balance} ${b.currency}, floor ${floor}. At 0 DeepSeek answers 402.${note("deepseek_floor")}`,
         }, t);
       }
     }
@@ -243,7 +268,7 @@ export function createClientGuard({ configPath = DEFAULT_CONFIG_PATH, getDb = ()
       alertOnce("stale", backend, {
         backend, age_seconds: b.age_seconds,
         title: `skgateway: ${backend} provider status is stale`,
-        summary: `${backend} is in use but its last provider snapshot is ${b.age_seconds === null ? "missing" : `${Math.round(b.age_seconds / 60)} minutes old`} (limit ${hours} h). The FWE runner holds new ${backend} lanes while /status provider_usage is stale.`,
+        summary: `${backend} is in use but its last provider snapshot is ${b.age_seconds === null ? "missing" : `${Math.round(b.age_seconds / 60)} minutes old`} (limit ${hours} h), so /status provider_usage is stale for it.${note("stale")}`,
       }, t);
     }
   }
@@ -258,14 +283,14 @@ export function createClientGuard({ configPath = DEFAULT_CONFIG_PATH, getDb = ()
       for (const r of db.prepare("SELECT req_id, cache_read_tokens FROM token_usage WHERE ts >= ?").iterate(t - 26 * 3600e3)) {
         if (r.cache_read_tokens) cached.set(r.req_id, r.cache_read_tokens);
       }
-      const today = chicagoDay(t);
+      const today = dayOf(t);
       let n = 0;
       for (const r of db.prepare("SELECT id, started_at, client, backend, model, model_served, input_tokens, output_tokens, status_code FROM request_log WHERE started_at >= ?").iterate(t - 26 * 3600e3)) {
         if (!isFamily(r.backend)) continue;
         const client = r.client || "untagged";
         if (r.started_at > t - 1500 * 60000) bumpMinute(client, r.started_at);
         if (r.status_code >= 200 && r.status_code < 400 && r.started_at > (lastUse.get(r.backend) || 0)) lastUse.set(r.backend, r.started_at);
-        if (chicagoDay(r.started_at) !== today || !(r.status_code >= 200 && r.status_code < 400)) continue;
+        if (dayOf(r.started_at) !== today || !(r.status_code >= 200 && r.status_code < 400)) continue;
         const u = usageFor(client, r.backend, t);
         const input = r.input_tokens || 0, output = r.output_tokens || 0;
         u.calls += 1;
@@ -300,7 +325,7 @@ export function createClientGuard({ configPath = DEFAULT_CONFIG_PATH, getDb = ()
       siem({
         ts: new Date(t).toISOString(), event: "client.untagged", client, remote, path, model: model ?? null,
         user_agent: headers["user-agent"] ?? null,
-        ...(grace ? { warning: chicagoDay(t) <= String(grace)
+        ...(grace ? { warning: dayOf(t) <= String(grace)
           ? `untagged request: send x-app (SKGW_CLIENT); grace until ${grace}, after that reject_untagged may be switched on`
           : `untagged request after the grace date ${grace}` } : {}),
       });
@@ -324,15 +349,15 @@ export function createClientGuard({ configPath = DEFAULT_CONFIG_PATH, getDb = ()
         const u = usageFor(client, family, t);
         for (const unit of ["calls", "tokens"]) {
           const limit = positive(cap[unit]);
-          if (limit && u[unit] >= limit) { first ??= { client, family, unit, limit, used: u[unit], day: chicagoDay(t) }; return true; }
+          if (limit && u[unit] >= limit) { first ??= { client, family, unit, limit, used: u[unit], day: dayOf(t) }; return true; }
         }
         return false;
       });
       if (over) {
         siem({ ts: new Date(t).toISOString(), event: "client.cap_denied", ...first, model: model ?? null, session_id: session });
         return { client, session, reject: deny(429, "client_daily_cap",
-          `Daily cap reached: client "${client}" used ${first.used} of ${first.limit} ${first.unit} on ${first.family} today (${first.day}, America/Chicago). Resets at midnight Chicago.`,
-          { cap: first }, secondsToChicagoMidnight(t)) };
+          `Daily cap reached: client "${client}" used ${first.used} of ${first.limit} ${first.unit} on ${first.family} today (${first.day}, ${tz()}). Resets at midnight ${tz()}.`,
+          { cap: first }, secondsToMidnight(t, tz())) };
       }
     }
 
@@ -391,7 +416,7 @@ export function createClientGuard({ configPath = DEFAULT_CONFIG_PATH, getDb = ()
     };
   }
 
-  /** Estimated dollars per Chicago day, client and provider from request_log. */
+  /** Estimated dollars per day (caps file timezone), client and provider from request_log. */
   function spend({ days = 1 } = {}) {
     loadConfig();
     const db = getDb();
@@ -406,7 +431,7 @@ export function createClientGuard({ configPath = DEFAULT_CONFIG_PATH, getDb = ()
     const agg = new Map();
     // ponytail: full scan of request_log (no started_at index), fine for a loopback admin call.
     for (const r of db.prepare("SELECT id, started_at, client, backend, model, model_served, input_tokens, output_tokens, status_code FROM request_log WHERE started_at >= ?").iterate(since)) {
-      const day = chicagoDay(r.started_at);
+      const day = dayOf(r.started_at);
       const k = `${day}\t${r.client || "untagged"}\t${r.backend || "none"}`;
       let a = agg.get(k);
       if (!a) { a = { day, client: r.client || "untagged", provider: r.backend || "none", calls: 0, input_tokens: 0, output_tokens: 0, cached_tokens: 0, dollars: 0, unpriced_calls: 0 }; agg.set(k, a); }
@@ -418,11 +443,11 @@ export function createClientGuard({ configPath = DEFAULT_CONFIG_PATH, getDb = ()
     }
     const rows = [...agg.values()].map((a) => ({ ...a, dollars: Math.round(a.dollars * 1e4) / 1e4 }))
       .sort((x, y) => (x.day < y.day ? 1 : x.day > y.day ? -1 : y.dollars - x.dollars));
-    return { available: true, days: d, timezone: TZ, rows };
+    return { available: true, days: d, timezone: tz(), rows };
   }
 
   /**
-   * Yesterday's (Chicago day) first and last DeepSeek balance reading and the
+   * Yesterday's (caps file timezone) first and last DeepSeek balance reading and the
    * estimated DeepSeek dollars between them, for the daily summary. Computed
    * once per day (yesterday is final), so /status polling stays cheap.
    */
@@ -431,14 +456,14 @@ export function createClientGuard({ configPath = DEFAULT_CONFIG_PATH, getDb = ()
     loadConfig();
     const db = getDb();
     if (!db) return null;
-    const [y, m, d] = chicagoDay(now()).split("-").map(Number);
+    const [y, m, d] = dayOf(now()).split("-").map(Number);
     const day = new Date(Date.UTC(y, m - 1, d - 1)).toISOString().slice(0, 10);
     if (dailyCache?.day === day) return dailyCache;
     let rows = [];
     try {
       rows = db.prepare("SELECT observed_at, currency, total_balance FROM deepseek_balance_log WHERE observed_at >= ? ORDER BY observed_at")
         .all(new Date(Date.UTC(y, m - 1, d - 3)).toISOString())
-        .filter((r) => chicagoDay(Date.parse(r.observed_at)) === day);
+        .filter((r) => dayOf(Date.parse(r.observed_at)) === day);
     } catch { /* table not there yet */ }
     const usd = rows.filter((r) => r.currency === "USD");
     const list = usd.length ? usd : rows;
