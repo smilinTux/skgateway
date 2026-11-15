@@ -16,6 +16,7 @@
    - [siem](#siem)
    - [dashboard](#dashboard)
    - [identity](#identity)
+   - [evidence_budget_monitoring](#evidence_budget_monitoring)
 6. [Example Configurations](#example-configurations)
    - [Minimal — NVIDIA proxy replacement](#minimal--nvidia-proxy-replacement)
    - [Full enterprise](#full-enterprise)
@@ -478,6 +479,30 @@ identity:
 | `require_agent_id` | boolean | `false` | When `true`, requests without a recognizable agent identity are rejected with HTTP 401. |
 | `allow_anonymous` | boolean | `true` | When `false` and `require_agent_id: true`, requests that can't be mapped to a known agent are rejected. When `true`, they proceed as the `anonymous` agent. |
 | `capauth_verify` | boolean | `false` | When `true`, the gateway cryptographically verifies the `X-CapAuth-Signature` header using the agent's registered PGP public key. Requests with invalid signatures are rejected. |
+
+---
+
+### `evidence_budget_monitoring`
+
+Optional evidence and budget monitoring: per-client caps and limits, provider
+rate-limit and balance snapshots, the `provider_usage` (contract
+`skgw-provider-usage/1`) and `clients` blocks on `GET /status`,
+`GET /admin/clients/usage`, and an alert outbox. **Off by default**; with it
+off the gateway behaves as if the feature did not exist. Full guide and the
+versioned contract: [EVIDENCE-BUDGET-MONITORING.md](EVIDENCE-BUDGET-MONITORING.md).
+
+```yaml
+evidence_budget_monitoring:
+  enabled: true
+  client_caps: client-caps.yaml
+  provider_backends: [codex, deepseek, zai]
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | boolean or null | `null` | `true` on, `false` off. `null` (unset) is on only when `$SKGATEWAY_CLIENT_CAPS` is set. Read at boot. |
+| `client_caps` | string | `null` | Caps, limits and alerts file; relative to this config file. Unset: `$SKGATEWAY_CLIENT_CAPS`, else `client-caps.yaml` beside this file. |
+| `provider_backends` | list | `[codex, deepseek, zai]` | Backends always listed in `provider_usage.backends`. |
 
 ---
 

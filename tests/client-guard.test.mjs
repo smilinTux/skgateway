@@ -1,5 +1,7 @@
 /**
- * client-guard.test.mjs (pck3): per-client guard rails.
+ * client-guard.test.mjs: per-client guard rails of evidence and budget monitoring.
+ * The fixture runs on America/Chicago days (timezone in the caps file), which
+ * exercises a non-UTC calendar; the default zone is UTC (last tests).
  * Features: 1 client identity, 2 daily caps, 3 rate limits, 4 alerts,
  * 5 price table and spend, 6 untagged logging and reject switch.
  */
@@ -10,7 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import Database from "better-sqlite3";
-import { createClientGuard, clientOf, sessionOf, chicagoDay, estimateDollars, secondsToChicagoMidnight, isPeak } from "../src/policy/client-guard.mjs";
+import { createClientGuard, clientOf, sessionOf, dayIn, estimateDollars, secondsToMidnight, isPeak, zoneOf } from "../src/policy/client-guard.mjs";
 import { createRouteSiemEmitter } from "../src/proxy/router.mjs";
 
 // 2026-11-14 12:00 Chicago (CST, UTC-6)
@@ -22,9 +24,10 @@ function setup(extra = "", { db = null, start = NOON } = {}) {
   const configPath = join(dir, "client-caps.yaml");
   writeFileSync(configPath, `
 enabled: true
+timezone: America/Chicago
 reject_untagged: false
 untagged_grace_until: "2026-11-21"
-exempt_backends: [chiap08-qwen38]
+exempt_backends: [local-qwen]
 families:
   codex: ["gpt-*"]
   deepseek: ["deepseek-*", "sk-l"]
@@ -60,7 +63,7 @@ const ok = (g, client, backend, extra = {}) => g.record({ client, backend, statu
 
 // ── 1. client identity ──
 test("client is x-app, untagged when absent or blank, sanitized and bounded", () => {
-  assert.equal(clientOf({ "x-app": "fwe-lane" }), "fwe-lane");
+  assert.equal(clientOf({ "x-app": "lane-b" }), "lane-b");
   assert.equal(clientOf({}), "untagged");
   assert.equal(clientOf({ "x-app": "   " }), "untagged");
   assert.equal(clientOf({ "x-app": "a b\n<x>" }), "a_b__x_");
@@ -71,11 +74,11 @@ test("client is x-app, untagged when absent or blank, sanitized and bounded", ()
 
 test("router audit events carry client and session", async () => {
   const seen = [];
-  const emit = createRouteSiemEmitter((e) => seen.push(e), { client: "fwe-lane", sessionId: "s-9", model: "gpt-6.1-sol" });
+  const emit = createRouteSiemEmitter((e) => seen.push(e), { client: "lane-b", sessionId: "s-9", model: "gpt-6.1-sol" });
   await emit("request", { method: "POST" });
   await emit("response", { status: 200 });
   for (const e of seen) {
-    assert.equal(e.client, "fwe-lane");
+    assert.equal(e.client, "lane-b");
     assert.equal(e.session_id, "s-9");
   }
   const none = [];
@@ -107,10 +110,10 @@ test("caps: per-client override, failed calls not counted, local exempt", () => 
   for (let i = 0; i < 10; i++) ok(guard, "big", "codex");
   assert.equal(guard.check({ headers: { "x-app": "big" }, model: "gpt-x" }).reject, null);
   for (let i = 0; i < 10; i++) guard.record({ client: "c", backend: "codex", statusCode: 429 });
-  for (let i = 0; i < 10; i++) ok(guard, "c", "chiap08-qwen38");
+  for (let i = 0; i < 10; i++) ok(guard, "c", "local-qwen");
   assert.equal(guard.check({ headers: { "x-app": "c" }, model: "gpt-x" }).reject, null);
   assert.equal(guard.check({ headers: { "x-app": "c" }, model: "qwen3.8-27b" }).reject, null);
-  assert.equal(guard.snapshot().clients.some((r) => r.family === "chiap08-qwen38"), false);
+  assert.equal(guard.snapshot().clients.some((r) => r.family === "local-qwen"), false);
 });
 
 test("caps: tokens from usage; bucket refused only when every family is over", () => {
@@ -127,12 +130,12 @@ test("caps: tokens from usage; bucket refused only when every family is over", (
 test("caps reset on the Chicago day, not the UTC day", () => {
   const { guard, clock } = setup();
   clock.t = Date.parse("2026-11-15T03:00:00Z"); // 21:00 Chicago on 11-14, already 11-15 in UTC
-  assert.equal(chicagoDay(clock.t), "2026-11-14");
+  assert.equal(dayIn(clock.t, "America/Chicago"), "2026-11-14");
   for (let i = 0; i < 3; i++) ok(guard, "d", "deepseek");
   assert.equal(guard.check({ headers: { "x-app": "d" }, model: "deepseek-v4-pro" }).reject.status, 429);
   clock.t = Date.parse("2026-11-15T06:00:01Z"); // 00:00:01 Chicago 11-15
   assert.equal(guard.check({ headers: { "x-app": "d" }, model: "deepseek-v4-pro" }).reject, null);
-  assert.ok(secondsToChicagoMidnight(Date.parse("2026-11-15T05:59:00Z")) <= 60);
+  assert.ok(secondsToMidnight(Date.parse("2026-11-15T05:59:00Z"), "America/Chicago") <= 60);
 });
 
 test("guard is off when the config file is missing or enabled is false", () => {
@@ -168,24 +171,24 @@ test("session and client per-minute limits answer 429 with Retry-After, window s
 test("alerts fire once per threshold per Chicago day, kept in metrics.db across a restart; a new day can fire", () => {
   const db = new Database(":memory:");
   const { guard, make, outbox, clock } = setup("", { db });
-  for (let i = 0; i < 4; i++) ok(guard, "chiap04-fwe-lane", "codex"); // 4 of 5 = 80 percent
-  ok(guard, "chiap04-fwe-lane", "codex");                              // second pass, same day
+  for (let i = 0; i < 4; i++) ok(guard, "lane-a", "codex"); // 4 of 5 = 80 percent
+  ok(guard, "lane-a", "codex");                              // second pass, same day
   let lines = readFileSync(outbox, "utf8").trim().split("\n").map(JSON.parse);
   assert.equal(lines.length, 1);
   assert.equal(lines[0].kind, "cap");
-  assert.equal(lines[0].room, "NAM Admin");
-  assert.match(lines[0].summary, /chiap04-fwe-lane: 4 of 5 calls on codex/);
-  assert.match(lines[0].summary, /answers 429 to chiap04-fwe-lane's codex calls until midnight Central/);
+  assert.equal("room" in lines[0], false, "no room unless alerts.room is set");
+  assert.match(lines[0].summary, /lane-a: 4 of 5 calls on codex/);
+  assert.match(lines[0].summary, /answers 429 to lane-a's codex calls until midnight America\/Chicago/);
   assert.equal(db.prepare("SELECT count(*) n FROM alert_fired").get().n, 1);
   const again = make(); // restart: counters start at zero here (no request_log), fired state comes from alert_fired
-  for (let i = 0; i < 4; i++) ok(again, "chiap04-fwe-lane", "codex");
+  for (let i = 0; i < 4; i++) ok(again, "lane-a", "codex");
   again.providerObserved("codex", "headers", { windows: [{ name: "primary", unit: "percent", used_percent: 82, reset_at: "2026-11-14T20:00:00Z" }] });
   again.providerObserved("codex", "headers", { windows: [{ name: "primary", unit: "percent", used_percent: 85, reset_at: "2026-11-14T20:00:00Z" }] });
   lines = readFileSync(outbox, "utf8").trim().split("\n").map(JSON.parse);
   assert.deepEqual(lines.map((l) => l.kind), ["cap", "codex"]);
-  assert.match(lines[1].summary, /codex primary window 82% used, resets Nov 14, 14:00 Central/);
+  assert.match(lines[1].summary, /codex primary window 82% used, resets Nov 14, 14:00 America\/Chicago/);
   clock.t += 86400e3; // new Chicago day: both may fire again
-  for (let i = 0; i < 4; i++) ok(again, "chiap04-fwe-lane", "codex");
+  for (let i = 0; i < 4; i++) ok(again, "lane-a", "codex");
   again.providerObserved("codex", "headers", { windows: [{ name: "primary", unit: "percent", used_percent: 90 }] });
   assert.deepEqual(readFileSync(outbox, "utf8").trim().split("\n").map((l) => JSON.parse(l).kind), ["cap", "codex", "cap", "codex"]);
 });
@@ -276,10 +279,10 @@ function metricsDb() {
   db.exec(`CREATE TABLE request_log (id TEXT PRIMARY KEY, started_at INTEGER, client TEXT, backend TEXT, model TEXT, model_served TEXT, input_tokens INTEGER, output_tokens INTEGER, status_code INTEGER);
            CREATE TABLE token_usage (req_id TEXT, ts INTEGER, cache_read_tokens INTEGER);`);
   const ins = db.prepare("INSERT INTO request_log VALUES (?,?,?,?,?,?,?,?,?)");
-  ins.run("r1", NOON - 3600e3, "fwe-lane", "deepseek", "deepseek-v4-pro", null, 1e6, 1e6, 200);
+  ins.run("r1", NOON - 3600e3, "lane-b", "deepseek", "deepseek-v4-pro", null, 1e6, 1e6, 200);
   ins.run("r2", NOON - 3600e3, null, "deepseek", "deepseek-v4-pro", null, 0, 0, 200);
-  ins.run("r3", NOON - 13 * 3600e3, "fwe-lane", "deepseek", "deepseek-v4-pro", null, 1e6, 0, 200); // yesterday in Chicago
-  ins.run("r4", NOON - 60e3, "fwe-lane", "chiap08-qwen38", "qwen", null, 9, 9, 200);
+  ins.run("r3", NOON - 13 * 3600e3, "lane-b", "deepseek", "deepseek-v4-pro", null, 1e6, 0, 200); // yesterday in Chicago
+  ins.run("r4", NOON - 60e3, "lane-b", "local-qwen", "qwen", null, 9, 9, 200);
   db.prepare("INSERT INTO token_usage VALUES (?,?,?)").run("r1", NOON - 3600e3, 1e6);
   return db;
 }
@@ -289,19 +292,19 @@ test("seed from request_log at boot, snapshot and spend per day, client and prov
   const { guard } = setup("", { db });
   const snap = guard.snapshot();
   assert.equal(snap.day, "2026-11-14");
-  const row = snap.clients.find((r) => r.client === "fwe-lane" && r.family === "deepseek");
+  const row = snap.clients.find((r) => r.client === "lane-b" && r.family === "deepseek");
   assert.deepEqual([row.calls, row.tokens, row.dollars], [1, 2e6, 3.1]);
   assert.ok(snap.clients.find((r) => r.client === "untagged"), "NULL client seeds as untagged");
   const s = guard.spend({ days: 2 });
   const key = (r) => `${r.day}|${r.client}|${r.provider}`;
   const byKey = Object.fromEntries(s.rows.map((r) => [key(r), r]));
-  assert.equal(byKey["2026-11-14|fwe-lane|deepseek"].dollars, 3.1);
-  assert.equal(byKey["2026-11-13|fwe-lane|deepseek"].dollars, 1);
-  assert.equal(byKey["2026-11-14|fwe-lane|chiap08-qwen38"].unpriced_calls, 1);
+  assert.equal(byKey["2026-11-14|lane-b|deepseek"].dollars, 3.1);
+  assert.equal(byKey["2026-11-13|lane-b|deepseek"].dollars, 1);
+  assert.equal(byKey["2026-11-14|lane-b|local-qwen"].unpriced_calls, 1);
   // two more successful deepseek calls hit the cap of 3 seeded with today's rows
-  ok(guard, "fwe-lane", "deepseek");
-  ok(guard, "fwe-lane", "deepseek");
-  assert.equal(guard.check({ headers: { "x-app": "fwe-lane" }, model: "deepseek-v4-pro" }).reject.status, 429);
+  ok(guard, "lane-b", "deepseek");
+  ok(guard, "lane-b", "deepseek");
+  assert.equal(guard.check({ headers: { "x-app": "lane-b" }, model: "deepseek-v4-pro" }).reject.status, 429);
 });
 
 // ── 6. untagged ──
@@ -362,7 +365,7 @@ test("peak windows: UTC weekday and hours, end exclusive; weekends and holidays 
 test("deepseekDaily: yesterday's first and last balance and the estimate between them", () => {
   const dir = mkdtempSync(join(tmpdir(), "client-guard-daily-"));
   const configPath = join(dir, "caps.yaml");
-  writeFileSync(configPath, `enabled: true\nfamilies: { deepseek: ["deepseek-*"] }\npeak_windows_utc: ["01:00-04:00", "06:00-10:00"]\npeak_weekdays: [Mon, Tue, Wed, Thu, Fri]\nholidays: []\nprices:\n  deepseek-v4-pro:\n    peak: { input: 1.32, output: 3.96, cached: 0.044 }\n    offpeak: { input: 0.66, output: 1.98, cached: 0.022 }\nalerts: { outbox: ${join(dir, "a.jsonl")} }\n`);
+  writeFileSync(configPath, `enabled: true\ntimezone: America/Chicago\nfamilies: { deepseek: ["deepseek-*"] }\npeak_windows_utc: ["01:00-04:00", "06:00-10:00"]\npeak_weekdays: [Mon, Tue, Wed, Thu, Fri]\nholidays: []\nprices:\n  deepseek-v4-pro:\n    peak: { input: 1.32, output: 3.96, cached: 0.044 }\n    offpeak: { input: 0.66, output: 1.98, cached: 0.022 }\nalerts: { outbox: ${join(dir, "a.jsonl")} }\n`);
   const db = new Database(":memory:");
   db.exec(`CREATE TABLE request_log (id TEXT PRIMARY KEY, started_at INTEGER, client TEXT, backend TEXT, model TEXT, model_served TEXT, input_tokens INTEGER, output_tokens INTEGER, status_code INTEGER);
            CREATE TABLE token_usage (req_id TEXT, backend TEXT, ts INTEGER, cache_read_tokens INTEGER);
@@ -385,4 +388,41 @@ test("deepseekDaily: yesterday's first and last balance and the estimate between
   assert.equal(d.estimated_dollars, 3.982);
   assert.equal(d.drift_percent, -60.2);
   assert.equal(g.deepseekDaily(), d, "cached for the day");
+});
+
+// ── 7. estate wording and the calendar come from the caps file ──
+test("alerts.room and alerts.notes are copied onto outbox records; no estate wording otherwise", () => {
+  const { guard, outbox } = setup();
+  for (let i = 0; i < 4; i++) ok(guard, "a", "codex");
+  const plain = JSON.parse(readFileSync(outbox, "utf8").trim());
+  assert.doesNotMatch(plain.summary, /Caps:|lane|runner|top-up/);
+
+  const dir = mkdtempSync(join(tmpdir(), "client-guard-notes-"));
+  const out2 = join(dir, "alerts.jsonl");
+  const cfg = join(dir, "client-caps.yaml");
+  writeFileSync(cfg, `
+enabled: true
+families: { codex: ["gpt-*"] }
+caps: { default: { codex: { calls: 5 } } }
+alerts:
+  outbox: ${out2}
+  room: Ops Room
+  notes: { cap: "Caps live in the cluster config repo." }
+`);
+  const g = createClientGuard({ configPath: cfg, getDb: () => null, siem: () => {}, now: () => NOON, log: {} });
+  for (let i = 0; i < 4; i++) ok(g, "a", "codex");
+  const rec = JSON.parse(readFileSync(out2, "utf8").trim());
+  assert.equal(rec.room, "Ops Room");
+  assert.match(rec.summary, /until midnight UTC; .* Caps live in the cluster config repo\.$/);
+  assert.equal(rec.day, "2026-11-14");
+});
+
+test("timezone defaults to UTC and an invalid zone falls back to UTC", () => {
+  assert.equal(zoneOf(undefined), "UTC");
+  assert.equal(zoneOf("Not/AZone"), "UTC");
+  assert.equal(zoneOf("Europe/Berlin"), "Europe/Berlin");
+  // 03:00Z on 11-15 is still 11-14 in Chicago but 11-15 in UTC
+  const t = Date.parse("2026-11-15T03:00:00Z");
+  assert.equal(dayIn(t), "2026-11-15");
+  assert.equal(dayIn(t, "America/Chicago"), "2026-11-14");
 });

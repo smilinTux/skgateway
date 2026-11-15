@@ -262,6 +262,9 @@ GET http://localhost:18780/health
 ### GET /status
 
 Detailed gateway status including backend health snapshots and basic metrics.
+With [evidence and budget monitoring](EVIDENCE-BUDGET-MONITORING.md) on, it
+also carries `provider_usage` (contract `skgw-provider-usage/1`) and `clients`,
+and the loopback-only `GET /admin/clients/usage?days=1..31` is served.
 
 **Request**
 
