@@ -66,6 +66,7 @@ test("the spec file is the version-1 contract, field for field", () => {
   assert.deepEqual(Object.keys(SPEC.clients.keys), ["day", "enabled", "reject_untagged", "clients"]);
   assert.deepEqual(Object.keys(SPEC.clients.row), ["client", "family", "calls", "tokens", "dollars", "cap_calls", "cap_tokens"]);
   assert.deepEqual(Object.keys(SPEC.alert_record.keys), ["ts", "day", "kind", "key", "severity", "title", "summary"]);
+  assert.deepEqual(Object.keys(SPEC.metrics_db.request_log), ["started_at", "model", "status_code", "cost_truth", "agent_id", "session_id", "client"]);
   assert.equal(SPEC.router_log_lines.success_regex, "\\[router\\] 200 OK backend=([A-Za-z0-9_.-]+)");
   assert.equal(SPEC.router_log_lines.throttled_regex, "\\[router\\] (402|429) THROTTLED backend=([A-Za-z0-9_.-]+)");
 });
