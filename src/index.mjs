@@ -43,7 +43,7 @@ import {
 } from "./operator/http.mjs";
 import { fromAnthropicRequest, toAnthropicMessage, modelRetrieveObject } from "./proxy/anthropic-frontend.mjs";
 import { fromResponsesRequest, normalizeErrorBody, responsesError, responsesStreamEvents, toResponsesObject } from "./proxy/responses-frontend.mjs";
-import { readCodexAuthHeaders } from "./proxy/codex-adapter.mjs";
+import { readCodexAuthHeaders, codexCliVersionInfo } from "./proxy/codex-adapter.mjs";
 import { readZaiAuthHeaders, ZAI_CREDENTIALS_PATH } from "./proxy/zai-adapter.mjs";
 import { SSEWriter, jsonToSSE } from "./proxy/stream.mjs";
 import { handleEmbeddings, handleTranscriptions, createMediaLimiter } from "./proxy/media-routes.mjs";
@@ -961,6 +961,13 @@ let poolConfig = {
   capacityDomains: config.pooling?.capacity_domains || {},
 };
 let pool = getPool(poolConfig);
+
+// The Codex backend gates /models and request identity on the client version
+// we report, so a stale value silently hides new models. Say which one is used.
+if (Object.values(config.backends || {}).some((b) => b?.auth_type === "codex_oauth" && b.enabled !== false)) {
+  const cx = codexCliVersionInfo();
+  console.log(`[skgateway] codex client version ${cx.version} (${cx.source})`);
+}
 
 // Subscription recovery is autonomous: once retry_at is due, one bounded,
 // public-synthetic request tests the exact provider/model. routeAndSend owns

@@ -14,7 +14,41 @@ import {
   fromCodexResponse,
   parseCodexSSE,
   readCodexAuthHeaders,
+  CODEX_CLI_VERSION,
+  codexCliVersionInfo,
+  compareVersions,
+  _resetCodexVersionProbe,
 } from "../src/proxy/codex-adapter.mjs";
+import { writeFileSync, mkdtempSync, rmSync, chmodSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join as joinPath } from "node:path";
+
+// Run every version test with a known env and a fresh probe cache, so the
+// host's real codex CLI never leaks into a result.
+function withCodexEnv(env, fn) {
+  const keys = ["SKGATEWAY_CODEX_CLI_VERSION", "SKGATEWAY_CODEX_CLI_DETECT", "SKGATEWAY_CODEX_BIN"];
+  const prev = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+  for (const k of keys) delete process.env[k];
+  Object.assign(process.env, env);
+  _resetCodexVersionProbe();
+  try {
+    return fn();
+  } finally {
+    for (const k of keys) {
+      if (prev[k] === undefined) delete process.env[k];
+      else process.env[k] = prev[k];
+    }
+    _resetCodexVersionProbe();
+  }
+}
+
+function fakeCodex(output, exitCode = 0) {
+  const dir = mkdtempSync(joinPath(tmpdir(), "fake-codex-"));
+  const bin = joinPath(dir, "codex");
+  writeFileSync(bin, `#!/bin/sh\necho '${output}'\nexit ${exitCode}\n`);
+  chmodSync(bin, 0o755);
+  return { bin, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+}
 
 function openaiBody(obj) {
   return Buffer.from(JSON.stringify(obj), "utf-8");
@@ -328,30 +362,93 @@ test("readCodexAuthHeaders: codex CLI auth.json shape, flat shape, and failures"
 
 // ── client version header ─────────────────────────────────────────────────────
 
-test("toCodexRequest: version header defaults to the pinned CLI version", () => {
-  const prev = process.env.SKGATEWAY_CODEX_CLI_VERSION;
-  delete process.env.SKGATEWAY_CODEX_CLI_VERSION;
-  try {
+test("toCodexRequest: version header defaults to the built-in CLI version", () => {
+  withCodexEnv({ SKGATEWAY_CODEX_CLI_DETECT: "off" }, () => {
     const r = toCodexRequest(openaiBody({ model: "gpt-6.1-sol", messages: [{ role: "user", content: "hi" }] }));
-    assert.equal(r.headers.version, "0.163.0");
+    assert.equal(CODEX_CLI_VERSION, "0.170.0");
+    assert.equal(r.headers.version, "0.170.0");
     assert.equal(r.headers.originator, "codex_cli_rs");
-  } finally {
-    if (prev !== undefined) process.env.SKGATEWAY_CODEX_CLI_VERSION = prev;
-  }
+  });
 });
 
 test("toCodexRequest: SKGATEWAY_CODEX_CLI_VERSION overrides the version header; junk is ignored", () => {
-  const prev = process.env.SKGATEWAY_CODEX_CLI_VERSION;
   const body = openaiBody({ model: "gpt-6.1-sol", messages: [{ role: "user", content: "hi" }] });
-  try {
-    process.env.SKGATEWAY_CODEX_CLI_VERSION = "0.170.2";
+  withCodexEnv({ SKGATEWAY_CODEX_CLI_DETECT: "off", SKGATEWAY_CODEX_CLI_VERSION: "0.170.2" }, () => {
     assert.equal(toCodexRequest(body).headers.version, "0.170.2");
-    process.env.SKGATEWAY_CODEX_CLI_VERSION = "latest";
-    assert.equal(toCodexRequest(body).headers.version, "0.163.0");
-  } finally {
-    if (prev === undefined) delete process.env.SKGATEWAY_CODEX_CLI_VERSION;
-    else process.env.SKGATEWAY_CODEX_CLI_VERSION = prev;
-  }
+  });
+  withCodexEnv({ SKGATEWAY_CODEX_CLI_DETECT: "off", SKGATEWAY_CODEX_CLI_VERSION: "latest" }, () => {
+    assert.equal(toCodexRequest(body).headers.version, "0.170.0");
+  });
+});
+
+test("codexCliVersionInfo: a newer installed codex CLI is used", () => {
+  const f = fakeCodex("codex-cli 0.172.3");
+  try {
+    withCodexEnv({ SKGATEWAY_CODEX_BIN: f.bin }, () => {
+      assert.deepEqual(codexCliVersionInfo(), { version: "0.172.3", source: "installed codex CLI" });
+    });
+  } finally { f.cleanup(); }
+});
+
+test("codexCliVersionInfo: an older installed codex CLI never downgrades the default", () => {
+  const f = fakeCodex("codex-cli 0.163.0");
+  try {
+    withCodexEnv({ SKGATEWAY_CODEX_BIN: f.bin }, () => {
+      assert.deepEqual(codexCliVersionInfo(), { version: "0.170.0", source: "built-in default, installed 0.163.0 not newer" });
+    });
+  } finally { f.cleanup(); }
+});
+
+test("codexCliVersionInfo: the env pin wins over the installed CLI", () => {
+  const f = fakeCodex("codex-cli 0.172.3");
+  try {
+    withCodexEnv({ SKGATEWAY_CODEX_BIN: f.bin, SKGATEWAY_CODEX_CLI_VERSION: "0.171.0" }, () => {
+      assert.deepEqual(codexCliVersionInfo(), { version: "0.171.0", source: "env SKGATEWAY_CODEX_CLI_VERSION" });
+    });
+  } finally { f.cleanup(); }
+});
+
+test("codexCliVersionInfo: missing, failing or versionless CLI falls back to the default", () => {
+  withCodexEnv({ SKGATEWAY_CODEX_BIN: "/nonexistent/codex" }, () => {
+    assert.deepEqual(codexCliVersionInfo(), {
+      version: "0.170.0", source: "built-in default, codex not found, set SKGATEWAY_CODEX_BIN",
+    });
+  });
+  const bad = fakeCodex("codex-cli 0.199.0", 1);
+  const junk = fakeCodex("codex-cli dev build");
+  try {
+    withCodexEnv({ SKGATEWAY_CODEX_BIN: bad.bin }, () => assert.equal(codexCliVersionInfo().version, "0.170.0"));
+    withCodexEnv({ SKGATEWAY_CODEX_BIN: junk.bin }, () => assert.equal(codexCliVersionInfo().version, "0.170.0"));
+  } finally { bad.cleanup(); junk.cleanup(); }
+});
+
+test("codexCliVersionInfo: SKGATEWAY_CODEX_CLI_DETECT=off skips the probe", () => {
+  const f = fakeCodex("codex-cli 0.172.3");
+  try {
+    withCodexEnv({ SKGATEWAY_CODEX_BIN: f.bin, SKGATEWAY_CODEX_CLI_DETECT: "off" }, () => {
+      assert.equal(codexCliVersionInfo().source, "built-in default, detection off");
+    });
+  } finally { f.cleanup(); }
+});
+
+test("codexCliVersionInfo: a hung codex that ignores SIGTERM is killed at the timeout", () => {
+  const dir = mkdtempSync(joinPath(tmpdir(), "hung-codex-"));
+  const bin = joinPath(dir, "codex");
+  writeFileSync(bin, "#!/bin/sh\ntrap '' TERM\nexec sleep 30\n");
+  chmodSync(bin, 0o755);
+  try {
+    withCodexEnv({ SKGATEWAY_CODEX_BIN: bin }, () => {
+      const t0 = Date.now();
+      assert.equal(codexCliVersionInfo().version, "0.170.0");
+      assert.ok(Date.now() - t0 < 10000, "probe must not wait for the hung child");
+    });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("compareVersions orders numerically, not lexically", () => {
+  assert.ok(compareVersions("0.170.0", "0.99.9") > 0);
+  assert.ok(compareVersions("0.163.0", "0.170.0") < 0);
+  assert.equal(compareVersions("1.2.3", "1.2.3"), 0);
 });
 
 // ── runaway output ceiling (2026-10-26) ───────────────────────────────────────
