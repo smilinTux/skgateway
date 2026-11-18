@@ -394,7 +394,7 @@ test("codexCliVersionInfo: an older installed codex CLI never downgrades the def
   const f = fakeCodex("codex-cli 0.163.0");
   try {
     withCodexEnv({ SKGATEWAY_CODEX_BIN: f.bin }, () => {
-      assert.deepEqual(codexCliVersionInfo(), { version: "0.170.0", source: "built-in default" });
+      assert.deepEqual(codexCliVersionInfo(), { version: "0.170.0", source: "built-in default, installed 0.163.0 not newer" });
     });
   } finally { f.cleanup(); }
 });
@@ -410,7 +410,9 @@ test("codexCliVersionInfo: the env pin wins over the installed CLI", () => {
 
 test("codexCliVersionInfo: missing, failing or versionless CLI falls back to the default", () => {
   withCodexEnv({ SKGATEWAY_CODEX_BIN: "/nonexistent/codex" }, () => {
-    assert.equal(codexCliVersionInfo().version, "0.170.0");
+    assert.deepEqual(codexCliVersionInfo(), {
+      version: "0.170.0", source: "built-in default, codex not found, set SKGATEWAY_CODEX_BIN",
+    });
   });
   const bad = fakeCodex("codex-cli 0.199.0", 1);
   const junk = fakeCodex("codex-cli dev build");
@@ -424,9 +426,23 @@ test("codexCliVersionInfo: SKGATEWAY_CODEX_CLI_DETECT=off skips the probe", () =
   const f = fakeCodex("codex-cli 0.172.3");
   try {
     withCodexEnv({ SKGATEWAY_CODEX_BIN: f.bin, SKGATEWAY_CODEX_CLI_DETECT: "off" }, () => {
-      assert.equal(codexCliVersionInfo().source, "built-in default");
+      assert.equal(codexCliVersionInfo().source, "built-in default, detection off");
     });
   } finally { f.cleanup(); }
+});
+
+test("codexCliVersionInfo: a hung codex that ignores SIGTERM is killed at the timeout", () => {
+  const dir = mkdtempSync(joinPath(tmpdir(), "hung-codex-"));
+  const bin = joinPath(dir, "codex");
+  writeFileSync(bin, "#!/bin/sh\ntrap '' TERM\nsleep 30\n");
+  chmodSync(bin, 0o755);
+  try {
+    withCodexEnv({ SKGATEWAY_CODEX_BIN: bin }, () => {
+      const t0 = Date.now();
+      assert.equal(codexCliVersionInfo().version, "0.170.0");
+      assert.ok(Date.now() - t0 < 10000, "probe must not wait for the hung child");
+    });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("compareVersions orders numerically, not lexically", () => {

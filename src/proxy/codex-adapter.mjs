@@ -88,6 +88,7 @@ export function compareVersions(a, b) {
 }
 
 let detected; // undefined = not probed yet, null = probe found nothing
+let probeNote = ""; // why the probe found nothing, for the startup log
 
 /**
  * Version of the Codex CLI installed on this host, from `codex --version`
@@ -98,18 +99,25 @@ let detected; // undefined = not probed yet, null = probe found nothing
 export function detectInstalledCodexVersion() {
   if (detected !== undefined) return detected;
   detected = null;
-  if ((process.env.SKGATEWAY_CODEX_CLI_DETECT || "").trim().toLowerCase() === "off") return detected;
+  if ((process.env.SKGATEWAY_CODEX_CLI_DETECT || "").trim().toLowerCase() === "off") {
+    probeNote = "detection off";
+    return detected;
+  }
   try {
     const bin = (process.env.SKGATEWAY_CODEX_BIN || "").trim() || "codex";
     const out = execFileSync(bin, ["--version"], {
       encoding: "utf8",
       timeout: 3000,
+      killSignal: "SIGKILL", // a wrapper that ignores SIGTERM must not hold the probe
+      maxBuffer: 64 * 1024,
       stdio: ["ignore", "pipe", "ignore"],
     });
     const m = /(\d+\.\d+\.\d+)/.exec(out);
     if (m) detected = m[1];
-  } catch {
+    else probeNote = "codex printed no version";
+  } catch (e) {
     // missing or failing CLI: fall back to the built-in default
+    probeNote = e?.code === "ENOENT" ? "codex not found, set SKGATEWAY_CODEX_BIN" : "codex --version failed";
   }
   return detected;
 }
@@ -117,6 +125,7 @@ export function detectInstalledCodexVersion() {
 /** Test hook: forget the cached probe result. */
 export function _resetCodexVersionProbe() {
   detected = undefined;
+  probeNote = "";
 }
 
 /**
@@ -134,7 +143,8 @@ export function codexCliVersionInfo() {
   if (installed && compareVersions(installed, CODEX_CLI_VERSION) > 0) {
     return { version: installed, source: "installed codex CLI" };
   }
-  return { version: CODEX_CLI_VERSION, source: "built-in default" };
+  const why = installed ? `installed ${installed} not newer` : probeNote;
+  return { version: CODEX_CLI_VERSION, source: why ? `built-in default, ${why}` : "built-in default" };
 }
 
 /** Effective Codex CLI version (see codexCliVersionInfo). */
