@@ -76,6 +76,22 @@ const RE_THINKING_PREAMBLE =
   /^(The user wants me to|I need to|I should|Let me first|First,? I'?ll|I'?ll start by|My plan is to|Actually,? I|Looking at|Now I need|Good,? the|The instructions? (?:mention|say)|Read required|\d+\.\s+(?:Read|Check|Search|Call|Use|Get|Then|First|Next))[^\n]*\n?(\n?(I should|I need to|Let me|I'?ll|Then I|First|Next|Actually|However|Now|Good|\d+\.)[^\n]*\n?)*/i;
 
 /**
+ * Leaked reasoning with no tags (qwen3.8 fallback, 2026-11-18): the model
+ * narrates the request, then its plan, then answers. The opener must name the
+ * user and a request verb, so "The user table has..." is left alone.
+ */
+const RE_META_OPENER =
+  /^(?:(?:The user|The human|The person|Chef)\b.{0,160}?\b(?:is asking|are asking|asks|asked|wants|wanted|is saying|says|said|wrote|is requesting|requests|message|question)\b|Let me think\b|Okay,? (?:so )?the user\b)/i;
+
+/** A line that talks ABOUT the reply instead of being the reply. */
+const RE_PLANNING_LINE =
+  /\b(?:I should|I'll|I will|I need to|I want to|Let me|Let's|my (?:reply|answer|response)|(?:reply|answer|response) (?:should|can|will)|keep it|no tools? (?:needed|required)|short reply|background from|this refers to)\b|^(?:Hmm|Wait|Actually,? wait|Okay,? so)\b|^(?:The user|The human|He|She|They)\b.{0,80}\b(?:is asking|asks|asked|wants|said|wrote)\b/i;
+
+/** Planning that speaks in the first person (a bare restatement is not enough). */
+const RE_FIRST_PERSON_PLAN =
+  /\b(?:I should|I'll|I will|I need to|I want to|Let me|Let's)\b/i;
+
+/**
  * Matches `<think>...</think>` blocks emitted by some reasoning models
  * (e.g. DeepSeek R1, QwQ).
  */
@@ -254,6 +270,28 @@ export function recoverKimiToolCalls(text) {
 }
 
 /**
+ * Drop leading lines that narrate the request and plan the reply, keeping the
+ * reply itself. Conservative: needs a request-restating opener, at least one
+ * first-person plan line, and at least one line left over (the last line is
+ * never removed), otherwise the text is returned unchanged.
+ */
+function stripLeakedPlanningLines(text, label) {
+  if (!text || !RE_META_OPENER.test(text.trimStart())) return text;
+  const lines = text.split("\n");
+  let end = 0;
+  while (end < lines.length) {
+    const line = lines[end].trim();
+    if (line && !RE_PLANNING_LINE.test(line)) break;
+    end++;
+  }
+  const planning = lines.slice(0, end).join("\n");
+  const remainder = lines.slice(end).join("\n").trim();
+  if (!remainder || !RE_FIRST_PERSON_PLAN.test(planning)) return text;
+  console.log(`[${label}] SANITIZED: stripped leaked reasoning (${planning.length} chars), kept ${remainder.length} chars`);
+  return remainder;
+}
+
+/**
  * Strip all Kimi K2.5 leaked tool-call markup from a text string.
  * Also removes leaked chain-of-thought planning preambles.
  *
@@ -295,6 +333,8 @@ function stripKimiMarkup(text, { label = "sanitizer" } = {}) {
     }
   }
 
+  cleaned = stripLeakedPlanningLines(cleaned, label);
+
   if (cleaned === text) return text;
 
   // Collapse excess whitespace
@@ -313,7 +353,17 @@ function stripKimiMarkup(text, { label = "sanitizer" } = {}) {
  * @returns {{ text: string, hadThinking: boolean }}
  */
 function handleThinkBlocks(text) {
-  if (!text || !RE_THINK_BLOCK.test(text)) return { text, hadThinking: false };
+  if (!text) return { text, hadThinking: false };
+  // Reasoning templates put the opening <think> in the prompt, so only the
+  // closing tag comes back: everything before the last stray </think> is reasoning.
+  RE_THINK_BLOCK.lastIndex = 0;
+  const unpaired = text.replace(RE_THINK_BLOCK, "");
+  const lastClose = unpaired.toLowerCase().lastIndexOf("</think>");
+  if (lastClose !== -1) {
+    return { text: unpaired.slice(lastClose + "</think>".length).replace(RE_EXCESS_NEWLINES, "\n\n").trim(), hadThinking: true };
+  }
+  RE_THINK_BLOCK.lastIndex = 0;
+  if (!RE_THINK_BLOCK.test(text)) return { text, hadThinking: false };
 
   RE_THINK_BLOCK.lastIndex = 0;
   const matches = [...text.matchAll(RE_THINK_BLOCK)];

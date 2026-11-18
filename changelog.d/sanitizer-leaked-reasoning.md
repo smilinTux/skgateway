@@ -1,0 +1,1 @@
+- Response sanitizer now strips untagged leaked reasoning from fallback models (replies that open by restating the request or with "Let me think", then plan, then answer) and drops everything before an unpaired closing think tag. Found when a qwen3.8 failover posted its chain of thought into a Talk room.
