@@ -434,7 +434,7 @@ test("codexCliVersionInfo: SKGATEWAY_CODEX_CLI_DETECT=off skips the probe", () =
 test("codexCliVersionInfo: a hung codex that ignores SIGTERM is killed at the timeout", () => {
   const dir = mkdtempSync(joinPath(tmpdir(), "hung-codex-"));
   const bin = joinPath(dir, "codex");
-  writeFileSync(bin, "#!/bin/sh\ntrap '' TERM\nsleep 30\n");
+  writeFileSync(bin, "#!/bin/sh\ntrap '' TERM\nexec sleep 30\n");
   chmodSync(bin, 0o755);
   try {
     withCodexEnv({ SKGATEWAY_CODEX_BIN: bin }, () => {
