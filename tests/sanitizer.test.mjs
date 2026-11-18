@@ -561,3 +561,61 @@ describe("sanitizeResponse + recovery integration", () => {
     assert.throws(() => JSON.parse(tc.function.arguments));
   });
 });
+
+// ---------------------------------------------------------------------------
+// Leaked chain-of-thought from reasoning fallbacks (2026-11-18)
+//
+// When the claude-code-api login expired, Lumina fell back to
+// qwen3.8-27b, which wrote its reasoning as plain reply text with no
+// <think> tags. The old RE_THINKING_PREAMBLE only caught openers such as
+// "The user wants me to", so "The user (Chef) is asking:" leaked into a chat.
+// ---------------------------------------------------------------------------
+
+describe("sanitizeResponse: leaked planning paragraphs", () => {
+  const run = (content) =>
+    sanitizeResponse(
+      { choices: [{ index: 0, message: { role: "assistant", content } }] },
+      { thinkMode: "strip", label: "test" }
+    ).choices[0].message.content;
+
+  test("strips the real 2026-11-18 Workshop leak and keeps the answer", () => {
+    const answer =
+      "Less wordy now, Chef, the last long recap was because I hit the max tool-iteration cap. " +
+      "Want me to close it and push the PR, or leave it for now?";
+    const leaked =
+      'The user (Chef) is asking: "lumina, are you still buggin out or are you less wordy now?" ' +
+      "This refers to his comment about me dumping long thinking output into the chat.\n\n" +
+      "Background from the last turn: I said I hit the iteration cap and gave a long summary. " +
+      "He's now asking if I'm still being verbose.\n\n" +
+      "I should be brief. This is a Talk room, short, warm, in-character. Answer in 2-3 lines.\n\n" +
+      "Keep it tight, no tools needed. The question is conversational.\n\n" +
+      "Let me write a short reply.\n" +
+      answer;
+    assert.equal(run(leaked), answer);
+  });
+
+  test("strips a single-paragraph-per-line leak separated by blank lines", () => {
+    const leaked =
+      "The user wants to know the time zone of the server.\n\n" +
+      "I need to answer directly.\n\n" +
+      "The server runs on US Eastern time.";
+    assert.equal(run(leaked), "The server runs on US Eastern time.");
+  });
+
+  test("never strips the final paragraph, even if it is all planning-like", () => {
+    const text = "The user is asking about X.\n\nI should answer carefully.";
+    assert.equal(run(text), text);
+  });
+
+  test("leaves a normal answer that mentions 'the user' alone", () => {
+    const text =
+      "The user table has three columns: id, name and email.\n\n" +
+      "I'll add an index on email if you want faster lookups.";
+    assert.equal(run(text), text);
+  });
+
+  test("leaves a normal multi-paragraph answer untouched", () => {
+    const text = "Done. The gateway restarted cleanly.\n\nI'll keep an eye on the logs.\n\nAnything else?";
+    assert.equal(run(text), text);
+  });
+});
