@@ -63,6 +63,7 @@
  */
 
 import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 
 /**
@@ -71,17 +72,74 @@ import { createHash } from "node:crypto";
  * headers on a plausible CLI version, so this is functional, not cosmetic.
  * Bump together with the fleet's codex CLI.
  */
-export const CODEX_CLI_VERSION = "0.163.0";
+export const CODEX_CLI_VERSION = "0.170.0";
+
+const SEMVER = /^\d+\.\d+\.\d+/;
+
+/** Compare two x.y.z versions numerically: <0, 0, >0. */
+export function compareVersions(a, b) {
+  const pa = a.split(".").map((n) => parseInt(n, 10));
+  const pb = b.split(".").map((n) => parseInt(n, 10));
+  for (let i = 0; i < 3; i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0);
+    if (d !== 0) return d;
+  }
+  return 0;
+}
+
+let detected; // undefined = not probed yet, null = probe found nothing
 
 /**
- * Effective Codex CLI version. SKGATEWAY_CODEX_CLI_VERSION overrides the
- * default so a new model gated on client version can be unlocked without a
- * code release (the backend gates models by this value, e.g. gpt-6.1-sol
- * needs >= 0.163.0).
+ * Version of the Codex CLI installed on this host, from `codex --version`
+ * (binary from SKGATEWAY_CODEX_BIN, else `codex` on PATH). Probed once and
+ * cached; null when the CLI is missing, slow, or prints no version.
+ * SKGATEWAY_CODEX_CLI_DETECT=off disables the probe.
  */
+export function detectInstalledCodexVersion() {
+  if (detected !== undefined) return detected;
+  detected = null;
+  if ((process.env.SKGATEWAY_CODEX_CLI_DETECT || "").trim().toLowerCase() === "off") return detected;
+  try {
+    const bin = (process.env.SKGATEWAY_CODEX_BIN || "").trim() || "codex";
+    const out = execFileSync(bin, ["--version"], {
+      encoding: "utf8",
+      timeout: 3000,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    const m = /(\d+\.\d+\.\d+)/.exec(out);
+    if (m) detected = m[1];
+  } catch {
+    // missing or failing CLI: fall back to the built-in default
+  }
+  return detected;
+}
+
+/** Test hook: forget the cached probe result. */
+export function _resetCodexVersionProbe() {
+  detected = undefined;
+}
+
+/**
+ * Effective Codex CLI version and where it came from. The backend gates
+ * /models and request identity on this value (gpt-6.1-sol needs >= 0.163.0,
+ * gpt-6.2-sol and gpt-6.2-astra need >= 0.170.0), so a stale value silently
+ * hides new models. Order: SKGATEWAY_CODEX_CLI_VERSION (explicit pin), then
+ * the installed CLI when it is newer than the built-in default, then the
+ * built-in default. An older installed CLI never downgrades the default.
+ */
+export function codexCliVersionInfo() {
+  const pinned = (process.env.SKGATEWAY_CODEX_CLI_VERSION || "").trim();
+  if (SEMVER.test(pinned)) return { version: pinned, source: "env SKGATEWAY_CODEX_CLI_VERSION" };
+  const installed = detectInstalledCodexVersion();
+  if (installed && compareVersions(installed, CODEX_CLI_VERSION) > 0) {
+    return { version: installed, source: "installed codex CLI" };
+  }
+  return { version: CODEX_CLI_VERSION, source: "built-in default" };
+}
+
+/** Effective Codex CLI version (see codexCliVersionInfo). */
 export function codexCliVersion() {
-  const v = (process.env.SKGATEWAY_CODEX_CLI_VERSION || "").trim();
-  return /^\d+\.\d+\.\d+/.test(v) ? v : CODEX_CLI_VERSION;
+  return codexCliVersionInfo().version;
 }
 
 /** Codex client identity sent on every /responses call (measured from the CLI). */
