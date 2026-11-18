@@ -65,6 +65,14 @@ describe("live pipeline wiring (card 080e032e)", () => {
     );
   });
 
+  test("buffered SSE bodies are sanitized, not passed through (2026-11-18 leak)", () => {
+    const indexContent = readFileSync("./src/index.mjs", "utf-8");
+    assert.ok(
+      indexContent.includes("sanitizeSSEBody(responseBody"),
+      "index.mjs must run sanitizeSSEBody over text/event-stream bodies"
+    );
+  });
+
   test("response sanitization wiring is present after routeAndSend", () => {
     const indexContent = readFileSync("./src/index.mjs", "utf-8");
 

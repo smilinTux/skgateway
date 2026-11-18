@@ -1,0 +1,1 @@
+- Response sanitizer now covers buffered SSE bodies (`stream: true` on the plain chat path), not just JSON, so a leaky fallback model cannot stream its reasoning to a client. Only `delta.content` is rewritten; tool-call, usage and finish frames are untouched.

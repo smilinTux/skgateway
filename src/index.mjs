@@ -14,7 +14,7 @@ import { loadConfig, getConfig } from "./config.mjs";
 import { createProxyServer, handleRequest, buildConfig, trimSystemMessages, trimConversationHistory } from "./proxy/core.mjs";
 import { ingressRequestLimit, requestLimitResponse } from "./proxy/request-limits.mjs";
 import { createRouter, routeAndSend, startKimiAuthKeepalive, warnUnmatchedNoFailover } from "./proxy/router.mjs";
-import { normalizeSystemMessageOrder, sanitizeResponse } from "./proxy/sanitizer.mjs";
+import { normalizeSystemMessageOrder, sanitizeResponse, sanitizeSSEBody } from "./proxy/sanitizer.mjs";
 import { applyCapacityView, availabilityState, buildModelCatalog, reconcileModeFromConfig, tagLocalModels, mergeDiscoveredCatalog, isModelAvailable, isCatalogDisabledBackend, excludedModelIds, withoutExcludedModels } from "./proxy/advertise.mjs";
 import { isDeepStrictEqual } from "node:util";
 import { loadAllowlist, saveAllowlist, applyAllowlist } from "./advertise.mjs";
@@ -2953,8 +2953,18 @@ export const server = http.createServer(async (req, res) => {
               console.warn(`[skgateway] response not JSON, skipping sanitization: ${parseError.message}`);
             }
           }
-          // Streaming responses are buffered by routeAndSend and arrive here as
-          // complete bodies, so the same sanitization applies.
+          else {
+            // Streaming responses are buffered by routeAndSend and arrive here as
+            // complete SSE bodies. Clean the assistant text frame by frame; a
+            // body with nothing to clean comes back as the same buffer.
+            const cleanedSSE = sanitizeSSEBody(responseBody, {
+              label: "skgateway",
+            });
+            if (cleanedSSE !== responseBody) {
+              result.body = cleanedSSE;
+              console.log(`[skgateway] SSE response sanitized for model=${parsedModel}`);
+            }
+          }
         } catch (e) {
           // Fail-closed: sanitization error rejects before sending to client
           console.error("[skgateway] response sanitization failed (fail-closed):", e.message);
