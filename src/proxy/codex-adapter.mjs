@@ -196,6 +196,17 @@ export function readCodexAuthHeaders(path) {
  * Only the hash is sent, never prompt text. SKGW_CODEX_PROMPT_CACHE_KEY=0
  * turns it off without a release.
  *
+ * SESSION_ID HEADER (2026-11-18). The key alone is not enough: the same key
+ * is also sent as the `session_id` request header, as the Codex CLI does.
+ * MEASURED on chiap01 against the live backend (gpt-6-luna, ~9.8k-token
+ * stable prefix, 5-turn append-only conversations, 3 runs each): follow-up
+ * turns hit the cache 2 of 12 times with prompt_cache_key only (17 percent,
+ * matching the 13 percent fleet rate seen 2026-11-11 to 18) and 9 of 12
+ * times with the header added (75 percent). Live logs showed the same
+ * shape before this: a stable key per conversation, mostly cached=0, an
+ * occasional near-full hit, i.e. requests landing on a cold replica. The
+ * header carries the same opaque hash, nothing more.
+ *
  * @param {{runawayMaxOutputTokens?: number, sessionId?: string}} [opts]
  * @returns {{path: string, headers: Record<string,string>, body: Buffer, clientStream: boolean, dropped: string[], callerMaxTokens: number|null, maxOutputTokens: number|null}|null}
  */
@@ -333,6 +344,7 @@ export function toCodexRequest(openaiBody, opts = {}) {
       accept: "text/event-stream",
       originator: CODEX_ORIGINATOR,
       version: codexCliVersion(),
+      ...(promptCacheKey ? { session_id: promptCacheKey } : {}),
     },
     body: Buffer.from(JSON.stringify(out), "utf-8"),
     clientStream: req.stream === true,
