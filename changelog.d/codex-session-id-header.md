@@ -1,0 +1,1 @@
+- Codex backend: send the per-conversation prompt cache key as the `session_id` header too, as the Codex CLI does. Measured on chiap01: follow-up turns went from 2 of 12 cached to 9 of 12.

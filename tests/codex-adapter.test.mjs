@@ -472,6 +472,17 @@ test("prompt_cache_key: session header wins, then a client key", () => {
   assert.equal(tr.promptCacheKey, ck);
 });
 
+test("prompt_cache_key: same key rides the session_id header", () => {
+  const msgs = [{ role: "system", content: "sys" }, { role: "user", content: "hi" }];
+  const tr = toCodexRequest(openaiBody({ model: "m", messages: msgs }));
+  const ck = JSON.parse(tr.body.toString("utf-8")).prompt_cache_key;
+  assert.match(ck, /^skgw-[0-9a-f]{40}$/);
+  assert.equal(tr.headers.session_id, ck);
+  const withSession = toCodexRequest(openaiBody({ model: "m", messages: msgs }), { sessionId: "sess-1" });
+  assert.equal(withSession.headers.session_id, JSON.parse(withSession.body.toString("utf-8")).prompt_cache_key);
+  assert.notEqual(withSession.headers.session_id, "sess-1");
+});
+
 test("prompt_cache_key: kill switch SKGW_CODEX_PROMPT_CACHE_KEY=0 omits it", () => {
   process.env.SKGW_CODEX_PROMPT_CACHE_KEY = "0";
   try {
