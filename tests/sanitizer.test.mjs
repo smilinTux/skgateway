@@ -619,3 +619,37 @@ describe("sanitizeResponse: leaked planning paragraphs", () => {
     assert.equal(run(text), text);
   });
 });
+
+describe("sanitizeResponse: unpaired </think> and untagged self-talk", () => {
+  const run = (content) =>
+    sanitizeResponse(
+      { choices: [{ index: 0, message: { role: "assistant", content } }] },
+      { thinkMode: "strip", label: "test" }
+    ).choices[0].message.content;
+
+  test("drops everything before a stray closing tag (opening tag was in the prompt)", () => {
+    assert.equal(run("Let me work this out. 2+2 is 4.\n</think>\n\nThe answer is 4."), "The answer is 4.");
+  });
+
+  test("still strips complete think pairs", () => {
+    assert.equal(run("<think>plan</think>Final."), "Final.");
+  });
+
+  test("a stray closing tag with nothing after it yields empty content", () => {
+    assert.equal(run("only reasoning here</think>"), "");
+  });
+
+  test("strips untagged 'Let me think / Actually wait' self-talk before the answer", () => {
+    const leaked =
+      "Let me think about what Chef is asking here.\n" +
+      "Actually wait, I should double check the date first.\n" +
+      "Hmm, the user wanted a short answer so I'll keep it brief.\n" +
+      "It is Tuesday.";
+    assert.equal(run(leaked), "It is Tuesday.");
+  });
+
+  test("a normal reply that starts with 'Actually' is kept", () => {
+    const text = "Actually, the gateway restarted cleanly.\nNo action needed.";
+    assert.equal(run(text), text);
+  });
+});

@@ -81,11 +81,11 @@ const RE_THINKING_PREAMBLE =
  * user and a request verb, so "The user table has..." is left alone.
  */
 const RE_META_OPENER =
-  /^(?:The user|The human|The person|Chef)\b.{0,160}?\b(?:is asking|are asking|asks|asked|wants|wanted|is saying|says|said|wrote|is requesting|requests|message|question)\b/i;
+  /^(?:(?:The user|The human|The person|Chef)\b.{0,160}?\b(?:is asking|are asking|asks|asked|wants|wanted|is saying|says|said|wrote|is requesting|requests|message|question)\b|Let me think\b|Okay,? (?:so )?the user\b)/i;
 
 /** A line that talks ABOUT the reply instead of being the reply. */
 const RE_PLANNING_LINE =
-  /\b(?:I should|I'll|I will|I need to|I want to|Let me|Let's|my (?:reply|answer|response)|(?:reply|answer|response) (?:should|can|will)|keep it|no tools? (?:needed|required)|short reply|background from|this refers to)\b|^(?:The user|The human|He|She|They)\b.{0,80}\b(?:is asking|asks|asked|wants|said|wrote)\b/i;
+  /\b(?:I should|I'll|I will|I need to|I want to|Let me|Let's|my (?:reply|answer|response)|(?:reply|answer|response) (?:should|can|will)|keep it|no tools? (?:needed|required)|short reply|background from|this refers to)\b|^(?:Hmm|Wait|Actually,? wait|Okay,? so)\b|^(?:The user|The human|He|She|They)\b.{0,80}\b(?:is asking|asks|asked|wants|said|wrote)\b/i;
 
 /** Planning that speaks in the first person (a bare restatement is not enough). */
 const RE_FIRST_PERSON_PLAN =
@@ -353,7 +353,17 @@ function stripKimiMarkup(text, { label = "sanitizer" } = {}) {
  * @returns {{ text: string, hadThinking: boolean }}
  */
 function handleThinkBlocks(text) {
-  if (!text || !RE_THINK_BLOCK.test(text)) return { text, hadThinking: false };
+  if (!text) return { text, hadThinking: false };
+  // Reasoning templates put the opening <think> in the prompt, so only the
+  // closing tag comes back: everything before the last stray </think> is reasoning.
+  RE_THINK_BLOCK.lastIndex = 0;
+  const unpaired = text.replace(RE_THINK_BLOCK, "");
+  const lastClose = unpaired.toLowerCase().lastIndexOf("</think>");
+  if (lastClose !== -1) {
+    return { text: unpaired.slice(lastClose + "</think>".length).replace(RE_EXCESS_NEWLINES, "\n\n").trim(), hadThinking: true };
+  }
+  RE_THINK_BLOCK.lastIndex = 0;
+  if (!RE_THINK_BLOCK.test(text)) return { text, hadThinking: false };
 
   RE_THINK_BLOCK.lastIndex = 0;
   const matches = [...text.matchAll(RE_THINK_BLOCK)];
