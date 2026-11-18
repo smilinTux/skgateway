@@ -465,6 +465,76 @@ export function sanitizeResponse(body, config = {}) {
 }
 
 // ---------------------------------------------------------------------------
+// Public API: sanitizeSSEBody
+// ---------------------------------------------------------------------------
+
+/**
+ * Sanitize the assistant text of a buffered chat-completion SSE body.
+ *
+ * The gateway buffers whole responses, so a `stream: true` request on the plain
+ * chat path hands the client the backend's SSE frames unparsed, and a leaky
+ * fallback model's reasoning reached the client untouched. Each choice's
+ * content deltas are joined, run through the same cleanup as the JSON path
+ * (leaked markup, planning lines, <think> blocks), and written back: the clean
+ * text rides in the first content frame and later content deltas are dropped.
+ *
+ * Deliberately narrow: only `delta.content` changes. Tool-call frames,
+ * reasoning fields, usage, finish reasons and non-JSON lines are untouched, and
+ * a body with nothing to clean is returned as the SAME buffer.
+ *
+ * @param {Buffer|string} body
+ * @param {object} [config]
+ * @param {string} [config.label]
+ * @returns {Buffer|string} The input when unchanged, else a new Buffer.
+ */
+export function sanitizeSSEBody(body, config = {}) {
+  const label = config.label || "sanitizer";
+  const raw = Buffer.isBuffer(body) ? body.toString("utf-8") : String(body ?? "");
+  const parts = raw.split(/(\r?\n\r?\n)/); // even index: event, odd: separator
+
+  const frames = []; // { i, lines, dataIdx, obj }
+  const byChoice = new Map(); // choice index -> [{ choice }]
+  for (let i = 0; i < parts.length; i += 2) {
+    const lines = parts[i].split(/\r?\n/);
+    const dataIdx = lines.findIndex((l) => l.startsWith("data:"));
+    if (dataIdx === -1) continue;
+    const payload = lines[dataIdx].slice(5).trim();
+    if (!payload.startsWith("{")) continue; // [DONE], keep-alives
+    let obj;
+    try { obj = JSON.parse(payload); } catch { continue; } // leave a bad frame alone
+    if (!Array.isArray(obj?.choices)) continue;
+    const frame = { i, lines, dataIdx, obj };
+    frames.push(frame);
+    for (const c of obj.choices) {
+      if (typeof c?.delta?.content !== "string") continue;
+      const key = c.index ?? 0;
+      if (!byChoice.has(key)) byChoice.set(key, []);
+      byChoice.get(key).push({ frame, choice: c });
+    }
+  }
+
+  const dirty = new Set();
+  for (const refs of byChoice.values()) {
+    const full = refs.map((r) => r.choice.delta.content).join("");
+    let cleaned = stripKimiMarkup(full, { label });
+    cleaned = handleThinkBlocks(cleaned).text;
+    if (cleaned === full) continue;
+    refs.forEach((r, n) => {
+      if (n === 0 && cleaned) r.choice.delta.content = cleaned;
+      else delete r.choice.delta.content;
+      dirty.add(r.frame);
+    });
+  }
+  if (dirty.size === 0) return body;
+
+  for (const f of dirty) {
+    f.lines[f.dataIdx] = "data: " + JSON.stringify(f.obj);
+    parts[f.i] = f.lines.join(parts[f.i].includes("\r\n") ? "\r\n" : "\n");
+  }
+  return Buffer.from(parts.join(""), "utf-8");
+}
+
+// ---------------------------------------------------------------------------
 // Tool-pairing repair (internal helper)
 // ---------------------------------------------------------------------------
 

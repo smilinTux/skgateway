@@ -18,6 +18,7 @@ import {
   recoverKimiToolCalls,
   sanitizeRequest,
   sanitizeResponse,
+  sanitizeSSEBody,
   trimHistoryToBudget,
 } from "../src/proxy/sanitizer.mjs";
 
@@ -651,5 +652,71 @@ describe("sanitizeResponse: unpaired </think> and untagged self-talk", () => {
   test("a normal reply that starts with 'Actually' is kept", () => {
     const text = "Actually, the gateway restarted cleanly.\nNo action needed.";
     assert.equal(run(text), text);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SSE bodies (stream:true on /v1/chat/completions is passed through buffered)
+// ---------------------------------------------------------------------------
+
+describe("sanitizeSSEBody", () => {
+  const frame = (delta, extra = {}) =>
+    "data: " + JSON.stringify({ id: "c1", object: "chat.completion.chunk", choices: [{ index: 0, delta, finish_reason: null, ...extra }] }) + "\n\n";
+  const build = (pieces) =>
+    Buffer.from(
+      frame({ role: "assistant" }) +
+        pieces.map((t) => frame({ content: t })).join("") +
+        "data: " + JSON.stringify({ id: "c1", choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { total_tokens: 9 } }) + "\n\n" +
+        "data: [DONE]\n\n"
+    );
+  const text = (buf) =>
+    buf.toString("utf-8").split("\n\n").filter((e) => e.startsWith("data: {"))
+      .map((e) => JSON.parse(e.slice(6))).flatMap((o) => o.choices.map((c) => c.delta?.content ?? "")).join("");
+
+  test("strips leaked reasoning spread across many chunks, keeps the answer", () => {
+    const leaked =
+      "The user (Chef) is asking: are you less wordy now?\n\nI should be brief.\n\nLet me write a short reply.\nLess wordy now, Chef.";
+    const pieces = leaked.match(/.{1,7}/gs);
+    const out = sanitizeSSEBody(build(pieces), { label: "test" });
+    assert.equal(text(out), "Less wordy now, Chef.");
+    const s = out.toString("utf-8");
+    assert.ok(s.includes('"finish_reason":"stop"'));
+    assert.ok(s.includes('"total_tokens":9'));
+    assert.ok(s.trimEnd().endsWith("data: [DONE]"));
+  });
+
+  test("strips a stray </think> across chunk boundaries", () => {
+    const out = sanitizeSSEBody(build(["reason", "ing </th", "ink>The answer is 4."]), { label: "test" });
+    assert.equal(text(out), "The answer is 4.");
+  });
+
+  test("a clean stream comes back byte-identical", () => {
+    const body = build(["Hello ", "there, ", "Chef."]);
+    const out = sanitizeSSEBody(body, { label: "test" });
+    assert.equal(out, body);
+  });
+
+  test("tool_call frames and non-JSON lines survive", () => {
+    const body = Buffer.from(
+      ": keep-alive\n\n" +
+        frame({ tool_calls: [{ index: 0, id: "t1", function: { name: "f", arguments: "{}" } }] }) +
+        "data: [DONE]\n\n"
+    );
+    assert.equal(sanitizeSSEBody(body, { label: "test" }), body);
+  });
+
+  test("multiple choices are sanitized independently", () => {
+    const f = (i, t) => "data: " + JSON.stringify({ choices: [{ index: i, delta: { content: t } }] }) + "\n\n";
+    const body = Buffer.from(f(0, "x </think>A0") + f(1, "plain B1") + "data: [DONE]\n\n");
+    const out = sanitizeSSEBody(body, { label: "test" }).toString("utf-8");
+    const objs = out.split("\n\n").filter((e) => e.startsWith("data: {")).map((e) => JSON.parse(e.slice(6)));
+    const by = {};
+    for (const o of objs) for (const c of o.choices) by[c.index] = (by[c.index] || "") + (c.delta.content ?? "");
+    assert.deepEqual(by, { 0: "A0", 1: "plain B1" });
+  });
+
+  test("a malformed frame is left alone instead of throwing", () => {
+    const body = Buffer.from("data: {not json\n\n" + frame({ content: "ok" }) + "data: [DONE]\n\n");
+    assert.equal(sanitizeSSEBody(body, { label: "test" }), body);
   });
 });
