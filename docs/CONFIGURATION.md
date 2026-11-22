@@ -241,7 +241,7 @@ backends:
 | `cooldown_ms` | integer | `60000` | Duration (ms) a backend stays in "down" state before being re-probed. |
 | `health_path` | string | `"/health"` | URL path used for liveness probe requests during backend recovery. |
 | `failover_model` | string | — | Model to use on the same backend when the requested model is unavailable. |
-| `model_aliases` | object | `{}` | Map of client-requested model IDs to backend-actual model IDs. Applied before forwarding. |
+| `model_aliases` | object | `{}` | Map of gateway model IDs (listed in this backend's `models`) to the ID this upstream actually serves. Rewritten in the request body only for attempts on this backend, so a name-strict engine such as vLLM can sit behind a gateway ID of its own. The top-level `model_aliases` is different: it renames the request before routing. |
 
 **Model capacity recovery probes:**
 

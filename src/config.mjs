@@ -884,6 +884,13 @@ export function assertProviderRoutes(
         (!Number.isInteger(backend.runaway_max_output_tokens) || backend.runaway_max_output_tokens < 16)) {
       errs.push(`backends.${name}.runaway_max_output_tokens must be an integer >= 16 (the Codex backend minimum)`);
     }
+    if ('model_aliases' in backend) {
+      const ma = backend.model_aliases;
+      if (!ma || typeof ma !== 'object' || Array.isArray(ma) ||
+          Object.entries(ma).some(([k, v]) => !k || typeof v !== 'string' || !v)) {
+        errs.push(`backends.${name}.model_aliases must map gateway model ids to non-empty upstream model ids`);
+      }
+    }
     if ('require_observed_health' in backend && typeof backend.require_observed_health !== 'boolean') {
       errs.push(`backends.${name}.require_observed_health must be a boolean`);
     }
