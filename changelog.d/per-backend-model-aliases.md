@@ -1,0 +1,1 @@
+- Per-backend `model_aliases` now works (it was documented but never implemented): a backend can serve a gateway id under the id its upstream actually serves, so name-strict engines like vLLM that share an upstream name get gateway ids of their own.

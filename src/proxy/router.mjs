@@ -1008,6 +1008,18 @@ export class Backend {
     this.min_output_tokens = Number.isFinite(config.min_output_tokens) && config.min_output_tokens > 0
       ? config.min_output_tokens
       : 0;
+    /**
+     * Per-backend upstream model names: gateway id -> the id THIS upstream
+     * serves. Lets a name-strict engine (vLLM rejects any id it does not
+     * serve) sit behind a gateway id of its own, so two hosts serving the same
+     * upstream name never share one gateway id. Applied per attempt, only for
+     * this backend.
+     * @type {Record<string,string>}
+     */
+    this.model_aliases = (config.model_aliases && typeof config.model_aliases === "object" && !Array.isArray(config.model_aliases))
+      ? Object.fromEntries(Object.entries(config.model_aliases)
+          .filter(([k, v]) => typeof k === "string" && k && typeof v === "string" && v))
+      : {};
 
     this._totalRequests = 0;
     this._totalErrors = 0;
@@ -4229,6 +4241,12 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       candidateModel,
       Number.isFinite(backend?.min_output_tokens) ? backend.min_output_tokens : 0,
     );
+    // Per-backend upstream name (backends.<id>.model_aliases): this door
+    // serves the gateway id under a different upstream id.
+    const upstreamModel = backend?.model_aliases?.[candidateModel];
+    if (upstreamModel && upstreamModel !== candidateModel) {
+      attemptBody = rewriteBodyModel(attemptBody, upstreamModel);
+    }
     let attemptTimeoutMs = isBucketChain
       ? bucketLivenessTimeoutMs(backend.timeout_ms)
       : backend.timeout_ms;
