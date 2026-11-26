@@ -305,6 +305,14 @@ const DEFAULTS = {
   //                     to this config file.
   //   provider_backends backends listed in /status provider_usage (contract
   //                     skgw-provider-usage/1), each always present.
+  // Privacy (docs/CONFIGURATION.md, "privacy"). content_logs: true logs as
+  // before; false keeps request and response text out of every log line, SIEM
+  // event, metrics.db and cache (src/privacy.mjs), and turns the semantic
+  // cache shadow off, since it holds prompts and answers.
+  privacy: {
+    content_logs: true,
+  },
+
   evidence_budget_monitoring: {
     enabled: null,
     client_caps: null,
@@ -1157,6 +1165,10 @@ function validate(cfg, removedBackendIds = new Set()) {
       if (!Number.isInteger(ca?.[key]) || ca[key] < 1) errs.push(`${name}.${key} must be a positive integer`);
     }
   }
+
+  // privacy
+  if (!cfg.privacy || typeof cfg.privacy.content_logs !== 'boolean')
+    errs.push('privacy.content_logs must be a boolean');
 
   // metrics
   if (typeof cfg.metrics.enabled !== 'boolean')

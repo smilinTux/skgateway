@@ -76,7 +76,8 @@ import { genericBucketQualification, applyGenericBucketMetadata, genericBucketQu
 import { readFileSync } from "node:fs";
 import { load as yamlLoad } from "js-yaml";
 import { createShadowRecorder } from "./proxy/semantic-cache-shadow.mjs";
-import { createClientGuard, clientOf } from "./policy/client-guard.mjs";
+import { createClientGuard, clientOf, meteringClient } from "./policy/client-guard.mjs";
+import { setContentLogs, contentLogsOn, logError } from "./privacy.mjs";
 import { attachProviderStore, pollDeepseekBalance, providerUsageStatus } from "./metrics/provider-usage.mjs";
 import { unservedRequest } from "./proxy/unserved-request.mjs";
 
@@ -97,6 +98,9 @@ for (let i = 0; i < args.length; i++) {
 // ─── Load config ───
 const _cfgEmitter = await loadConfig({ configPath });
 const config = _cfgEmitter.current();
+// Before anything logs a request: privacy.content_logs (src/privacy.mjs).
+setContentLogs(config.privacy?.content_logs);
+if (!contentLogsOn()) console.log("[skgateway] privacy: content_logs off (lengths and classes only, semantic cache shadow off)");
 const port = portOverride || config.server?.port || 18780;
 const bind = config.server?.bind || "127.0.0.1";
 let clientAuthenticator = config.client_auth?.enabled ? new ClientAuthenticator(config.client_auth) : null;
@@ -1349,7 +1353,9 @@ if (EBM_ON) {
 let _shadowCache = null;
 function shadowCache(config) {
   const cfg = config.semantic_cache;
-  if (!cfg?.enabled) return null;
+  // It keeps prompt and answer text in memory and sends prompts to an
+  // embedding service, so it never runs with content logs off.
+  if (!cfg?.enabled || !contentLogsOn()) return null;
   if (!_shadowCache) _shadowCache = createShadowRecorder(cfg, { emit: siemHook });
   return _shadowCache;
 }
@@ -2462,7 +2468,7 @@ export const server = http.createServer(async (req, res) => {
       ts: new Date().toISOString(),
       event: "identity.resolved",
       agent_id: identity.agent_id,
-      ...(EBM_ON ? { client: clientOf(req.headers) } : {}),
+      ...(EBM_ON ? { client: meteringClient(req.headers, identity) } : {}),
       method: identity.method,
       verified: identity.verified,
       session_id: identity.session_id,
@@ -2604,9 +2610,12 @@ export const server = http.createServer(async (req, res) => {
     // Untagged logging/reject, daily caps and rate limits, before any dispatch.
     // A guard failure never fails the request: it degrades to logging only.
     // Off: the raw x-app header (or nothing) is the attribution client, as before.
-    let skClient = EBM_ON ? clientOf(req.headers) : (req.headers["x-app"] || undefined);
+    // A caller verified by client_auth is metered under its verified client id
+    // either way, and its x-app header is ignored (it could name anyone).
+    const verifiedClient = identity?.method === "client_auth" ? meteringClient(req.headers, identity) : null;
+    let skClient = verifiedClient ?? (EBM_ON ? clientOf(req.headers) : (req.headers["x-app"] || undefined));
     if (EBM_ON) try {
-      const guard = clientGuard.check({ headers: req.headers, model: parsedModel, remote: req.socket?.remoteAddress ?? null, path: req.url });
+      const guard = clientGuard.check({ headers: req.headers, client: verifiedClient, model: parsedModel, remote: req.socket?.remoteAddress ?? null, path: req.url });
       skClient = guard.client;
       if (guard.reject) {
         res.writeHead(guard.reject.status, guard.reject.headers);
@@ -2837,7 +2846,7 @@ export const server = http.createServer(async (req, res) => {
     } catch (e) {
       // Fail-closed: any error during limit application rejects the request
       // before provider dispatch
-      console.error("[skgateway] model limits processing failed (fail-closed):", e.message);
+      console.error("[skgateway] model limits processing failed (fail-closed):", logError(e));
       closeMetrics({ statusCode: 500, errorMsg: describeException(e, "request_processing_failed") });
       if (!res.headersSent) {
         res.writeHead(500, { "content-type": "application/json" });
@@ -2957,7 +2966,7 @@ export const server = http.createServer(async (req, res) => {
               }
             } catch (parseError) {
               // Not parseable as JSON - pass through unchanged
-              console.warn(`[skgateway] response not JSON, skipping sanitization: ${parseError.message}`);
+              console.warn(`[skgateway] response not JSON, skipping sanitization: ${logError(parseError)}`);
             }
           }
           else {
@@ -2974,7 +2983,7 @@ export const server = http.createServer(async (req, res) => {
           }
         } catch (e) {
           // Fail-closed: sanitization error rejects before sending to client
-          console.error("[skgateway] response sanitization failed (fail-closed):", e.message);
+          console.error("[skgateway] response sanitization failed (fail-closed):", logError(e));
           closeMetrics({ statusCode: 500, errorMsg: describeException(e, "response_sanitization_failed") });
           if (!res.headersSent) {
             res.writeHead(500, { "content-type": "application/json" });
@@ -3260,7 +3269,7 @@ export const server = http.createServer(async (req, res) => {
       }
     }
   } catch (err) {
-    console.error("[skgateway] unhandled error:", err.message);
+    console.error("[skgateway] unhandled error:", logError(err));
     if (!res.headersSent) {
       res.writeHead(502, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: { message: "Gateway error", code: 502 } }));
@@ -3374,6 +3383,7 @@ _cfgEmitter.on("config-changed", () => {
   const prevPoolConfig = poolConfig;
   try {
     Object.assign(config, _cfgEmitter.current());
+    setContentLogs(config.privacy?.content_logs);
     clientAuthenticator = config.client_auth?.enabled ? new ClientAuthenticator(config.client_auth) : null;
     operatorAuthenticator = config.operator_auth?.enabled ? new ClientAuthenticator(config.operator_auth) : null;
     advertiseReconcileMode = reconcileModeFromConfig(config);
@@ -3390,6 +3400,7 @@ _cfgEmitter.on("config-changed", () => {
     // the pool limits as they were before this reload attempt.
     for (const k of Object.keys(config)) delete config[k];
     Object.assign(config, prevConfig);
+    setContentLogs(config.privacy?.content_logs);
     try { restoreRouterBackends(prevRouterBackends); } catch {}
     try { if (prevPoolConfig !== poolConfig) { pool.reconfigure(prevPoolConfig); poolConfig = prevPoolConfig; } } catch {}
     if (clientAuthenticator) clientAuthenticator.available = false;

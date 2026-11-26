@@ -65,6 +65,7 @@ import {
 } from "./sanitizer.mjs";
 import { parseRetryAfter, jitteredBackoff } from "./retry.mjs";
 import { shouldForceNonStream } from "../classifiers/classifier.mjs";
+import { contentLogsOn, logText } from "../privacy.mjs";
 
 // ---------------------------------------------------------------------------
 // Default configuration
@@ -314,7 +315,7 @@ export function normalizeSuccessfulResponse(resBody, cfg) {
       choice.message.content = cleaned;
       log(`promoted reasoning to content (${cleaned.length} chars)`);
     } else if (cleaned.length > 0) {
-      log(`suppressed short reasoning (${cleaned.length} chars): ${cleaned.slice(0, 80)}...`);
+      log(`suppressed short reasoning (${cleaned.length} chars)` + (contentLogsOn() ? `: ${cleaned.slice(0, 80)}...` : ""));
     } else {
       log("suppressed empty reasoning after sanitization");
     }
@@ -1065,13 +1066,13 @@ export async function handleRequest(clientReq, clientRes, cfg) {
         const tc = peek.choices?.[0]?.message?.tool_calls;
         if (tc && tc.length > 0) {
           const names = tc.map((c) => c.function?.name).join(", ");
-          log(`model called: [${names}] (${tc.length} calls)`);
+          log(`model called: [${contentLogsOn() ? names : "names withheld"}] (${tc.length} calls)`);
         } else {
           const content  = peek.choices?.[0]?.message?.content;
           const fr       = peek.choices?.[0]?.finish_reason;
           log(`model response: text (${content ? content.length : 0} chars) finish_reason=${fr}`);
           if (!content || content.length === 0) {
-            log(`EMPTY RESPONSE DEBUG: ${JSON.stringify(peek.choices?.[0]).slice(0, 500)}`);
+            log(`EMPTY RESPONSE DEBUG: ${logText(JSON.stringify(peek.choices?.[0]), 500)}`);
           }
         }
       } catch {
@@ -1118,7 +1119,7 @@ export async function handleRequest(clientReq, clientRes, cfg) {
           );
           if (invalidCalls.length > 0) {
             const badNames = invalidCalls.map((tc) => tc.function?.name || "(empty)").join(", ");
-            warn(`CALLAUTO DETECTED: invalid tool names [${badNames}] — stripping tool_calls, returning text-only`);
+            warn(`CALLAUTO DETECTED: invalid tool names [${contentLogsOn() ? badNames : `${invalidCalls.length} withheld`}], stripping tool_calls, returning text-only`);
             choice.message.tool_calls = choice.message.tool_calls.filter(
               (tc) => tc.function?.name && allToolNames.has(tc.function.name),
             );
@@ -1162,7 +1163,7 @@ export async function handleRequest(clientReq, clientRes, cfg) {
     stopSSEKeepAlive(sseState);
 
     if (res.status >= 400) {
-      error(`${res.status} ERROR: ${res.body.toString("utf-8").slice(0, 300)}`);
+      error(`${res.status} ERROR: ${logText(res.body.toString("utf-8"), 300)}`);
       if (!clientRes.headersSent) {
         clientRes.writeHead(res.status, res.headers);
       }

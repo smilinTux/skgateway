@@ -20,6 +20,8 @@
  *  - All regex patterns are pre-compiled at module load time.
  */
 
+import { contentLogsOn } from "../privacy.mjs";
+
 // ---------------------------------------------------------------------------
 // Defaults
 // ---------------------------------------------------------------------------
@@ -434,7 +436,7 @@ export function sanitizeResponse(body, config = {}) {
         c.message.content = recoveredContent;
         const names = recovered.map((tc) => tc.function?.name).join(",");
         console.log(
-          `[${label}] SANITIZED: recovered ${recovered.length} tool_call(s) from leaked markup [${names}]`
+          `[${label}] SANITIZED: recovered ${recovered.length} tool_call(s) from leaked markup [${contentLogsOn() ? names : "names withheld"}]`
         );
       }
     }

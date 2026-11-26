@@ -48,6 +48,7 @@ import {
 } from "../discovery/capacity_store.mjs";
 import { isRoutable, isEffectivelyRoutable } from "../discovery/lifecycle.mjs";
 import { applyReasoningFloor } from "./core.mjs";
+import { logText, logError } from "../privacy.mjs";
 import { enforceResponseContract } from "./response-contract.mjs";
 import { shouldForceNonStream } from "../classifiers/classifier.mjs";
 import { openAIJsonToSSEBuffer } from "./stream.mjs";
@@ -4131,7 +4132,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       console.info(`[router] non-stream flip: model=${parsedBody.model || requestedModel || "?"} reason=${decision.reason}`);
     }
   } catch (err) {
-    console.warn(`[router] non-stream classifier skipped: ${err.message}`);
+    console.warn(`[router] non-stream classifier skipped: ${logError(err)}`);
   }
 
   let lastResult = null;
@@ -4704,7 +4705,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           } else {
             if (raw && raw.status >= 400) {
               let d = "";
-              try { d = raw.body?.toString("utf-8").slice(0, 600); } catch { /* ignore */ }
+              try { d = logText(raw.body?.toString("utf-8"), 600); } catch { /* ignore */ }
               const reqTokens = (() => { try { return JSON.parse(tr.body.toString("utf-8")).max_tokens; } catch { return "?"; } })();
               console.warn(`[router] anthropic ${raw.status} err (sent max_tokens=${reqTokens}): ${d}`);
             }
@@ -4850,7 +4851,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
           res = enforceResponseContract(res, requestedModel);
         }
       } catch (err) {
-        console.warn(`[router] flip SSE re-emission skipped: ${err.message}`);
+        console.warn(`[router] flip SSE re-emission skipped: ${logError(err)}`);
       }
     }
     if (!flippedToNonStream) {
@@ -5320,7 +5321,7 @@ export async function routeAndSend(router, request, upstreamPath, method, client
       // "check gateway logs" is actually actionable.
       if (res.status >= 400) {
         let detail = "";
-        try { detail = res.body?.toString("utf-8").slice(0, 500); } catch { /* ignore */ }
+        try { detail = logText(res.body?.toString("utf-8"), 500); } catch { /* ignore */ }
         console.warn(`[router] ${res.status} upstream_error backend=${backendId} body=${detail}`);
         // 4xx are non-retryable but are client/payload errors the SOC needs.
         await emitSiem("error", {

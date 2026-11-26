@@ -17,6 +17,7 @@
    - [dashboard](#dashboard)
    - [identity](#identity)
    - [evidence_budget_monitoring](#evidence_budget_monitoring)
+   - [privacy](#privacy)
 6. [Example Configurations](#example-configurations)
    - [Minimal — NVIDIA proxy replacement](#minimal--nvidia-proxy-replacement)
    - [Full enterprise](#full-enterprise)
@@ -503,6 +504,36 @@ evidence_budget_monitoring:
 | `enabled` | boolean or null | `null` | `true` on, `false` off. `null` (unset) is on only when `$SKGATEWAY_CLIENT_CAPS` is set. Read at boot. |
 | `client_caps` | string | `null` | Caps, limits and alerts file; relative to this config file. Unset: `$SKGATEWAY_CLIENT_CAPS`, else `client-caps.yaml` beside this file. |
 | `provider_backends` | list | `[codex, deepseek, zai]` | Backends always listed in `provider_usage.backends`. |
+
+---
+
+### `privacy`
+
+What the gateway may keep of the text it carries. Content always flows to the
+backend and back to the caller; this decides only what lands in log lines,
+SIEM events, `metrics.db` and caches.
+
+```yaml
+privacy:
+  content_logs: false
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `content_logs` | boolean | `true` | `true` logs as before, including slices of upstream error bodies and model text where a log line quotes them. `false` keeps request and response text out of every log line, SIEM event, `metrics.db` row and cache: those sites log a length (`[N chars withheld]`) or an error class (`SyntaxError`, `Error code=ECONNRESET`) instead, tool names in log lines are withheld, and the semantic cache shadow does not run (it holds prompts and answers in memory and sends prompts to an embedding service). Must be a boolean; validated at boot and on reload. Hot-reloads on SIGHUP. |
+
+What is recorded per request with `content_logs: false` is metadata only: the
+client id, agent id, model asked for and served, backend, token counts,
+estimated cost, status and timings (plus the session id and user agent the
+caller sends, if any). The routing decision caches stay on: they live in
+memory and are keyed by a hash of the request text, holding no text.
+
+Pair it with `client_auth` for a metered per-client gateway: with
+`client_auth.enabled: true` the verified client id is the metering key for
+caps, `/admin/clients/usage`, audit events and `request_log.client`, and the
+caller's `x-app` header is ignored (see
+[EVIDENCE-BUDGET-MONITORING.md](EVIDENCE-BUDGET-MONITORING.md)).
+`tests/sidekick-privacy.test.mjs` checks both against live gateway processes.
 
 ---
 
