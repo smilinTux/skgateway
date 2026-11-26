@@ -59,6 +59,13 @@ export function secondsToMidnight(ms, tz = DEFAULT_TIMEZONE) {
 
 const clean = (v) => String(v ?? "").trim().replace(/[^A-Za-z0-9._:@\-]/g, "_").slice(0, 64);
 export const clientOf = (headers = {}) => clean(headers["x-app"]) || "untagged";
+/**
+ * The metering client for a request: with client_auth on, the client id the
+ * gateway verified (x-app is ignored, so a caller cannot bill another client);
+ * otherwise the x-app header, "untagged" when absent.
+ */
+export const meteringClient = (headers = {}, identity = null) =>
+  (identity?.method === "client_auth" && identity.client_id ? String(identity.client_id) : clientOf(headers));
 export const sessionOf = (headers = {}) => clean(headers["x-session-id"]) || null;
 
 const globRe = (p) => new RegExp("^" + String(p).split("*").map((s) => s.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*") + "$", "i");
@@ -314,10 +321,10 @@ export function createClientGuard({ configPath = DEFAULT_CONFIG_PATH, getDb = ()
    * Pre-dispatch check. Returns { client, session, reject } where reject is
    * null or { status, headers, body } to send instead of routing.
    */
-  function check({ headers = {}, model, remote = null, path = null } = {}) {
+  function check({ headers = {}, model, remote = null, path = null, client: verified = null } = {}) {
     loadConfig();
     const t = now();
-    const client = clientOf(headers);
+    const client = verified || clientOf(headers);
     const session = sessionOf(headers);
 
     if (client === "untagged") {

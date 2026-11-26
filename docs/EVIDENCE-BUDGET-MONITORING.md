@@ -7,7 +7,9 @@ It is **off by default**. Each cluster switches it on in its own config repo.
 With it on, the gateway:
 
 - names every caller by its `x-app` header (`untagged` when absent) on audit
-  events and in `request_log`;
+  events and in `request_log`, or, when `client_auth` verified the caller, by
+  its verified client id (its `x-app` header is then ignored, so a caller
+  cannot charge another client);
 - keeps per-client daily caps and per-minute rate limits for paid provider
   families (logged and enforced from a caps file you own);
 - records the provider rate-limit headers of real calls (Codex, zai) and the
@@ -25,6 +27,13 @@ balance poll, no `provider_snapshot`, `deepseek_balance_log` or `alert_fired`
 table, no `/admin/clients/usage`, and audit events carry no `client` field.
 `tests/evidence-budget-monitoring.test.mjs` checks both states against live
 gateway processes.
+
+For a gateway that meters each client and keeps no content, run it with
+`client_auth.enabled: true` and `privacy.content_logs: false`
+([CONFIGURATION.md](CONFIGURATION.md#privacy)): per request it then records
+the verified client id, agent id, model, backend, token counts, estimated
+cost, status and timings, and no prompt or reply text, caller address, session
+id, user agent or request path in any log, SIEM event or `metrics.db` row.
 
 ## Switching it on
 
