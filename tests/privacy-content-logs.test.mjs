@@ -10,7 +10,7 @@ import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "../src/config.mjs";
-import { setContentLogs, contentLogsOn, logText, logError } from "../src/privacy.mjs";
+import { setContentLogs, contentLogsOn, logText, logError, withholdRequestMeta, metaValue } from "../src/privacy.mjs";
 import { meteringClient } from "../src/policy/client-guard.mjs";
 import { normalizeSuccessfulResponse } from "../src/proxy/core.mjs";
 
@@ -73,4 +73,15 @@ test("core: suppressed reasoning is quoted when on and only counted when off", (
   const off = run();
   assert.doesNotMatch(off, new RegExp(CANARY));
   assert.match(off, /suppressed short reasoning \(16 chars\)/);
+});
+
+test("withholdRequestMeta and metaValue drop caller metadata only when off", () => {
+  const evt = { event: "identity.resolved", client: "sk-aaaaaaaaaaaa", model: "m", remote: "10.1.2.3", session_id: "s", user_agent: "ua", path: "/v1/x", fingerprint: "f",
+    details: { status: 200, path: "/v1/x", session_id: "s" } };
+  assert.equal(withholdRequestMeta(evt), evt);
+  assert.equal(metaValue("ua"), "ua");
+  setContentLogs(false);
+  assert.deepEqual(withholdRequestMeta(evt), { event: "identity.resolved", client: "sk-aaaaaaaaaaaa", model: "m", details: { status: 200 } });
+  assert.equal(evt.remote, "10.1.2.3", "the caller's object is not mutated");
+  assert.equal(metaValue("ua"), undefined);
 });

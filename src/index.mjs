@@ -77,7 +77,7 @@ import { readFileSync } from "node:fs";
 import { load as yamlLoad } from "js-yaml";
 import { createShadowRecorder } from "./proxy/semantic-cache-shadow.mjs";
 import { createClientGuard, clientOf, meteringClient } from "./policy/client-guard.mjs";
-import { setContentLogs, contentLogsOn, logError } from "./privacy.mjs";
+import { setContentLogs, contentLogsOn, logError, withholdRequestMeta, metaValue } from "./privacy.mjs";
 import { attachProviderStore, pollDeepseekBalance, providerUsageStatus } from "./metrics/provider-usage.mjs";
 import { unservedRequest } from "./proxy/unserved-request.mjs";
 
@@ -1283,6 +1283,8 @@ if (siemEnabled) {
 
 function siemHook(evt) {
   if (!siemEnabled) return;
+  // content_logs false: no caller address, session, user agent or path.
+  evt = withholdRequestMeta(evt);
   try {
     fs.appendFile(siemPath, JSON.stringify(evt) + "\n", () => {});
   } catch (e) {
@@ -2696,7 +2698,7 @@ export const server = http.createServer(async (req, res) => {
           agentId: metricsAgentId,
           model: parsedModel || "unknown",
           backend: undefined,           // not chosen yet; overridden on response
-          sessionId: req.headers["x-session-id"] || undefined,
+          sessionId: metaValue(req.headers["x-session-id"] || undefined),
         });
       } catch (err) {
         console.error("[skgateway] metrics recordRequest failed:", err.message);
@@ -2748,7 +2750,7 @@ export const server = http.createServer(async (req, res) => {
           // Provider-neutral rail attribution (card e19f88db / SKGW-ATTRIBUTION-01)
           attribution: {
             client: skClient,
-            application: req.headers["user-agent"] || undefined,
+            application: metaValue(req.headers["user-agent"] || undefined),
             // One canonical source: the router's result.logicalRoute, the
             // same value response headers expose. Never re-derive here.
             // Card bc908525 / review b62e19f8 finding 4.

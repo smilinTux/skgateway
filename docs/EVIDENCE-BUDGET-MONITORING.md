@@ -31,8 +31,9 @@ gateway processes.
 For a gateway that meters each client and keeps no content, run it with
 `client_auth.enabled: true` and `privacy.content_logs: false`
 ([CONFIGURATION.md](CONFIGURATION.md#privacy)): per request it then records
-the verified client id, model, token counts, estimated cost and timings, and
-no prompt or reply text in any log, SIEM event or `metrics.db` row.
+the verified client id, agent id, model, backend, token counts, estimated
+cost, status and timings, and no prompt or reply text, caller address, session
+id, user agent or request path in any log, SIEM event or `metrics.db` row.
 
 ## Switching it on
 

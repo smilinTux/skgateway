@@ -47,3 +47,31 @@ export function logError(err) {
   const code = typeof err?.code === "string" && /^[A-Z0-9_]{1,40}$/.test(err.code) ? ` code=${err.code}` : "";
   return name + code;
 }
+
+/**
+ * Per-request fields that say who is asking or from where rather than what
+ * was metered: the caller's address, session id, user agent, request path and
+ * key fingerprint. With content logs off they are withheld from every SIEM
+ * and audit event (top level and `details`), so an event carries only the
+ * client id, agent id, model, backend, token counts, cost, status and time.
+ */
+const REQUEST_META = ["remote", "session_id", "user_agent", "path", "fingerprint"];
+
+const strip = (obj) => {
+  const out = { ...obj };
+  for (const k of REQUEST_META) delete out[k];
+  return out;
+};
+
+/** The event as is while content logs are on; without the REQUEST_META fields while off. */
+export function withholdRequestMeta(evt) {
+  if (contentLogs || !evt || typeof evt !== "object") return evt;
+  const out = strip(evt);
+  if (out.details && typeof out.details === "object" && !Array.isArray(out.details)) out.details = strip(out.details);
+  return out;
+}
+
+/** A per-request value for metrics.db: the value while content logs are on, undefined (NULL) while off. */
+export function metaValue(value) {
+  return contentLogs ? value : undefined;
+}

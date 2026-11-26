@@ -159,6 +159,21 @@ const chat = (g, { model = "priv-ok", headers = {}, content = `hello ${CANARY}`,
     method: "POST", headers: { "content-type": "application/json", ...headers },
     body: JSON.stringify({ model, stream, messages: [{ role: "system", content: `system ${CANARY}` }, { role: "user", content }] }),
   });
+// Distinctive caller metadata: a loopback source address of its own, a path
+// with a marker query, a session id and a user agent nothing else contains.
+const META = { remote: "127.83.47.91", path: "/v1/chat/completions?trace=PRIVPATHQ7", session: "PRIVSESSN3", agent: "PRIVAGENT5/1.0" };
+const META_NEEDLES = { remote: META.remote, path: "PRIVPATHQ7", session: META.session, agent: "PRIVAGENT5" };
+function metaChat(g, headers = {}) {
+  const body = JSON.stringify({ model: "priv-ok", messages: [{ role: "user", content: "metadata probe" }] });
+  return new Promise((ok, no) => {
+    const req = http.request({
+      host: "127.0.0.1", port: g.port, path: META.path, method: "POST", localAddress: META.remote,
+      headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body), "x-session-id": META.session, "user-agent": META.agent, ...headers },
+    }, (res) => { let t = ""; res.on("data", (c) => { t += c; }); res.on("end", () => ok({ status: res.statusCode, text: t })); });
+    req.once("error", no);
+    req.end(body);
+  });
+}
 const audit = (g) => readFileSync(join(g.dir, "logs", "audit.jsonl"), "utf8").trim().split("\n").filter(Boolean).map(JSON.parse);
 
 /** Every file under `dir` whose bytes contain `needle`. */
@@ -218,6 +233,7 @@ test("content_logs false keeps every canary out of logs, SIEM, metrics.db and st
     const r = await chat(g, { ...c, headers: sidekickHeaders });
     await r.text();
   }
+  assert.equal((await metaChat(g, sidekickHeaders)).status, 200, "the metadata probe was served");
   await wait(6500); // metrics flush interval is 5 s
   const events = audit(g);
   assert.ok(events.some((e) => e.event === "prompt.classified" && e.jailbreak === true), "the jailbreak prompt was classified");
@@ -230,6 +246,19 @@ test("content_logs false keeps every canary out of logs, SIEM, metrics.db and st
   assert.deepEqual(filesContaining(g.dir, CANARY), [], "no file under the gateway's home holds content");
   assert.equal(g.out.includes(CANARY), false, `stdout/stderr hold no content:\n${g.out.split("\n").filter((l) => l.includes(CANARY)).join("\n")}`);
   assert.equal(g.out.includes(TOKEN), false, "the bearer token is never logged");
+  for (const [what, needle] of Object.entries(META_NEEDLES)) {
+    assert.deepEqual(filesContaining(g.dir, needle), [], `no file holds the caller's ${what}`);
+    assert.equal(g.out.includes(needle), false, `stdout/stderr hold no caller ${what}`);
+  }
+});
+
+test("content_logs true (default) still records the caller's session, user agent, path and address", async () => {
+  const g = gws.def;
+  assert.equal((await metaChat(g)).status, 200);
+  await wait(6500); // metrics flush interval is 5 s
+  for (const [what, needle] of Object.entries(META_NEEDLES)) {
+    assert.ok(filesContaining(g.dir, needle).length > 0, `the ${what} is recorded as before`);
+  }
 });
 
 test("content_logs true (default) keeps today's behaviour: the upstream error body is logged", async () => {

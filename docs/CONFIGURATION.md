@@ -520,13 +520,27 @@ privacy:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `content_logs` | boolean | `true` | `true` logs as before, including slices of upstream error bodies and model text where a log line quotes them. `false` keeps request and response text out of every log line, SIEM event, `metrics.db` row and cache: those sites log a length (`[N chars withheld]`) or an error class (`SyntaxError`, `Error code=ECONNRESET`) instead, tool names in log lines are withheld, and the semantic cache shadow does not run (it holds prompts and answers in memory and sends prompts to an embedding service). Must be a boolean; validated at boot and on reload. Hot-reloads on SIGHUP. |
+| `content_logs` | boolean | `true` | `true` logs as before, including slices of upstream error bodies and model text where a log line quotes them. `false` keeps request and response text out of every log line, SIEM event, `metrics.db` row and cache: those sites log a length (`[N chars withheld]`) or an error class (`SyntaxError`, `Error code=ECONNRESET`) instead, tool names in log lines are withheld, and the semantic cache shadow does not run (it holds prompts and answers in memory and sends prompts to an embedding service). It also withholds the caller address, session id, user agent and request path (below). Must be a boolean; validated at boot and on reload. Hot-reloads on SIGHUP. |
 
-What is recorded per request with `content_logs: false` is metadata only: the
-client id, agent id, model asked for and served, backend, token counts,
-estimated cost, status and timings (plus the session id and user agent the
-caller sends, if any). The routing decision caches stay on: they live in
-memory and are keyed by a hash of the request text, holding no text.
+With `content_logs: false` a SIEM or audit event and a `metrics.db` row
+record per request only:
+
+- the client id (the verified one under `client_auth`) and the agent id
+  (for a seat gateway a constant such as `sidekick`);
+- the model asked for and the model served;
+- the backend, provider and route that served it (the upstream, not the
+  person);
+- token counts and estimated cost;
+- status, error class and timings, plus the gateway's own request id.
+
+The caller's address, `x-session-id`, user agent, request path and key
+fingerprint are withheld: dropped from every SIEM and audit event (top level
+and `details`) and stored as NULL in `request_log.session_id`,
+`request_log.application`, `token_usage.session_id` and `cost_log.session_id`. The session id is
+still used in memory for per-session rate limits and routing affinity. The
+routing decision caches stay on: they live in memory and are keyed by a hash
+of the request text, holding no text. With `content_logs: true` all of these
+are recorded as before.
 
 Pair it with `client_auth` for a metered per-client gateway: with
 `client_auth.enabled: true` the verified client id is the metering key for
