@@ -51,6 +51,7 @@ function registry(path, agentId, clientId, token, revision) {
 }
 
 let upstream, upPort;
+const upstreamSaw = []; // the headers of every request the stub backend received
 const gws = {};
 
 function stubAnswer(model, stream) {
@@ -124,6 +125,7 @@ async function boot(name, { privateMode }) {
 
 before(async () => {
   upstream = http.createServer((req, res) => {
+    upstreamSaw.push({ ...req.headers });
     let body = "";
     req.on("data", (c) => { body += c; });
     req.on("end", () => {
@@ -229,15 +231,24 @@ test("content_logs false keeps every canary out of logs, SIEM, metrics.db and st
     { model: "priv-err500" },
     { model: "priv-notjson" },
   ];
+  const status = {};
   for (const c of calls) {
     const r = await chat(g, { ...c, headers: sidekickHeaders });
     await r.text();
+    status[c.model] = r.status;
   }
   assert.equal((await metaChat(g, sidekickHeaders)).status, 200, "the metadata probe was served");
   await wait(6500); // metrics flush interval is 5 s
   const events = audit(g);
   assert.ok(events.some((e) => e.event === "prompt.classified" && e.jailbreak === true), "the jailbreak prompt was classified");
-  assert.ok(events.some((e) => e.event_type === "error" || e.type === "upstream_client_error"), "the error paths ran");
+  // Each error path ran on its own: the upstream 400, the upstream 500 and the non-JSON body.
+  const of = (model, type) => events.filter((e) => e.model === model && e.event_type === type);
+  assert.equal(status["priv-err400"], 400, "the upstream 400 reached the caller");
+  assert.ok(of("priv-err400", "error").some((e) => e.details?.type === "upstream_client_error"), "the 400 path logged its error event");
+  assert.equal(status["priv-err500"], 500, "the upstream 500 reached the caller");
+  assert.ok(of("priv-err500", "error").some((e) => e.details?.type === "upstream_error"), "the 500 path logged its error event");
+  assert.equal(status["priv-notjson"], 200, "the non-JSON body was relayed");
+  assert.ok(of("priv-notjson", "response").some((e) => e.details?.status === 200), "the non-JSON path logged its response");
   const db = new Database(join(g.dir, "metrics.db"), { readonly: true });
   const rows = db.prepare("SELECT client, input_tokens, output_tokens FROM request_log").all();
   db.close();
@@ -269,3 +280,29 @@ test("content_logs true (default) keeps today's behaviour: the upstream error bo
   await wait(300);
   assert.match(g.out, new RegExp(`upstream_error backend=stub body=.*${CANARY}`));
 });
+
+// Headers that carry the person's network address. A reverse proxy in front of
+// the gateway adds them; none of them may reach a model provider, on any gateway.
+const ADDRESS_HEADERS = {
+  "x-forwarded-for": "198.51.100.23", forwarded: "for=198.51.100.23;proto=https", "x-real-ip": "198.51.100.23",
+  "cf-connecting-ip": "198.51.100.23", "true-client-ip": "198.51.100.23", "x-client-ip": "198.51.100.23",
+  "x-cluster-client-ip": "198.51.100.23", "fastly-client-ip": "198.51.100.23", via: "1.1 proxy-198-51-100-23",
+};
+
+for (const [name, mode] of [["priv", "content_logs false, client auth"], ["def", "default"]]) {
+  test(`the provider never sees the caller's address headers (${mode})`, async () => {
+    const from = upstreamSaw.length;
+    const headers = { ...(name === "priv" ? sidekickHeaders : {}), ...ADDRESS_HEADERS };
+    for (const stream of [false, true]) {
+      const r = await chat(gws[name], { headers, content: "address probe", stream });
+      assert.equal(r.status, 200);
+      await r.text();
+    }
+    const seen = upstreamSaw.slice(from);
+    assert.ok(seen.length >= 2, "the stub backend was called");
+    for (const h of seen) {
+      for (const key of Object.keys(ADDRESS_HEADERS)) assert.equal(h[key], undefined, `${key} reached the provider`);
+      assert.equal(JSON.stringify(h).includes("198.51.100.23"), false, "the caller address reached the provider");
+    }
+  });
+}

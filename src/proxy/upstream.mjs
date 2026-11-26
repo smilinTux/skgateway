@@ -102,6 +102,34 @@ export function buildUpstreamUrl(reqUrl, targetUrl) {
 }
 
 /**
+ * Headers that carry the caller's network address, set by a reverse proxy or
+ * CDN in front of the gateway. A provider has no use for them and must not
+ * learn who is behind the gateway, so they are stripped from EVERY upstream
+ * call, whatever privacy.content_logs says. The gateway reads them itself (net
+ * trust) from the incoming request before this; that copy is untouched.
+ * x-forwarded-host and x-forwarded-proto are kept: they name the gateway's own
+ * front, not the person.
+ */
+export const CLIENT_ADDRESS_HEADERS = [
+  "x-forwarded-for",
+  "forwarded",
+  "x-forwarded",
+  "forwarded-for",
+  "x-real-ip",
+  "x-client-ip",
+  "x-cluster-client-ip",
+  "x-originating-ip",
+  "x-remote-addr",
+  "x-remote-ip",
+  "cf-connecting-ip",
+  "cf-connecting-ipv6",
+  "cf-ipcountry",
+  "true-client-ip",
+  "fastly-client-ip",
+  "via",
+];
+
+/**
  * Forward one HTTP request to the upstream origin and collect the full
  * response body before resolving.
  *
@@ -187,6 +215,9 @@ export function sendUpstream(reqUrl, method, headers, body, targetUrl, timeoutMs
     // Strip hop-by-hop headers that must not be forwarded
     delete proxyHeaders.connection;
     delete proxyHeaders["keep-alive"];
+    // The caller's network address never reaches a provider (every upstream
+    // call goes through here). The gateway is the provider's client.
+    for (const h of CLIENT_ADDRESS_HEADERS) delete proxyHeaders[h];
 
     const transport = upstream.protocol === "https:" ? https : http;
 
