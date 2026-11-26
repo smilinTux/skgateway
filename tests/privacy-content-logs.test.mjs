@@ -4,9 +4,9 @@
  * core.mjs log sites that the live gateway test cannot reach (they belong to
  * the standalone proxy in core.mjs/handleRequest).
  */
-import { test, afterEach } from "node:test";
+import { test, afterEach, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "../src/config.mjs";
@@ -16,9 +16,12 @@ import { normalizeSuccessfulResponse } from "../src/proxy/core.mjs";
 
 const CANARY = "PRIVCANARY"; // ten chars: a JSON SyntaxError quotes the first ten of its input
 afterEach(() => setContentLogs(true));
+const dirs = [];
+after(() => { for (const d of dirs) rmSync(d, { recursive: true, force: true }); });
 
 async function configWith(yaml) {
   const dir = mkdtempSync(join(tmpdir(), "skgw-privacy-cfg-"));
+  dirs.push(dir);
   const path = join(dir, "gw.yaml");
   writeFileSync(path, [
     "backends:", "  stub:", "    url: http://127.0.0.1:9/v1", "    auth_type: none", "    models: [m]", "    priority: 1",
