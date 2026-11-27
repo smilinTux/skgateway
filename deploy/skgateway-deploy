@@ -102,6 +102,16 @@ STATE_DIR="$HOME/.local/state/skgateway/$INSTANCE"
 
 # read_env_value FILE KEY: last KEY=value line in FILE, quotes stripped.
 # Returns 1 (no output) if the file or the key is missing.
+# The /v1/models half of the health check. Without client auth it must answer 2xx; with
+# CLIENT_AUTH=true it must answer 401 to this anonymous call.
+models_probe_ok() {
+  if [ "${CLIENT_AUTH_VAL:-false}" = true ]; then
+    [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:$PORT/v1/models" 2>/dev/null)" = 401 ]
+  else
+    curl -fsS --max-time 2 "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1
+  fi
+}
+
 read_env_value() {
   local file="$1" key="$2" line val
   [ -f "$file" ] || return 1
@@ -233,6 +243,13 @@ do_deploy() {
   local release_pin
   release_pin="$(read_env_value "$INSTANCE_ENV" RELEASE)" || die "instance.env missing RELEASE: $INSTANCE_ENV"
   NODE_OPTIONS_VAL="$(read_env_value "$INSTANCE_ENV" NODE_OPTIONS || true)"
+  # CLIENT_AUTH=true: the instance runs client_auth, so /v1/models must REFUSE an anonymous call
+  # (401). That proves the server is up and that auth is on; a 200 there fails the deploy.
+  CLIENT_AUTH_VAL="$(read_env_value "$INSTANCE_ENV" CLIENT_AUTH || echo false)"
+  case "$CLIENT_AUTH_VAL" in
+    true|false) ;;
+    *) die "instance.env has an invalid CLIENT_AUTH '$CLIENT_AUTH_VAL' (must be true or false): $INSTANCE_ENV" ;;
+  esac
   local secrets_method
   secrets_method="$(read_env_value "$INSTANCE_ENV" SECRETS_METHOD || echo none)"
 
@@ -350,7 +367,11 @@ do_deploy() {
   handle_optional_units
 
   if [ "$EXECUTE" -ne 1 ]; then
-    log "DRY-RUN: would health-check http://127.0.0.1:$PORT/healthz and /v1/models (timeout ${HEALTH_TIMEOUT_S}s)"
+    if [ "$CLIENT_AUTH_VAL" = true ]; then
+      log "DRY-RUN: would health-check http://127.0.0.1:$PORT/healthz (200) and /v1/models (401 without a credential) (timeout ${HEALTH_TIMEOUT_S}s)"
+    else
+      log "DRY-RUN: would health-check http://127.0.0.1:$PORT/healthz and /v1/models (timeout ${HEALTH_TIMEOUT_S}s)"
+    fi
     log "DRY-RUN: no changes were made."
     exit 0
   fi
@@ -360,7 +381,7 @@ do_deploy() {
   healthy=0
   while [ "$SECONDS" -lt "$deadline" ]; do
     if curl -fsS --max-time 2 "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1 \
-      && curl -fsS --max-time 2 "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1; then
+      && models_probe_ok; then
       healthy=1
       break
     fi
