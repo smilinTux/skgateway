@@ -159,10 +159,10 @@ function makeFakeSystemctl() {
 
 // ─── fake health endpoint ───────────────────────────────────────────────────
 
-function startHealthServer(port) {
+function startHealthServer(port, { modelsStatus = 200 } = {}) {
   const server = http.createServer((req, res) => {
     if (req.url === '/healthz' || req.url === '/v1/models') {
-      res.writeHead(200, { 'content-type': 'application/json' });
+      res.writeHead(req.url === '/v1/models' ? modelsStatus : 200, { 'content-type': 'application/json' });
       res.end('{}');
     } else {
       res.writeHead(404);
@@ -300,6 +300,57 @@ describe('skgateway-deploy', () => {
       assert.match(r.systemctlLog, /restart skgateway-demo|enable --now skgateway-demo/);
     } finally {
       await stopServer(health);
+    }
+  });
+
+  test('CLIENT_AUTH=true: an anonymous /v1/models must get 401, and a 200 there fails the deploy', async () => {
+    const home = freshHome();
+    const configRepo = buildConfigRepo({
+      authed: { port: 19241, release: source.tagV1, extraEnv: { CLIENT_AUTH: 'true' } },
+      open: { port: 19242, release: source.tagV1, extraEnv: { CLIENT_AUTH: 'true' } },
+    });
+    const refuses = await startHealthServer(19241, { modelsStatus: 401 });
+    const answers = await startHealthServer(19242, { modelsStatus: 200 });
+    try {
+      const ok = await runDeploy(
+        ['--release', source.tagV1, '--config-repo', configRepo, '--instance', 'authed', '--execute'],
+        { home, repoRoot: source.dir, extraEnv: FAST_HEALTH },
+      );
+      assert.equal(ok.status, 0, ok.stderr + ok.stdout);
+      const bad = await runDeploy(
+        ['--release', source.tagV1, '--config-repo', configRepo, '--instance', 'open', '--execute'],
+        { home, repoRoot: source.dir, extraEnv: FAST_HEALTH },
+      );
+      assert.notEqual(bad.status, 0);
+      assert.match(bad.stderr, /health check failed/);
+    } finally {
+      await stopServer(refuses);
+      await stopServer(answers);
+    }
+  });
+
+  test('without CLIENT_AUTH a 401 on /v1/models fails the deploy; a bad CLIENT_AUTH value is refused', async () => {
+    const home = freshHome();
+    const configRepo = buildConfigRepo({
+      plain: { port: 19243, release: source.tagV1 },
+      typo: { port: 19244, release: source.tagV1, extraEnv: { CLIENT_AUTH: 'yes' } },
+    });
+    const refuses = await startHealthServer(19243, { modelsStatus: 401 });
+    try {
+      const r = await runDeploy(
+        ['--release', source.tagV1, '--config-repo', configRepo, '--instance', 'plain', '--execute'],
+        { home, repoRoot: source.dir, extraEnv: FAST_HEALTH },
+      );
+      assert.notEqual(r.status, 0);
+      assert.match(r.stderr, /health check failed/);
+      const t = await runDeploy(
+        ['--release', source.tagV1, '--config-repo', configRepo, '--instance', 'typo'],
+        { home, repoRoot: source.dir },
+      );
+      assert.notEqual(t.status, 0);
+      assert.match(t.stderr, /invalid CLIENT_AUTH 'yes'/);
+    } finally {
+      await stopServer(refuses);
     }
   });
 

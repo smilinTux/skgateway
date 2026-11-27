@@ -69,6 +69,7 @@ Optional keys:
 | Key | Meaning |
 |---|---|
 | `NODE_OPTIONS` | Passed through to the Node process via the unit's `Environment=`. |
+| `CLIENT_AUTH` | `true` for an instance with `client_auth.enabled`: the health check then expects `/v1/models` to answer 401 to its anonymous call (server up, auth on), and a 200 fails the deploy. Default `false` (`/v1/models` must answer 2xx). |
 | `SECRETS_METHOD` | `ansible-vault`, `sops`, or `none`. Default `none`. See [Secrets](#secrets). |
 | `VAULT_PASSWORD_FILE` | Path to the ansible-vault password file, only when `SECRETS_METHOD=ansible-vault`. **Never commit this file or put it inside the config repo.** |
 
